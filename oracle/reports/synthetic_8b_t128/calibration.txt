@@ -1,0 +1,246 @@
+weights: SYNTHETIC (deterministic, seeded; no Meta weights present). Every range below is a property of the synthetic distribution, not of Llama-3.
+config: llama3 d=4096 i=14336 L=1 h=32 kv=8 hd=128 eps=1e-05 theta=500000 rope=half_split softmax=row_max
+tokens: 128   layers: 1
+
+PASS 1 -- row-max SoftMax (the mathematical reference)
+======================================================
+Calibration report -- measured input ranges
+==========================================
+SoftMax shift: per-row maximum
+
+Measured ranges, merged across layers
+-------------------------------------
+(min/max are exact; quantiles come from a bounded reservoir)
+
+channel                         samples           min           max          mean      stddev      p99.99
+x_in                             524288      -4.42643       4.43823    0.00256915        1.03       4.429
+attn_norm.sum_sq                    128       3890.88       4302.02       4088.29       85.57        4302
+attn_norm.mean_sq                   128      0.949933       1.05031      0.998129     0.02089        1.05
+attn_norm.inv_rms                   128      0.975757       1.02601        1.0011     0.01045       1.026
+attn_norm.out                    524288      -5.12586       4.78523    0.00238425       1.036       4.755
+q_proj                           524288      -5.94551       4.73096  -0.000678344       1.049       4.646
+k_proj                           131072      -4.51081       4.70908   -0.00275494       1.037       4.709
+v_proj                           131072       -4.6157       4.35668   -0.00340031       1.038        4.33
+q_rope                           524288      -5.68446        4.9877      0.002643       1.046       4.891
+k_rope                           131072      -4.13426       4.70807   -0.00635634       1.036       4.623
+attn.scores                      524288      -5.22805       4.79956   -0.00117203       1.046       4.727
+attn.exp_input                   524288      -7.98147       5.26624      -2.23289       1.265       5.168
+attn.exp                         524288             0             1     0.0800863      0.1605           1
+attn.denominator                   4096             1        30.749       10.0384       5.555       30.75
+attn.reciprocal                    4096     0.0325214             1      0.156645      0.1497           1
+attn.probs                       524288             0             1     0.0096112     0.04839           1
+attn.context                     524288      -3.35383       3.35478   -0.00819934      0.3439       3.294
+o_proj                           524288      -3.58481       3.74969    0.00223748      0.3611        3.75
+x_mid                            524288       -5.2611       5.21397    0.00484529       1.081       5.157
+ffn_norm.sum_sq                     128       4015.38          8281       4414.21       483.7        8281
+ffn_norm.mean_sq                    128      0.980327       2.02174        1.0777      0.1181       2.022
+ffn_norm.inv_rms                    128      0.703295       1.00998      0.966535     0.04095        1.01
+ffn_norm.out                     524288      -4.96741          4.81  -0.000294834       1.035       4.748
+ffn.gate                        1835008      -4.84298       4.62524    0.00175725       1.033       4.541
+ffn.up                          1835008      -5.07395       5.12104   -0.00470374       1.044       5.024
+ffn.silu                        1835008     -0.278465       4.58035      0.215482      0.5883       4.532
+ffn.swiglu                      1835008      -11.3632       12.5798    0.00199966        0.87       12.15
+ffn.down                         524288      -2.83605       2.70101   0.000116121      0.6203       2.694
+x_out                            524288      -5.66864       5.68373    0.00715099       1.245       5.636
+
+Derived fit intervals
+---------------------
+
+rsqrt  from attn_norm.mean_sq + ffn_norm.mean_sq (union)
+  observed          [0.949933, 2.02174]
+  with 5% margin  [0.896342, 2.07533]
+  samples           256
+  hi/lo             2.315
+  note: 1/sqrt has a branch point at 0. The lower bound is the number that sets the fit degree; it is floored by rms_norm_eps and by nothing else, so a token whose activations are all near zero drives it. The lower bound must never be allowed to reach 0.
+
+exp  from attn.exp_input
+  observed          [-7.98147, 5.26624]
+  with 5% margin  [-8.64385, 5.92863]
+  samples           524288
+  note: This channel INCLUDES causally masked positions on purpose. The encrypted circuit applies the mask to exp(u), not to u, so exp is evaluated at every position including the masked ones and the fit interval must cover them. Under row-max shifting an unmasked u is <= 0, but a masked u can be positive -- which is why the observed upper bound here is not 0.
+
+reciprocal  from attn.denominator
+  observed          [1, 30.749]
+  with 5% margin  [0.5, 32.2365]
+  samples           4096
+  hi/lo             64.47
+  note: The measured denominator range, NOT the worst case. The worst case for a causal row of length T is [1, T] (row 0 has one key, row T-1 has T), and fitting 1/x over that was measured at 98.6% wrong in the HEonGPU record. The ratio hi/lo below is the whole difficulty of this fit. Lower bound clamped to observed_lo/2 to stay positive.
+
+silu  from ffn.gate
+  observed          [-4.84298, 4.84298]
+  with 5% margin  [-5.32728, 5.32728]
+  samples           1835008
+  note: Symmetrised: SiLU is fitted over a symmetric interval because the gate distribution is close to symmetric and an asymmetric interval buys nothing. The width tracks the model width, so this number is NOT transferable to a different hidden size.
+
+How far these numbers may be taken
+=================================
+1.  An interval measured on N token windows is a LOWER BOUND on the interval a
+    deployment sees. Widen it deliberately and say by how much; do not quietly
+    fit to the measurement.
+
+2.  With synthetic weights every number here is a property of the synthetic
+    distribution, not of Llama-3. The weight scaling (1/sqrt(fan_in)) was
+    chosen so the score distribution lands in the same decade a trained model
+    produces; that is a modelling choice, and it is the whole reason these
+    ranges are plausible rather than the e^75 dynamic range HEonGPU measured
+    from unscaled random weights.
+
+3.  The exp channel deliberately includes causally masked positions, because
+    the encrypted circuit masks exp(u) rather than u. An interval measured
+    over unmasked positions only will be too narrow, and the failure will look
+    like Chebyshev instability rather than like a range error.
+
+4.  The reciprocal interval is where calibration pays. The worst case for a
+    causal row is [1, T]; the measured range is far narrower, and the ratio
+    between them is the degree saving. Recheck it whenever the sequence
+    length, the fixed SoftMax shift, or the score scale changes -- all three
+    move it.
+
+5.  Quantiles come from a bounded reservoir and are approximate. Minima and
+    maxima are exact. Build intervals from the extremes; read the quantiles
+    only to see how much of the interval is tail.
+
+6.  After merging across layers, quantiles are approximate twice over (a
+    resampling of a sample). The merged extremes remain exact.
+
+
+PASS 2 -- fixed-shift SoftMax (what an encrypted circuit runs)
+=============================================================
+Measured score range over pass 1: [-5.22805, 4.79956].
+The fixed shift is set to the measured MAXIMUM, 4.79956, which is the only
+choice that keeps every exp argument at or below zero and therefore keeps
+exp bounded by 1. A shift chosen any lower lets exp grow; chosen higher, the
+denominator underflows towards the bottom of the reciprocal interval.
+This shift is a property of the MEASURED score distribution and must be
+re-measured whenever the weights, the sequence length or the scale change.
+
+Calibration report -- measured input ranges
+==========================================
+SoftMax shift: fixed at the measured max
+
+Measured ranges, merged across layers
+-------------------------------------
+(min/max are exact; quantiles come from a bounded reservoir)
+
+channel                         samples           min           max          mean      stddev      p99.99
+x_in                             524288      -4.42643       4.43823    0.00256915        1.03       4.429
+attn_norm.sum_sq                    128       3890.88       4302.02       4088.29       85.57        4302
+attn_norm.mean_sq                   128      0.949933       1.05031      0.998129     0.02089        1.05
+attn_norm.inv_rms                   128      0.975757       1.02601        1.0011     0.01045       1.026
+attn_norm.out                    524288      -5.12586       4.78523    0.00238425       1.036       4.755
+q_proj                           524288      -5.94551       4.73096  -0.000678344       1.049       4.646
+k_proj                           131072      -4.51081       4.70908   -0.00275494       1.037       4.709
+v_proj                           131072       -4.6157       4.35668   -0.00340031       1.038        4.33
+q_rope                           524288      -5.68446        4.9877      0.002643       1.046       4.891
+k_rope                           131072      -4.13426       4.70807   -0.00635634       1.036       4.623
+attn.scores                      524288      -5.22805       4.79956   -0.00117203       1.046       4.727
+attn.exp_input                   524288      -10.0276             0      -4.79389       1.045    -0.04244
+attn.exp                         524288             0             1    0.00883168     0.04642           1
+attn.denominator                   4096    0.00100733       2.65444       0.89266      0.5399       2.654
+attn.reciprocal                    4096      0.376727       992.719       6.25393       48.22       992.7
+attn.probs                       524288             0             1     0.0096112     0.04839           1
+attn.context                     524288      -3.35383       3.35478   -0.00819934      0.3439       3.294
+o_proj                           524288      -3.58481       3.74969    0.00223748      0.3611        3.75
+x_mid                            524288       -5.2611       5.21397    0.00484529       1.081       5.157
+ffn_norm.sum_sq                     128       4015.38          8281       4414.21       483.7        8281
+ffn_norm.mean_sq                    128      0.980327       2.02174        1.0777      0.1181       2.022
+ffn_norm.inv_rms                    128      0.703295       1.00998      0.966535     0.04095        1.01
+ffn_norm.out                     524288      -4.96741          4.81  -0.000294834       1.035       4.748
+ffn.gate                        1835008      -4.84298       4.62524    0.00175725       1.033       4.541
+ffn.up                          1835008      -5.07395       5.12104   -0.00470374       1.044       5.024
+ffn.silu                        1835008     -0.278465       4.58035      0.215482      0.5883       4.532
+ffn.swiglu                      1835008      -11.3632       12.5798    0.00199966        0.87       12.15
+ffn.down                         524288      -2.83605       2.70101   0.000116121      0.6203       2.694
+x_out                            524288      -5.66864       5.68373    0.00715099       1.245       5.636
+
+Derived fit intervals
+---------------------
+
+rsqrt  from attn_norm.mean_sq + ffn_norm.mean_sq (union)
+  observed          [0.949933, 2.02174]
+  with 5% margin  [0.896342, 2.07533]
+  samples           256
+  hi/lo             2.315
+  note: 1/sqrt has a branch point at 0. The lower bound is the number that sets the fit degree; it is floored by rms_norm_eps and by nothing else, so a token whose activations are all near zero drives it. The lower bound must never be allowed to reach 0.
+
+exp  from attn.exp_input
+  observed          [-10.0276, 0]
+  with 5% margin  [-10.529, 0.50138]
+  samples           524288
+  note: This channel INCLUDES causally masked positions on purpose. The encrypted circuit applies the mask to exp(u), not to u, so exp is evaluated at every position including the masked ones and the fit interval must cover them. Under row-max shifting an unmasked u is <= 0, but a masked u can be positive -- which is why the observed upper bound here is not 0.
+
+reciprocal  from attn.denominator
+  observed          [0.00100733, 2.65444]
+  with 5% margin  [0.000503667, 2.78711]
+  samples           4096
+  hi/lo             5534
+  note: The measured denominator range, NOT the worst case. The worst case for a causal row of length T is [1, T] (row 0 has one key, row T-1 has T), and fitting 1/x over that was measured at 98.6% wrong in the HEonGPU record. The ratio hi/lo below is the whole difficulty of this fit. Lower bound clamped to observed_lo/2 to stay positive.
+
+silu  from ffn.gate
+  observed          [-4.84298, 4.84298]
+  with 5% margin  [-5.32728, 5.32728]
+  samples           1835008
+  note: Symmetrised: SiLU is fitted over a symmetric interval because the gate distribution is close to symmetric and an asymmetric interval buys nothing. The width tracks the model width, so this number is NOT transferable to a different hidden size.
+
+How far these numbers may be taken
+=================================
+1.  An interval measured on N token windows is a LOWER BOUND on the interval a
+    deployment sees. Widen it deliberately and say by how much; do not quietly
+    fit to the measurement.
+
+2.  With synthetic weights every number here is a property of the synthetic
+    distribution, not of Llama-3. The weight scaling (1/sqrt(fan_in)) was
+    chosen so the score distribution lands in the same decade a trained model
+    produces; that is a modelling choice, and it is the whole reason these
+    ranges are plausible rather than the e^75 dynamic range HEonGPU measured
+    from unscaled random weights.
+
+3.  The exp channel deliberately includes causally masked positions, because
+    the encrypted circuit masks exp(u) rather than u. An interval measured
+    over unmasked positions only will be too narrow, and the failure will look
+    like Chebyshev instability rather than like a range error.
+
+4.  The reciprocal interval is where calibration pays. The worst case for a
+    causal row is [1, T]; the measured range is far narrower, and the ratio
+    between them is the degree saving. Recheck it whenever the sequence
+    length, the fixed SoftMax shift, or the score scale changes -- all three
+    move it.
+
+5.  Quantiles come from a bounded reservoir and are approximate. Minima and
+    maxima are exact. Build intervals from the extremes; read the quantiles
+    only to see how much of the interval is tail.
+
+6.  After merging across layers, quantiles are approximate twice over (a
+    resampling of a sample). The merged extremes remain exact.
+
+
+SHIFT STRATEGY -- the measured cost of not being able to take a maximum
+==========================================================================
+                          exp argument            denominator (1/x argument)
+  per-row maximum   [    -7.981,    5.266]   [         1,    30.75]  ratio    30.75
+  one fixed shift   [    -10.03,        0]   [  0.001007,    2.654]  ratio     2635
+
+Read it this way. A per-row maximum normalises every row, so its denominator
+sits in a narrow band and 1/x is easy to fit -- but a maximum is not a
+low-degree polynomial and CKKS cannot compute one. A single global shift IS
+computable, and it pays for that by widening the denominator range by the full
+spread of the per-row maxima: a row whose own scores are far below the global
+maximum contributes exponentially small terms.
+
+The ratio in the right-hand column is what the 1/x fit has to span, and the
+degree table above shows what that costs. If the fixed-shift ratio is large
+enough that no candidate degree fits it, the answer is NOT a higher degree.
+The options, in the order they should be considered:
+
+  1. Shift per row-block rather than globally, if the packing lets a block of
+     rows share one plaintext constant. This narrows the ratio by exactly the
+     spread of the per-block maxima and costs nothing but the constants.
+  2. Refresh the denominator on a narrow auxiliary track so the reciprocal is
+     evaluated at a fixed depth over a fixed range (the "refresh_denominator"
+     idea in the HEonGPU record, which reports the fit moving off the wide
+     track entirely).
+  3. Split the 1/x domain and select with a low-degree comparison -- expensive,
+     and the last resort.
+
+This measurement is the input to that decision; it is not the decision. S0 owns
+the choice, and it cannot be made without knowing the packing.

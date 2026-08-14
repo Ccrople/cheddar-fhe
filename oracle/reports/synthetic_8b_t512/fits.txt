@@ -1,0 +1,214 @@
+PART A -- over the FIXED-SHIFT intervals (the circuit that is
+actually implementable under CKKS). These are the degrees to plan
+against unless the shift strategy changes.
+
+Polynomial degree recommendations
+=================================
+Each row is a MEASURED max relative approximation error of a degree-n
+Chebyshev interpolant, evaluated in float64 on a 20001-point grid over
+the stated interval. It is a lower bound on what the encrypted
+evaluation achieves -- CKKS noise is on top of it and is not here.
+
+The 'interval' column is the part that is measured or guessed, and it
+is labelled per row. The error column is always measured.
+
+rsqrt over [0.88342, 2.07594]   interval: MEASURED (attn_norm.mean_sq + ffn_norm.mean_sq (union) on SYNTHETIC weights)
+  judged on: pointwise relative error, target 1.0e-04
+  function dynamic range over the interval: 1.533
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     1.2693e-03     1.2693e-03     1.3505e-03     6.4227e-04
+         7       3     1.8215e-06     1.8215e-06     1.9379e-06     9.1287e-07   <-- smallest that meets the target
+        15       4     5.0464e-12     5.0464e-12     5.3690e-12     2.5053e-12
+        31       5     5.2516e-15     3.4436e-15     3.6637e-15     1.4453e-15
+        63       6     1.1779e-14     8.2437e-15     8.7708e-15     3.3912e-15
+       127       7     1.6070e-14     1.6070e-14     1.7097e-14     4.4117e-15
+
+exp over [-11.8325, 0.56345]   interval: MEASURED (attn.exp_input on SYNTHETIC weights)
+  judged on: relative to peak error, target 1.0e-04
+  function dynamic range over the interval: 2.418e+05
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     6.6378e+03     2.2400e-01     3.9351e-01     1.0414e-01
+         7       3     2.9517e+02     4.4307e-03     7.7836e-03     2.9537e-03
+        15       4     4.1372e-03     3.4943e-08     6.1386e-08     3.0496e-08   <-- smallest that meets the target
+        31       5     3.9038e-11     1.2640e-15     2.2204e-15     3.6857e-16
+        63       6     1.8691e-10     1.2640e-15     2.2204e-15     4.5275e-16
+       127       7     1.6748e-10     1.3904e-15     2.4425e-15     6.7192e-16
+
+reciprocal over [0.000259222, 5.37479]   interval: MEASURED (attn.denominator on SYNTHETIC weights)
+  judged on: pointwise relative error, target 1.0e-04
+  function dynamic range over the interval: 2.073e+04
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     9.9846e-01     9.9846e-01     3.8517e+03     3.4431e+01
+         7       3     9.9386e-01     9.9386e-01     3.8340e+03     3.3948e+01
+        15       4     9.7580e-01     9.7580e-01     3.7644e+03     3.2523e+01
+        31       5     9.0875e-01     9.0875e-01     3.5057e+03     2.8786e+01
+        63       6     7.0332e-01     7.0332e-01     2.7132e+03     2.0966e+01
+       127       7     3.2861e-01     3.2861e-01     1.2677e+03     1.0002e+01
+  No candidate degree up to 127 reached the target on this interval. Narrow the interval (which is what calibration is for), split the domain, or accept a larger error -- do NOT simply raise the degree, because the levels have to come from somewhere.
+
+silu over [-6.05187, 6.05187]   interval: MEASURED (ffn.gate on SYNTHETIC weights)
+  judged on: relative to peak error, target 1.0e-04
+  function dynamic range over the interval: inf   (f changes sign; not used as a gate)
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     9.4746e+04     9.4746e-02     5.7204e-01     2.6853e-01
+         7       3     1.2340e+04     1.2340e-02     7.4502e-02     3.2958e-02
+        15       4     2.2860e+02     2.2860e-04     1.3802e-03     6.0909e-04
+        31       5     7.8875e-02     7.8875e-08     4.7622e-07     2.1017e-07   <-- smallest that meets the target
+        63       6     1.0040e-08     1.0070e-14     6.0799e-14     2.5382e-14
+       127       7     1.2504e-09     2.7950e-15     1.6875e-14     5.6384e-15
+
+Which error column a row is judged on, and why
+---------------------------------------------
+  rsqrt, reciprocal   POINTWISE RELATIVE. Their output is a scale factor --
+                      1/sqrt(x) multiplies the normalised row, 1/denominator
+                      multiplies the attention numerator -- so a relative error
+                      in the fit is a relative error in the answer at every
+                      magnitude, including the small ones.
+
+  exp, silu           RELATIVE TO PEAK (err/peak). Their output is summed or
+                      weighted, not used as a scale: exp feeds a normalising
+                      sum in which the small terms carry almost no mass, and
+                      SiLU feeds a 14336-term contraction. Judging these two
+                      pointwise reports an error the circuit does not suffer,
+                      and for SiLU it is meaningless outright -- SiLU crosses
+                      zero, so the pointwise ratio near the root measures where
+                      the root is, not how good the fit is.
+
+Both columns are printed for every row, so the choice can be argued with.
+
+Two ways a row can fail, and they need different fixes
+------------------------------------------------------
+"no candidate degree reached the target" is an APPROXIMATION failure: the
+function is hard to fit on that interval. Narrowing the interval or splitting
+the domain fixes it; so does a higher degree, at the cost of levels.
+
+"REJECTED ON DYNAMIC RANGE" is not an approximation failure at all. The
+function's own values span more decades over that interval than the ciphertext
+scale can carry, so the result is unrepresentable however well it is
+approximated, and no degree helps. This is the failure the HEonGPU record
+describes: an exp over a span of e^75 did not fail loudly, it returned values
+that outgrew int64 at decrypt and looked like a library fault.
+
+How to read the depth column
+---------------------------
+depth = ceil(log2(degree+1)), the multiplicative depth of a baby-step/giant-
+step evaluation. It is a structural count, not a measurement of Cheddar's
+EvalPoly, and Cheddar's own scale/level bookkeeping may add to it. Session S3's
+level tracer is what settles the real number.
+
+Why the smallest degree that meets the target is the right pick
+---------------------------------------------------------------
+A degree costs levels and levels cost bootstraps. HEonGPU measured accuracy
+going UP when fit degrees came DOWN, because the deeper circuit ran out of
+chain and had to be refreshed more often. Take the smallest degree that meets
+the target on the CALIBRATED interval, and spend any surplus on narrowing the
+interval instead -- that is the cheaper lever by a wide margin.
+
+
+PART B -- over the PER-ROW-MAXIMUM intervals. A row maximum is
+NOT computable under CKKS, so this table is not a plan; it is the
+upper bound on what any better shift strategy could buy. Where a
+row here needs a lower degree than the same row in Part A, that
+difference is the prize for narrowing the shift -- per row-block,
+or via a refreshed auxiliary denominator track.
+
+Polynomial degree recommendations
+=================================
+Each row is a MEASURED max relative approximation error of a degree-n
+Chebyshev interpolant, evaluated in float64 on a 20001-point grid over
+the stated interval. It is a lower bound on what the encrypted
+evaluation achieves -- CKKS noise is on top of it and is not here.
+
+The 'interval' column is the part that is measured or guessed, and it
+is labelled per row. The error column is always measured.
+
+rsqrt over [0.88342, 2.07594]   interval: MEASURED (attn_norm.mean_sq + ffn_norm.mean_sq (union) on SYNTHETIC weights)
+  judged on: pointwise relative error, target 1.0e-04
+  function dynamic range over the interval: 1.533
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     1.2693e-03     1.2693e-03     1.3505e-03     6.4227e-04
+         7       3     1.8215e-06     1.8215e-06     1.9379e-06     9.1287e-07   <-- smallest that meets the target
+        15       4     5.0464e-12     5.0464e-12     5.3690e-12     2.5053e-12
+        31       5     5.2516e-15     3.4436e-15     3.6637e-15     1.4453e-15
+        63       6     1.1779e-14     8.2437e-15     8.7708e-15     3.3912e-15
+       127       7     1.6070e-14     1.6070e-14     1.7097e-14     4.4117e-15
+
+exp over [-9.82847, 6.92085]   interval: MEASURED (attn.exp_input on SYNTHETIC weights)
+  judged on: relative to peak error, target 1.0e-04
+  function dynamic range over the interval: 1.88e+07
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     2.9984e+04     3.3774e-01     3.4219e+02     7.2272e+01
+         7       3     3.1388e+03     1.4480e-02     1.4671e+01     4.6781e+00
+        15       4     3.6618e-01     8.5872e-07     8.7004e-04     3.8551e-04   <-- smallest that meets the target
+        31       5     2.2836e-10     2.0197e-15     2.0464e-12     1.6446e-13
+        63       6     8.8938e-10     1.6831e-15     1.7053e-12     2.6028e-13
+       127       7     7.5373e-10     3.3662e-15     3.4106e-12     3.7160e-13
+
+reciprocal over [0.5, 91.7361]   interval: MEASURED (attn.denominator on SYNTHETIC weights)
+  judged on: pointwise relative error, target 1.0e-04
+  function dynamic range over the interval: 183.5
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     8.4730e-01     8.4730e-01     1.6946e+00     9.9364e-02
+         7       3     5.5997e-01     5.5997e-01     1.1199e+00     5.6015e-02
+        15       4     1.8593e-01     1.8593e-01     3.7186e-01     1.8393e-02
+        31       5     1.7589e-02     1.7589e-02     3.5178e-02     1.8203e-03
+        63       6     1.5471e-04     1.5471e-04     3.0943e-04     1.6190e-05
+       127       7     1.1969e-08     1.1968e-08     2.3937e-08     1.2574e-09   <-- smallest that meets the target
+
+silu over [-6.05187, 6.05187]   interval: MEASURED (ffn.gate on SYNTHETIC weights)
+  judged on: relative to peak error, target 1.0e-04
+  function dynamic range over the interval: inf   (f changes sign; not used as a gate)
+    degree   depth  pointwise rel       err/peak    max abs err        rms err
+         3       2     9.4746e+04     9.4746e-02     5.7204e-01     2.6853e-01
+         7       3     1.2340e+04     1.2340e-02     7.4502e-02     3.2958e-02
+        15       4     2.2860e+02     2.2860e-04     1.3802e-03     6.0909e-04
+        31       5     7.8875e-02     7.8875e-08     4.7622e-07     2.1017e-07   <-- smallest that meets the target
+        63       6     1.0003e-08     1.0033e-14     6.0577e-14     2.5379e-14
+       127       7     1.1401e-09     2.6479e-15     1.5987e-14     5.5906e-15
+
+Which error column a row is judged on, and why
+---------------------------------------------
+  rsqrt, reciprocal   POINTWISE RELATIVE. Their output is a scale factor --
+                      1/sqrt(x) multiplies the normalised row, 1/denominator
+                      multiplies the attention numerator -- so a relative error
+                      in the fit is a relative error in the answer at every
+                      magnitude, including the small ones.
+
+  exp, silu           RELATIVE TO PEAK (err/peak). Their output is summed or
+                      weighted, not used as a scale: exp feeds a normalising
+                      sum in which the small terms carry almost no mass, and
+                      SiLU feeds a 14336-term contraction. Judging these two
+                      pointwise reports an error the circuit does not suffer,
+                      and for SiLU it is meaningless outright -- SiLU crosses
+                      zero, so the pointwise ratio near the root measures where
+                      the root is, not how good the fit is.
+
+Both columns are printed for every row, so the choice can be argued with.
+
+Two ways a row can fail, and they need different fixes
+------------------------------------------------------
+"no candidate degree reached the target" is an APPROXIMATION failure: the
+function is hard to fit on that interval. Narrowing the interval or splitting
+the domain fixes it; so does a higher degree, at the cost of levels.
+
+"REJECTED ON DYNAMIC RANGE" is not an approximation failure at all. The
+function's own values span more decades over that interval than the ciphertext
+scale can carry, so the result is unrepresentable however well it is
+approximated, and no degree helps. This is the failure the HEonGPU record
+describes: an exp over a span of e^75 did not fail loudly, it returned values
+that outgrew int64 at decrypt and looked like a library fault.
+
+How to read the depth column
+---------------------------
+depth = ceil(log2(degree+1)), the multiplicative depth of a baby-step/giant-
+step evaluation. It is a structural count, not a measurement of Cheddar's
+EvalPoly, and Cheddar's own scale/level bookkeeping may add to it. Session S3's
+level tracer is what settles the real number.
+
+Why the smallest degree that meets the target is the right pick
+---------------------------------------------------------------
+A degree costs levels and levels cost bootstraps. HEonGPU measured accuracy
+going UP when fit degrees came DOWN, because the deeper circuit ran out of
+chain and had to be refreshed more often. Take the smallest degree that meets
+the target on the CALIBRATED interval, and spend any surplus on narrowing the
+interval instead -- that is the cheaper lever by a wide margin.
