@@ -282,8 +282,11 @@ TEST_P(ChainBed, ProjectionResidualPath) {
                    "0 levels");
 
   // Repeat the projection+residual block until the level budget runs out, to
-  // measure error growth and find the bootstrap point.
-  std::cout << "repeat,level,max_abs_err,scale_log2\n";
+  // measure error growth and find the bootstrap point. The host magnitude is
+  // reported alongside the error: a linear chain amplifies the signal every
+  // stage, and dynamic range can run out before the level budget does.
+  std::cout << "repeat,level,max_abs_err,rel_err,host_max_abs,scale_log2,"
+               "log2_q_over_scale\n";
   Ciphertext<word> cur;
   context_->Copy(cur, ct_sum);
   std::vector<Complex> ref_cur = ref_sum;
@@ -315,8 +318,23 @@ TEST_P(ChainBed, ProjectionResidualPath) {
     const s3::ErrorStats stats = tracer.Trace(
         "repeat " + std::to_string(repeats) + " proj+residual", sum_i, ref_next,
         meta, 0.0, "level " + std::to_string(lvl_i));
+
+    double host_max = 0.0;
+    for (const auto &v : ref_next) host_max = std::max(host_max, std::abs(v));
+
+    // The largest message a ciphertext at this level can carry is about
+    // q / (2 * scale). Report it so a dynamic-range overflow is separable from
+    // a level exhaustion.
+    const NPInfo np_i = param_->LevelToNP(lvl_i);
+    const auto primes_i = param_->GetPrimeVector(np_i);
+    double log2_q = 0.0;
+    for (const auto &p : primes_i) log2_q += std::log2(static_cast<double>(p));
+    const double log2_headroom = log2_q - std::log2(sum_i.GetScale());
+
     std::cout << repeats << ',' << lvl_i << ',' << stats.max_abs << ','
-              << std::log2(sum_i.GetScale()) << '\n';
+              << (host_max > 0 ? stats.max_abs / host_max : 0.0) << ','
+              << host_max << ',' << std::log2(sum_i.GetScale()) << ','
+              << log2_headroom << '\n';
 
     cur = std::move(sum_i);
     ref_cur = std::move(ref_next);
@@ -542,34 +560,59 @@ TEST_P(ChainBed, SiluSwigluPath) {
             << " levels_consumed=" << entry_level - exit_level << "\n";
 
   // Repeat the SiLU+gate shape to find how many fit in one level budget.
+  //
+  // A Chebyshev fit is only valid on [-1, 1] and diverges violently outside
+  // it, so each repeat must re-map its input back into the fit domain before
+  // the next stage. A real decoder block gets this for free from the RMSNorm
+  // that precedes every SwiGLU; here it is paid explicitly and costs one
+  // level per stage. Without it the chain is measuring the divergence of the
+  // host polynomial, not anything about Cheddar.
   int repeats = 0;
   Ciphertext<word> cur;
   context_->Copy(cur, ct_out);
   std::vector<Complex> ref_cur = ref_out;
-  const int depth = entry_level - exit_level;
+  const int depth = entry_level - exit_level + 1;  // +1 for the re-map
+  std::cout << "repeat,level,max_abs_err,rel_err,host_max_abs\n";
   while (param_->NPToLevel(cur.GetNP()) > depth) {
-    const int lvl = param_->NPToLevel(cur.GetNP());
+    // Re-map the previous stage's output into [-1, 1] using its observed range.
+    double obs = 0.0;
+    for (const auto &v : ref_cur) obs = std::max(obs, std::abs(v.real()));
+    obs = std::max(obs, 1e-6);
+    const s3::DomainMap remap{-obs, obs};
+    const int pre_lvl = param_->NPToLevel(cur.GetNP());
+    Ciphertext<word> cur_unit;
+    AffineToUnit(cur_unit, cur, remap, pre_lvl);
+    std::vector<Complex> ref_unit(kSlots);
+    for (int i = 0; i < kSlots; ++i) {
+      ref_unit[i] = Complex(remap.ToUnit(ref_cur[i].real()), 0.0);
+    }
+
+    const int lvl = param_->NPToLevel(cur_unit.GetNP());
     auto poly_i = MakePoly(silu, lvl);
     Ciphertext<word> silu_i, down_i, out_i;
-    poly_i->Evaluate(context_, silu_i, cur, interface_->GetMultiplicationKey());
+    poly_i->Evaluate(context_, silu_i, cur_unit,
+                     interface_->GetMultiplicationKey());
     const int lvl_i = param_->NPToLevel(silu_i.GetNP());
-    context_->LevelDown(down_i, cur, lvl_i);
+    context_->LevelDown(down_i, cur_unit, lvl_i);
     context_->HMult(out_i, silu_i, down_i,
                     interface_->GetMultiplicationKey(), true);
 
     std::vector<Complex> ref_next(kSlots);
     for (int i = 0; i < kSlots; ++i) {
-      ref_next[i] = Complex(poly_i->PlainEvaluate(ref_cur[i].real()), 0.0) *
-                    ref_cur[i];
+      ref_next[i] = Complex(poly_i->PlainEvaluate(ref_unit[i].real()), 0.0) *
+                    ref_unit[i];
     }
     ++repeats;
     const s3::ErrorStats stats =
         tracer.Trace("repeat " + std::to_string(repeats) + " silu+gate", out_i,
                      ref_next, meta, 0.0,
                      "level " + std::to_string(param_->NPToLevel(out_i.GetNP())));
-    std::cout << "repeat " << repeats
-              << " level=" << param_->NPToLevel(out_i.GetNP())
-              << " max_abs_err=" << stats.max_abs << "\n";
+    double host_max = 0.0;
+    for (const auto &v : ref_next) host_max = std::max(host_max, std::abs(v));
+    std::cout << repeats << ',' << param_->NPToLevel(out_i.GetNP()) << ','
+              << stats.max_abs << ','
+              << (host_max > 0 ? stats.max_abs / host_max : 0.0) << ','
+              << host_max << '\n';
     cur = std::move(out_i);
     ref_cur = std::move(ref_next);
   }
