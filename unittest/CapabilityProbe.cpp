@@ -605,6 +605,91 @@ TEST_P(ProbeBed, LinearTransformBSGS) {
 }
 
 // ===========================================================================
+// 8b. The level floor of the hoisted linear transform
+// ===========================================================================
+
+/**
+ * The chain probe found a projection+residual chain producing garbage from the
+ * stage whose input level had num_q <= alpha, with ~2^279 of modulus headroom
+ * still available and a host magnitude of only ~2^12 -- so neither level
+ * exhaustion nor dynamic range explains it. This probe isolates the effect:
+ * one single LinearTransform, at each input level, against a host matvec.
+ *
+ * If there is a level floor below which the hoisted BSGS path is invalid, a
+ * Llama block must bootstrap before it reaches that floor, and that is a hard
+ * scheduling constraint rather than a tuning preference.
+ */
+TEST_P(ProbeBed, LinearTransformLevelFloor) {
+  s3::DetRandom rng;
+  const int n = kTraceSlots;
+  const int bs = 8, gs = 4;
+
+  StripedMatrix matrix(n, n);
+  for (int d = 0; d < bs * gs; d += 2) {
+    std::vector<Complex> diag;
+    rng.ComplexMsg(diag, n, -0.5, 0.5);
+    matrix[d] = diag;
+  }
+
+  std::vector<Complex> msg;
+  rng.Real(msg, n, -1.0, 1.0);
+  std::vector<Complex> ref(n, Complex(0.0, 0.0));
+  for (const auto &[d, diag] : matrix) {
+    for (int i = 0; i < n; ++i) ref[i] += diag[i] * msg[(i + d) % n];
+  }
+
+  // Generate the keys once at a high level; lower levels reuse them.
+  {
+    LinearTransform<word> lt_top(context_, matrix, param_->max_level_,
+                                 DetermineScale(param_->max_level_), bs, gs);
+    EvkRequest req;
+    lt_top.AddRequiredRotations(req);
+    interface_->PrepareRotationKey(req);
+  }
+
+  std::cout << "alpha=" << GetAlpha() << " dnum=" << GetDnum() << "\n";
+  std::cout << "in_level,num_q,num_aux_alpha,beta_ceil_q_over_alpha,"
+               "out_level,max_abs_err,verdict\n";
+
+  int floor_level = -1;
+  for (int level = param_->default_encryption_level_; level >= 2; --level) {
+    const NPInfo np = param_->LevelToNP(level);
+    const int num_q = np.GetNumQ();
+    const int beta = (num_q + GetAlpha() - 1) / GetAlpha();
+
+    LinearTransform<word> lt(context_, matrix, level, DetermineScale(level), bs,
+                             gs);
+    Ciphertext<word> ct, res;
+    EncodeAndEncrypt(ct, msg, level);
+    lt.Evaluate(context_, res, ct, interface_->GetEvkMap());
+
+    std::vector<Complex> got;
+    Plaintext<word> pt;
+    interface_->Decrypt(pt, res);
+    context_->encoder_.Decode(got, pt);
+    const s3::ErrorStats stats = s3::CompareDecoded(ref, got);
+    const bool ok = stats.max_abs < 1e-3;
+    if (!ok && floor_level < 0) floor_level = level;
+
+    std::cout << level << ',' << num_q << ',' << GetAlpha() << ',' << beta
+              << ',' << param_->NPToLevel(res.GetNP()) << ',' << stats.max_abs
+              << ',' << (ok ? "OK" : "GARBAGE") << '\n';
+  }
+
+  if (floor_level >= 0) {
+    const int num_q = param_->LevelToNP(floor_level).GetNumQ();
+    std::cout << "LEVEL FLOOR: the hoisted LinearTransform first fails at "
+                 "input level "
+              << floor_level << " (num_q=" << num_q
+              << ", alpha=" << GetAlpha() << ").\n";
+    std::cout << "A Llama block must bootstrap before an input reaches this "
+                 "level if it is to use LinearTransform.\n";
+  } else {
+    std::cout << "No level floor observed down to level 2.\n";
+  }
+}
+
+// ===========================================================================
 // 9. EvalPoly: the four Llama non-linearity fits
 // ===========================================================================
 
