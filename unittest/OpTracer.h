@@ -245,15 +245,30 @@ class OpTracer {
     const int level = (np.num_aux_ == 0) ? param.NPToLevel(np) : -2;
     const double scale = ct.GetScale();
 
+    // Operation names and notes contain commas, so every free-text field is
+    // quoted. Without this the trace files do not parse into columns.
+    auto q = [](const std::string &s) {
+      std::string escaped;
+      escaped.reserve(s.size() + 2);
+      escaped.push_back('"');
+      for (char c : s) {
+        if (c == '"') escaped.push_back('"');  // RFC 4180 doubling
+        escaped.push_back(c);
+      }
+      escaped.push_back('"');
+      return escaped;
+    };
+
     if (out_.is_open()) {
-      out_ << run_id_ << ',' << chain_ << ',' << seq_ << ',' << op << ','
-           << notes << ',' << param.log_degree_ << ',' << ct.GetNumSlots()
-           << ',' << level << ',' << param.max_level_ << ',' << np.num_main_
-           << ',' << np.num_ter_ << ',' << np.num_aux_ << ',' << np.GetNumQ()
-           << ',' << np.GetNumTotal() << ',' << (ct.HasRx() ? 3 : 2) << ','
-           << std::setprecision(17) << scale << ','
-           << std::setprecision(8) << std::log2(scale) << ',' << meta.layout
-           << ',' << meta.shape << ',' << decrypt_path << ',';
+      out_ << q(run_id_) << ',' << q(chain_) << ',' << seq_ << ',' << q(op)
+           << ',' << q(notes) << ',' << param.log_degree_ << ','
+           << ct.GetNumSlots() << ',' << level << ',' << param.max_level_
+           << ',' << np.num_main_ << ',' << np.num_ter_ << ',' << np.num_aux_
+           << ',' << np.GetNumQ() << ',' << np.GetNumTotal() << ','
+           << (ct.HasRx() ? 3 : 2) << ',' << std::setprecision(17) << scale
+           << ',' << std::setprecision(8) << std::log2(scale) << ','
+           << q(meta.layout) << ',' << q(meta.shape) << ',' << q(decrypt_path)
+           << ',';
       if (stats.valid) {
         out_ << std::scientific << std::setprecision(6) << stats.max_abs << ','
              << stats.mean_abs << ',' << stats.snr << ','
