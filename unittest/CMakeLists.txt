@@ -26,6 +26,16 @@ if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # S3 capability probes. Additive only; nothing above is modified.
+  # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
+  add_executable(capability_probe CapabilityProbe.cpp)
+  target_link_libraries(capability_probe
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  add_executable(chain_probe ChainProbe.cpp)
+  target_link_libraries(chain_probe
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
