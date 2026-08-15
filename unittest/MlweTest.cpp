@@ -241,6 +241,61 @@ TEST_P(Testbed32, ModDecompMatchesHostIndexing) {
   }
 }
 
+// ModPack at the full ring degree, which is the one case the degree-4096 suite
+// cannot cover: bootparam_40 carries terminal primes, so its NPs have a
+// nonzero terminal-prime offset and the embedded secrets have to be encoded
+// against the right prime for each limb. Grafting is invisible at
+// ringdegree12_28, whose terminal prime list is empty.
+//
+// Rank 2 deliberately. The number of switching keys is the rank, each is the
+// size of a rotation key, and there is no serialization in Cheddar -- rank 16
+// here would cost a couple of GiB to prove nothing that rank 2 does not.
+TEST_P(Testbed32, ModPackInvertsModDecompAtFullDegree) {
+  const int degree = 1 << log_degree_;
+  const int small_degree = degree / 2;
+  const int rank = 2;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  const int level = 2;
+  interface_->PrepareModPackKeys(small_degree, level);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  std::vector<double> coeffs(degree);
+  Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+
+  std::vector<MlweCiphertext<word>> parts;
+  mlwe.ModDecomp(parts, ct, small_degree);
+  ASSERT_EQ(static_cast<int>(parts.size()), rank);
+
+  Ciphertext<word> packed;
+  mlwe.ModPack(context_, packed, parts, keys);
+  ASSERT_EQ(param_->NPToLevel(packed.GetNP()), level);
+
+  Plaintext<word> out;
+  interface_->Decrypt(out, packed);
+  std::vector<double> got;
+  context_->encoder_.DecodeCoeff(got, out);
+  ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+  double max_abs = 0.0;
+  for (int i = 0; i < degree; i++) {
+    max_abs = std::max(max_abs, std::abs(got[i] - coeffs[i]));
+  }
+  std::cout << "degree " << degree << " -> " << small_degree << ", rank "
+            << rank << ", level " << level << ": max error " << max_abs
+            << std::endl;
+  ASSERT_LT(max_abs, 1e-3);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_40.json"),

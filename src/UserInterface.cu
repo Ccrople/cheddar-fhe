@@ -216,6 +216,12 @@ const EvaluationKey<word> &UserInterface<word>::GetSparseToDenseKey() const {
 }
 
 template <typename word>
+const EvaluationKey<word> &UserInterface<word>::GetModPackKey(int rank,
+                                                              int j) const {
+  return evk_map_.GetModPackKey(rank, j);
+}
+
+template <typename word>
 const EvkMap<word> &UserInterface<word>::GetEvkMap() const {
   return evk_map_;
 }
@@ -246,6 +252,14 @@ void UserInterface<word>::PrepareSecrets() {
     }
   }
   CopyHostToDevice(main_secret_, main_s);
+
+  // The same ternary coefficients, kept as signed integers. PrepareModPackKeys
+  // has to re-encode a *permuted subset* of them under every prime, which the
+  // RNS copy above cannot supply and the NTT-domain device copy cannot either.
+  main_secret_coeffs_.assign(degree, 0);
+  for (int j = 0; j < hamming_weight; j++) {
+    main_secret_coeffs_[indices[j]] = ternary_values[j] ? -1 : 1;
+  }
   auto main_sx_view = MainSecretView();
   context_->ntt_handler_.NTT(main_sx_view, np_max, MainSecretConstView(), true);
 
@@ -313,6 +327,62 @@ void UserInterface<word>::PrepareRotationKey(const EvkRequest &evk_request) {
     AssertTrue(rot_idx > 0,
                "Invalid rotation index " + std::to_string(rot_idx));
     PrepareRotationKey(Abs(rot_idx), level);
+  }
+}
+
+template <typename word>
+void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level) {
+  const int degree = context_->param_.degree_;
+  const int L = context_->param_.L_;
+  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
+                 small_degree < degree && degree % small_degree == 0,
+             "PrepareModPackKeys: small_degree must be a power of two properly "
+             "dividing the ring degree");
+  AssertTrue(!main_secret_coeffs_.empty(),
+             "PrepareModPackKeys: secrets are not prepared");
+
+  // GetNPForEvk reserves -1 for the dense-to-sparse base, which is not what a
+  // caller asking for "the full level range" means.
+  if (max_level < 0) max_level = context_->param_.max_level_;
+
+  const int rank = degree / small_degree;
+  const NPInfo np = GetNPForEvk(max_level);
+  const int num_total_primes = np.GetNumTotal();
+  const int num_q = np.GetNumQ();
+  const int prime_offset = context_->param_.GetMaxNumTer() - np.num_ter_;
+
+  for (int j = 0; j < rank; j++) {
+    // The j-th module component of the decomposed secret, embedded back into
+    // R_N: coefficient j + k*s of sk becomes coefficient k*s. Everything off a
+    // multiple of k is zero, which is exactly what makes this an element of
+    // the degree-N' subring seen from the full ring.
+    HostVector<word> host(num_total_primes * degree, 0);
+    for (int i = 0; i < num_total_primes; i++) {
+      // Same prime indexing as SampleRandomPolynomial: the q primes are offset
+      // by the terminal primes this NP does not carry, the aux primes follow L.
+      const int prime_index =
+          (i >= num_q) ? (L + i - num_q) : (i + prime_offset);
+      const word prime = all_primes_[prime_index];
+      for (int s = 0; s < small_degree; s++) {
+        const int coeff = main_secret_coeffs_[j + rank * s];
+        if (coeff == 0) continue;
+        host[i * degree + rank * s] = (coeff > 0) ? word{1} : (prime - 1);
+      }
+    }
+
+    Dv embedded(num_total_primes * degree);
+    CopyHostToDevice(embedded, host);
+    const int aux_size = np.num_aux_ * degree;
+    auto embedded_view = embedded.View(aux_size);
+    context_->ntt_handler_.NTT(embedded_view, np, embedded.ConstView(aux_size),
+                               true);
+
+    // The ciphertext arrives under the embedded secret and has to leave under
+    // the ordinary one, so the ordinary secret is the encryption secret and
+    // the embedded one is the target -- the same direction as the
+    // relinearization key, which carries s^2 as its target.
+    PrepareEvk(EvkMap<word>::ModPackKeyIndex(rank, j), np, main_secret_,
+               embedded);
   }
 }
 

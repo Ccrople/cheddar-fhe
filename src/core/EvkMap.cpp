@@ -38,6 +38,13 @@ const EvaluationKey<word> &EvkMap<word>::GetSparseToDenseKey() const {
   return GetEvk(kSparseToDenseKeyIndex);
 }
 
+template <typename word>
+const EvaluationKey<word> &EvkMap<word>::GetModPackKey(int rank, int j) const {
+  AssertTrue(rank > 1 && j >= 0 && j < rank,
+             "GetModPackKey: Invalid rank or component index");
+  return GetEvk(ModPackKeyIndex(rank, j));
+}
+
 template class EvkMap<uint32_t>;
 template class EvkMap<uint64_t>;
 

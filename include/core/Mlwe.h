@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "core/Container.h"
+#include "core/Context.h"
 #include "core/DeviceVector.h"
 #include "core/NPInfo.h"
 #include "core/NTT.h"
@@ -114,6 +115,7 @@ template <typename word>
 class MlweHandler {
  private:
   using Ct = Ciphertext<word>;
+  using Evk = EvaluationKey<word>;
 
   const Parameter<word> &param_;
   const NTTHandler<word> &ntt_handler_;
@@ -142,6 +144,68 @@ class MlweHandler {
    */
   void ModDecomp(std::vector<MlweCiphertext<word>> &res, const Ct &ct,
                  int small_degree) const;
+
+  /**
+   * @brief Pack k = degree / small_degree coefficient-domain MLWE ciphertexts
+   * of rank k back into one NTT-domain RLWE ciphertext at the ring degree.
+   * This is the inverse of ModDecomp, and it is the step [BAE] section 2.3
+   * calls ModPack.
+   *
+   * ## The algorithm ([BAE] appendix A, p. 36)
+   *
+   * The k inputs (a_i, b_i) satisfy <a_i, sk'> + b_i = m_i over R_{N'}, with
+   * sk' = ( e*_0(sk), ..., e*_{k-1}(sk) ). Recompose X^k-adically -- the same
+   * interleaving ModDecomp undoes, and equally free:
+   *
+   *     A_j[i + k*s] = a_i[j][s],     B[i + k*s] = b_i[s]
+   *
+   * Because each sk'_j lies in the subring (its nonzero coefficients sit only
+   * on multiples of X^k) and X^i commutes with it,
+   *
+   *     sum_j A_j * sk'_j  +  B  =  sum_i m_i X^i  =  m     in R_N.
+   *
+   * That is an MLWE ciphertext of rank k *at the full degree*. Reducing it to
+   * rank 1 is k key switches: for each j, switch (A_j, 0) from sk'_j to the
+   * ordinary secret sk, then sum the results and add B.
+   *
+   * ## What it costs, and why it is not free like ModDecomp
+   *
+   * ModDecomp needs no key and spends no security, because rank k over degree
+   * N' is exactly as hard as RLWE over degree kN'. **The reverse direction is
+   * not symmetric**: it needs k switching keys, one per module component, from
+   * a secret that is *not* sk. [BAE] section 2.3 states this outright, and it
+   * is the reason the PC-MM is scheduled at the lowest level -- k key switches
+   * at fifty limbs would dominate the two plaintext products they exist to
+   * serve.
+   *
+   * The keys are ordinary CKKS switching keys, so nothing new is needed on the
+   * key-generation side beyond the embedded secrets themselves; see
+   * UserInterface::PrepareModPackKeys.
+   *
+   * The k switches are accumulated *before* the single mod-down, following the
+   * MultKeyNoModDown / ModDown split that Context::MultKey performs internally.
+   * Mod-down is the expensive half of a key switch (an INTT over the auxiliary
+   * primes and an NTT back), so this is k mod-downs turned into one. It also
+   * rounds once instead of k times, so the accumulated result is no noisier
+   * than the naive order.
+   *
+   * The inputs are in the coefficient domain, which is where the PC-MM leaves
+   * them; the recomposed polynomials are transformed here, once each, because
+   * key switching is defined in the NTT domain. Cheddar's NTT is only tuned
+   * for log_degree 16 (NTTUtils.cuh:399-432) but it is the *full* ring degree
+   * that is transformed here, never the small one -- ModPack asks nothing of
+   * the small-degree transform.
+   *
+   * @param context the CKKS context, for key switching
+   * @param res output ciphertext, at the ring degree and in the NTT domain
+   * @param cts the k input MLWE ciphertexts, in decomposition-index order,
+   *        all sharing one NP, rank and degree, and with no auxiliary primes
+   * @param keys the k switching keys, keys[j] switching from the embedded
+   *        j-th module component of the secret to the ordinary secret
+   */
+  void ModPack(ConstContextPtr<word> context, Ct &res,
+               const std::vector<MlweCiphertext<word>> &cts,
+               const std::vector<const Evk *> &keys) const;
 
   /**
    * @brief Inverse-transform a ciphertext component into the coefficient

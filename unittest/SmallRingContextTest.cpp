@@ -378,6 +378,176 @@ TEST_P(Testbed32, MlwePcmmCommutesWithModDecomp) {
   ASSERT_EQ(mismatches, 0) << "first at " << first;
 }
 
+// ModPack, at the shape it exists for: back from MLWE^16 at degree 256 to an
+// ordinary RLWE ciphertext at degree 4096.
+//
+// This is checked through decryption rather than against a reimplementation of
+// the indexing, because unlike ModDecomp there is nothing to compare word for
+// word -- ModPack ends in k key switches, so its output is a *different*
+// ciphertext of the same message, right down to the noise. The message is the
+// only invariant, and it is also the only thing the pipeline cares about.
+//
+// That makes it a strong test in one specific way: if the X^k-adic
+// recomposition put a single coefficient in the wrong place, or paired A_j
+// with the wrong switching key, the decryption would not be slightly wrong, it
+// would be noise. There is no way to be nearly right here.
+TEST_P(Testbed32, ModPackInvertsModDecomp) {
+  const int degree = param_->degree_;
+  const int small_degree = 256;
+  const int rank = degree / small_degree;
+  ASSERT_EQ(rank, 16);
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  interface_->PrepareModPackKeys(small_degree);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  // Level 0 has num_q == alpha == 2, so its key switch decomposes into a
+  // single digit; level 1 has num_q 3 and decomposes into two. Both are worth
+  // covering, and level 0 is where the product is actually scheduled.
+  for (int level = 0; level <= param_->max_level_; level++) {
+    std::vector<double> coeffs(degree);
+    Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+    Ciphertext<word> ct;
+    interface_->Encrypt(ct, pt);
+
+    std::vector<MlweCiphertext<word>> parts;
+    mlwe.ModDecomp(parts, ct, small_degree);
+    ASSERT_EQ(static_cast<int>(parts.size()), rank);
+
+    Ciphertext<word> packed;
+    mlwe.ModPack(context_, packed, parts, keys);
+
+    ASSERT_EQ(param_->NPToLevel(packed.GetNP()), level)
+        << "ModPack must not change the level";
+    EXPECT_NEAR(packed.GetScale() / ct.GetScale(), 1.0, 1e-9);
+
+    Plaintext<word> out;
+    interface_->Decrypt(out, packed);
+    std::vector<double> got;
+    context_->encoder_.DecodeCoeff(got, out);
+    ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+    double max_abs = 0.0;
+    for (int i = 0; i < degree; i++) {
+      max_abs = std::max(max_abs, std::abs(got[i] - coeffs[i]));
+    }
+    std::cout << "level " << level << " ModDecomp(256) -> ModPack: max error "
+              << max_abs << " over " << rank << " key switches" << std::endl;
+    // The k switches each add their own mod-down rounding, so this is looser
+    // than the encryption round trip above by roughly sqrt(k).
+    ASSERT_LT(max_abs, 1e-3) << "ModPack did not recover the message at level "
+                             << level;
+  }
+}
+
+// The whole Bae PC-MM path, end to end and against a host reference:
+//
+//   encrypt rows (coefficient encoding) -> ModDecomp to degree 256
+//     -> the two plaintext products in MLWE format -> ModPack -> decrypt
+//
+// MlwePcmmCommutesWithModDecomp above pins the product against the RLWE
+// overload, but both sides of that identity are Cheddar's own code. This one
+// leaves the library entirely: the expected value is U * M computed in double
+// precision on the host, so a shared misconception between the two product
+// implementations cannot survive it.
+TEST_P(Testbed32, BaePcmmThroughModDecompAndModPack) {
+  const int degree = param_->degree_;
+  const int small_degree = 256;
+  const int rank = degree / small_degree;
+  const int rows = 3, cols = 4;
+
+  // Everything runs at the top of this ring's single multiplicative level. The
+  // product is not rescaled (Bae PC-MM leaves that to the caller, as
+  // Context::Mult does), so the result carries scale u_scale * ct_scale and
+  // that has to stay under the level-1 modulus of ~2^64.2. With both operands
+  // bounded by 1 and cols = 4, 2^20 * 2^28 * 4 = 2^50 leaves ample room.
+  const int level = param_->max_level_;
+  const double ct_scale = DetermineScale(level);
+  const double u_scale = 1048576.0;  // 2^20
+
+  PcmmHandler<word> pcmm(*param_);
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  interface_->PrepareModPackKeys(small_degree);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  std::vector<std::vector<double>> m(cols, std::vector<double>(degree));
+  std::vector<Ciphertext<word>> cts(cols);
+  for (int j = 0; j < cols; j++) {
+    Random::SampleUniformReal(m[j].data(), degree, -1.0, 1.0);
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, level, ct_scale, m[j]);
+    interface_->Encrypt(cts[j], pt);
+  }
+
+  std::vector<double> u_values(rows * cols);
+  Random::SampleUniformReal(u_values.data(), rows * cols, -1.0, 1.0);
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, u_scale, u_values, rows, cols);
+
+  // Down to MLWE.
+  std::vector<std::vector<MlweCiphertext<word>>> parts(cols);
+  for (int j = 0; j < cols; j++) {
+    mlwe.ModDecomp(parts[j], cts[j], small_degree);
+  }
+
+  // The product, one decomposition index at a time. Index i of the result row
+  // r depends only on index i of every input, which is exactly why the product
+  // survives the decomposition.
+  std::vector<std::vector<MlweCiphertext<word>>> by_row(rows);
+  for (auto &row : by_row) row.resize(rank);
+  for (int i = 0; i < rank; i++) {
+    std::vector<MlweCiphertext<word>> column;
+    column.reserve(cols);
+    for (int j = 0; j < cols; j++) column.push_back(std::move(parts[j][i]));
+
+    std::vector<MlweCiphertext<word>> got;
+    pcmm.Multiply(got, u, column);
+    ASSERT_EQ(static_cast<int>(got.size()), rows);
+    for (int r = 0; r < rows; r++) by_row[r][i] = std::move(got[r]);
+  }
+
+  // Back up to RLWE, and check against the host.
+  double worst = 0.0;
+  for (int r = 0; r < rows; r++) {
+    Ciphertext<word> packed;
+    mlwe.ModPack(context_, packed, by_row[r], keys);
+    EXPECT_NEAR(packed.GetScale() / (u_scale * ct_scale), 1.0, 1e-9);
+
+    Plaintext<word> out;
+    interface_->Decrypt(out, packed);
+    std::vector<double> got;
+    context_->encoder_.DecodeCoeff(got, out);
+    ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+    double max_abs = 0.0;
+    for (int x = 0; x < degree; x++) {
+      double want = 0.0;
+      for (int j = 0; j < cols; j++) want += u_values[r * cols + j] * m[j][x];
+      max_abs = std::max(max_abs, std::abs(got[x] - want));
+    }
+    worst = std::max(worst, max_abs);
+    std::cout << "row " << r << ": max error " << max_abs << std::endl;
+  }
+
+  std::cout << "Bae PC-MM " << rows << "x" << cols
+            << " through MLWE^" << rank << " at degree " << small_degree
+            << ", level " << level << ": worst error " << worst << std::endl;
+  // U is quantised at 2^-20 and multiplies cols messages, which alone accounts
+  // for a few 1e-6; the key switches add the rest.
+  ASSERT_LT(worst, 1e-3);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     SmallRing, Testbed32,
     testing::Values("ringdegree12_28.json"),

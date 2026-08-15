@@ -61,6 +61,7 @@ class UserInterface {
   const Evk &GetConjugationKey() const;
   const Evk &GetDenseToSparseKey() const;
   const Evk &GetSparseToDenseKey() const;
+  const Evk &GetModPackKey(int rank, int j) const;
 
   /**
    * @brief Getter for the evaluation key map.
@@ -85,6 +86,28 @@ class UserInterface {
    */
   void PrepareRotationKey(const EvkRequest &evk_request);
 
+  /**
+   * @brief Prepare the k = degree / small_degree switching keys that
+   * MlweHandler::ModPack needs to come back from the MLWE format.
+   *
+   * ModPack leaves a rank-k MLWE ciphertext at the full ring degree under the
+   * secret ( e*_0(sk), ..., e*_{k-1}(sk) ), whose j-th component embeds into
+   * R_N as the polynomial holding sk's coefficients j, j+k, j+2k, ... on the
+   * powers X^0, X^k, X^{2k}, ... Reducing that to rank 1 means switching each
+   * component to the ordinary secret, so this generates one ordinary
+   * evaluation key per component. They are the *only* key material the whole
+   * Bae PC-MM path uses -- the product itself needs none, and ModDecomp needs
+   * none.
+   *
+   * Note the direction: the keys are indexed by module rank as well as by
+   * component, because a different rank decomposes the secret differently.
+   *
+   * @param small_degree N', the degree the MLWE ciphertexts live at
+   * @param max_level maximum level for the keys (default: -1 -->
+   * param_->max_level_)
+   */
+  void PrepareModPackKeys(int small_degree, int max_level = -1);
+
  private:
   static inline constexpr double kErrorStandardDeviation = 3.2;
   static inline constexpr int kernel_block_dim_ = 256;
@@ -92,6 +115,8 @@ class UserInterface {
   ContextPtr<word> context_;
   Dv main_secret_;
   Dv sparse_secret_;
+  // main_secret_ as signed ternary coefficients, for PrepareModPackKeys
+  std::vector<int> main_secret_coeffs_;
 
   EvkMap<word> evk_map_;
 
