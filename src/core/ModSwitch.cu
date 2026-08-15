@@ -569,7 +569,7 @@ void ModSwitchHandler<word>::ModDownWorker(DvView<word> &dst,
   NPInfo np_dst =
       param_.LevelToNP((type == ModDownType::ModDown ? level_ : level_ - 1), 0);
   NPInfo np_non_intt(Min(np_src.num_main_, np_dst.num_main_),
-                     Min(np_src.num_ter_, np_dst.num_ter_), 0);
+                     Min(np_src.num_ter_, np_dst.num_ter_), 0, np_src.degree_);
 
   int src_len = np_src.GetNumTotal() - np_non_intt.GetNumTotal();
   int dst_len = np_dst.GetNumTotal();

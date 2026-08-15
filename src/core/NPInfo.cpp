@@ -17,6 +17,13 @@ NPInfo::NPInfo(int num_main /*= 0*/, int num_ter /*= 0*/, int num_aux /*= 0*/,
   AssertTrue(num_ter >= 0, "Negative num_ter given");
   AssertTrue(num_aux >= 0, "Negative num_aux given");
   AssertTrue(degree >= 0, "Negative degree given");
+  // An NPInfo that names primes but no ring is meaningless: every buffer sized
+  // from it would come out zero-length, and it compares unequal to the ring it
+  // was derived from. Catching it here makes a construction site that forgot
+  // the degree fail loudly and locally, rather than surfacing later as a
+  // puzzling subset-check failure somewhere in ModDown.
+  AssertTrue(degree > 0 || (num_main == 0 && num_ter == 0 && num_aux == 0),
+             "NPInfo names primes but no ring degree");
 }
 
 NPInfo::NPInfo(const NPInfo &other) {

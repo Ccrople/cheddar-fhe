@@ -132,7 +132,8 @@ void HoistHandler<word>::CompilePlaintexts(ConstContextPtr<word> context,
     hoist_pt_map_.try_emplace(gs_idx, std::map<int, Pt>{});
     gs_indices_.push_back(gs_idx);
     for (const auto &[bs_idx, message] : bs_map) {
-      hoist_pt_map_.at(gs_idx).try_emplace(bs_idx, NPInfo(0, 0, 0));
+      hoist_pt_map_.at(gs_idx).try_emplace(
+          bs_idx, NPInfo(0, 0, 0, context->param_.degree_));
       int num_p_primes = context->param_.alpha_;
 
       context->encoder_.Encode(hoist_pt_map_.at(gs_idx).at(bs_idx), pt_level_,
@@ -219,7 +220,7 @@ void HoistHandler<word>::BSFusedKeyMult(
   int padded_num_q = num_q + prime_offset;
   int beta = DivCeil(padded_num_q, num_aux);
 
-  NPInfo np(num_main, num_ter, num_aux);
+  NPInfo np(num_main, num_ter, num_aux, context->param_.degree_);
 
   for (auto &[_, accum] : res) {
     accum.RemoveRx();
@@ -488,7 +489,7 @@ void HoistHandler<word>::EvaluateFinalModDown(ConstContextPtr<word> context,
   NPInfo next_np = context->param_.LevelToNP(pt_level_ - 1);
   auto &mod_switcher = context->mod_switch_handlers_.at(pt_level_);
 
-  NPInfo np(next_np.num_main_, next_np.num_ter_, 0);
+  NPInfo np(next_np.num_main_, next_np.num_ter_, 0, next_np.degree_);
 
   // this may not be handled properly by intermediate operations
   res.ModifyNP(np);
@@ -518,7 +519,7 @@ void HoistHandler<word>::EvaluateMinKSBabyStep(
   AssertTrue(bs.empty(), "Hoist: bs should be empty");
   Ct tmp;
   for (const auto &bs_idx : bs_indices_) {
-    bs.try_emplace(bs_idx, NPInfo(0, 0, 0));
+    bs.try_emplace(bs_idx, NPInfo(0, 0, 0, context->param_.degree_));
     if (bs_idx == 0) {
       context->Copy(bs[0], input);
     } else {
@@ -591,7 +592,8 @@ void HoistHandler<word>::EvaluateBabyStep(ConstContextPtr<word> context,
   AssertFalse(input.HasRx(), "Hoist: input should be relinearized");
 
   if (bs_indices_.size() == 1 && *bs_indices_.begin() == 0) {
-    bs.try_emplace(0, NPInfo(num_main_primes, num_ter_primes, 0));
+    bs.try_emplace(0, NPInfo(num_main_primes, num_ter_primes, 0,
+                             input_np.degree_));
     context->Copy(bs[0], input);
     return;
   }
@@ -622,7 +624,8 @@ void HoistHandler<word>::EvaluateBabyStep(ConstContextPtr<word> context,
                                 num_q_primes);
   Dv pseudo_modup_tmp;
 
-  NPInfo modup_np(num_main_primes, num_ter_primes, num_p_primes);
+  NPInfo modup_np(num_main_primes, num_ter_primes, num_p_primes,
+                  context->param_.degree_);
 
   // Special handling for bs_idx = 0 case
   if (bs_indices_.find(0) == bs_indices_.end()) {
@@ -697,8 +700,9 @@ void HoistHandler<word>::EvaluateGiantStep(ConstContextPtr<word> context,
   const Ct &ref_ct = bs.begin()->second;
   NPInfo ref_np = ref_ct.GetNP();
   int num_aux_primes = context->param_.alpha_;
-  NPInfo q_prime_np(ref_np.num_main_, ref_np.num_ter_, 0);
-  NPInfo q_p_prime_np(ref_np.num_main_, ref_np.num_ter_, num_aux_primes);
+  NPInfo q_prime_np(ref_np.num_main_, ref_np.num_ter_, 0, ref_np.degree_);
+  NPInfo q_p_prime_np(ref_np.num_main_, ref_np.num_ter_, num_aux_primes,
+                      ref_np.degree_);
   int prime_offset = context->param_.GetMaxNumTer() - ref_np.num_ter_;
   int num_q_primes = ref_np.GetNumQ();
   int padded_num_q_primes = num_q_primes + prime_offset;

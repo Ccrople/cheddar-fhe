@@ -626,7 +626,7 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const std::vector<Dv> &a_modup,
   AssertTrue(key.GetBeta() >= beta && static_cast<int>(a_modup.size()) == beta,
              "Beta mismatch");
 
-  NPInfo np(num_main, num_ter, num_aux);
+  NPInfo np(num_main, num_ter, num_aux, param_.degree_);
   accum.RemoveRx();
   accum.ModifyNP(np);
   accum.SetScale(a_orig.GetScale());
