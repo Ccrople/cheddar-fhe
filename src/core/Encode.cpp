@@ -394,6 +394,92 @@ void Encoder<word>::PlaintextToComplexVector(
   }
 }
 
+// SinC splits the message into N/k blocks of k/2 slots, sends each through
+// iDFT_k, and interleaves the resulting subring elements with stride N/k. Both
+// directions share that block geometry, so it is derived once here.
+//
+// The k/2 complex outputs of SpecialIFFT carry the k real coefficients of the
+// subring element as (real parts | imaginary parts), the same split
+// ComplexVectorToPlaintext performs at the full degree.
+namespace {
+
+struct SinCLayout {
+  int num_blocks;       // N/k, and also the coefficient stride
+  int slots_per_block;  // k/2
+};
+
+SinCLayout MakeSinCLayout(int degree, int sub_degree) {
+  AssertTrue(sub_degree >= 2 && sub_degree <= degree &&
+                 IsPowOfTwo(sub_degree) && degree % sub_degree == 0,
+             "SinC: sub_degree must be a power of two dividing the ring "
+             "degree, and at least 2");
+  return SinCLayout{degree / sub_degree, sub_degree / 2};
+}
+
+}  // namespace
+
+template <typename word>
+void Encoder<word>::EncodeSinC(Plaintext<word> &ptxt, int level, double scale,
+                               const std::vector<Complex> &message,
+                               int sub_degree, int num_aux /*= 0*/) const {
+  const int degree = param_.degree_;
+  const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
+  AssertTrue(static_cast<int>(message.size()) == degree / 2,
+             "EncodeSinC: message must fill every slot of the ring");
+
+  std::vector<double> coeffs(degree, 0.0);
+  std::vector<Complex> block(layout.slots_per_block);
+
+  for (int i = 0; i < layout.num_blocks; i++) {
+    const auto first = message.begin() + i * layout.slots_per_block;
+    std::copy(first, first + layout.slots_per_block, block.begin());
+
+    // iDFT_2 is the identity on a single complex number, and SpecialIFFT's
+    // bit reversal is not defined for a one-element vector, so skip it.
+    if (layout.slots_per_block > 1) SpecialIFFT(block);
+
+    for (int t = 0; t < layout.slots_per_block; t++) {
+      const int real_index = i + t * layout.num_blocks;
+      const int imag_index =
+          i + (t + layout.slots_per_block) * layout.num_blocks;
+      coeffs[real_index] = block[t].real();
+      coeffs[imag_index] = block[t].imag();
+    }
+  }
+
+  EncodeCoeff(ptxt, level, scale, coeffs, num_aux);
+}
+
+template <typename word>
+void Encoder<word>::DecodeSinC(std::vector<Complex> &message,
+                               const Plaintext<word> &ptxt,
+                               int sub_degree) const {
+  const int degree = param_.degree_;
+  const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
+
+  std::vector<double> coeffs;
+  DecodeCoeff(coeffs, ptxt);
+  AssertTrue(static_cast<int>(coeffs.size()) == degree,
+             "DecodeSinC: unexpected coefficient count");
+
+  message.resize(degree / 2);
+  std::vector<Complex> block(layout.slots_per_block);
+
+  for (int i = 0; i < layout.num_blocks; i++) {
+    for (int t = 0; t < layout.slots_per_block; t++) {
+      const int real_index = i + t * layout.num_blocks;
+      const int imag_index =
+          i + (t + layout.slots_per_block) * layout.num_blocks;
+      block[t] = Complex(coeffs[real_index], coeffs[imag_index]);
+    }
+
+    if (layout.slots_per_block > 1) SpecialFFT(block);
+
+    std::copy(block.begin(), block.end(),
+              message.begin() + i * layout.slots_per_block);
+  }
+}
+
 template <typename word>
 void Encoder<word>::EncodeConstant(Constant<word> &constant, int level,
                                    double scale, double number,

@@ -27,6 +27,14 @@ add_executable(coeff_encode_test CoeffEncodeTest.cpp)
 target_link_libraries(coeff_encode_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# Slots-in-Coefficients, the encoding [KANG]'s batch CC-MM operates in. Placed
+# next to the encoding tests rather than the matrix-product ones on purpose: it
+# is an encoding, it spends no levels, and the CC-MM work builds upward from
+# here. Degree 4096, so its own executable.
+add_executable(sinc_encode_test SinCEncodeTest.cpp)
+target_link_libraries(sinc_encode_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
