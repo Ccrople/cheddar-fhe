@@ -32,6 +32,11 @@ add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# RLWE -> MLWE decomposition (Bae et al. appendix A).
+add_executable(mlwe_test MlweTest.cpp)
+target_link_libraries(mlwe_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test

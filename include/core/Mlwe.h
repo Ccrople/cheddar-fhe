@@ -1,0 +1,153 @@
+#pragma once
+
+#include <vector>
+
+#include "core/Container.h"
+#include "core/DeviceVector.h"
+#include "core/NPInfo.h"
+#include "core/NTT.h"
+#include "core/Parameter.h"
+
+namespace cheddar {
+
+/**
+ * @brief RLWE-to-MLWE decomposition of Bae, Cheon, Hanrot, Park and Stehle
+ * (CRYPTO 2024), appendix A -- the format the PC-MM uses when the encrypted
+ * matrix is narrower than the ring degree.
+ *
+ * ## Why this exists
+ *
+ * An RLWE ciphertext at degree N holds N coefficients, so using one ciphertext
+ * per row of a d-wide matrix wastes a factor N/d. MLWE fixes that: the same
+ * data becomes k = N/N' ciphertexts over the subring of degree N', each of
+ * module rank k, and one of them holds exactly one row.
+ *
+ * Crucially the security dimension is unchanged, because MLWE of rank k over
+ * degree N' is as hard as RLWE over degree kN' = N. **ModDecomp needs no
+ * switching key and therefore costs no security at all** -- unlike RingSwitch,
+ * which does need one and is only safe at a small modulus.
+ *
+ * ## The decomposition
+ *
+ * With N' | N and k = N/N', identify Y = X^k, so R_{N'} = Z[Y]/(Y^{N'} + 1).
+ * Every a in R_N splits X^k-adically (paper, eq. 14) into k elements of
+ * R_{N'}:
+ *
+ *     e*_i(a)[s] = a[i + k*s],     0 <= i < k,  0 <= s < N'
+ *
+ * that is, e*_i(a) is the stride-k slice of the coefficient vector starting at
+ * offset i. Then (paper, eq. 15), with
+ *
+ *     sk'    = ( e*_0(sk), ..., e*_{k-1}(sk) )                 in R^k_{N'}
+ *     a~_i[j] = e*_{i-j}(a)          for j <= i
+ *             = Y * e*_{i-j+k}(a)    for j >  i
+ *
+ * the pair (a~_i, e*_i(b)) is an MLWE^k ciphertext of e*_i(m) under sk'.
+ *
+ * The wrap carries no sign change: it comes from X^{i+k} = X^i * Y, and
+ * i + k < 2k <= N, so the negacyclic reduction of R_N is never reached. The
+ * negacyclic wrap of R_{N'} does appear inside the multiplication by Y:
+ * (Y*q)[0] = -q[N'-1], (Y*q)[s] = q[s-1] for s >= 1.
+ *
+ * ## Representation
+ *
+ * The output is in the **coefficient** domain, not the NTT domain. That is not
+ * a convenience: the whole point of this format is to feed the two plaintext
+ * matrix products, which are defined on coefficient vectors, and the result is
+ * converted back by ModPack. **No NTT at degree N' is ever required**, which
+ * matters because Cheddar's NTT is only tuned for log_degree 16 and its launch
+ * configuration degenerates below that (NTTUtils.cuh:399-432).
+ *
+ * ## Cost, and why RingSwitch comes first
+ *
+ * Materializing a~_i costs k times the original a-part, because each of the k
+ * ciphertexts carries all k blocks. Two things keep that affordable, and both
+ * are scheduling decisions rather than accidents:
+ *
+ *   * the product is placed at the lowest level, where a ciphertext has two or
+ *     three limbs rather than fifty;
+ *   * a RingSwitch from N down to N1 before decomposing reduces k from N/N' to
+ *     N1/N', which is why Sylph reaches degree 256 by "ring-switching followed
+ *     by an MLWE decomposition" rather than decomposing straight from 2^16.
+ *
+ * The k blocks are shared between all k ciphertexts, so a compact
+ * representation that stores them once and applies the rotation implicitly is
+ * possible; this implementation materializes them, which is simpler and is
+ * what the correctness tests check.
+ *
+ * @tparam word uint32_t or uint64_t
+ */
+template <typename word>
+class MlweCiphertext {
+ public:
+  MlweCiphertext() = default;
+
+  // Movable, but not copyable (it owns device memory).
+  MlweCiphertext(MlweCiphertext &&) = default;
+  MlweCiphertext &operator=(MlweCiphertext &&) = default;
+
+  int GetRank() const;
+  int GetDegree() const;
+  NPInfo GetNP() const;
+  double GetScale() const;
+
+  // member variables (public, as elsewhere in Cheddar)
+  int rank_ = 0;       // k
+  int degree_ = 0;     // N'
+  NPInfo np_;
+  double scale_ = 1.0;
+
+  // a_[(limb * rank_ + j) * degree_ + s] = coefficient s of a~_i[j]
+  DeviceVector<word> a_;
+  // b_[limb * degree_ + s] = coefficient s of e*_i(b)
+  DeviceVector<word> b_;
+};
+
+template <typename word>
+class MlweHandler {
+ private:
+  using Ct = Ciphertext<word>;
+
+  const Parameter<word> &param_;
+  const NTTHandler<word> &ntt_handler_;
+
+  static constexpr int kernel_block_dim_ = 256;
+
+ public:
+  MlweHandler(const Parameter<word> &param,
+              const NTTHandler<word> &ntt_handler);
+
+  // disable copying (or moving also)
+  MlweHandler(const MlweHandler &) = delete;
+  MlweHandler &operator=(const MlweHandler &) = delete;
+
+  /**
+   * @brief Decompose one NTT-domain RLWE ciphertext into k = degree /
+   * small_degree coefficient-domain MLWE ciphertexts of rank k.
+   *
+   * The input is inverse-transformed internally, since Cheddar keeps
+   * ciphertexts in the NTT domain but the decomposition is defined on
+   * coefficients. No key is used and no security is spent.
+   *
+   * @param res output, resized to k
+   * @param ct input ciphertext, no aux primes and no rx_ part
+   * @param small_degree N', a power of two dividing the ring degree
+   */
+  void ModDecomp(std::vector<MlweCiphertext<word>> &res, const Ct &ct,
+                 int small_degree) const;
+
+  /**
+   * @brief Inverse-transform a ciphertext component into the coefficient
+   * domain and copy it to the host. Exposed because the decomposition is only
+   * meaningful against coefficient vectors, so tests need them.
+   *
+   * @param res output host vector, num_total_primes * degree entries
+   * @param src NTT-domain component view
+   * @param np the NPInfo of the component
+   */
+  void ComponentToHostCoeffs(HostVector<word> &res,
+                             const DvConstView<word> &src,
+                             const NPInfo &np) const;
+};
+
+}  // namespace cheddar

@@ -51,6 +51,7 @@ set(CKKS_GPU_SOURCES
   src/core/ElementWise.cu
   src/core/ModSwitch.cu
   src/core/NTT.cu
+  src/core/Mlwe.cu
   src/core/Parameter.cu
   src/core/Pcmm.cu
   src/UserInterface.cu
