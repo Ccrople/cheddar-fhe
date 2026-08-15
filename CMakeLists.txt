@@ -54,6 +54,7 @@ set(CKKS_GPU_SOURCES
   src/core/Mlwe.cu
   src/core/Parameter.cu
   src/core/Pcmm.cu
+  src/core/RingSwitch.cu
   src/UserInterface.cu
 )
 if(USE_GMP)

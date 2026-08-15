@@ -65,6 +65,12 @@ add_executable(multi_ring_test MultiRingTest.cpp)
 target_link_libraries(multi_ring_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# Ring switching, 65536 -> 16 x 4096. Needs three rings' worth of parameter
+# files and, like the above, more than one Context per process.
+add_executable(ring_switch_test RingSwitchTest.cpp)
+target_link_libraries(ring_switch_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
@@ -91,3 +97,7 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_40_64bit.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_40_64bit.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_28.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_28.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_30.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_30.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_30.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_30.json COPYONLY)

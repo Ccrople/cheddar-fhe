@@ -61,6 +61,21 @@ class UserInterface {
   const Evk &GetDenseToSparseKey() const;
   const Evk &GetSparseToDenseKey() const;
   const Evk &GetModPackKey(int rank, int j) const;
+  const Evk &GetRingSwitchKey(int rank) const;
+
+  /**
+   * @brief This ring's secret as signed ternary coefficients.
+   *
+   * Exposed because a ring switch is a key switch between two *different*
+   * Contexts: the key is built in the big ring but its target secret is the
+   * small ring's own, independently sampled, embedded into the big ring. The
+   * small ring's UserInterface is the only thing that knows those
+   * coefficients, so it has to hand them over.
+   *
+   * This obviously has no place outside a test harness, which is what
+   * UserInterface already is (see the warning it prints on construction).
+   */
+  const std::vector<int> &GetSecretCoeffs() const;
 
   /**
    * @brief Getter for the evaluation key map.
@@ -106,6 +121,37 @@ class UserInterface {
    * param_->max_level_)
    */
   void PrepareModPackKeys(int small_degree, int max_level = -1);
+
+  /**
+   * @brief Prepare the key that switches a ciphertext of this ring onto a
+   * secret lying in the degree-`small_degree` subring, which is what lets it
+   * be split into `rank` ciphertexts of that degree ([BAE] appendix A).
+   *
+   * The direction is the mirror of PrepareModPackKeys. There the ciphertext
+   * arrives under an embedded secret and leaves under the ordinary one; here
+   * it arrives under the ordinary secret and leaves under the embedded one,
+   * so the roles of encryption and target secret are exchanged.
+   *
+   * Only one key is needed, not `rank` of them: the target secret has nonzero
+   * coefficients only at multiples of X^k, so its X^k-adic view is
+   * (s_small, 0, ..., 0) and the MLWE relation collapses to rank 1.
+   *
+   * **The modulus this key is published at is a security parameter.** An
+   * attacker can apply e*_i to it and read RLWE samples at degree
+   * `small_degree`, so log2(PQ) has to fit that degree's budget, not this
+   * one's. [BAE] states the condition outright. In practice this means the
+   * key must be built in a parameter set whose alpha is small -- the ordinary
+   * presets carry alpha=12, and P alone is then 2^372 against a budget near
+   * 2^104.
+   *
+   * @param small_degree N', the degree the switched ciphertexts will live at
+   * @param small_secret_coeffs the small ring's secret, from its own
+   * UserInterface::GetSecretCoeffs; exactly `small_degree` entries
+   * @param max_level maximum level for the key (default: -1 --> max_level_)
+   */
+  void PrepareRingSwitchKey(int small_degree,
+                            const std::vector<int> &small_secret_coeffs,
+                            int max_level = -1);
 
  private:
   static inline constexpr double kErrorStandardDeviation = 3.2;

@@ -25,6 +25,7 @@ class EvkMap : public std::unordered_map<int, EvaluationKey<word>> {
   static inline constexpr int kDenseToSparseKeyIndex = -33333333;
   static inline constexpr int kSparseToDenseKeyIndex = -44444444;
   static inline constexpr int kModPackKeyIndexBase = -55555555;
+  static inline constexpr int kRingSwitchKeyIndexBase = -66666666;
 
   using Base::Base;
   EvkMap(const EvkMap &) = delete;
@@ -49,12 +50,29 @@ class EvkMap : public std::unordered_map<int, EvaluationKey<word>> {
     return kModPackKeyIndexBase - rank - j;
   }
 
+  /**
+   * @brief Key index of the ring-switching key for module rank `rank`.
+   *
+   * Unlike ModPack there is only one key per rank, not one per component: the
+   * target secret lies in the degree-N' subring, so its X^k-adic view is
+   * (s_small, 0, ..., 0) and every component past the first contributes
+   * nothing. That collapse is what makes a ring switch one key switch rather
+   * than k of them.
+   *
+   * @param rank module rank k = degree / small_degree
+   * @return int the key index
+   */
+  static constexpr int RingSwitchKeyIndex(int rank) {
+    return kRingSwitchKeyIndexBase - rank;
+  }
+
   const Evk &GetRotationKey(int rot_idx) const;
   const Evk &GetMultiplicationKey() const;
   const Evk &GetConjugationKey() const;
   const Evk &GetDenseToSparseKey() const;
   const Evk &GetSparseToDenseKey() const;
   const Evk &GetModPackKey(int rank, int j) const;
+  const Evk &GetRingSwitchKey(int rank) const;
 };
 
 }  // namespace cheddar

@@ -45,6 +45,12 @@ const EvaluationKey<word> &EvkMap<word>::GetModPackKey(int rank, int j) const {
   return GetEvk(ModPackKeyIndex(rank, j));
 }
 
+template <typename word>
+const EvaluationKey<word> &EvkMap<word>::GetRingSwitchKey(int rank) const {
+  AssertTrue(rank > 1, "GetRingSwitchKey: Invalid rank");
+  return GetEvk(RingSwitchKeyIndex(rank));
+}
+
 template class EvkMap<uint32_t>;
 template class EvkMap<uint64_t>;
 
