@@ -51,6 +51,13 @@ const EvaluationKey<word> &EvkMap<word>::GetRingSwitchKey(int rank) const {
   return GetEvk(RingSwitchKeyIndex(rank));
 }
 
+template <typename word>
+const EvaluationKey<word> &EvkMap<word>::GetInverseRingSwitchKey(
+    int rank) const {
+  AssertTrue(rank > 1, "GetInverseRingSwitchKey: Invalid rank");
+  return GetEvk(InverseRingSwitchKeyIndex(rank));
+}
+
 template class EvkMap<uint32_t>;
 template class EvkMap<uint64_t>;
 

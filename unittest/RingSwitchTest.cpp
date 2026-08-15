@@ -140,3 +140,63 @@ TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
   // magnitude tighter than any indexing or convention error would leave it.
   EXPECT_LT(worst, 1e-3);
 }
+
+// Down and back up. This is what a Llama block actually needs: without the
+// return trip the pipeline can descend, multiply, and then has nowhere to go.
+TEST(RingSwitch, RoundTripsThroughTheSmallRing) {
+  Ring big(kSwitchParam);
+  Ring small(kSmallParam);
+
+  const int degree = big.Degree();
+  const int small_degree = small.Degree();
+  const int rank = degree / small_degree;
+  const int level = big.param->max_level_;
+
+  const auto &small_secret = small.ui->GetSecretCoeffs();
+  big.ui->PrepareRingSwitchKey(small_degree, small_secret, level);
+  big.ui->PrepareInverseRingSwitchKey(small_degree, small_secret, level);
+
+  std::mt19937_64 gen(0xD0DEC0DE);
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+  std::vector<double> coeffs(degree);
+  for (auto &c : coeffs) c = dist(gen);
+
+  Plaintext<word> pt;
+  big.context->encoder_.EncodeCoeff(pt, level, big.param->GetScale(level),
+                                    coeffs);
+  Ciphertext<word> ct;
+  big.ui->Encrypt(ct, pt);
+
+  RingSwitchHandler<word> rs(big.context, small.context);
+
+  std::vector<Ciphertext<word>> parts;
+  rs.Switch(parts, ct, big.ui->GetRingSwitchKey(rank));
+
+  Ciphertext<word> back;
+  rs.SwitchBack(back, parts, big.ui->GetInverseRingSwitchKey(rank));
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // Back in the big ring, under the big ring's own secret again.
+  Plaintext<word> back_pt;
+  big.ui->Decrypt(back_pt, back);
+  std::vector<double> got;
+  big.context->encoder_.DecodeCoeff(got, back_pt);
+  ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+  double worst = 0.0;
+  int worst_c = -1;
+  for (int c = 0; c < degree; c++) {
+    const double d = std::abs(got[c] - coeffs[c]);
+    if (d > worst) {
+      worst = d;
+      worst_c = c;
+    }
+  }
+  std::cout << "round trip " << degree << " -> " << rank << " x "
+            << small_degree << " -> " << degree << ": max |diff| = " << worst
+            << " (coefficient " << worst_c << ")" << std::endl;
+
+  // Two key switches now, so a little looser than the one-way bound.
+  EXPECT_LT(worst, 2e-3);
+}

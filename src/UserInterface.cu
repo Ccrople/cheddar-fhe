@@ -222,6 +222,12 @@ const EvaluationKey<word> &UserInterface<word>::GetRingSwitchKey(
 }
 
 template <typename word>
+const EvaluationKey<word> &UserInterface<word>::GetInverseRingSwitchKey(
+    int rank) const {
+  return evk_map_.GetInverseRingSwitchKey(rank);
+}
+
+template <typename word>
 const std::vector<int> &UserInterface<word>::GetSecretCoeffs() const {
   AssertTrue(!main_secret_coeffs_.empty(),
              "GetSecretCoeffs: secrets are not prepared");
@@ -394,33 +400,16 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level) {
 }
 
 template <typename word>
-void UserInterface<word>::PrepareRingSwitchKey(
-    int small_degree, const std::vector<int> &small_secret_coeffs,
-    int max_level) {
+void UserInterface<word>::BuildSubringSecret(
+    Dv &res, const NPInfo &np, int small_degree,
+    const std::vector<int> &small_secret_coeffs) const {
   const int degree = context_->param_.degree_;
   const int L = context_->param_.L_;
-  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
-                 small_degree < degree && degree % small_degree == 0,
-             "PrepareRingSwitchKey: small_degree must be a power of two "
-             "properly dividing the ring degree");
-  AssertTrue(static_cast<int>(small_secret_coeffs.size()) == small_degree,
-             "PrepareRingSwitchKey: the small secret must have small_degree "
-             "coefficients");
-  AssertTrue(!main_secret_coeffs_.empty(),
-             "PrepareRingSwitchKey: secrets are not prepared");
-
-  if (max_level < 0) max_level = context_->param_.max_level_;
-
   const int rank = degree / small_degree;
-  const NPInfo np = GetNPForEvk(max_level);
   const int num_total_primes = np.GetNumTotal();
   const int num_q = np.GetNumQ();
   const int prime_offset = context_->param_.GetMaxNumTer() - np.num_ter_;
 
-  // The small ring's secret seen from the big ring: coefficient s of s_small
-  // becomes coefficient rank * s, everything else zero. That is precisely what
-  // makes it an element of the degree-N' subring, and why the X^k-adic view of
-  // it is (s_small, 0, ..., 0).
   HostVector<word> host(num_total_primes * degree, 0);
   for (int i = 0; i < num_total_primes; i++) {
     // Same prime indexing as SampleRandomPolynomial and PrepareModPackKeys.
@@ -433,18 +422,68 @@ void UserInterface<word>::PrepareRingSwitchKey(
     }
   }
 
-  Dv embedded(num_total_primes * degree);
-  CopyHostToDevice(embedded, host);
+  res.resize(num_total_primes * degree);
+  CopyHostToDevice(res, host);
   const int aux_size = np.num_aux_ * degree;
-  auto embedded_view = embedded.View(aux_size);
-  context_->ntt_handler_.NTT(embedded_view, np, embedded.ConstView(aux_size),
-                             true);
+  auto view = res.View(aux_size);
+  context_->ntt_handler_.NTT(view, np, res.ConstView(aux_size), true);
+}
+
+template <typename word>
+void UserInterface<word>::PrepareRingSwitchKey(
+    int small_degree, const std::vector<int> &small_secret_coeffs,
+    int max_level) {
+  const int degree = context_->param_.degree_;
+  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
+                 small_degree < degree && degree % small_degree == 0,
+             "PrepareRingSwitchKey: small_degree must be a power of two "
+             "properly dividing the ring degree");
+  AssertTrue(static_cast<int>(small_secret_coeffs.size()) == small_degree,
+             "PrepareRingSwitchKey: the small secret must have small_degree "
+             "coefficients");
+  AssertTrue(!main_secret_coeffs_.empty(),
+             "PrepareRingSwitchKey: secrets are not prepared");
+
+  if (max_level < 0) max_level = context_->param_.max_level_;
+  const int rank = degree / small_degree;
+  const NPInfo np = GetNPForEvk(max_level);
+
+  Dv embedded;
+  BuildSubringSecret(embedded, np, small_degree, small_secret_coeffs);
 
   // Mirror of PrepareModPackKeys: the ciphertext arrives under the ordinary
   // secret and has to leave under the embedded one, so the embedded secret is
   // the encryption secret and the ordinary one is the target.
   PrepareEvk(EvkMap<word>::RingSwitchKeyIndex(rank), np, embedded,
              main_secret_);
+}
+
+template <typename word>
+void UserInterface<word>::PrepareInverseRingSwitchKey(
+    int small_degree, const std::vector<int> &small_secret_coeffs,
+    int max_level) {
+  const int degree = context_->param_.degree_;
+  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
+                 small_degree < degree && degree % small_degree == 0,
+             "PrepareInverseRingSwitchKey: small_degree must be a power of two "
+             "properly dividing the ring degree");
+  AssertTrue(static_cast<int>(small_secret_coeffs.size()) == small_degree,
+             "PrepareInverseRingSwitchKey: the small secret must have "
+             "small_degree coefficients");
+  AssertTrue(!main_secret_coeffs_.empty(),
+             "PrepareInverseRingSwitchKey: secrets are not prepared");
+
+  if (max_level < 0) max_level = context_->param_.max_level_;
+  const int rank = degree / small_degree;
+  const NPInfo np = GetNPForEvk(max_level);
+
+  Dv embedded;
+  BuildSubringSecret(embedded, np, small_degree, small_secret_coeffs);
+
+  // The recomposed ciphertext arrives under the embedded secret and has to
+  // leave under the ordinary one -- the exchange of the pair above.
+  PrepareEvk(EvkMap<word>::InverseRingSwitchKeyIndex(rank), np, main_secret_,
+             embedded);
 }
 
 template <typename word>

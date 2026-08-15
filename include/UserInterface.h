@@ -62,6 +62,7 @@ class UserInterface {
   const Evk &GetSparseToDenseKey() const;
   const Evk &GetModPackKey(int rank, int j) const;
   const Evk &GetRingSwitchKey(int rank) const;
+  const Evk &GetInverseRingSwitchKey(int rank) const;
 
   /**
    * @brief This ring's secret as signed ternary coefficients.
@@ -153,6 +154,33 @@ class UserInterface {
                             const std::vector<int> &small_secret_coeffs,
                             int max_level = -1);
 
+  /**
+   * @brief Prepare the key for the way back: off the subring secret and onto
+   * this ring's ordinary one, after the k small ciphertexts have been
+   * recomposed X^k-adically ([BAE] appendix A, "key-switch the k small
+   * ciphertexts from sk' back to sk and recombine").
+   *
+   * The same two secrets as PrepareRingSwitchKey with their roles exchanged.
+   *
+   * Its security condition is *weaker* than the forward key's, and the reason
+   * is worth recording. The forward key encrypts under the subring secret, so
+   * applying e*_i to it yields clean degree-N' samples and it binds at N'.
+   * This one encrypts under the dense secret sk, so e*_i mixes all k
+   * components and produces no small-ring sample -- it binds at the full
+   * degree N, where the same modulus is far easier. It is built at the same
+   * small P anyway, because it has to live in the same Context as the forward
+   * key.
+   *
+   * @param small_degree N', the degree the ciphertexts being recomposed live
+   * at
+   * @param small_secret_coeffs the small ring's secret, exactly `small_degree`
+   * entries
+   * @param max_level maximum level for the key (default: -1 --> max_level_)
+   */
+  void PrepareInverseRingSwitchKey(int small_degree,
+                                   const std::vector<int> &small_secret_coeffs,
+                                   int max_level = -1);
+
  private:
   static inline constexpr double kErrorStandardDeviation = 3.2;
   static inline constexpr int kernel_block_dim_ = 256;
@@ -178,6 +206,13 @@ class UserInterface {
 
   void PrepareEvk(int key_idx, const NPInfo &np, const Dv &encryption_secret,
                   const Dv &target_secret);
+
+  // The small ring's secret seen from this ring: coefficient s lands at
+  // rank * s and everything else is zero, which is what makes it an element of
+  // the degree-N' subring. Shared by both ring-switch directions, which differ
+  // only in which side of PrepareEvk it goes on.
+  void BuildSubringSecret(Dv &res, const NPInfo &np, int small_degree,
+                          const std::vector<int> &small_secret_coeffs) const;
 
   void SampleRandomPolynomial(Dv &poly, const NPInfo &np) const;
   void SampleError(Dv &poly, const NPInfo &np) const;

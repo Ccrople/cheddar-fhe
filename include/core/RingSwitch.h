@@ -97,6 +97,25 @@ class RingSwitchHandler {
    * UserInterface::PrepareRingSwitchKey on the big Context
    */
   void Switch(std::vector<Ct> &res, const Ct &ct, const Evk &swk) const;
+
+  /**
+   * @brief The way back: recompose `rank` degree-N' ciphertexts into one at
+   * degree N.
+   *
+   * X^k-adic recomposition first, which is free and needs no key. It is also
+   * already *correct* as a ciphertext: because sk' lies in the subring,
+   * multiplying by it does not mix the X^k-adic components, so
+   * e*_i(a~ * sk') = e*_i(a~) * s_small and the interleaved pair decrypts to
+   * the interleaved message under sk' at degree N. Only then does a single key
+   * switch move it off sk' and onto the ordinary secret.
+   *
+   * @param res output, one ciphertext at the big degree
+   * @param parts the rank inputs, all at the small Context, same level, no aux
+   * primes and no rx_ part
+   * @param swk the inverse ring-switching key, from
+   * UserInterface::PrepareInverseRingSwitchKey on the big Context
+   */
+  void SwitchBack(Ct &res, const std::vector<Ct> &parts, const Evk &swk) const;
 };
 
 }  // namespace cheddar

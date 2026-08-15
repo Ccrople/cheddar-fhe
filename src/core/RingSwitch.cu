@@ -23,6 +23,21 @@ __global__ void RingSwitchGather(word *const *dst_ptrs, const word *src,
       basic::StreamingLoad(src + limb * degree + i + rank * s);
 }
 
+// The inverse interleave: dst[limb][i + k*s] = src_i[limb][s]. Every output
+// coefficient is written exactly once, so no clearing is needed.
+//
+// grid: (small_degree / block, k, num_total_primes)
+template <typename word>
+__global__ void RingSwitchScatter(word *dst, const word *const *src_ptrs,
+                                  int rank, int small_degree, int degree) {
+  const int s = blockIdx.x * blockDim.x + threadIdx.x;
+  const int i = blockIdx.y;
+  const int limb = blockIdx.z;
+
+  dst[limb * degree + i + rank * s] =
+      basic::StreamingLoad(src_ptrs[i] + limb * small_degree + s);
+}
+
 }  // namespace kernel
 
 template <typename word>
@@ -144,6 +159,77 @@ void RingSwitchHandler<word>::Switch(std::vector<Ct> &res, const Ct &ct,
     small_->ntt_handler_.NTT(bx_view, small_np, gathered_b[i].ConstView(0),
                              true);
   }
+}
+
+template <typename word>
+void RingSwitchHandler<word>::SwitchBack(Ct &res, const std::vector<Ct> &parts,
+                                         const Evk &swk) const {
+  const int degree = big_->param_.degree_;
+  const int small_degree = small_->param_.degree_;
+  AssertTrue(static_cast<int>(parts.size()) == rank_,
+             "RingSwitch::SwitchBack: expected exactly rank ciphertexts");
+
+  const NPInfo small_np = parts.at(0).GetNP();
+  AssertTrue(small_np.num_aux_ == 0,
+             "RingSwitch::SwitchBack: aux primes are not supported");
+  AssertTrue(small_np.degree_ == small_degree,
+             "RingSwitch::SwitchBack: inputs do not belong to the small ring");
+  for (const auto &p : parts) {
+    AssertTrue(p.GetNP() == small_np,
+               "RingSwitch::SwitchBack: ciphertexts differ in NP");
+    AssertTrue(!p.HasRx(),
+               "RingSwitch::SwitchBack: inputs must not carry an rx_ part");
+  }
+
+  const int level = small_->param_.NPToLevel(small_np);
+  AssertTrue(level >= 0, "RingSwitch::SwitchBack: inputs are not at a valid "
+                         "level");
+  const int num_total_primes = small_np.GetNumTotal();
+
+  // 1. Leave the NTT domain at the small degree; the interleave is defined on
+  //    coefficients.
+  std::vector<DeviceVector<word>> a_coeffs(rank_), b_coeffs(rank_);
+  HostVector<word *> h_src_a(rank_), h_src_b(rank_);
+  for (int i = 0; i < rank_; i++) {
+    a_coeffs[i].resize(num_total_primes * small_degree);
+    b_coeffs[i].resize(num_total_primes * small_degree);
+    auto av = a_coeffs[i].View(0);
+    auto bv = b_coeffs[i].View(0);
+    small_->ntt_handler_.INTT(av, small_np, parts[i].AxConstView());
+    small_->ntt_handler_.INTT(bv, small_np, parts[i].BxConstView());
+    h_src_a[i] = a_coeffs[i].data();
+    h_src_b[i] = b_coeffs[i].data();
+  }
+  DeviceVector<word *> d_src_a(rank_), d_src_b(rank_);
+  CopyHostToDevice(d_src_a, h_src_a);
+  CopyHostToDevice(d_src_b, h_src_b);
+
+  // 2. X^k-adic recomposition. Free, and already a valid ciphertext at degree
+  //    N under the subring secret.
+  DeviceVector<word> a_full(num_total_primes * degree);
+  DeviceVector<word> b_full(num_total_primes * degree);
+  const dim3 grid_dim(small_degree / kernel_block_dim_, rank_,
+                      num_total_primes);
+  kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
+      a_full.data(), d_src_a.data(), rank_, small_degree, degree);
+  kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
+      b_full.data(), d_src_b.data(), rank_, small_degree, degree);
+
+  // 3. Back into the NTT domain at the big degree, as one ciphertext of the
+  //    big Context.
+  const NPInfo big_np = big_->param_.LevelToNP(level);
+  Ct recomposed;
+  recomposed.RemoveRx();
+  recomposed.ModifyNP(big_np);
+  recomposed.SetNumSlots(degree / 2);
+  recomposed.SetScale(parts.at(0).GetScale());
+  auto ax_view = recomposed.AxView();
+  auto bx_view = recomposed.BxView();
+  big_->ntt_handler_.NTT(ax_view, big_np, a_full.ConstView(0), true);
+  big_->ntt_handler_.NTT(bx_view, big_np, b_full.ConstView(0), true);
+
+  // 4. One key switch off the subring secret.
+  big_->MultKey(res, recomposed, swk);
 }
 
 template class RingSwitchHandler<uint32_t>;

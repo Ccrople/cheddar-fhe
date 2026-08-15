@@ -26,6 +26,7 @@ class EvkMap : public std::unordered_map<int, EvaluationKey<word>> {
   static inline constexpr int kSparseToDenseKeyIndex = -44444444;
   static inline constexpr int kModPackKeyIndexBase = -55555555;
   static inline constexpr int kRingSwitchKeyIndexBase = -66666666;
+  static inline constexpr int kInverseRingSwitchKeyIndexBase = -77777777;
 
   using Base::Base;
   EvkMap(const EvkMap &) = delete;
@@ -66,6 +67,20 @@ class EvkMap : public std::unordered_map<int, EvaluationKey<word>> {
     return kRingSwitchKeyIndexBase - rank;
   }
 
+  /**
+   * @brief Key index of the key that brings a recomposed ciphertext back off
+   * the subring secret, for module rank `rank`.
+   *
+   * The same two secrets as RingSwitchKeyIndex with their roles exchanged, so
+   * it is a genuinely different key and needs its own index.
+   *
+   * @param rank module rank k = degree / small_degree
+   * @return int the key index
+   */
+  static constexpr int InverseRingSwitchKeyIndex(int rank) {
+    return kInverseRingSwitchKeyIndexBase - rank;
+  }
+
   const Evk &GetRotationKey(int rot_idx) const;
   const Evk &GetMultiplicationKey() const;
   const Evk &GetConjugationKey() const;
@@ -73,6 +88,7 @@ class EvkMap : public std::unordered_map<int, EvaluationKey<word>> {
   const Evk &GetSparseToDenseKey() const;
   const Evk &GetModPackKey(int rank, int j) const;
   const Evk &GetRingSwitchKey(int rank) const;
+  const Evk &GetInverseRingSwitchKey(int rank) const;
 };
 
 }  // namespace cheddar
