@@ -54,9 +54,16 @@ namespace cheddar {
  * The output is in the **coefficient** domain, not the NTT domain. That is not
  * a convenience: the whole point of this format is to feed the two plaintext
  * matrix products, which are defined on coefficient vectors, and the result is
- * converted back by ModPack. **No NTT at degree N' is ever required**, which
- * matters because Cheddar's NTT is only tuned for log_degree 16 and its launch
- * configuration degenerates below that (NTTUtils.cuh:399-432).
+ * converted back by ModPack. No NTT at degree N' is required *by this path*.
+ *
+ * That is a statement about the PC-MM only, and must not be read as a general
+ * escape from small-degree NTT. Sylph's other small-ring operator, the batch
+ * CC-MM, lives at degree 2^12 in the SinC encoding ([SYLPH] table 4) and does
+ * need a working transform there, as does every key switch and rescale
+ * performed on a ring-switched degree-2^12 ciphertext. Cheddar's NTT launch
+ * configuration is only tuned for log_degree 16 and degenerates below it
+ * (NTTUtils.cuh:399-432), so small-degree NTT remains a prerequisite of the
+ * pipeline as a whole -- just not of the decomposition implemented here.
  *
  * ## Cost, and why RingSwitch comes first
  *

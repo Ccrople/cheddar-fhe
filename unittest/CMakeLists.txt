@@ -37,6 +37,14 @@ add_executable(mlwe_test MlweTest.cpp)
 target_link_libraries(mlwe_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# Does the NTT work below log_degree 16? Sylph needs degree 4096 for the batch
+# CC-MM. MUST be run one --gtest_filter per process: __cm_log_degree is
+# write-once per process, so a second degree in the same process would silently
+# run at the first one's. See run_small_ring_ntt.sh.
+add_executable(small_ring_ntt_test SmallRingNttTest.cpp)
+target_link_libraries(small_ring_ntt_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
