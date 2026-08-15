@@ -52,6 +52,7 @@ set(CKKS_GPU_SOURCES
   src/core/ModSwitch.cu
   src/core/NTT.cu
   src/core/Parameter.cu
+  src/core/Pcmm.cu
   src/UserInterface.cu
 )
 if(USE_GMP)
