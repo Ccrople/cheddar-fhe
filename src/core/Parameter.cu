@@ -140,6 +140,7 @@ Parameter<word>::Parameter(
   short_base_np_.num_ter_ =
       level_config_.at(0).second - additional_base_.second;
   short_base_np_.num_aux_ = short_base_np_.num_main_ + short_base_np_.num_ter_;
+  short_base_np_.degree_ = degree_;
   AssertTrue(additional_base_.first >= 0 && additional_base_.second >= 0 &&
                  short_base_np_.num_main_ >= 0 &&
                  short_base_np_.num_ter_ >= 0 &&
@@ -289,10 +290,11 @@ NPInfo Parameter<word>::LevelToNP(int level, int num_aux /*= 0*/) const {
   if (level == -1) {
     AssertTrue(num_aux <= short_base_np_.num_aux_,
                "Invalid number of aux primes for short base");
-    return NPInfo(short_base_np_.num_main_, short_base_np_.num_ter_, num_aux);
+    return NPInfo(short_base_np_.num_main_, short_base_np_.num_ter_, num_aux,
+                  degree_);
   }
   const auto& config = level_config_.at(level);
-  return NPInfo(config.first, config.second, num_aux);
+  return NPInfo(config.first, config.second, num_aux, degree_);
 }
 
 template <typename word>

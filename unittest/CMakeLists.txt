@@ -59,6 +59,12 @@ add_executable(llama_pcmm_test LlamaPcmmTest.cpp)
 target_link_libraries(llama_pcmm_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# Two ring degrees alive in one process. This is the test the multi-ring change
+# exists to pass, and the one case that must NOT be split per process.
+add_executable(multi_ring_test MultiRingTest.cpp)
+target_link_libraries(multi_ring_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test

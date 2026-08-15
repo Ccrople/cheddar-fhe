@@ -20,12 +20,6 @@ void Container<word>::SetScale(double scale) {
 }
 
 template <typename word>
-void Container<word>::SetDegree(int degree) {
-  AssertTrue(IsPowOfTwo(degree), "Container degree must be a power of two");
-  degree_ = degree;
-}
-
-template <typename word>
 Constant<word>::Constant(const NPInfo &num_primes /*= NPInfo{}*/)
     : Base(num_primes), cx_(num_primes.GetNumTotal()) {}
 
@@ -57,9 +51,9 @@ template <typename word>
 Ciphertext<word>::Ciphertext(const NPInfo &num_primes /*= NPInfo{}*/,
                              bool has_rx /*= false*/)
     : Base(num_primes),
-      bx_(num_primes.GetNumTotal() * Base::degree_),
-      ax_(num_primes.GetNumTotal() * Base::degree_),
-      rx_(has_rx ? num_primes.GetNumTotal() * Base::degree_ : 0) {}
+      bx_(num_primes.GetNumTotal() * num_primes.degree_),
+      ax_(num_primes.GetNumTotal() * num_primes.degree_),
+      rx_(has_rx ? num_primes.GetNumTotal() * num_primes.degree_ : 0) {}
 
 template <typename word>
 bool Ciphertext<word>::HasRx() const {
@@ -83,7 +77,7 @@ NPInfo Ciphertext<word>::GetNP() const {
     AssertTrue(bx_.size() == rx_.size(), "Ciphertext DV size mismatch");
   }
   int total = this->num_primes_.GetNumTotal();
-  AssertTrue(static_cast<int>(bx_.size()) == total * Base::degree_,
+  AssertTrue(static_cast<int>(bx_.size()) == total * this->num_primes_.degree_,
              "Ciphertext num primes mismatch");
   return this->num_primes_;
 }
@@ -91,7 +85,13 @@ NPInfo Ciphertext<word>::GetNP() const {
 template <typename word>
 void Ciphertext<word>::ModifyNP(const NPInfo &num_primes) {
   this->num_primes_ = num_primes;
-  int new_size = num_primes.GetNumTotal() * Base::degree_;
+  // Reproduces what the old `Base::degree_ / 2` member initialiser gave, but
+  // from this container's own ring rather than from whichever Context was
+  // constructed most recently.
+  if (num_slots_ == 0 && num_primes.degree_ > 0) {
+    num_slots_ = num_primes.degree_ / 2;
+  }
+  int new_size = num_primes.GetNumTotal() * num_primes.degree_;
 
   bx_.resize(new_size);
   ax_.resize(new_size);
@@ -114,46 +114,46 @@ void Ciphertext<word>::SetNumSlots(int num_slots) {
 
 template <typename word>
 DvView<word> Ciphertext<word>::BxView(int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return bx_.View(aux_size, front_offset);
 }
 
 template <typename word>
 DvConstView<word> Ciphertext<word>::BxConstView(
     int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return bx_.ConstView(aux_size, front_offset);
 }
 
 template <typename word>
 DvView<word> Ciphertext<word>::AxView(int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return ax_.View(aux_size, front_offset);
 }
 
 template <typename word>
 DvConstView<word> Ciphertext<word>::AxConstView(
     int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return ax_.ConstView(aux_size, front_offset);
 }
 
 template <typename word>
 DvView<word> Ciphertext<word>::RxView(int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return rx_.View(aux_size, front_offset);
 }
 
 template <typename word>
 DvConstView<word> Ciphertext<word>::RxConstView(
     int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return rx_.ConstView(aux_size, front_offset);
 }
 
@@ -181,12 +181,12 @@ std::vector<DvConstView<word>> Ciphertext<word>::ConstViewVector(
 
 template <typename word>
 Plaintext<word>::Plaintext(const NPInfo &num_primes /*= NPInfo{}*/)
-    : Base(num_primes), mx_(num_primes.GetNumTotal() * Base::degree_) {}
+    : Base(num_primes), mx_(num_primes.GetNumTotal() * num_primes.degree_) {}
 
 template <typename word>
 NPInfo Plaintext<word>::GetNP() const {
   int total = this->num_primes_.GetNumTotal();
-  AssertTrue(static_cast<int>(mx_.size()) == total * Base::degree_,
+  AssertTrue(static_cast<int>(mx_.size()) == total * this->num_primes_.degree_,
              "Plaintext num primes mismatch");
   return this->num_primes_;
 }
@@ -194,7 +194,10 @@ NPInfo Plaintext<word>::GetNP() const {
 template <typename word>
 void Plaintext<word>::ModifyNP(const NPInfo &num_primes) {
   this->num_primes_ = num_primes;
-  mx_.resize(num_primes.GetNumTotal() * Base::degree_);
+  if (num_slots_ == 0 && num_primes.degree_ > 0) {
+    num_slots_ = num_primes.degree_ / 2;
+  }
+  mx_.resize(num_primes.GetNumTotal() * num_primes.degree_);
 }
 
 template <typename word>
@@ -209,16 +212,16 @@ void Plaintext<word>::SetNumSlots(int num_slots) {
 
 template <typename word>
 DvView<word> Plaintext<word>::View(int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return mx_.View(aux_size, front_offset);
 }
 
 template <typename word>
 DvConstView<word> Plaintext<word>::ConstView(
     int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   return mx_.ConstView(aux_size, front_offset);
 }
 
@@ -227,7 +230,7 @@ EvaluationKey<word>::EvaluationKey(const NPInfo &num_primes /*= NPInfo{}*/,
                                    int beta /*= 0*/)
     : Base(num_primes) {
   AssertTrue(beta >= 0, "Negative beta given for evaluation key");
-  int size = num_primes.GetNumTotal() * Base::degree_;
+  int size = num_primes.GetNumTotal() * num_primes.degree_;
   for (int i = 0; i < beta; i++) {
     bx_.emplace_back(size);
     ax_.emplace_back(size);
@@ -247,7 +250,7 @@ NPInfo EvaluationKey<word>::GetNP() const {
 
   if (beta != 0) {
     auto size = bx_[0].size();
-    AssertTrue(static_cast<int>(size) == total * Base::degree_,
+    AssertTrue(static_cast<int>(size) == total * this->num_primes_.degree_,
                "Evaluation key num primes mismatch");
     for (int i = 0; i < beta; i++) {
       AssertTrue(bx_[i].size() == size, "Evk DV size mismatch");
@@ -261,7 +264,7 @@ template <typename word>
 void EvaluationKey<word>::ModifyNP(const NPInfo &num_primes) {
   this->num_primes_ = num_primes;
   int beta = GetBeta();
-  int new_size = num_primes.GetNumTotal() * Base::degree_;
+  int new_size = num_primes.GetNumTotal() * num_primes.degree_;
   for (int i = 0; i < beta; i++) {
     bx_[i].resize(new_size);
     ax_[i].resize(new_size);
@@ -271,8 +274,8 @@ void EvaluationKey<word>::ModifyNP(const NPInfo &num_primes) {
 template <typename word>
 DvView<word> EvaluationKey<word>::BxView(int index,
                                          int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   AssertTrue(index < GetBeta(), "Evk index out of range");
   return bx_.at(index).View(aux_size, front_offset);
 }
@@ -280,8 +283,8 @@ DvView<word> EvaluationKey<word>::BxView(int index,
 template <typename word>
 DvConstView<word> EvaluationKey<word>::BxConstView(
     int index, int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   AssertTrue(index < GetBeta(), "Evk index out of range");
   return bx_.at(index).ConstView(aux_size, front_offset);
 }
@@ -289,8 +292,8 @@ DvConstView<word> EvaluationKey<word>::BxConstView(
 template <typename word>
 DvView<word> EvaluationKey<word>::AxView(int index,
                                          int np_front_ignore /*= 0*/) {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   AssertTrue(index < GetBeta(), "Evk index out of range");
   return ax_.at(index).View(aux_size, front_offset);
 }
@@ -298,8 +301,8 @@ DvView<word> EvaluationKey<word>::AxView(int index,
 template <typename word>
 DvConstView<word> EvaluationKey<word>::AxConstView(
     int index, int np_front_ignore /*= 0*/) const {
-  int aux_size = this->num_primes_.num_aux_ * Base::degree_;
-  int front_offset = np_front_ignore * Base::degree_;
+  int aux_size = this->num_primes_.num_aux_ * this->num_primes_.degree_;
+  int front_offset = np_front_ignore * this->num_primes_.degree_;
   AssertTrue(index < GetBeta(), "Evk index out of range");
   return ax_.at(index).ConstView(aux_size, front_offset);
 }

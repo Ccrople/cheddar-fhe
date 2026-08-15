@@ -5,22 +5,34 @@
 namespace cheddar {
 
 template <typename word>
+const Parameter<word> &MultiLevelCiphertext<word>::ParamFor(int degree) {
+  auto found = params_.find(degree);
+  AssertTrue(found != params_.end(),
+             "MultiLevelCiphertext: no Context registered for ring degree " +
+                 std::to_string(degree));
+  return *found->second;
+}
+
+template <typename word>
 void MultiLevelCiphertext<word>::StaticInit(const Parameter<word> &param,
                                             const Encoder<word> &encoder) {
-  param_ = &param;
-  int max_level = param_->max_level_;
-  level_down_consts_.clear();
-  level_down_consts_.resize(max_level + 1);
+  const int degree = param.degree_;
+  params_[degree] = &param;
+  int max_level = param.max_level_;
+  auto &consts = level_down_consts_[degree];
+  consts.clear();
+  consts.resize(max_level + 1);
   for (int i = 1; i < max_level; i++) {
-    double scale = param_->GetRescalePrimeProd(i);
-    encoder.EncodeConstant(level_down_consts_.at(i), i, scale, 1.0);
+    double scale = param.GetRescalePrimeProd(i);
+    encoder.EncodeConstant(consts.at(i), i, scale, 1.0);
   }
 }
 
 template <typename word>
-void MultiLevelCiphertext<word>::StaticDestroy() {
-  param_ = nullptr;
-  level_down_consts_.clear();
+void MultiLevelCiphertext<word>::StaticDestroy(const Parameter<word> &param) {
+  // Only this ring's entries; another Context may still be alive.
+  params_.erase(param.degree_);
+  level_down_consts_.erase(param.degree_);
 }
 
 template <typename word>
@@ -29,21 +41,29 @@ MultiLevelCiphertext<word>::MultiLevelCiphertext(Ct &&ct) {
   AssertTrue(!ct.HasRx(), "MultiLevelCiphertext: Rx is not allowed.");
   AssertTrue(np.num_aux_ == 0,
              "MultiLevelCiphertext: Aux primes are not allowed.");
-  int level = param_->NPToLevel(np);
+  // The ciphertext names its own ring through its NPInfo, so no caller has to
+  // say which Context this belongs to.
+  degree_ = np.degree_;
+  int level = ParamFor(degree_).NPToLevel(np);
   level_map_.try_emplace(level, std::move(ct));
 }
 
 template <typename word>
 void MultiLevelCiphertext<word>::AllocateLevel(int level) {
-  NPInfo np = param_->LevelToNP(level, 0);
+  NPInfo np = ParamFor(degree_).LevelToNP(level, 0);
   AssertTrue(!Exists(level), "AddCiphertextAtLevel: Level " +
                                  std::to_string(level) + " already exists");
   level_map_.try_emplace(level, np);
 }
 
 template <typename word>
-const Constant<word> &MultiLevelCiphertext<word>::GetLevelDownConst(int level) {
-  return level_down_consts_.at(level);
+const Constant<word> &MultiLevelCiphertext<word>::GetLevelDownConst(int degree,
+                                                                    int level) {
+  auto found = level_down_consts_.find(degree);
+  AssertTrue(found != level_down_consts_.end(),
+             "MultiLevelCiphertext: no Context registered for ring degree " +
+                 std::to_string(degree));
+  return found->second.at(level);
 }
 
 template <typename word>

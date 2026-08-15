@@ -73,7 +73,6 @@ Context<word>::Context(const Parameter<word> &param)
       ntt_handler_(param_),
       encoder_(param_, ntt_handler_) {
   // 0. Set some static variables
-  Container<word>::SetDegree(param_.degree_);
   MultiLevelCiphertext<word>::StaticInit(param_, encoder_);
 
   // 1. Initialize mod_switch_handlers_
@@ -125,7 +124,7 @@ Context<word>::Context(const Parameter<word> &param)
 
 template <typename word>
 Context<word>::~Context() {
-  MultiLevelCiphertext<word>::StaticDestroy();
+  MultiLevelCiphertext<word>::StaticDestroy(param_);
 }
 
 template <typename word>
@@ -943,7 +942,7 @@ void Context<word>::AddLowerLevelsUntil(MultiLevelCiphertext<word> &ml_ct,
   for (int i = old_min_level - 1; i >= min_level; i--) {
     ml_ct.AllocateLevel(i);
     Mult(tmp, ml_ct.AtLevel(i + 1),
-         MultiLevelCiphertext<word>::GetLevelDownConst(i + 1));
+         MultiLevelCiphertext<word>::GetLevelDownConst(param_.degree_, i + 1));
     Rescale(ml_ct.AtLevel(i), tmp);
   }
 }

@@ -21,15 +21,25 @@ class MultiLevelCiphertext {
 
   std::map<int, Ct> level_map_;
 
-  static inline const Parameter<word> *param_ = nullptr;
+  // Which ring this instance belongs to, taken from its first ciphertext.
+  int degree_ = 0;
+
+  // Keyed by ring degree rather than held as a single pointer, so that two
+  // Contexts at different degrees can be alive at once. With a single static
+  // the second Context's StaticInit silently replaced the first's parameter
+  // and level-down constants, and every MultiLevelCiphertext of the first ring
+  // then resolved its levels against the wrong modulus chain.
+  static inline std::map<int, const Parameter<word> *> params_{};
 
   // different from the one in Context
-  static inline std::vector<Constant<word>> level_down_consts_{};
+  static inline std::map<int, std::vector<Constant<word>>> level_down_consts_{};
+
+  static const Parameter<word> &ParamFor(int degree);
 
  public:
   static void StaticInit(const Parameter<word> &param,
                          const Encoder<word> &encoder);
-  static void StaticDestroy();
+  static void StaticDestroy(const Parameter<word> &param);
 
   MultiLevelCiphertext(Ct &&ct);
 
@@ -48,7 +58,12 @@ class MultiLevelCiphertext {
   // For the use in Context::AddLowerLevelsUntil
 
   void AllocateLevel(int level);
-  static const Constant<word> &GetLevelDownConst(int level);
+
+  /**
+   * @param degree ring degree selecting which Context's constants to use
+   * @param level the level being stepped down from
+   */
+  static const Constant<word> &GetLevelDownConst(int degree, int level);
 };
 
 }  // namespace cheddar

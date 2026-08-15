@@ -14,7 +14,10 @@ namespace cheddar {
 template <typename word>
 class Container {
  protected:
-  static inline int degree_ = 0;
+  // The ring degree is not held here. It lives in num_primes_, so that two
+  // Contexts at different degrees can coexist: a static made whichever Context
+  // was constructed last decide the size of every buffer allocated afterwards,
+  // for both rings and without a diagnostic. See NPInfo.
   double scale_ = 1.0;
   NPInfo num_primes_;
 
@@ -54,13 +57,6 @@ class Container {
    * @param scale the new scale
    */
   void SetScale(double scale);
-
-  /**
-   * @brief Static function used by Context
-   *
-   * @param degree the polynomial degree
-   */
-  static void SetDegree(int degree);
 };
 
 /**
@@ -132,7 +128,9 @@ template <typename word>
 class Ciphertext : public Container<word> {
  private:
   using Base = Container<word>;
-  int num_slots_ = Base::degree_ / 2;
+  // 0 until ModifyNP or SetNumSlots supplies one; ModifyNP defaults it to
+  // degree / 2, which is what the old static-derived initialiser produced.
+  int num_slots_ = 0;
 
  public:
   /**
@@ -226,7 +224,9 @@ template <typename word>
 class Plaintext : public Container<word> {
  private:
   using Base = Container<word>;
-  int num_slots_ = Base::degree_ / 2;
+  // 0 until ModifyNP or SetNumSlots supplies one; ModifyNP defaults it to
+  // degree / 2, which is what the old static-derived initialiser produced.
+  int num_slots_ = 0;
 
  public:
   /**
