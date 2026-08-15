@@ -52,6 +52,13 @@ add_executable(small_ring_context_test SmallRingContextTest.cpp)
 target_link_libraries(small_ring_context_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The PC-MM against a real Llama-3-8B layer-2 query projection. Needs the
+# weight bundle; set LLAMA3_REAL_DIR or the test skips itself. Degree 4096, so
+# again its own executable.
+add_executable(llama_pcmm_test LlamaPcmmTest.cpp)
+target_link_libraries(llama_pcmm_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
