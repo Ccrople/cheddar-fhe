@@ -196,6 +196,87 @@ void PcmmHandler<word>::Multiply(std::vector<Ct> &res,
       rows, cols, degree);
 }
 
+template <typename word>
+void PcmmHandler<word>::Multiply(
+    std::vector<MlweCiphertext<word>> &res, const PlainMatrix<word> &u,
+    const std::vector<MlweCiphertext<word>> &cts) const {
+  const int rows = u.rows_;
+  const int cols = u.cols_;
+  AssertTrue(rows > 0 && cols > 0, "Pcmm::Multiply(MLWE): Invalid matrix shape");
+  AssertTrue(cols == static_cast<int>(cts.size()),
+             "Pcmm::Multiply(MLWE): u.cols_ does not match the number of "
+             "ciphertexts");
+
+  const NPInfo np = cts.at(0).np_;
+  AssertTrue(np == u.np_, "Pcmm::Multiply(MLWE): NP mismatch between u and cts");
+  const int rank = cts.at(0).rank_;
+  const int small_degree = cts.at(0).degree_;
+  const double ct_scale = cts.at(0).scale_;
+  for (const auto &ct : cts) {
+    AssertTrue(ct.np_ == np, "Pcmm::Multiply(MLWE): ciphertexts differ in NP");
+    AssertTrue(ct.rank_ == rank && ct.degree_ == small_degree,
+               "Pcmm::Multiply(MLWE): ciphertexts differ in rank or degree");
+  }
+  AssertTrue(small_degree % kernel_block_dim_ == 0,
+             "Pcmm::Multiply(MLWE): degree must be a multiple of the block "
+             "dim");
+
+  // Aliasing would make the accumulation read partially-written rows.
+  for (const auto &r : res) {
+    for (const auto &c : cts) {
+      AssertTrue(&r != &c,
+                 "Pcmm::Multiply(MLWE): in-place operation is not supported");
+    }
+  }
+
+  const int num_total_primes = np.GetNumTotal();
+  // Per-limb stride of the a-part. All k blocks of a limb are contiguous, so
+  // the accumulator treats them as one long row and needs no notion of rank.
+  const int a_stride = rank * small_degree;
+
+  res.clear();
+  res.resize(rows);
+  for (auto &r : res) {
+    r.rank_ = rank;
+    r.degree_ = small_degree;
+    r.np_ = np;
+    r.scale_ = u.scale_ * ct_scale;
+    r.a_.resize(num_total_primes * a_stride);
+    r.b_.resize(num_total_primes * small_degree);
+  }
+
+  HostVector<word *> h_dst_a(rows), h_dst_b(rows);
+  HostVector<word *> h_src_a(cols), h_src_b(cols);
+  for (int i = 0; i < rows; i++) {
+    h_dst_a[i] = res[i].a_.data();
+    h_dst_b[i] = res[i].b_.data();
+  }
+  for (int j = 0; j < cols; j++) {
+    h_src_a[j] = const_cast<word *>(cts[j].a_.data());
+    h_src_b[j] = const_cast<word *>(cts[j].b_.data());
+  }
+
+  DeviceVector<word *> d_dst_a(rows), d_dst_b(rows);
+  DeviceVector<word *> d_src_a(cols), d_src_b(cols);
+  CopyHostToDevice(d_dst_a, h_dst_a);
+  CopyHostToDevice(d_dst_b, h_dst_b);
+  CopyHostToDevice(d_src_a, h_src_a);
+  CopyHostToDevice(d_src_b, h_src_b);
+
+  const word *primes = param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_primes = param_.GetInvPrimesPtr(np);
+
+  const dim3 grid_b(small_degree / kernel_block_dim_, rows, num_total_primes);
+  kernel::PcmmAccum<word><<<grid_b, kernel_block_dim_>>>(
+      d_dst_b.data(), d_src_b.data(), u.data_.data(), primes, inv_primes, rows,
+      cols, small_degree);
+
+  const dim3 grid_a(a_stride / kernel_block_dim_, rows, num_total_primes);
+  kernel::PcmmAccum<word><<<grid_a, kernel_block_dim_>>>(
+      d_dst_a.data(), d_src_a.data(), u.data_.data(), primes, inv_primes, rows,
+      cols, a_stride);
+}
+
 template class PlainMatrix<uint32_t>;
 template class PlainMatrix<uint64_t>;
 template class PcmmHandler<uint32_t>;

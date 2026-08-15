@@ -27,6 +27,7 @@
 
 #include "Testbed.h"
 #include "core/Mlwe.h"
+#include "core/Pcmm.h"
 
 using word = uint32_t;
 
@@ -255,6 +256,124 @@ TEST_P(Testbed32, ModDecompToSylphDegree256) {
     }
   }
   std::cout << "ModDecomp 4096 -> 256, rank " << rank << ", " << num_total
+            << " limbs: " << mismatches << " mismatches" << std::endl;
+  ASSERT_EQ(mismatches, 0) << "first at " << first;
+}
+
+// The MLWE PC-MM, checked by commutation rather than against a hand-rolled
+// Montgomery reference.
+//
+// ModDecomp is a re-indexing of coefficients and an INTT; the PC-MM is a scalar
+// linear combination. Both are linear, so the two orders must agree:
+//
+//     ModDecomp( sum_j u_j * ct_j )^(i)  ==  sum_j u_j * ModDecomp(ct_j)^(i)
+//
+// The left side is the already-validated RLWE overload followed by ModDecomp;
+// the right side is the new MLWE overload. Any Montgomery or domain convention
+// appears on both sides and cancels, which is precisely what makes this a
+// stronger check than reimplementing the convention in the test and agreeing
+// with myself.
+//
+// Comparison is mod p, not word-for-word: the two orders are equal as residues
+// but need not produce identical representatives if any stage reduces lazily.
+TEST_P(Testbed32, MlwePcmmCommutesWithModDecomp) {
+  const int degree = param_->degree_;
+  const int small_degree = 256;
+  const int rank = degree / small_degree;
+  const int rows = 3, cols = 4;
+  const int level = 0;
+
+  PcmmHandler<word> pcmm(*param_);
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  std::vector<Ciphertext<word>> cts(cols);
+  for (int j = 0; j < cols; j++) {
+    std::vector<double> coeffs(degree);
+    Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+    interface_->Encrypt(cts[j], pt);
+  }
+
+  std::vector<double> u_values(rows * cols);
+  Random::SampleUniformReal(u_values.data(), rows * cols, -1.0, 1.0);
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, 1024.0, u_values, rows, cols);
+
+  // Left side: RLWE product, then decompose each row.
+  std::vector<Ciphertext<word>> rlwe_res;
+  pcmm.Multiply(rlwe_res, u, cts);
+  ASSERT_EQ(static_cast<int>(rlwe_res.size()), rows);
+  std::vector<std::vector<MlweCiphertext<word>>> expected(rows);
+  for (int r = 0; r < rows; r++) {
+    mlwe.ModDecomp(expected[r], rlwe_res[r], small_degree);
+  }
+
+  // Right side: decompose each input, then take the product per index i.
+  std::vector<std::vector<MlweCiphertext<word>>> parts(cols);
+  for (int j = 0; j < cols; j++) {
+    mlwe.ModDecomp(parts[j], cts[j], small_degree);
+  }
+
+  const NPInfo np = cts[0].GetNP();
+  const auto primes = param_->GetPrimeVector(np);
+  const int num_total = np.GetNumTotal();
+  const int a_stride = rank * small_degree;
+
+  long long mismatches = 0;
+  std::string first;
+  for (int i = 0; i < rank; i++) {
+    // Each part is consumed exactly once, so moving is safe and avoids a copy
+    // that MlweCiphertext deliberately does not offer.
+    std::vector<MlweCiphertext<word>> column;
+    column.reserve(cols);
+    for (int j = 0; j < cols; j++) column.push_back(std::move(parts[j][i]));
+
+    std::vector<MlweCiphertext<word>> got;
+    pcmm.Multiply(got, u, column);
+    ASSERT_EQ(static_cast<int>(got.size()), rows);
+
+    for (int r = 0; r < rows; r++) {
+      ASSERT_EQ(got[r].rank_, rank);
+      ASSERT_EQ(got[r].degree_, small_degree);
+      EXPECT_NEAR(got[r].scale_ / expected[r][i].scale_, 1.0, 1e-9);
+
+      HostVector<word> ga, gb, ea, eb;
+      CopyDeviceToHost(ga, got[r].a_);
+      CopyDeviceToHost(gb, got[r].b_);
+      CopyDeviceToHost(ea, expected[r][i].a_);
+      CopyDeviceToHost(eb, expected[r][i].b_);
+
+      for (int limb = 0; limb < num_total; limb++) {
+        const uint64_t p = primes[limb];
+        for (int s = 0; s < small_degree; s++) {
+          const int idx = limb * small_degree + s;
+          if (gb[idx] % p != eb[idx] % p) {
+            if (!mismatches) {
+              first = "b i=" + std::to_string(i) + " r=" + std::to_string(r) +
+                      " limb=" + std::to_string(limb) +
+                      " s=" + std::to_string(s);
+            }
+            mismatches++;
+          }
+        }
+        for (int t = 0; t < a_stride; t++) {
+          const int idx = limb * a_stride + t;
+          if (ga[idx] % p != ea[idx] % p) {
+            if (!mismatches) {
+              first = "a i=" + std::to_string(i) + " r=" + std::to_string(r) +
+                      " limb=" + std::to_string(limb) +
+                      " t=" + std::to_string(t);
+            }
+            mismatches++;
+          }
+        }
+      }
+    }
+  }
+
+  std::cout << "MLWE PC-MM " << rows << "x" << cols << " at degree "
+            << small_degree << ", rank " << rank << ", " << num_total
             << " limbs: " << mismatches << " mismatches" << std::endl;
   ASSERT_EQ(mismatches, 0) << "first at " << first;
 }

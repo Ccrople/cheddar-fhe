@@ -4,6 +4,7 @@
 
 #include "core/Container.h"
 #include "core/DeviceVector.h"
+#include "core/Mlwe.h"
 #include "core/NPInfo.h"
 #include "core/Parameter.h"
 
@@ -162,6 +163,38 @@ class PcmmHandler {
    */
   void Multiply(std::vector<Ct> &res, const PlainMatrix<word> &u,
                 const std::vector<Ct> &cts) const;
+
+  /**
+   * @brief The same product on MLWE ciphertexts: res[i] = sum_j u[i][j] *
+   * cts[j].
+   *
+   * This is the format [SYLPH] table 4 actually uses for the PC-MM, which runs
+   * at ring degree 256 -- reached from the degree-4096 ring by ModDecomp, and
+   * so narrower than the ring the RLWE overload above assumes (the header's
+   * format rule: columns <= N calls for MLWE).
+   *
+   * No new kernel is involved. An MLWE ciphertext is a rank-k vector `a_` plus
+   * a single `b_`, and the product is a scalar linear combination of both, so
+   * it is the RLWE case with k components instead of one. The layout
+   * `a_[(limb * rank + j) * degree + s]` keeps all k * degree words of a limb
+   * contiguous, which means the existing accumulator handles the a-part
+   * verbatim once it is told the per-limb stride is `rank * degree` rather
+   * than `degree`.
+   *
+   * Being a scalar combination, this is also domain-agnostic: it is correct on
+   * the coefficient-domain output of ModDecomp exactly as it is on NTT-domain
+   * RLWE, because scaling and addition commute with the transform.
+   *
+   * As with the RLWE overload, no rescaling is performed; the result carries
+   * scale `u.scale_ * cts[0].scale_`.
+   *
+   * @param res output, resized to u.rows_
+   * @param u encoded plaintext matrix, u.cols_ must equal cts.size()
+   * @param cts input MLWE ciphertexts, all sharing one NP, rank and degree
+   */
+  void Multiply(std::vector<MlweCiphertext<word>> &res,
+                const PlainMatrix<word> &u,
+                const std::vector<MlweCiphertext<word>> &cts) const;
 };
 
 }  // namespace cheddar
