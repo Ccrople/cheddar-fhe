@@ -245,7 +245,7 @@ TEST_P(Testbed32, ModDecompMatchesHostIndexing) {
 // cannot cover: bootparam_40 carries terminal primes, so its NPs have a
 // nonzero terminal-prime offset and the embedded secrets have to be encoded
 // against the right prime for each limb. Grafting is invisible at
-// ringdegree12_28, whose terminal prime list is empty.
+// ringdegree12_30, whose terminal prime list is empty.
 //
 // Rank 2 deliberately. The number of switching keys is the rank, each is the
 // size of a rotation key, and there is no serialization in Cheddar -- rank 16

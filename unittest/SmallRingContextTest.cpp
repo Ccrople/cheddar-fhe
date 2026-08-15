@@ -5,9 +5,9 @@
 // nothing more: it exercised NTTHandler alone, at one limb, with no Context,
 // no encoder and no key material. This file asks the next question, which is
 // the one the pipeline actually depends on -- whether
-// parameters/ringdegree12_28.json produces a working CKKS instance.
+// parameters/ringdegree12_30.json produces a working CKKS instance.
 //
-// The parameter set is [KANG] table 2's S12 shape, which is what [SYLPH]
+// The parameter set is the ring [SYLPH] table 4 needs for the batch CC-MM
 // table 4 needs for the batch CC-MM (ring degree 4096, SinC) and PCMv, and
 // which is also the parent ring of the degree-256 MLWE view that carries the
 // Bae PC-MM. Its derived quantities are asserted below against S12 so that a
@@ -53,31 +53,41 @@ Error MeasureError(const std::vector<Complex> &got,
 
 }  // namespace
 
-// The JSON must keep describing S12. These are cheap and they pin the file.
-TEST_P(Testbed32, S12ParameterDerivations) {
+// The JSON must keep describing the ring the pipeline actually uses. These are
+// cheap and they pin the file.
+TEST_P(Testbed32, ParameterDerivations) {
   EXPECT_EQ(log_degree_, 12);
   EXPECT_EQ(param_->degree_, 4096);
 
-  // L = |main| + |ter| = 3, alpha = |aux| = 2, so dnum = ceil(3/2) = 2, which
-  // is S12's dnum. Nothing here is configured directly; all three are derived
-  // in Parameter's initialiser list, so this is a real check of the JSON.
+  // L = |main| + |ter| = 3, alpha = |aux| = 1, so dnum = ceil(3/1) = 3.
+  // Nothing here is configured directly; all three are derived in Parameter's
+  // initialiser list, so this is a real check of the JSON.
+  //
+  // alpha is 1 rather than [KANG] S12's 2 because this ring has to *receive* a
+  // ring switch. The switching key is published at P*Q and an attacker reads
+  // degree-4096 samples from it, so log2 PQ must fit this ring's budget: two
+  // auxiliary primes would put it at 131.75 and the ring at 100.4 gate bits.
+  // One puts it at 100.75 and 132.8. See Doing.md 1.5e.
   EXPECT_EQ(param_->L_, 3);
-  EXPECT_EQ(GetAlpha(), 2);
-  EXPECT_EQ(GetDnum(), 2);
+  EXPECT_EQ(GetAlpha(), 1);
+  EXPECT_EQ(GetDnum(), 3);
 
-  // Exactly one multiplicative level. Two would put log2 QP at 132 and the
+  // Exactly one multiplicative level. Two would put log2 QP at 130.75 and the
   // ring below 128-bit security, which is why [KANG] S12 is "28 x 1" and why
   // Sylph performs a single product down here before going back up.
   EXPECT_EQ(param_->max_level_, 1);
   EXPECT_EQ(default_encryption_level_, 1);
 
-  // The scale is a single 28-bit prime -- no grafting is needed at this ring,
-  // because 28 is below the 31-bit cap that forces the big ring's ratios.
+  // The scale is a single prime -- no grafting is needed at this ring, because
+  // 30 bits is below the 31-bit cap that forces the big ring's ratios. It is
+  // 2^30 rather than S12's 2^28 because the primes are bootparam_30's first
+  // three, which is what lets a switched ciphertext land here with its RNS
+  // limbs unchanged.
   EXPECT_EQ(param_->ter_primes_.size(), 0u);
   const double ratio = param_->GetRescalePrimeProd(1);
-  EXPECT_NEAR(std::log2(ratio), 28.0, 0.01);
-  EXPECT_NEAR(std::log2(param_->GetScale(0)), 28.0, 0.01);
-  EXPECT_NEAR(std::log2(param_->GetScale(1)), 28.0, 0.01);
+  EXPECT_NEAR(std::log2(ratio), 30.0, 0.01);
+  EXPECT_NEAR(std::log2(param_->GetScale(0)), 30.0, 0.01);
+  EXPECT_NEAR(std::log2(param_->GetScale(1)), 30.0, 0.01);
 
   std::cout << "degree " << param_->degree_ << ", L " << param_->L_
             << ", alpha " << GetAlpha() << ", dnum " << GetDnum()
@@ -550,7 +560,7 @@ TEST_P(Testbed32, BaePcmmThroughModDecompAndModPack) {
 
 INSTANTIATE_TEST_SUITE_P(
     SmallRing, Testbed32,
-    testing::Values("ringdegree12_28.json"),
+    testing::Values("ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

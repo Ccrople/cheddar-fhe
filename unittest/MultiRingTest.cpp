@@ -22,7 +22,7 @@
 // by whichever Context was built last, and A -- built first, used after B
 // exists -- is the one that breaks.
 //
-// Ring A is bootparam_30 at degree 65536, ring B is ringdegree12_28 at 4096,
+// Ring A is bootparam_30 at degree 65536, ring B is ringdegree12_30 at 4096,
 // which is the actual pair Sylph needs: non-linear work upstairs, batch CC-MM
 // and the PC-MM's parent ring downstairs.
 
@@ -165,7 +165,7 @@ TEST(MultiRing, TwoDegreesInterleaved) {
   // Construction order matters to the bug: A first, then B. Every global would
   // now hold B's degree, and A is what fails.
   Ring a("bootparam_30.json");
-  Ring b("ringdegree12_28.json");
+  Ring b("ringdegree12_30.json");
 
   ASSERT_EQ(a.Degree(), 65536);
   ASSERT_EQ(b.Degree(), 4096);
@@ -201,7 +201,7 @@ TEST(MultiRing, TwoDegreesInterleaved) {
 // wins" and "the first Context wins" are different bugs and only one of them
 // is caught by a fixed order.
 TEST(MultiRing, TwoDegreesReversedConstructionOrder) {
-  Ring b("ringdegree12_28.json");
+  Ring b("ringdegree12_30.json");
   Ring a("bootparam_30.json");
 
   const double b_coeff = b.CoeffRoundTrip(0, 500);

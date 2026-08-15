@@ -101,8 +101,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_40_64bit.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_40_64bit.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_28.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_28.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_30.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_30.json

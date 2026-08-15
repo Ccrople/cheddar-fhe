@@ -27,18 +27,22 @@
 // input channel, holding that channel's 128 token values in coefficients
 // 0..127. That wastes 32x of each polynomial, and fixing that waste is exactly
 // what the MLWE format is for -- one degree-4096 parent carries 16 channels
-// once ModDecomp splits it to degree 256. The MLWE overload is already
-// implemented and proven equal to this one by commutation
-// (SmallRingContextTest), but reading its output back needs ModPack, which
-// does not exist yet. So the packing here is deliberately the wasteful one:
-// it is the version that can be decrypted today, and the numbers it produces
-// carry over unchanged.
+// once ModDecomp splits it to degree 256. The MLWE overload is proven equal to
+// this one by commutation (SmallRingContextTest) and PipelineChainTest runs it
+// for real, so the wasteful packing is kept here on purpose: it isolates the
+// arithmetic from the ring switching and the repacking, which is what makes a
+// failure here mean the *product* is wrong.
 //
-// SCALES. Activations at 2^28 (the ring's own scale), weights at 2^20. The
-// product is therefore at 2^48 and |Y| <= 10.5 puts the encoded result at
-// 2^51.3 against log2 Q1 = 64.17 -- twelve bits of headroom. Weights at 2^20
-// keep about fourteen bits on a typical entry, which is what bounds the error
-// here; the activation quantisation at 2^28 is two orders below it.
+// SCALES. Activations at 2^30 (the ring's own scale) and weights at 2^30. The
+// product is therefore at 2^60, and |Y| <= 10.5 puts the encoded result at
+// 2^63.4 against log2 Q1 = 69.76 -- about six bits of headroom. Weights at
+// 2^30 keep roughly twenty-four bits on a typical entry of RMS 0.0175, which
+// is what bounds the error here; the activation quantisation is far below it.
+//
+// 2^30 is also the only weight scale that would leave a *rescaled* result on
+// this ring's canonical level-0 scale, which is what PipelineChainTest needs.
+// Nothing is rescaled here -- the result is decoded at the product scale -- but
+// matching it keeps the two tests telling the same story.
 
 #undef ENABLE_EXTENSION
 
@@ -59,7 +63,7 @@ constexpr int kTokens = 128;
 constexpr int kChannels = 4096;
 constexpr int kOutChannels = 128;
 constexpr double kRmsEps = 1e-5;
-constexpr double kWeightScale = 1048576.0;  // 2^20
+constexpr double kWeightScale = 1073741824.0;  // 2^30
 
 std::string DataDir() {
   const char *env = std::getenv("LLAMA3_REAL_DIR");
@@ -192,8 +196,8 @@ TEST_P(Testbed32, RealLlama3QueryProjection) {
             << "), mean abs err " << mean_abs << ", relative to |Y| max "
             << (max_abs / want_absmax) << std::endl;
 
-  // Weight quantisation at 2^20 dominates: a half-ulp of 2^-21 against 4096
-  // random-signed terms and an activation RMS of 0.39 predicts roughly 1e-5.
+  // Weight quantisation at 2^30 dominates: a half-ulp of 2^-31 against 4096
+  // random-signed terms and an activation RMS of 0.39 predicts roughly 1e-8.
   // The bound below is loose enough not to be flaky and tight enough that a
   // real regression -- a wrong transpose, a lost limb, an overflow -- moves it
   // by orders of magnitude rather than percent.
@@ -201,7 +205,7 @@ TEST_P(Testbed32, RealLlama3QueryProjection) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    SmallRing, Testbed32, testing::Values("ringdegree12_28.json"),
+    SmallRing, Testbed32, testing::Values("ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
