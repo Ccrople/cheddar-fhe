@@ -71,6 +71,12 @@ add_executable(ring_switch_test RingSwitchTest.cpp)
 target_link_libraries(ring_switch_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# RingSwitch -> ModDecomp -> PC-MM -> ModPack -> Rescale -> SwitchBack, in one
+# process. The only place the chain's level and scale budget is checked.
+add_executable(pipeline_chain_test PipelineChainTest.cpp)
+target_link_libraries(pipeline_chain_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
