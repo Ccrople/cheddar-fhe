@@ -45,6 +45,13 @@ add_executable(small_ring_ntt_test SmallRingNttTest.cpp)
 target_link_libraries(small_ring_ntt_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# A full Context at ring degree 4096 (Sylph's batch CC-MM ring, KANG S12).
+# Its own executable for the same reason as above: appending the degree-4096
+# preset to an existing suite would silently evaluate it at degree 65536.
+add_executable(small_ring_context_test SmallRingContextTest.cpp)
+target_link_libraries(small_ring_context_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
@@ -69,3 +76,5 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_40_64bit.json
                ${CMAKE_CURRENT_BINARY_DIR}/bootparam_40_64bit.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_28.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_28.json COPYONLY)
