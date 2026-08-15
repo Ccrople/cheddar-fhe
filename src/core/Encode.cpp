@@ -1,5 +1,7 @@
 #include "core/Encode.h"
 
+#include <cmath>
+
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "common/PrimeUtils.h"
@@ -79,6 +81,151 @@ void Encoder<word>::Decode(std::vector<Complex> &message,
                                 icrt1_dv.ConstView());
   PlaintextToComplexVector(message, tmp);
   SpecialFFT(message);
+}
+
+// Constants for the inverse CRT performed on the host during decoding:
+// icrt1[i] = ( degree * prod_{j != i} p_j )^{-1} mod p_i. The INTT multiplies
+// each limb by this, so PlaintextToRealVector / PlaintextToComplexVector only
+// have to scale by prod_{j != i} p_j over the integers and sum.
+template <typename word>
+DeviceVector<word> Encoder<word>::MakeICRTConstants(const NPInfo &np) const {
+  auto primes = param_.GetPrimeVector(np);
+  int num_total_primes = np.GetNumTotal();
+  word degree = param_.degree_;
+
+  HostVector<word> icrt1(num_total_primes);
+  for (int i = 0; i < num_total_primes; i++) {
+    word mod_prime = primes[i];
+    word prod = 1;
+    for (int j = 0; j < num_total_primes; j++) {
+      if (i == j) continue;
+      prod = primeutil::MultMod(prod, primes[j], mod_prime);
+    }
+    prod = primeutil::MultMod(prod, degree, mod_prime);
+    // deliberately not using the Montgomery form here
+    icrt1[i] = primeutil::InvMod(prod, mod_prime);
+  }
+
+  DeviceVector<word> icrt1_dv(num_total_primes);
+  CopyHostToDevice(icrt1_dv, icrt1);
+  return icrt1_dv;
+}
+
+template <typename word>
+void Encoder<word>::EncodeCoeff(Plaintext<word> &ptxt, int level, double scale,
+                                const std::vector<double> &coeffs,
+                                int num_aux /*= 0*/) const {
+  RealVectorToPlaintext(ptxt, level, scale, coeffs, num_aux);
+  NPInfo np = param_.LevelToNP(level, num_aux);
+  auto mx_temp = ptxt.View();
+  ntt_handler_.NTT(mx_temp, np, ptxt.ConstView(), true);
+}
+
+template <typename word>
+void Encoder<word>::DecodeCoeff(std::vector<double> &coeffs,
+                                const Plaintext<word> &ptxt) const {
+  Plaintext<word> tmp;
+  NPInfo np = ptxt.GetNP();
+  AssertTrue(np.num_aux_ == 0, "DecodeCoeff: Aux primes not supported");
+
+  DeviceVector<word> icrt1_dv = MakeICRTConstants(np);
+
+  tmp.ModifyNP(np);
+  tmp.SetNumSlots(ptxt.GetNumSlots());
+  tmp.SetScale(ptxt.GetScale());
+
+  auto mx_temp = tmp.View();
+  ntt_handler_.INTTAndMultConst(mx_temp, np, ptxt.ConstView(),
+                                icrt1_dv.ConstView());
+  PlaintextToRealVector(coeffs, tmp);
+}
+
+template <typename word>
+void Encoder<word>::RealVectorToPlaintext(Plaintext<word> &ptxt, int level,
+                                          double scale,
+                                          const std::vector<double> &coeffs,
+                                          int num_aux /*= 0*/) const {
+  int degree = param_.degree_;
+  int num_coeffs = static_cast<int>(coeffs.size());
+
+  AssertTrue(num_coeffs > 0 && num_coeffs <= degree,
+             "RealVectorToPlaintext: invalid number of coefficients");
+
+  NPInfo np = param_.LevelToNP(level, num_aux);
+  auto primes = param_.GetPrimeVector(np);
+  int num_total_primes = np.GetNumTotal();
+  HostVector<word> mx(num_total_primes * degree, 0);
+
+  std::vector<BigInt> big_primes;
+  for (int j = 0; j < num_total_primes; j++) {
+    big_primes.emplace_back(static_cast<uint64_t>(primes[j]));
+  }
+
+  BigInt residue(static_cast<uint64_t>(0));
+  for (int i = 0; i < num_coeffs; i++) {
+    // BigInt(double) truncates, so round here to get the nearest integer.
+    BigInt value(std::round(coeffs[i] * scale));
+    for (int j = 0; j < num_total_primes; j++) {
+      // BigInt::Mod is always non-negative, which is what the RNS limb needs
+      // even for a negative coefficient.
+      BigInt::Mod(residue, value, big_primes[j]);
+      mx[i + j * degree] = residue.GetUnsigned();
+    }
+  }
+
+  ptxt.ModifyNP(np);
+  // Coefficient encoding occupies every coefficient, so the slot metadata is
+  // set to the full width; it is not meaningful for this encoding.
+  ptxt.SetNumSlots(degree / 2);
+  ptxt.SetScale(scale);
+  CopyHostToDevice(ptxt.mx_, mx);
+}
+
+template <typename word>
+void Encoder<word>::PlaintextToRealVector(std::vector<double> &coeffs,
+                                          const Plaintext<word> &ptxt) const {
+  NPInfo np = ptxt.GetNP();
+  int num_total_primes = np.GetNumTotal();
+  auto primes = param_.GetPrimeVector(np);
+  int degree = param_.degree_;
+  double scale = ptxt.GetScale();
+
+  HostVector<word> intt_res;
+  CopyDeviceToHost(intt_res, ptxt.mx_);
+
+  std::vector<BigInt> big_primes;
+  BigInt prime_prod(static_cast<uint64_t>(1));
+  for (int i = 0; i < num_total_primes; i++) {
+    big_primes.emplace_back(static_cast<uint64_t>(primes[i]));
+    BigInt::Mult(prime_prod, prime_prod, big_primes[i]);
+  }
+  BigInt half_prime_prod(static_cast<uint64_t>(0));
+  BigInt::Div2(half_prime_prod, prime_prod);
+
+  // prod_{k != j} p_k does not depend on the coefficient index, so hoist it out
+  // of the loop over `degree` coefficients.
+  std::vector<BigInt> crt_weight;
+  for (int j = 0; j < num_total_primes; j++) {
+    BigInt prod(static_cast<uint64_t>(1));
+    for (int k = 0; k < num_total_primes; k++) {
+      if (j == k) continue;
+      BigInt::Mult(prod, prod, big_primes[k]);
+    }
+    crt_weight.push_back(prod);
+  }
+
+  coeffs.resize(degree);
+  BigInt tmp(static_cast<uint64_t>(0));
+  for (int i = 0; i < degree; i++) {
+    BigInt icrt(static_cast<uint64_t>(0));
+    for (int j = 0; j < num_total_primes; j++) {
+      BigInt limb(static_cast<uint64_t>(intt_res[j * degree + i]));
+      BigInt::Mult(tmp, limb, crt_weight[j]);
+      BigInt::Add(icrt, icrt, tmp);
+    }
+    BigInt::NormalizeMod(icrt, icrt, prime_prod, half_prime_prod);
+    coeffs[i] = icrt.GetDouble() / scale;
+  }
 }
 
 template <typename word>

@@ -34,6 +34,12 @@ class Encoder {
                                 int num_aux = 0) const;
   void PlaintextToComplexVector(std::vector<Complex> &data,
                                 const Plaintext<word> &ptxt) const;
+  void RealVectorToPlaintext(Plaintext<word> &ptxt, int level, double scale,
+                             const std::vector<double> &coeffs,
+                             int num_aux = 0) const;
+  void PlaintextToRealVector(std::vector<double> &coeffs,
+                             const Plaintext<word> &ptxt) const;
+  DeviceVector<word> MakeICRTConstants(const NPInfo &np) const;
   void SpecialIFFT(std::vector<Complex> &data) const;
   void SpecialFFT(std::vector<Complex> &data) const;
 
@@ -66,6 +72,40 @@ class Encoder {
    * @param ptxt input plaintext (NTT-applied)
    */
   void Decode(std::vector<Complex> &message, const Plaintext<word> &ptxt) const;
+
+  /**
+   * @brief Encode a real vector directly into the COEFFICIENTS of a plaintext,
+   * bypassing the special FFT:
+   *
+   *     ptxt  =  sum_i  round(scale * coeffs[i]) * X^i    in Z[X]/(X^N + 1)
+   *
+   * This is the `Ecd_coeff` of Bae et al. (CRYPTO 2024) and is the encoding the
+   * reduction-based matrix-multiplication algorithms operate in. Unlike the
+   * slot encoding, multiplication of two coefficient-encoded plaintexts is the
+   * negacyclic convolution of the encoded vectors, not their pointwise product.
+   *
+   * Coefficients past `coeffs.size()` are set to zero. Note that the value is
+   * rounded to nearest here, whereas Encode() truncates towards zero via
+   * BigInt(double); the difference is half a unit in the last place of `scale`.
+   *
+   * @param ptxt output plaintext (NTT-applied, as for Encode)
+   * @param level level of the plaintext
+   * @param scale scale to apply
+   * @param coeffs real coefficient vector, at most `degree` entries
+   * @param num_aux number of auxiliary primes
+   */
+  void EncodeCoeff(Plaintext<word> &ptxt, int level, double scale,
+                   const std::vector<double> &coeffs, int num_aux = 0) const;
+
+  /**
+   * @brief Decode a coefficient-encoded plaintext back into a real vector of
+   * length `degree`. Inverse of EncodeCoeff.
+   *
+   * @param coeffs output real coefficient vector (resized to `degree`)
+   * @param ptxt input plaintext (NTT-applied)
+   */
+  void DecodeCoeff(std::vector<double> &coeffs,
+                   const Plaintext<word> &ptxt) const;
 
   /**
    * @brief Encode a real number (double) into an RNS constant for a given level

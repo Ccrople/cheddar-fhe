@@ -22,6 +22,11 @@ add_executable(basic_test BasicTest.cpp)
 target_link_libraries(basic_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# Coefficient-domain encoding, for the reduction-based matrix products.
+add_executable(coeff_encode_test CoeffEncodeTest.cpp)
+target_link_libraries(coeff_encode_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
