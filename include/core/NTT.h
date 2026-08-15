@@ -23,7 +23,6 @@ class NTTHandler {
   using Dv = DeviceVector<word>;
   using Hv = HostVector<word>;
 
-  static inline bool cm_populated_ = false;
 
   const Parameter<word> &param_;
 

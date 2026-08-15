@@ -74,7 +74,6 @@ class ModSwitchHandler {
 
   // heuristic CUDA kernel block number;
   static constexpr int block_dim_ = 256;
-  static inline bool cm_populated_ = false;
 
   void PopulateModSwitchConstants(Dv &const1,
                                   DeviceVector<make_signed_t<word>> &const2,

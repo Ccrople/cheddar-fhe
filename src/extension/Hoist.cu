@@ -1,6 +1,5 @@
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
-#include "common/ConstantMemory.cuh"
 #include "extension/Hoist.h"
 
 namespace {
@@ -23,9 +22,8 @@ __global__ void BSFusedKernel(
     word **dst_bx, word **dst_ax, const word **mod_up, const word **key_bx,
     const word **key_ax, int num_accum, int num_rotations, const word *primes,
     const make_signed_t<word> *inv_primes, int num_q_primes, word *key_extra,
-    const word *input_bx_pseudo_modup, word *galois_factors) {
+    const word *input_bx_pseudo_modup, word *galois_factors, int log_degree) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int log_degree = cm_log_degree();
   int prime_index = (i >> log_degree);
   int x_idx = i & ((1 << log_degree) - 1);
   int mod_up_index = i;
@@ -82,9 +80,9 @@ template <typename word, int num_bs_padded>
 __global__ void GSFusedKernel(word **dst_bx, word **dst_ax, const word **bx,
                               const word **ax, const word **mx, int num_bs,
                               int num_gs, const word *primes,
-                              const make_signed_t<word> *inv_primes) {
+                              const make_signed_t<word> *inv_primes,
+                              int log_degree) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int log_degree = cm_log_degree();
   int prime_index = (i >> log_degree);
   int bxax_index = i;
   int cx_index = i;
@@ -169,10 +167,6 @@ HoistHandler<word>::HoistHandler(ConstContextPtr<word> context,
   } else {
     ExtractBSIndices(hoist_map);
     CompilePlaintexts(context, hoist_map);
-  }
-  if (!cm_populated_) {
-    PopulateConstantMemory(context->param_);
-    cm_populated_ = true;
   }
 }
 
@@ -322,7 +316,8 @@ void HoistHandler<word>::BSFusedKeyMult(
         dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), modup_d_ptrs.data(),
         key_b_d_ptrs.data(), key_a_d_ptrs.data(), num_accum, num_rotations,
         primes, inv_primes, num_q_primes, key_extra_d.data(),
-        input_bx_pseudo_modup.data(), galois_factors.data());
+        input_bx_pseudo_modup.data(), galois_factors.data(),
+        context->param_.log_degree_);
   });
 }
 
@@ -432,7 +427,8 @@ void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
     if (num_bs <= (1 << (i - 1))) return;
     kernel::GSFusedKernel<word, num_bs_padded><<<grid_dim, block_dim>>>(
         dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), bx_d_ptrs.data(),
-        ax_d_ptrs.data(), mx_d_ptrs.data(), num_bs, num_gs, primes, inv_primes);
+        ax_d_ptrs.data(), mx_d_ptrs.data(), num_bs, num_gs, primes, inv_primes,
+        context->param_.log_degree_);
   });
 }
 

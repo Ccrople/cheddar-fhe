@@ -3,7 +3,6 @@
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
-#include "common/ConstantMemory.cuh"
 #include "common/DoubleWord.h"
 #include "common/PrimeUtils.h"
 #include "core/ModSwitch.h"
@@ -26,13 +25,13 @@ __global__ void ModSwitchMatrixMult(word *dst, const word *primes,
                                     const int src_len, const int dst_len,
                                     const int skip_start, const int skip_end,
                                     const make_signed_t<word> *src,
-                                    const make_signed_t<word> *bconv_table) {
+                                    const make_signed_t<word> *bconv_table,
+                                    const int log_degree) {
   // Load bconv_table into shared memory
   using signed_word = make_signed_t<word>;
   using signed_d_word = make_signed_double_word_t<word>;
 
   extern __shared__ char __smem[];
-  int log_degree = cm_log_degree();
 
   // For mod_prime q, we prepare bconv_table in range
   // [- (q - 1) / 2, (q - 1) / 2] -- normalized
@@ -192,10 +191,6 @@ ModSwitchHandler<word>::ModSwitchHandler(
       kNumThreadsPerBlock == kNumThreadsX * kNumThreadsY,
       "kNumThreadsPerBlock must be equal to kNumThreadsX * kNumThreadsY");
 
-  if (!cm_populated_) {
-    PopulateConstantMemory(param_);
-    cm_populated_ = true;
-  }
 
   NPInfo np = param_.LevelToNP(level_, num_aux_);
   int num_q_primes = np.GetNumQ();
@@ -502,7 +497,7 @@ void ModSwitchHandler<word>::ModUp(std::vector<DvView<word>> &dst,
 
     kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
         dst_i.data(), primes, inv_primes, src_len, dst_len, prime_index_start,
-        prime_index_end, src_ptr, mod_up2_.at(i).data());
+        prime_index_end, src_ptr, mod_up2_.at(i).data(), param_.log_degree_);
     ntt_handler_.NTTForModUp(dst_i, np, prime_index_start, prime_index_end,
                              dst_i);
   }
@@ -630,7 +625,7 @@ void ModSwitchHandler<word>::ModDownWorker(DvView<word> &dst,
 
   kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
       dst.data(), primes, inv_primes, src_len, dst_len, 0, 0, src_ptr,
-      bconv_table);
+      bconv_table, param_.log_degree_);
 
   // Prepare the constants for ModDownEpilogue
   int pad_start = 0;

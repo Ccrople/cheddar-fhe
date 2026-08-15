@@ -22,7 +22,6 @@ class ElementWiseHandler {
   static constexpr int kernel_block_dim_ = 256;
   static constexpr int max_num_poly_ = 3;
   static constexpr int max_num_accum_ = 8;
-  static inline bool cm_populated_ = false;
 
   uint32_t PermuteAmountToGaloisFactor(int permute_amount) const;
   void AssertNPMatch(std::vector<DvView<word>> &dst, const NPInfo &np) const;

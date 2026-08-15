@@ -27,7 +27,6 @@ class UserInterface {
   using Pt = Plaintext<word>;
   using Evk = EvaluationKey<word>;
 
-  static inline bool cm_populated_ = false;
 
  public:
   /**

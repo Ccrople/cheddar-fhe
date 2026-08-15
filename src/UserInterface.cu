@@ -1,7 +1,6 @@
 #include "UserInterface.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
-#include "common/ConstantMemory.cuh"
 #include "common/PrimeUtils.h"
 #include "common/PtrList.h"
 
@@ -18,9 +17,8 @@ __global__ void Encrypt(OutputPtrList<word, 2> dst, const word *primes,
                         const make_signed_t<word> *inv_primes, int num_q_primes,
                         const InputPtrList<word, 1> sx,
                         const InputPtrList<word, 1> mx,
-                        const InputPtrList<word, 1> ex) {
+                        const InputPtrList<word, 1> ex, int log_degree) {
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
 
@@ -57,9 +55,8 @@ template <typename word>
 __global__ void EncryptZero(OutputPtrList<word, 2> dst, const word *primes,
                             const make_signed_t<word> *inv_primes,
                             int num_q_primes, const InputPtrList<word, 1> sx,
-                            const InputPtrList<word, 1> ex) {
+                            const InputPtrList<word, 1> ex, int log_degree) {
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
 
@@ -88,9 +85,9 @@ __global__ void EncryptZero(OutputPtrList<word, 2> dst, const word *primes,
 template <typename word>
 __global__ void AddEvkPart(word *dst, const word *primes,
                            const make_signed_t<word> *inv_primes,
-                           const word *src, const word *p_prod) {
+                           const word *src, const word *p_prod,
+                           int log_degree) {
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -116,10 +113,6 @@ UserInterface<word>::UserInterface(ContextPtr<word> context)
   all_primes_ =
       param.GetPrimeVector(param.LevelToNP(param.max_level_, param.alpha_));
 
-  if (!cm_populated_) {
-    PopulateConstantMemory(context_->param_);
-    cm_populated_ = true;
-  }
 
   Warn(
       "UserInterface is for testing purposes only. "
@@ -164,7 +157,8 @@ void UserInterface<word>::Encrypt(Ct &ctxt, const Pt &ptxt) const {
 
   // bx = -ax * sx + mx + ex
   kernel::Encrypt<word><<<grid_dim, kernel_block_dim_>>>(
-      dst, primes, inv_primes, num_q_primes, sx, mx, ex);
+      dst, primes, inv_primes, num_q_primes, sx, mx, ex,
+      context_->param_.log_degree_);
 }
 
 template <typename word>
@@ -511,7 +505,8 @@ void UserInterface<word>::PrepareEvk(int key_idx, const NPInfo &np,
     int grid_dim = (num_q + np.num_aux_) * degree / kernel_block_dim_;
 
     kernel::EncryptZero<word><<<grid_dim, kernel_block_dim_>>>(
-        evk_ptr_list, primes, inv_primes, num_q, enc_s, ex);
+        evk_ptr_list, primes, inv_primes, num_q, enc_s, ex,
+        context_->param_.log_degree_);
 
     int chunk_size = np.num_aux_;
     if (i == beta - 1) {
@@ -523,7 +518,7 @@ void UserInterface<word>::PrepareEvk(int key_idx, const NPInfo &np,
         evk.bx_.at(i).data() + i * np.num_aux_ * degree,
         primes + i * np.num_aux_, inv_primes + i * np.num_aux_,
         target_s_ptr + i * np.num_aux_ * degree,
-        p_prod.data() + i * np.num_aux_);
+        p_prod.data() + i * np.num_aux_, context_->param_.log_degree_);
   }
 }
 

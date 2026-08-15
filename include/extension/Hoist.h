@@ -42,7 +42,6 @@ class HoistHandler {
   std::vector<int> gs_indices_;
 
   static constexpr int kernel_block_dim_ = 256;
-  static inline bool cm_populated_ = false;
 
   constexpr static int max_log_beta_ = 4;
   constexpr static int max_log_bs_ = 7;

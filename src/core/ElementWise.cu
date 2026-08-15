@@ -1,7 +1,6 @@
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
-#include "common/ConstantMemory.cuh"
 #include "common/DoubleWord.h"
 #include "common/PrimeUtils.h"
 #include "common/PtrList.h"
@@ -30,13 +29,13 @@ namespace kernel {
 
 // dst = src_1 + src_2 + ... + src_last;
 template <typename word, int num_poly, typename... PtrLists>
-__global__ void Sum(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void Sum(int log_degree,
+                    OutputPtrList<word, num_poly> dst, const word *primes,
                     int num_q_primes, const PtrLists... srcs) {
   static_assert(sizeof...(PtrLists) > 0, "Sum must have at least one source");
   static_assert((std::is_same_v<PtrLists, InputPtrList<word, num_poly>> && ...),
                 "Sum must have InputPtrList as the last source");
 
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -72,10 +71,10 @@ __global__ void Sum(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = src_1 - src_2;
 template <typename word, int num_poly>
-__global__ void Sub(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void Sub(int log_degree,
+                    OutputPtrList<word, num_poly> dst, const word *primes,
                     int num_q_primes, const InputPtrList<word, num_poly> src1,
                     const InputPtrList<word, num_poly> src2) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -96,9 +95,9 @@ __global__ void Sub(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = -src;
 template <typename word, int num_poly>
-__global__ void Neg(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void Neg(int log_degree,
+                    OutputPtrList<word, num_poly> dst, const word *primes,
                     int num_q_primes, const InputPtrList<word, num_poly> src) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -116,11 +115,11 @@ __global__ void Neg(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = src_1 * src_2;
 template <typename word, int num_poly>
-__global__ void Mult(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void Mult(int log_degree,
+                     OutputPtrList<word, num_poly> dst, const word *primes,
                      const make_signed_t<word> *inv_primes, int num_q_primes,
                      const InputPtrList<word, num_poly> src1,
                      const InputPtrList<word, num_poly> src2) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -144,11 +143,11 @@ __global__ void Mult(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = src - const_src;
 template <typename word, int num_poly>
-__global__ void AddConst(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void AddConst(int log_degree,
+                         OutputPtrList<word, num_poly> dst, const word *primes,
                          int num_q_primes,
                          const InputPtrList<word, num_poly> src,
                          const InputPtrList<word, 1> const_src) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -170,11 +169,11 @@ __global__ void AddConst(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = src - const_src;
 template <typename word, int num_poly>
-__global__ void SubConst(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void SubConst(int log_degree,
+                         OutputPtrList<word, num_poly> dst, const word *primes,
                          int num_q_primes,
                          const InputPtrList<word, num_poly> src,
                          const InputPtrList<word, 1> const_src) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -196,11 +195,11 @@ __global__ void SubConst(OutputPtrList<word, num_poly> dst, const word *primes,
 
 // dst = const_src - src;
 template <typename word, int num_poly>
-__global__ void SubOppositeConst(OutputPtrList<word, num_poly> dst,
+__global__ void SubOppositeConst(int log_degree,
+                                 OutputPtrList<word, num_poly> dst,
                                  const word *primes, int num_q_primes,
                                  const InputPtrList<word, num_poly> src,
                                  const InputPtrList<word, 1> const_src) {
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -223,7 +222,8 @@ __global__ void SubOppositeConst(OutputPtrList<word, num_poly> dst,
 // CAccum/PAccum version without src0
 // PtrLists: CPAcuumInputPtrList
 template <typename word, int num_poly, bool const_accum, typename... PtrLists>
-__global__ void CPAccum(OutputPtrList<word, num_poly> dst, const word *primes,
+__global__ void CPAccum(int log_degree,
+                        OutputPtrList<word, num_poly> dst, const word *primes,
                         const make_signed_t<word> *inv_primes, int num_q_primes,
                         const PtrLists... srcs) {
   static_assert(sizeof...(PtrLists) > 0,
@@ -233,7 +233,6 @@ __global__ void CPAccum(OutputPtrList<word, num_poly> dst, const word *primes,
       "CPAccum must have CPAccumInputPtrList as the last source");
 
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -289,7 +288,7 @@ __global__ void CPAccum(OutputPtrList<word, num_poly> dst, const word *primes,
 // CAccum/PAccum version with src0
 // PtrLists: CPAccumInputPtrList
 template <typename word, int num_poly, bool const_accum, typename... PtrLists>
-__global__ void CPAccumAdd(OutputPtrList<word, num_poly> dst,
+__global__ void CPAccumAdd(int log_degree, OutputPtrList<word, num_poly> dst,
                            const word *primes,
                            const make_signed_t<word> *inv_primes,
                            int num_q_primes,
@@ -302,7 +301,6 @@ __global__ void CPAccumAdd(OutputPtrList<word, num_poly> dst,
       "CPAccumAdd must have CPAccumInputPtrList as the last source");
 
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -368,9 +366,9 @@ __global__ void CPAccumAdd(OutputPtrList<word, num_poly> dst,
 // dst = permute(src1, r1) + permute(src2, r2) + ... + permute(src_last,
 // r_last); {src1, r1} embedded in a single PtrList
 template <typename word, int num_poly, typename... PtrLists>
-__global__ void Permute(OutputPtrList<word, num_poly> dst, int num_q_primes,
+__global__ void Permute(int log_degree,
+                        OutputPtrList<word, num_poly> dst, int num_q_primes,
                         const PermuteInputPtrList<word, num_poly> src1) {
-  int log_degree = cm_log_degree();
   int degree = 1 << log_degree;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -393,7 +391,7 @@ __global__ void Permute(OutputPtrList<word, num_poly> dst, int num_q_primes,
 // dst = permute(src1, r1) + permute(src2, r2) + ... + permute(src_last,
 // r_last); {src1, r1} embedded in a single PtrList
 template <typename word, int num_poly, typename... PtrLists>
-__global__ void PermuteAccum(OutputPtrList<word, num_poly> dst,
+__global__ void PermuteAccum(int log_degree, OutputPtrList<word, num_poly> dst,
                              const word *primes, int num_q_primes,
                              const PtrLists... srcs) {
   static_assert(sizeof...(PtrLists) > 0,
@@ -402,7 +400,6 @@ __global__ void PermuteAccum(OutputPtrList<word, num_poly> dst,
       (std::is_same_v<PtrLists, PermuteInputPtrList<word, num_poly>> && ...),
       "PermuteAccum must have PermuteInputPtrList as the last src");
 
-  int log_degree = cm_log_degree();
   int degree = 1 << log_degree;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -443,7 +440,8 @@ __global__ void PermuteAccum(OutputPtrList<word, num_poly> dst,
 // dst = src0 + permute(src1, r1) + permute(src2, r2) + ... + permute(src_last,
 // r_last); {src1, r1} embedded in a single PtrList
 template <typename word, int num_poly, typename... PtrLists>
-__global__ void PermuteAccumAdd(OutputPtrList<word, num_poly> dst,
+__global__ void PermuteAccumAdd(int log_degree,
+                                OutputPtrList<word, num_poly> dst,
                                 const word *primes, int num_q_primes,
                                 const InputPtrList<word, num_poly> src0,
                                 const PtrLists... srcs) {
@@ -453,7 +451,6 @@ __global__ void PermuteAccumAdd(OutputPtrList<word, num_poly> dst,
       (std::is_same_v<PtrLists, PermuteInputPtrList<word, num_poly>> && ...),
       "PermuteAccum must have PermuteInputPtrList as the last src");
 
-  int log_degree = cm_log_degree();
   int degree = 1 << log_degree;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -502,12 +499,12 @@ __global__ void PermuteAccumAdd(OutputPtrList<word, num_poly> dst,
 
 // (dst_bx, dst_ax, dst_rx) = (b1 * b2, b1 * a2 + a1 * b2, a1 * a2);
 template <typename word /*, int num_poly = 2*/>
-__global__ void Tensor(OutputPtrList<word, 3> dst, const word *primes,
+__global__ void Tensor(int log_degree,
+                       OutputPtrList<word, 3> dst, const word *primes,
                        const make_signed_t<word> *inv_primes, int num_q_primes,
                        const InputPtrList<word, 2> src1,
                        const InputPtrList<word, 2> src2) {
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -547,12 +544,12 @@ __global__ void Tensor(OutputPtrList<word, 3> dst, const word *primes,
 
 // dst = src_1 - src_2;
 template <typename word /*, int num_poly = 2*/>
-__global__ void TensorSquare(OutputPtrList<word, 3> dst, const word *primes,
+__global__ void TensorSquare(int log_degree,
+                             OutputPtrList<word, 3> dst, const word *primes,
                              const make_signed_t<word> *inv_primes,
                              int num_q_primes,
                              const InputPtrList<word, 2> src1) {
   using signed_word = make_signed_t<word>;
-  int log_degree = cm_log_degree();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
@@ -577,9 +574,9 @@ __global__ void TensorSquare(OutputPtrList<word, 3> dst, const word *primes,
 // Special kernels for bootstrapping
 
 template <typename word>
-__global__ void ModUpToMax1(word *dst, const word *primes, const word q0,
+__global__ void ModUpToMax1(int log_degree,
+                            word *dst, const word *primes, const word q0,
                             const word *src) {
-  int log_degree = cm_log_degree();
   int degree = 1 << log_degree;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -592,12 +589,12 @@ __global__ void ModUpToMax1(word *dst, const word *primes, const word q0,
 }
 
 template <typename word>
-__global__ void ModUpToMax2(word *dst, const word *primes, const word q0,
+__global__ void ModUpToMax2(int log_degree,
+                            word *dst, const word *primes, const word q0,
                             const word q1, const word *src) {
   using signed_word = make_signed_t<word>;
   using signed_d_word = make_signed_double_word_t<word>;
 
-  int log_degree = cm_log_degree();
   int degree = 1 << log_degree;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -623,13 +620,13 @@ __global__ void ModUpToMax2(word *dst, const word *primes, const word q0,
 }
 
 template <typename word, int num_poly>
-__global__ void MultImaginaryUnit(OutputPtrList<word, num_poly> dst,
+__global__ void MultImaginaryUnit(int log_degree,
+                                  OutputPtrList<word, num_poly> dst,
                                   const word *primes,
                                   const make_signed_t<word> *inv_primes,
                                   int num_q_primes,
                                   const InputPtrList<word, num_poly> src,
                                   const InputPtrList<word, 1> i_unit) {
-  int log_degree = cm_log_degree();
   int half_degree = 1 << (log_degree - 1);
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -664,10 +661,6 @@ ElementWiseHandler<word>::ElementWiseHandler(const Parameter<word> &param)
     : param_{param} {
   AssertTrue(param_.degree_ % kernel_block_dim_ == 0,
              "Invalid kernel block dim");
-  if (!cm_populated_) {
-    PopulateConstantMemory(param_);
-    cm_populated_ = true;
-  }
 }
 
 template <typename word>
@@ -710,7 +703,7 @@ void ElementWiseHandler<word>::Add(
     InputPtrList<word, j> src2_ptr_list(src2);
     src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
 
-    kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list, src2_ptr_list);
   });
 }
@@ -742,7 +735,7 @@ void ElementWiseHandler<word>::Sub(
     InputPtrList<word, j> src2_ptr_list(src2);
     src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
 
-    kernel::Sub<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Sub<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list, src2_ptr_list);
   });
 }
@@ -770,7 +763,7 @@ void ElementWiseHandler<word>::Neg(
     InputPtrList<word, j> src1_ptr_list(src1);
     src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
 
-    kernel::Neg<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Neg<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list);
   });
 }
@@ -803,7 +796,7 @@ void ElementWiseHandler<word>::Mult(
     InputPtrList<word, j> src2_ptr_list(src2);
     src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
 
-    kernel::Mult<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Mult<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list,
         src2_ptr_list);
   });
@@ -843,7 +836,7 @@ void ElementWiseHandler<word>::AddConst(
     InputPtrList<word, 1> src_const_ptr_list(src_const);
     src_const_ptr_list.extra_ = src_const.QSize() - num_q_primes;
 
-    kernel::AddConst<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::AddConst<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list, src_const_ptr_list);
   });
 }
@@ -874,7 +867,7 @@ void ElementWiseHandler<word>::SubConst(
     InputPtrList<word, 1> src_const_ptr_list(src_const);
     src_const_ptr_list.extra_ = src_const.QSize() - num_q_primes;
 
-    kernel::SubConst<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::SubConst<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list, src_const_ptr_list);
   });
 }
@@ -905,7 +898,7 @@ void ElementWiseHandler<word>::SubOppositeConst(
     InputPtrList<word, 1> src_const_ptr_list(src_const);
     src_const_ptr_list.extra_ = src_const.QSize() - num_q_primes;
 
-    kernel::SubOppositeConst<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::SubOppositeConst<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, num_q_primes, src1_ptr_list, src_const_ptr_list);
   });
 }
@@ -941,12 +934,12 @@ void ElementWiseHandler<word>::Tensor(
 
   if (src1.at(0).data() == src2.at(0).data() &&
       src1.at(1).data() == src2.at(1).data()) {
-    kernel::TensorSquare<word><<<grid_dim, kernel_block_dim_>>>(
+    kernel::TensorSquare<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list);
   } else {
     InputPtrList<word, 2> src2_ptr_list(src2);
     src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
-    kernel::Tensor<word><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Tensor<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list,
         src2_ptr_list);
   }
@@ -993,7 +986,7 @@ void ElementWiseHandler<word>::Permute(
     src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
     src1_ptr_list.galois_factor_ = galois_factor;
 
-    kernel::Permute<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::Permute<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, num_q_primes, src1_ptr_list);
   });
 }
@@ -1141,44 +1134,44 @@ void ElementWiseHandler<word>::PermuteAccumWorker(
       // Hard-coded kernel launch
       switch (num_accum) {
         case 1:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0]);
           break;
         case 2:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1]);
           break;
         case 3:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2]);
           break;
         case 4:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3]);
           break;
         case 5:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4]);
           break;
         case 6:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5]);
           break;
         case 7:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5], src_ptr_list[6]);
           break;
         case 8:
-          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccumAdd<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, extra_ct, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5], src_ptr_list[6],
@@ -1192,44 +1185,44 @@ void ElementWiseHandler<word>::PermuteAccumWorker(
       // Hard-coded kernel launch
       switch (num_accum) {
         case 1:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0]);
           break;
         case 2:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1]);
           break;
         case 3:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2]);
           break;
         case 4:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3]);
           break;
         case 5:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4]);
           break;
         case 6:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5]);
           break;
         case 7:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5], src_ptr_list[6]);
           break;
         case 8:
-          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(
+          kernel::PermuteAccum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
               dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
               src_ptr_list[1], src_ptr_list[2], src_ptr_list[3],
               src_ptr_list[4], src_ptr_list[5], src_ptr_list[6],
@@ -1308,39 +1301,39 @@ void ElementWiseHandler<word>::Accum(
     // Hard-coded kernel launch
     switch (num_accum) {
       case 2:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1]);
         break;
       case 3:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2]);
         break;
       case 4:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2], src_ptr_list[3]);
         break;
       case 5:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2], src_ptr_list[3], src_ptr_list[4]);
         break;
       case 6:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2], src_ptr_list[3], src_ptr_list[4],
             src_ptr_list[5]);
         break;
       case 7:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2], src_ptr_list[3], src_ptr_list[4],
             src_ptr_list[5], src_ptr_list[6]);
         break;
       case 8:
-        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(
+        kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
             dst_ptr_list, primes, num_q_primes, src_ptr_list[0],
             src_ptr_list[1], src_ptr_list[2], src_ptr_list[3], src_ptr_list[4],
             src_ptr_list[5], src_ptr_list[6], src_ptr_list[7]);
@@ -1520,46 +1513,47 @@ void ElementWiseHandler<word>::CPAccumWorker(
       switch (num_accum) {
         case 1:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(dst_ptr_list, primes,
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                                                dst_ptr_list, primes,
                                                 inv_primes, num_q_primes, src0,
                                                 src_ptr_list[0]);
           break;
         case 2:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1]);
           break;
         case 3:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2]);
           break;
         case 4:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3]);
           break;
         case 5:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4]);
           break;
         case 6:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5]);
           break;
         case 7:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
@@ -1567,7 +1561,7 @@ void ElementWiseHandler<word>::CPAccumWorker(
           break;
         case 8:
           kernel::CPAccumAdd<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes, src0,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
@@ -1581,46 +1575,47 @@ void ElementWiseHandler<word>::CPAccumWorker(
       switch (num_accum) {
         case 1:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(dst_ptr_list, primes,
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                                                dst_ptr_list, primes,
                                                 inv_primes, num_q_primes,
                                                 src_ptr_list[0]);
           break;
         case 2:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1]);
           break;
         case 3:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2]);
           break;
         case 4:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3]);
           break;
         case 5:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4]);
           break;
         case 6:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5]);
           break;
         case 7:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
@@ -1628,7 +1623,7 @@ void ElementWiseHandler<word>::CPAccumWorker(
           break;
         case 8:
           kernel::CPAccum<word, j, const_accum>
-              <<<grid_dim, kernel_block_dim_>>>(
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
                   dst_ptr_list, primes, inv_primes, num_q_primes,
                   src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
                   src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
@@ -1659,10 +1654,10 @@ void ElementWiseHandler<word>::ModUpToMax(DvView<word> &dst,
   int grid_dim = max_np.GetNumTotal() * param_.degree_ / kernel_block_dim_;
 
   if (base_primes.size() == 2) {
-    kernel::ModUpToMax2<word><<<grid_dim, kernel_block_dim_>>>(
+    kernel::ModUpToMax2<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst.data(), primes, base_primes.at(0), base_primes.at(1), src1.data());
   } else if (base_primes.size() == 1) {
-    kernel::ModUpToMax1<word><<<grid_dim, kernel_block_dim_>>>(
+    kernel::ModUpToMax1<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst.data(), primes, base_primes.at(0), src1.data());
   } else {
     Fail("ModUpToMax: Invalid base primes size");
@@ -1696,7 +1691,7 @@ void ElementWiseHandler<word>::MultImaginaryUnit(
     InputPtrList<word, 1> i_unit(src_i_unit);
     i_unit.extra_ = src_i_unit.QSize() - q_size;
 
-    kernel::MultImaginaryUnit<word, j><<<grid_dim, kernel_block_dim_>>>(
+    kernel::MultImaginaryUnit<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list, i_unit);
   });
 }

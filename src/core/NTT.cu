@@ -1,7 +1,6 @@
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
-#include "common/ConstantMemory.cuh"
 #include "common/PrimeUtils.h"
 #include "common/PtrList.h"
 #include "core/NTT.h"
@@ -1223,10 +1222,6 @@ int NTTHandler<word>::GetBlockDim(NTTType type, Phase phase) const {
 
 template <typename word>
 NTTHandler<word>::NTTHandler(const Parameter<word> &param) : param_(param) {
-  if (!cm_populated_) {
-    PopulateConstantMemory(param_);
-    cm_populated_ = true;
-  }
   PopulateTwiddleFactors();
 }
 
