@@ -140,10 +140,14 @@ class SubringMatrixHandler {
    *
    * Entry `(j, l)` of `U` is the subring element whose `DFT_k` is the vector
    * of that entry across the batch: `uhat_{j,l}[t] = values[t][j][l]`. It is
-   * built by SinC-encoding the message that repeats `uhat_{j,l}` in every one
-   * of the `d` blocks -- a subring element is exactly a message with that
-   * period, which is the same fact that makes sparsely packed ciphertexts
-   * work.
+   * built by SinC-encoding the message that carries `uhat_{j,l}` in **block 0
+   * and zero everywhere else** -- a subring element has coefficients only at
+   * multiples of `X^d`, and SinC puts position `i + t*d` in block `i`, so
+   * `Vec^d_k(u) = (u, 0, ..., 0)`.
+   *
+   * Note which way round that is. `u` multiplies *every* block, but it is
+   * *encoded* in one; repeating it across blocks encodes
+   * `(1 + X + ... + X^{d-1}) * u` instead, which mixes them.
    *
    * @param res output weights
    * @param level level to encode at

@@ -127,14 +127,24 @@ void SubringMatrixHandler<word>::EncodeWeights(
   // is encoded by handing SinC the lane vector once per block. Doing it this
   // way rather than writing coefficients directly keeps the encoding on the
   // one path that SinCEncodeTest pins.
-  std::vector<Complex> message(degree / 2);
+  // BLOCK 0 ONLY, and the rest zero. A subring element has coefficients solely
+  // at multiples of X^d, and SinC puts position i + t*d in block i, so
+  // Vec^d_k(u) = (u, 0, ..., 0) and the message that encodes u is supported on
+  // block 0 alone.
+  //
+  // Repeating uhat across all d blocks -- which reads as the natural thing to
+  // do, since u multiplies every block -- instead encodes
+  // (1 + X + ... + X^{d-1}) * u, which mixes the blocks. It is worth naming
+  // the failure because it is quiet: the X^i factor moves only the block
+  // index, leaving DFT_k and therefore the lane structure intact, so a
+  // lane-independence check still passes and only the values are wrong, high
+  // by the sqrt(d) of a sum over blocks.
+  std::vector<Complex> message(degree / 2, Complex(0.0, 0.0));
   Pt entry;
   for (int j = 0; j < cols_in; j++) {
     for (int l = 0; l < cols_out; l++) {
-      for (int block = 0; block < num_blocks; block++) {
-        for (int t = 0; t < lanes; t++) {
-          message[block * lanes + t] = values[t][j * cols_out + l];
-        }
+      for (int t = 0; t < lanes; t++) {
+        message[t] = values[t][j * cols_out + l];
       }
       encoder_.EncodeSinC(entry, level, scale, message, sub_degree, num_aux);
 
