@@ -42,6 +42,12 @@ add_executable(batch_cpmm_test BatchCpmmTest.cpp)
 target_link_libraries(batch_cpmm_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [KANG] Algorithm 2, the TWEAK transform, plus the monomial arithmetic it runs
+# on -- the key-free and level-free half of CMT. Degree 4096, its own binary.
+add_executable(tweak_test TweakTest.cpp)
+target_link_libraries(tweak_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
