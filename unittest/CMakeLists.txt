@@ -35,6 +35,13 @@ add_executable(sinc_encode_test SinCEncodeTest.cpp)
 target_link_libraries(sinc_encode_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [KANG] Algorithm 1, batch plaintext-ciphertext matrix multiplication over the
+# subring. Stands on the encoding above and shares its engine with the batch
+# CC-MM. Degree 4096, so its own executable.
+add_executable(batch_cpmm_test BatchCpmmTest.cpp)
+target_link_libraries(batch_cpmm_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
