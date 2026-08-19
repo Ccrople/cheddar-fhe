@@ -43,22 +43,28 @@ __global__ void SplitGather(int8_t *dst, const word *const *src_ptrs, int cols,
 // recombination needs 64 bits, and doing it once per output element rather
 // than once per product is why the groups exist.
 template <typename word>
-__global__ void CombineGroups(word *dst, const int32_t *groups, int num_groups,
-                              size_t n, size_t group_stride, word prime,
+__global__ void CombineGroups(word *const *dst_ptrs, const int32_t *groups,
+                              int num_groups, int rows, int degree,
+                              int limb_offset, word prime,
                               const word *shift_pow) {
+  // Every row at once. Launching this per output row -- 128 rows x 3 primes x
+  // 2 components = 768 launches of 4096 elements each -- put about 23 ms of
+  // pure launch overhead on a product whose GEMMs take 2.2 ms. The destinations
+  // are separate allocations, so they arrive as a pointer array, exactly as
+  // PcmmAccum takes them.
+  const size_t n = static_cast<size_t>(rows) * degree;
   const size_t idx =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
+  const int row = static_cast<int>(idx / degree);
+  const int x = static_cast<int>(idx % degree);
   uint64_t acc = 0;
   for (int t = 0; t < num_groups; t++) {
-    // The groups are rows * degree apart, not degree: this kernel handles one
-    // output row, so the row offset is folded into `groups` by the caller but
-    // the stride between groups is the whole slab.
-    const uint64_t part = static_cast<uint64_t>(
-        static_cast<uint32_t>(groups[t * group_stride + idx]));
+    const uint64_t part =
+        static_cast<uint64_t>(static_cast<uint32_t>(groups[t * n + idx]));
     acc = (acc + (part % prime) * static_cast<uint64_t>(shift_pow[t])) % prime;
   }
-  dst[idx] = static_cast<word>(acc);
+  dst_ptrs[row][limb_offset + x] = static_cast<word>(acc);
 }
 
 }  // namespace kernel
@@ -162,6 +168,15 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
     r.SetScale(u.scale * ct_scale);
   }
 
+  HostVector<word *> h_dst_bx(rows), h_dst_ax(rows);
+  for (int i = 0; i < rows; i++) {
+    h_dst_bx[i] = res[i].bx_.data();
+    h_dst_ax[i] = res[i].ax_.data();
+  }
+  DeviceVector<word *> d_dst_bx(rows), d_dst_ax(rows);
+  CopyHostToDevice(d_dst_bx, h_dst_bx);
+  CopyHostToDevice(d_dst_ax, h_dst_ax);
+
   HostVector<word *> h_src_bx(cols), h_src_ax(cols);
   for (int j = 0; j < cols; j++) {
     h_src_bx[j] = const_cast<word *>(cts[j].bx_.data());
@@ -233,14 +248,11 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
       DeviceVector<word> d_shift(num_groups);
       CopyHostToDevice(d_shift, h_shift);
 
-      for (int i = 0; i < rows; i++) {
-        word *dst = (comp == 0 ? res[i].bx_.data() : res[i].ax_.data()) +
-                    limb_offset;
-        kernel::CombineGroups<word>
-            <<<static_cast<int>((degree + kBlock - 1) / kBlock), kBlock>>>(
-                dst, groups.data() + static_cast<size_t>(i) * degree,
-                num_groups, degree, dst_n, primes[j], d_shift.data());
-      }
+      kernel::CombineGroups<word>
+          <<<static_cast<int>((dst_n + kBlock - 1) / kBlock), kBlock>>>(
+              (comp == 0 ? d_dst_bx.data() : d_dst_ax.data()), groups.data(),
+              num_groups, rows, degree, limb_offset, primes[j],
+              d_shift.data());
     }
   }
 }
