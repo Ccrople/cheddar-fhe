@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 #include "core/Container.h"
@@ -112,9 +113,12 @@ class CmtHandler {
                    int sub_degree, int sign, int level,
                    MonomialCache &cache) const;
 
-  // The i with 5^i == galois_factor (mod 2N), read out of Parameter's own
-  // table so the convention is the library's rather than a re-derivation.
-  int GaloisIndex(int galois_factor) const;
+  // factor -> i with 5^i == factor (mod 2N), read out of Parameter's own table
+  // so the convention is the library one rather than a re-derivation. Built in
+  // a single pass and reused: a scan per lookup would be d passes over N/2
+  // entries, which is the same order as a key switch and would be the only
+  // host-side cost in ScrambleAuto worth naming.
+  std::unordered_map<int, int> GaloisIndexTable() const;
 
  public:
   CmtHandler(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);

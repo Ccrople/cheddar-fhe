@@ -1,3 +1,5 @@
+#include <unordered_map>
+
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "core/Cmt.h"
@@ -149,14 +151,14 @@ void CmtHandler<word>::Tweak(ConstContextPtr<word> context,
 }
 
 template <typename word>
-int CmtHandler<word>::GaloisIndex(int galois_factor) const {
+std::unordered_map<int, int> CmtHandler<word>::GaloisIndexTable() const {
   const int half_degree = param_.degree_ / 2;
+  std::unordered_map<int, int> table;
+  table.reserve(half_degree * 2);
   for (int i = 0; i < half_degree; i++) {
-    if (param_.GetGaloisFactor(i) == galois_factor) return i;
+    table.emplace(param_.GetGaloisFactor(i), i);
   }
-  Fail("GaloisIndex: " + std::to_string(galois_factor) +
-       " is not a power of 5 modulo 2N");
-  return -1;
+  return table;
 }
 
 template <typename word>
@@ -168,11 +170,15 @@ std::vector<int> CmtHandler<word>::ScrambleAutoRotationIndices(
   const int d = degree / sub_degree;
   const int two_n = 2 * degree;
 
+  const std::unordered_map<int, int> table = GaloisIndexTable();
   std::vector<int> indices;
   indices.reserve(d > 0 ? d - 1 : 0);
   for (int t = 1; t < d; t++) {
     const int galois_factor = (2 * sub_degree * t + 1) % two_n;
-    indices.push_back(GaloisIndex(galois_factor));
+    const auto it = table.find(galois_factor);
+    AssertTrue(it != table.end(),
+               "ScrambleAutoRotationIndices: 2kt+1 is not a power of 5");
+    indices.push_back(it->second);
   }
   return indices;
 }
@@ -203,6 +209,7 @@ void CmtHandler<word>::ScrambleAuto(ConstContextPtr<word> context,
   }
 
   const int two_n = 2 * degree;
+  const std::unordered_map<int, int> table = GaloisIndexTable();
   res.resize(d);
 
   Ct switched;
@@ -223,7 +230,10 @@ void CmtHandler<word>::ScrambleAuto(ConstContextPtr<word> context,
       continue;
     }
 
-    const int index = GaloisIndex(galois_factor);
+    const auto it = table.find(galois_factor);
+    AssertTrue(it != table.end(),
+               "ScrambleAuto: 2kt+1 is not a power of 5 modulo 2N");
+    const int index = it->second;
     // MultKey then Permute rather than HRot: HRot reduces its argument modulo
     // the slot count, which is a rotation distance and not what this index is.
     context->MultKey(switched, cts[t_star], evk_map.GetRotationKey(index));
