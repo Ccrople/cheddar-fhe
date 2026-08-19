@@ -138,6 +138,33 @@ TEST_P(Testbed32, ProfileNonLinearOperators) {
            rms.Apply(rms_out, rms_in, wts, evk);
          }), std::to_string(num_ct) + " ct, T=64 H=4096");
 
+  // ---- what a plaintext encode costs on its own ---------------------------
+  //
+  // The claim being tested: these operator timings are dominated by host-side
+  // plaintext encoding, not by homomorphic work. Encoder::Encode runs
+  // SpecialIFFT over 32768 slots and then num_primes * degree BigInt::Mod
+  // reductions, all single-threaded on the CPU, before anything reaches the
+  // GPU. EncodeConstant does neither: one scalar, num_primes reductions, no
+  // IFFT. SiLU calls neither and comes in at 7.8 ms; RoPE calls Encode three
+  // times. If the numbers below are what they look like, that is the whole
+  // story rather than an inference from SiLU.
+  std::cout << "plaintext preparation, same warm-up and repeats:" << std::endl;
+  std::vector<Complex> table(slots, Complex(0.5, 0.0));
+  for (int lv : {level, level / 2}) {
+    Plaintext<word> pt;
+    const double sc = param_->GetScale(lv);
+    Report("Encode (full width), level " + std::to_string(lv),
+           TimeMs([&] { context_->encoder_.Encode(pt, lv, sc, table); }),
+           std::to_string(param_->LevelToNP(lv).GetNumTotal()) + " primes");
+  }
+  {
+    Constant<word> c;
+    const double sc = param_->GetScale(level);
+    Report("EncodeConstant, level " + std::to_string(level),
+           TimeMs([&] { context_->encoder_.EncodeConstant(c, level, sc, 0.5); }),
+           "scalar");
+  }
+
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "PCMM and CCMM are not in this file; by [SYLPH] table 6 they are "
