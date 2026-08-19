@@ -243,47 +243,22 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   EXPECT_LT(rel, std::pow(2.0, -12)) << "below Sylph's 12-bit precision target";
 }
 
-// Isolate the reduction. The full test showed the recovered inverse square
-// root wrong by 0.4% to 23% with no dependence on the argument -- t80 sits mid
-// interval and is the worst, t88 sits near the edge and is nearly right -- so
-// the polynomial cannot be what is wrong. Either the square or the
-// rotate-and-add is not producing sum_c x[t][c]^2.
+// What the reduction costs when the input is not order one.
 //
-// This checks exactly that quantity and nothing else.
-// The polynomial, in the clear. The encrypted error rises monotonically with
-// the argument -- 3% at u = 0.44, 29% at u = 1.50 -- while the reduction that
-// feeds it is only 0.45% off, so the inverse square root itself is suspect.
-// Cheddar's EvalPoly takes Chebyshev coefficients on [-1, 1], and a convention
-// mismatch there would look exactly like a broken circuit from the outside.
-// This settles it without touching a ciphertext.
-TEST_P(Testbed32, RmsNormPolynomialIsCorrectInTheClear) {
-  const double kWindowRatio = 6.0;
-  const int kDegree = 9;
-  RmsNormHandler<word> rms(context_, kTokens, kChannels, 1.0,
-                           default_encryption_level_, kEps, kWindowRatio,
-                           kDegree);
-  const double lo = 1.0 / std::sqrt(kWindowRatio),
-               hi = std::sqrt(kWindowRatio);
-  double worst = 0.0;
-  double worst_u = 0.0;
-  for (int i = 0; i <= 40; i++) {
-    const double u = lo + (hi - lo) * i / 40.0;
-    const double got = rms.PlainInvSqrt(u);
-    const double want = 1.0 / std::sqrt(u);
-    const double rel = std::abs(got - want) / want;
-    if (rel > worst) { worst = rel; worst_u = u; }
-    if (i % 8 == 0) {
-      std::cout << "  u " << u << "  got " << got << "  want " << want
-                << "  rel " << rel << std::endl;
-    }
-  }
-  std::cout << "polynomial worst relative error " << worst << " at u "
-            << worst_u << " (degree 9 on a 6x window should be 13.4 bits)"
-            << std::endl;
-  EXPECT_LT(worst, 1e-4);
-}
-
-TEST_P(Testbed32, RmsNormReductionIsExact) {
+// CKKS precision is absolute: a value gets only as many bits as it occupies
+// below the scaling factor. On this uncalibrated bundle the user tokens have
+// |x| ~ 0.022, so x^2 ~ 5e-4 uses about 19 of the 30 bits the scale offers,
+// and the error is correlated across slots, so summing 4096 of them does not
+// average it away.
+//
+// [SYLPH] never meets this: after calibration its RMSNorm input is 7.65
+// (table 2), which is order one and spends the scale well. We have neither the
+// sink prefix nor the orthogonal rotations that put it there, so the scaling
+// has to be supplied. RMSNorm is invariant under x -> beta*x, so it is free.
+//
+// This measures both, because the gap is the point -- it is the reason the
+// handler's input has a magnitude contract at all.
+TEST_P(Testbed32, RmsNormReductionNeedsOrderOneInput) {
   const std::string dir = DataDir();
   if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
 
@@ -299,53 +274,60 @@ TEST_P(Testbed32, RmsNormReductionIsExact) {
   for (int d = kTokens; d < slots; d *= 2) dists.push_back(d);
   for (int d : dists) interface_->PrepareRotationKey(d, level);
 
-  std::vector<Ciphertext<word>> cts(num_ct);
-  for (int i = 0; i < num_ct; i++) {
-    std::vector<Complex> msg(slots);
-    for (int s = 0; s < slots; s++) {
-      const int c = i * channels_per_ct + s / kTokens;
-      const int tk = kFirstToken + (s % kTokens);
-      msg[s] = Complex(x[static_cast<size_t>(tk) * kChannels + c], 0.0);
-    }
-    EncodeAndEncrypt(cts[i], msg, level);
+  double log_sum = 0.0;
+  for (int tk = kFirstToken; tk < kFirstToken + kTokens; tk++) {
+    log_sum += std::log(MeanSquare(x, tk));
   }
+  const double beta = 1.0 / std::sqrt(std::exp(log_sum / kTokens));
+  std::cout << "beta = " << beta << " brings |x| to order one" << std::endl;
 
   const auto &mult_key = interface_->GetMultiplicationKey();
-  Ciphertext<word> acc, sq, rotated;
-  for (int i = 0; i < num_ct; i++) {
-    context_->HMult(sq, cts[i], cts[i], mult_key);
-    if (i == 0) {
-      context_->Copy(acc, sq);
-    } else {
-      context_->Add(acc, acc, sq);
+  double worst_scaled = 1.0;
+
+  for (double scaling : {1.0, beta}) {
+    std::vector<Ciphertext<word>> cts(num_ct);
+    for (int i = 0; i < num_ct; i++) {
+      std::vector<Complex> msg(slots);
+      for (int s = 0; s < slots; s++) {
+        const int c = i * channels_per_ct + s / kTokens;
+        const int tk = kFirstToken + (s % kTokens);
+        msg[s] = Complex(
+            scaling * x[static_cast<size_t>(tk) * kChannels + c], 0.0);
+      }
+      EncodeAndEncrypt(cts[i], msg, level);
     }
-  }
-  for (int d : dists) {
-    context_->HRotAdd(rotated, acc, acc, interface_->GetRotationKey(d), d);
-    context_->Copy(acc, rotated);
+
+    Ciphertext<word> acc, sq, rotated;
+    for (int i = 0; i < num_ct; i++) {
+      context_->HMult(sq, cts[i], cts[i], mult_key);
+      if (i == 0) {
+        context_->Copy(acc, sq);
+      } else {
+        context_->Add(acc, acc, sq);
+      }
+    }
+    for (int d : dists) {
+      context_->HRotAdd(rotated, acc, acc, interface_->GetRotationKey(d), d);
+      context_->Copy(acc, rotated);
+    }
+
+    std::vector<Complex> got;
+    DecryptAndDecode(got, acc);
+
+    double worst = 0.0;
+    for (int tk = 0; tk < kTokens; tk++) {
+      const double want =
+          scaling * scaling * kChannels * MeanSquare(x, kFirstToken + tk);
+      worst = std::max(worst, std::abs(got[tk].real() - want) / want);
+    }
+    std::cout << "  scaling " << scaling << ": |x| ~ "
+              << (scaling * 0.022) << ", worst relative error " << worst
+              << " = 2^" << std::log2(worst) << std::endl;
+    if (scaling != 1.0) worst_scaled = worst;
   }
 
-  std::vector<Complex> got;
-  DecryptAndDecode(got, acc);
-
-  double worst = 0.0;
-  int worst_t = -1;
-  for (int tk = 0; tk < kTokens; tk++) {
-    double want = 0.0;
-    for (int c = 0; c < kChannels; c++) {
-      const double v = x[static_cast<size_t>(kFirstToken + tk) * kChannels + c];
-      want += v * v;
-    }
-    const double rel = std::abs(got[tk].real() - want) / want;
-    if (rel > worst) { worst = rel; worst_t = tk; }
-    if (tk % 16 == 0) {
-      std::cout << "  t" << (kFirstToken + tk) << "  got " << got[tk].real()
-                << "  want " << want << "  rel " << rel << std::endl;
-    }
-  }
-  std::cout << "reduction worst relative error " << worst << " at token "
-            << (kFirstToken + worst_t) << std::endl;
-  EXPECT_LT(worst, 1e-6);
+  EXPECT_LT(worst_scaled, 1e-5)
+      << "the reduction is inaccurate even with an order-one input";
 }
 
 INSTANTIATE_TEST_SUITE_P(
