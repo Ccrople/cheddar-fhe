@@ -17,6 +17,21 @@
 // +-12 is the interval with margin, and degree 31 is what that interval costs.
 //
 // TARGET. [SYLPH] section 3.1.2: 12 bits of precision matches FP16 perplexity.
+//
+// AND 2^30 CANNOT REACH IT. Measured here across all three presets, the error
+// the circuit adds on top of its own polynomial is a fixed integer magnitude
+// divided by the scaling factor -- it falls by very nearly five bits for every
+// five bits of scale:
+//
+//     scale   circuit vs its own polynomial   end to end vs true SiLU
+//     2^30    2.74e-03   12.10 bits           11.79 bits   under the bar
+//     2^35    1.01e-04   16.86 bits           13.47 bits   fit limited
+//     2^40    2.89e-06   21.99 bits           13.54 bits   fit limited
+//
+// So SiLU becomes fit limited at 2^35 and 2^40 buys nothing more while costing
+// three levels (max level 19 against 16). The tests below assert 12 bits from
+// 2^35 up and assert that 2^30 falls short, because that is the parameter
+// guidance and it should fail loudly if it ever stops being true.
 
 #include <algorithm>
 #include <cmath>
@@ -36,6 +51,8 @@ namespace {
 constexpr double kSylphRange = 12.0;
 constexpr int kSylphDegree = 31;
 constexpr double kTargetBits = 12.0;
+// Below this the circuit, not the approximation, sets the accuracy.
+constexpr double kMinUsableScale = 1.5e10;  // between 2^30 and 2^35
 
 double TrueSiLu(double x) { return x / (1.0 + std::exp(-x)); }
 
@@ -173,6 +190,15 @@ TEST_P(Testbed32, SiLuOnEncryptedSweep) {
             << Bits(err_vs_true, ref_absmax)
             << " bits), worst at x = " << worst_x << std::endl;
 
+  if (param_->base_scale_ < kMinUsableScale) {
+    // 2^30. Recorded as a fact about the parameter set, not tolerated as a
+    // near miss: if this ever passes, the scale guidance for the Llama
+    // non-linearities has changed and needs revisiting.
+    EXPECT_LT(Bits(err_vs_true, ref_absmax), kTargetBits)
+        << "2^30 now reaches 12 bits, so the recorded requirement of 2^35 for "
+           "the Llama non-linearities no longer holds";
+    return;
+  }
   // The circuit must not be the limiting factor. If it were, this is the
   // number that would move first.
   EXPECT_GT(Bits(err_vs_fit, ref_absmax), kTargetBits + 2.0)
@@ -319,7 +345,13 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
                "recovers"
             << std::endl;
 
-  EXPECT_GT(Bits(max_err, ref_interval), kTargetBits);
+  if (param_->base_scale_ < kMinUsableScale) {
+    EXPECT_LT(Bits(max_err, ref_interval), kTargetBits)
+        << "2^30 now reaches 12 bits on real weights, so the recorded "
+           "requirement of 2^35 no longer holds";
+  } else {
+    EXPECT_GT(Bits(max_err, ref_interval), kTargetBits);
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(
