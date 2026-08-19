@@ -4,6 +4,21 @@
 
 namespace cheddar {
 
+namespace {
+
+// Inverse modulo a power of two, by Newton iteration: each step doubles the
+// number of correct low bits, and x = 1 is already correct modulo 2 for odd a.
+int InvModPowerOfTwo(int a, int modulus) {
+  long long x = 1;
+  for (int i = 0; i < 32; i++) {
+    x = (x * (2 - static_cast<long long>(a) * x)) % modulus;
+    if (x < 0) x += modulus;
+  }
+  return static_cast<int>(x);
+}
+
+}  // namespace
+
 template <typename word>
 CmtHandler<word>::CmtHandler(const Parameter<word> &param,
                              const NTTHandler<word> &ntt_handler)
@@ -130,6 +145,138 @@ void CmtHandler<word>::Tweak(ConstContextPtr<word> context,
   for (auto &r : res) {
     AssertTrue(r.GetNP() == np, "Tweak: the transform changed the level");
     context->AssertSameScale(r, scale);
+  }
+}
+
+template <typename word>
+int CmtHandler<word>::GaloisIndex(int galois_factor) const {
+  const int half_degree = param_.degree_ / 2;
+  for (int i = 0; i < half_degree; i++) {
+    if (param_.GetGaloisFactor(i) == galois_factor) return i;
+  }
+  Fail("GaloisIndex: " + std::to_string(galois_factor) +
+       " is not a power of 5 modulo 2N");
+  return -1;
+}
+
+template <typename word>
+std::vector<int> CmtHandler<word>::ScrambleAutoRotationIndices(
+    int sub_degree) const {
+  const int degree = param_.degree_;
+  AssertTrue(sub_degree >= 1 && sub_degree <= degree && IsPowOfTwo(sub_degree),
+             "ScrambleAutoRotationIndices: invalid sub_degree");
+  const int d = degree / sub_degree;
+  const int two_n = 2 * degree;
+
+  std::vector<int> indices;
+  indices.reserve(d > 0 ? d - 1 : 0);
+  for (int t = 1; t < d; t++) {
+    const int galois_factor = (2 * sub_degree * t + 1) % two_n;
+    indices.push_back(GaloisIndex(galois_factor));
+  }
+  return indices;
+}
+
+template <typename word>
+void CmtHandler<word>::ScrambleAuto(ConstContextPtr<word> context,
+                                    std::vector<Ct> &res,
+                                    const std::vector<Ct> &cts, int sub_degree,
+                                    const EvkMap<word> &evk_map) const {
+  const int degree = param_.degree_;
+  const int d = static_cast<int>(cts.size());
+  AssertTrue(sub_degree >= 1 && sub_degree <= degree &&
+                 IsPowOfTwo(sub_degree) && degree / sub_degree == d,
+             "ScrambleAuto: the number of ciphertexts must be degree / "
+             "sub_degree");
+
+  const NPInfo np = cts.at(0).GetNP();
+  for (const auto &ct : cts) {
+    AssertTrue(ct.GetNP() == np, "ScrambleAuto: ciphertexts differ in NP");
+    AssertTrue(!ct.HasRx(),
+               "ScrambleAuto: ciphertexts must not carry an rx_ part");
+  }
+  for (const auto &r : res) {
+    for (const auto &c : cts) {
+      AssertTrue(&r != &c,
+                 "ScrambleAuto: in-place operation is not supported");
+    }
+  }
+
+  const int two_n = 2 * degree;
+  res.resize(d);
+
+  Ct switched;
+  for (int t = 0; t < d; t++) {
+    const int galois_factor = (2 * sub_degree * t + 1) % two_n;
+    const int inverse = InvModPowerOfTwo(galois_factor, two_n);
+
+    // The inverse lies in the same subgroup, so it is 2k*t_star + 1 and the
+    // division below is exact. Asserted rather than assumed: it is the one
+    // step where a wrong subgroup would go unnoticed.
+    AssertTrue((inverse - 1) % (2 * sub_degree) == 0,
+               "ScrambleAuto: the inverse left the subgroup");
+    const int t_star = ((inverse - 1) / (2 * sub_degree)) % d;
+
+    if (galois_factor == 1) {
+      // t = 0 is the identity automorphism, so it needs no key switch.
+      context->Copy(res[t], cts[t_star]);
+      continue;
+    }
+
+    const int index = GaloisIndex(galois_factor);
+    // MultKey then Permute rather than HRot: HRot reduces its argument modulo
+    // the slot count, which is a rotation distance and not what this index is.
+    context->MultKey(switched, cts[t_star], evk_map.GetRotationKey(index));
+    context->Permute(res[t], switched, index);
+  }
+}
+
+template <typename word>
+void CmtHandler<word>::Cmt(ConstContextPtr<word> context,
+                           std::vector<Ct> &res, const std::vector<Ct> &cts,
+                           int sub_degree, const EvkMap<word> &evk_map) const {
+  const int degree = param_.degree_;
+  const int d = static_cast<int>(cts.size());
+  AssertTrue(sub_degree >= 1 && sub_degree <= degree &&
+                 IsPowOfTwo(sub_degree) && degree / sub_degree == d,
+             "Cmt: the number of ciphertexts must be degree / sub_degree");
+
+  const NPInfo np = cts.at(0).GetNP();
+  const int level = param_.NPToLevel(np);
+  AssertTrue(level >= 0, "Cmt: inputs are not at a valid level");
+
+  MonomialCache cache;
+
+  // Adjust, first half: X^i * ct_i. Together with TWEAK's X^(2kij) twiddle
+  // this is Adjust's X^(i(2kt+1)), since i(2kt+1) = 2kit + i.
+  std::vector<Ct> staged(d);
+  for (int i = 0; i < d; i++) {
+    context->Mult(staged[i], cts[i], GetMonomial(cache, level, i));
+  }
+
+  std::vector<Ct> transformed;
+  Tweak(context, transformed, staged, sub_degree, 1);
+
+  // Adjust, second half: d^-1. The scale is host metadata, so this is a
+  // relabelling -- no kernel, no level, and exact.
+  for (auto &ct : transformed) {
+    ct.SetScale(ct.GetScale() * d);
+  }
+
+  std::vector<Ct> scrambled;
+  ScrambleAuto(context, scrambled, transformed, sub_degree, evk_map);
+
+  std::vector<Ct> untransformed;
+  Tweak(context, untransformed, scrambled, sub_degree, -1);
+
+  // invAdjust, second half: X^-j.
+  res.resize(d);
+  for (int j = 0; j < d; j++) {
+    context->Mult(res[j], untransformed[j], GetMonomial(cache, level, -j));
+  }
+
+  for (const auto &r : res) {
+    AssertTrue(r.GetNP() == np, "Cmt: the transform changed the level");
   }
 }
 

@@ -5,6 +5,7 @@
 
 #include "core/Container.h"
 #include "core/Context.h"
+#include "core/EvkMap.h"
 #include "core/NPInfo.h"
 #include "core/NTT.h"
 #include "core/Parameter.h"
@@ -24,15 +25,15 @@ namespace cheddar {
  *
  * ## What is implemented here
  *
- * The two stages that need **no key material and no multiplicative level**:
- * monomial multiplication, and `TWEAK` ([KANG] Algorithm 2). Together they are
- * the whole `O(dN log d)` half of CMT.
+ * All of it: monomial multiplication, `TWEAK` ([KANG] Algorithm 2),
+ * `ScrambleAuto`, and Algorithm 3 on top of them.
  *
- * `ScrambleAuto` -- the automorphisms `X -> X^(2kt+1)`, and with them the d key
- * switchings that dominate CMT's cost -- is **not** here yet. It is separated
- * on purpose: the key inventory is a real decision (see below) and it should be
- * made against measurements rather than folded into a transform that has
- * nothing to do with it.
+ * **The whole of CMT is level-free.** TWEAK is monomial multiplications and
+ * additions, ScrambleAuto is key switches and permutations, and the `d^-1` is
+ * a change to the recorded scale rather than an operation. That matters
+ * because the batch CC-MM spends this ring's only multiplicative level on its
+ * tensor product, so a CMT that cost one would leave the algorithm with
+ * nowhere to go.
  *
  * ## TWEAK
  *
@@ -76,12 +77,19 @@ namespace cheddar {
  *   * **one master key** for `X -> X^(5^(k/2))`, applied t times to reach the
  *     t-th element: one key, but `O(d^2)` key switchings.
  *
- * [KANG] section 4.3 takes the second. That is the right default *here* too --
- * Cheddar cannot serialize keys, so every key is regenerated per process, and
- * a rotation key was measured at ~300 ms and ~126 MiB (`Doing.md` section 2) --
- * but at `d = 32` it is 496 key switchings against 32, which is not obviously
- * the cheaper end. **The choice should be measured, not assumed**, and nothing
- * in this file presumes either.
+ * [KANG] section 4.3 takes the second, because it cares about key memory.
+ * **This implementation takes the first**, which is the cost model Algorithm 3
+ * is stated against ("d key switchings, all in ScrambleAuto"), and it is the
+ * cheaper end here: at `d = 32` the master key would be 496 key switchings
+ * against 32, and at this ring a key is a few hundred KiB rather than the
+ * ~126 MiB measured at log_degree 16 (`Doing.md` section 2). The d keys cost
+ * about 12 MiB in total.
+ *
+ * That is a judgement, not a measurement -- the timing has not been taken. If
+ * key memory ever binds (it would at log_degree 16, or at a larger d), the
+ * master-key variant replaces `ScrambleAuto` alone and nothing else in this
+ * file changes. `ScrambleAutoRotationIndices` exists so a caller can see the
+ * inventory it is being asked for.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -90,6 +98,7 @@ class CmtHandler {
  private:
   using Ct = Ciphertext<word>;
   using Pt = Plaintext<word>;
+  using Evk = EvaluationKey<word>;
 
   const Parameter<word> &param_;
   const NTTHandler<word> &ntt_handler_;
@@ -102,6 +111,10 @@ class CmtHandler {
   void TweakWorker(ConstContextPtr<word> context, std::vector<Ct> &cts,
                    int sub_degree, int sign, int level,
                    MonomialCache &cache) const;
+
+  // The i with 5^i == galois_factor (mod 2N), read out of Parameter's own
+  // table so the convention is the library's rather than a re-derivation.
+  int GaloisIndex(int galois_factor) const;
 
  public:
   CmtHandler(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);
@@ -140,6 +153,64 @@ class CmtHandler {
    */
   void Tweak(ConstContextPtr<word> context, std::vector<Ct> &res,
              const std::vector<Ct> &cts, int sub_degree, int sign) const;
+
+  /**
+   * @brief The rotation indices `ScrambleAuto` will ask for, so that a caller
+   * can generate exactly those keys and no others.
+   *
+   * The automorphisms are `X -> X^(2kt+1)` for `t` in `[d)`. Those elements
+   * form the subgroup `H = <5^(k/2)>` of order d, so each is `5^i` for some i
+   * and Cheddar can supply it as an ordinary rotation key. `t = 0` is the
+   * identity and is omitted.
+   *
+   * @param sub_degree k
+   * @return the indices, in increasing t order, without the identity
+   */
+  std::vector<int> ScrambleAutoRotationIndices(int sub_degree) const;
+
+  /**
+   * @brief [KANG] ScrambleAuto: `res[t] = cts[t*](X^(2kt+1))`, where
+   * `2k*t* + 1 = (2kt+1)^-1 mod 2N`.
+   *
+   * A permutation of the inputs followed by one automorphism each. Consumes no
+   * multiplicative level -- a key switch and a permutation are both level-free
+   * -- but it is where CMT's d key switchings live, and the only stage of the
+   * algorithm that needs key material at all.
+   *
+   * @param context the CKKS context
+   * @param res output, resized to `cts.size()`; may not alias `cts`
+   * @param cts input ciphertexts, `degree / sub_degree` of them
+   * @param sub_degree k
+   * @param evk_map rotation keys for `ScrambleAutoRotationIndices(k)`
+   */
+  void ScrambleAuto(ConstContextPtr<word> context, std::vector<Ct> &res,
+                    const std::vector<Ct> &cts, int sub_degree,
+                    const EvkMap<word> &evk_map) const;
+
+  /**
+   * @brief [KANG] Algorithm 3, the whole CMT:
+   *
+   *     X^i * ct  ->  TWEAK(+1)  ->  d^-1, ScrambleAuto  ->  TWEAK(-1)
+   *               ->  X^-j * ct
+   *
+   * The `X^i` and `X^-j` wrappers are what turn TWEAK's `X^(2kij)` twiddle
+   * into Adjust's `X^(i(2kt+1))`, since `i(2kt+1) = 2kit + i`.
+   *
+   * **`d^-1` is free.** The scale is host metadata, so dividing the message by
+   * d is recording a scale d times larger; the ciphertext words do not move
+   * and no level is spent. Encoding `1/d` as a constant instead would either
+   * round to zero at scale 1 or cost a rescale, and CMT cannot afford a level:
+   * the batch CC-MM spends this ring's only one on its tensor product.
+   *
+   * @param context the CKKS context
+   * @param res output, resized to `cts.size()`; may not alias `cts`
+   * @param cts input ciphertexts, `degree / sub_degree` of them
+   * @param sub_degree k
+   * @param evk_map rotation keys for `ScrambleAutoRotationIndices(k)`
+   */
+  void Cmt(ConstContextPtr<word> context, std::vector<Ct> &res,
+           const std::vector<Ct> &cts, int sub_degree,
+           const EvkMap<word> &evk_map) const;
 };
 
 }  // namespace cheddar

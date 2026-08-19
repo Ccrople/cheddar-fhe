@@ -48,6 +48,12 @@ add_executable(tweak_test TweakTest.cpp)
 target_link_libraries(tweak_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [KANG] Algorithm 3, the whole CMT: ScrambleAuto on top of TWEAK. Needs
+# rotation keys, unlike everything above it. Degree 4096, its own binary.
+add_executable(cmt_test CmtTest.cpp)
+target_link_libraries(cmt_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
