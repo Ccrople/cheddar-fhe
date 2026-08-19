@@ -65,8 +65,21 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   // multiply-and-rescale below costs a level and keeps every scale canonical.
   const int poly_level = input_level_ - 2;
   const double poly_scale = context_->param_.GetScale(poly_level);
+  // Target the canonical scale of the level the tree lands on, not of the one
+  // it starts from. EvalPoly stamps target_scale_ onto the result unchecked
+  // (EvalPoly.cpp:843), and under grafting those two scales differ -- enough
+  // that the output, while still decoding correctly, is non-canonical for its
+  // level and fails the next Add against anything else.
+  const int degree_used =
+      EvalPoly<word>(coeffs, poly_level, poly_scale, poly_scale, true)
+          .GetPolyDegree();
+  const int out_level = poly_level - Log2Ceil(degree_used + 1);
+  AssertTrue(out_level >= 0,
+             "RmsNorm: the inverse square root does not fit below the input "
+             "level");
   inv_sqrt_ = std::make_unique<EvalPoly<word>>(
-      coeffs, poly_level, poly_scale, poly_scale, /*chebyshev=*/true);
+      coeffs, poly_level, poly_scale, context_->param_.GetScale(out_level),
+      /*chebyshev=*/true);
   inv_sqrt_->Compile(context_);
 }
 

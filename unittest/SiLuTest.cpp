@@ -18,6 +18,7 @@
 //
 // TARGET. [SYLPH] section 3.1.2: 12 bits of precision matches FP16 perplexity.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -320,3 +321,11 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
 
   EXPECT_GT(Bits(max_err, ref_interval), kTargetBits);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    Cheddar, Testbed32, testing::Values("bootparam_30.json"),
+    [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
+      std::string p = info.param;
+      std::replace(p.begin(), p.end(), '.', '_');
+      return p;
+    });

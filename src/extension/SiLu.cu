@@ -27,9 +27,29 @@ SiLuHandler<word>::SiLuHandler(ConstContextPtr<word> context, double range,
   auto coeffs = chebfit::Interpolate([r](double v) { return SiLu(r * v); },
                                      degree);
 
-  const double scale = context_->param_.GetScale(input_level_);
-  poly_ = std::make_unique<EvalPoly<word>>(coeffs, input_level_, scale, scale,
-                                           /*chebyshev=*/true);
+  // The output scale has to be the canonical scale of the level the polynomial
+  // *lands on*, not of the level it starts from. EvalPoly takes target_scale_
+  // on trust: EvalPoly.cpp:843 sets the result to it with no check against the
+  // parameter set. Under grafting the two are not the same number --
+  // scale_[i] = sqrt(scale_[i-1] * prod_i) drifts, and across the five levels a
+  // degree-31 Chebyshev tree consumes on bootparam_30 the gap is 0.84%. The
+  // result would still decode correctly, because the declared scale matches the
+  // content, but it would be non-canonical for its level and the next Add
+  // against anything else would fail with "Scale mismatch".
+  //
+  // Ask EvalPoly for the degree rather than assume it: the tree is built from
+  // whatever coefficients survive, and level_consumption is
+  // Log2Ceil(GetPolyDegree() + 1) (EvalPoly.cpp:801, 817).
+  const double in_scale = context_->param_.GetScale(input_level_);
+  const int degree_used =
+      EvalPoly<word>(coeffs, input_level_, in_scale, in_scale, true)
+          .GetPolyDegree();
+  const int out_level = input_level_ - Log2Ceil(degree_used + 1);
+  AssertTrue(out_level >= 0, "SiLu: the polynomial does not fit below the "
+                             "input level");
+  poly_ = std::make_unique<EvalPoly<word>>(
+      coeffs, input_level_, in_scale, context_->param_.GetScale(out_level),
+      /*chebyshev=*/true);
   poly_->Compile(context_);
 }
 
