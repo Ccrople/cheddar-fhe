@@ -161,6 +161,11 @@ if (ENABLE_EXTENSION)
   add_executable(profile_test ProfileTest.cpp)
   target_link_libraries(profile_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # PCMM setup/online split and the plaintext footprint.
+  add_executable(pcmm_profile_test PcmmProfileTest.cpp)
+  target_link_libraries(pcmm_profile_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
