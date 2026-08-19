@@ -323,7 +323,9 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, Testbed32, testing::Values("bootparam_30.json"),
+    Cheddar, Testbed32,
+    testing::Values("bootparam_30.json", "bootparam_35.json",
+                    "bootparam_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
