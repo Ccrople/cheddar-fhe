@@ -77,6 +77,7 @@ if(ENABLE_EXTENSION)
     src/extension/EvalSpecialFFT.cpp
     src/extension/Hoist.cu
     src/extension/LinearTransform.cpp
+    src/extension/RmsNorm.cu
     src/extension/StripedMatrix.cpp
   )
 endif()

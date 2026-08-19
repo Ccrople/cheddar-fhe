@@ -1,0 +1,162 @@
+#include <cmath>
+
+#include "common/Assert.h"
+#include "common/CommonUtils.h"
+#include "extension/RmsNorm.h"
+
+namespace cheddar {
+
+namespace {
+
+// Chebyshev interpolation of f on [-1, 1] at degree n, returned in the
+// Chebyshev basis. Interpolating at the Chebyshev nodes rather than fitting in
+// the monomial basis is not a stylistic choice: on this window the monomial
+// coefficients of an inverse square root span many orders of magnitude, and
+// EvalPoly silently drops any coefficient below 1e-9 (Doing.md 1.4).
+template <typename F>
+std::vector<double> ChebyshevInterpolate(F f, int n) {
+  const int m = n + 1;
+  std::vector<double> node(m), value(m);
+  for (int j = 0; j < m; j++) {
+    node[j] = std::cos(M_PI * (j + 0.5) / m);
+    value[j] = f(node[j]);
+  }
+  std::vector<double> c(m, 0.0);
+  for (int k = 0; k < m; k++) {
+    double acc = 0.0;
+    for (int j = 0; j < m; j++) {
+      acc += value[j] * std::cos(M_PI * k * (j + 0.5) / m);
+    }
+    c[k] = (k == 0 ? 1.0 : 2.0) * acc / m;
+  }
+  return c;
+}
+
+// [SYLPH]'s window for the inverse square root, from the companion Llama-2
+// paper's table 4: the range of alpha_L * mean(x^2) after the layer constant.
+constexpr double kWindowLo = 0.18257418583505536;  // 1 / sqrt(30)
+constexpr double kWindowHi = 5.477225575051661;    // sqrt(30)
+
+}  // namespace
+
+template <typename word>
+RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
+                                     int num_tokens, int num_channels,
+                                     double layer_constant, int input_level,
+                                     int degree)
+    : context_{std::move(context)},
+      num_tokens_{num_tokens},
+      num_channels_{num_channels},
+      layer_constant_{layer_constant},
+      input_level_{input_level} {
+  AssertTrue(num_tokens_ > 0 && IsPowOfTwo(num_tokens_),
+             "RmsNorm: num_tokens must be a power of two");
+  AssertTrue(num_channels_ > 0 && IsPowOfTwo(num_channels_),
+             "RmsNorm: num_channels must be a power of two");
+  AssertTrue(layer_constant_ > 0.0, "RmsNorm: layer constant must be positive");
+
+  num_slots_ = context_->param_.degree_ / 2;
+  AssertTrue(num_slots_ % num_tokens_ == 0,
+             "RmsNorm: tokens must divide the slot count");
+  const long long total = 1LL * num_tokens_ * num_channels_;
+  AssertTrue(total % num_slots_ == 0,
+             "RmsNorm: T * H must be a multiple of the slot count");
+  num_ct_ = static_cast<int>(total / num_slots_);
+
+  // Rotate-and-add over whole token blocks. The same sequence reduces and
+  // broadcasts, so the sum lands in every block and nothing has to be
+  // redistributed afterwards.
+  for (int d = num_tokens_; d < num_slots_; d *= 2) {
+    rotation_distances_.push_back(d);
+  }
+
+  // The polynomial lives on [-1, 1], so the argument is mapped there first:
+  // v = (u - b) / a with a, b the half-width and centre of the window.
+  const double a = 0.5 * (kWindowHi - kWindowLo);
+  const double b = 0.5 * (kWindowHi + kWindowLo);
+  auto coeffs = ChebyshevInterpolate(
+      [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
+
+  const double scale = context_->param_.GetScale(input_level_);
+  inv_sqrt_ = std::make_unique<EvalPoly<word>>(coeffs, input_level_ - 1, scale,
+                                               scale, /*chebyshev=*/true);
+  inv_sqrt_->Compile(context_);
+}
+
+template <typename word>
+void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
+                                 const std::vector<Pt> &weight,
+                                 const EvkMap<word> &evk_map) const {
+  AssertTrue(static_cast<int>(x.size()) == num_ct_,
+             "RmsNorm: wrong number of input ciphertexts");
+  AssertTrue(weight.size() == x.size(),
+             "RmsNorm: one weight plaintext per input ciphertext");
+
+  const auto &mult_key = evk_map.GetMultiplicationKey();
+
+  // 1. Square, and accumulate across the ciphertexts that hold one token's
+  //    channels. This is the only place the channel axis is crossed between
+  //    ciphertexts; the rest of the reduction is inside one.
+  Ct acc, sq;
+  for (int i = 0; i < num_ct_; i++) {
+    context_->HMult(sq, x[i], x[i], mult_key);
+    if (i == 0) {
+      context_->Copy(acc, sq);
+    } else {
+      context_->Add(acc, acc, sq);
+    }
+  }
+
+  // 2. All-reduce over the channel axis within the ciphertext. The same
+  //    sequence reduces and broadcasts, so afterwards every slot already holds
+  //    its own token's sum and nothing has to be redistributed.
+  //
+  //    HRotAdd is res = (a << dist) + b, so res must not alias a or b: the
+  //    rotation would read words the accumulation has already overwritten.
+  Ct rotated;
+  for (int d : rotation_distances_) {
+    context_->HRotAdd(rotated, acc, acc, evk_map.GetRotationKey(d), d);
+    context_->Copy(acc, rotated);
+  }
+
+  // 3. Affine map onto the polynomial's domain, folded into one constant
+  //    multiply and one constant add:
+  //        v = (alpha_L / H) * S / a  -  b / a
+  //    [SYLPH] fuses scalings like this into the operation that produced x;
+  //    kept explicit here so the caller can see -- and move -- the level it
+  //    costs.
+  const double a = 0.5 * (kWindowHi - kWindowLo);
+  const double b = 0.5 * (kWindowHi + kWindowLo);
+  const int acc_level = context_->param_.NPToLevel(acc.GetNP());
+  Constant<word> k_const, shift_const;
+  context_->encoder_.EncodeConstant(
+      k_const, acc_level, context_->param_.GetScale(acc_level),
+      layer_constant_ / (num_channels_ * a));
+  context_->Mult(acc, acc, k_const);
+  const int v_level = context_->param_.NPToLevel(acc.GetNP());
+  context_->encoder_.EncodeConstant(shift_const, v_level,
+                                    context_->param_.GetScale(v_level),
+                                    -b / a);
+  context_->Add(acc, acc, shift_const);
+
+  // 4. The inverse square root.
+  Ct r;
+  inv_sqrt_->Evaluate(context_, r, acc, mult_key);
+
+  // 5. Apply. The weight plaintexts are expected to carry sqrt(alpha_L)
+  //    already, since 1/sqrt(mean) = sqrt(alpha_L) * r.
+  res.clear();
+  res.resize(num_ct_);
+  const int r_level = context_->param_.NPToLevel(r.GetNP());
+  Ct levelled;
+  for (int i = 0; i < num_ct_; i++) {
+    context_->LevelDown(levelled, x[i], r_level);
+    context_->HMult(res[i], levelled, r, mult_key);
+    context_->Mult(res[i], res[i], weight[i]);
+  }
+}
+
+template class RmsNormHandler<uint32_t>;
+template class RmsNormHandler<uint64_t>;
+
+}  // namespace cheddar
