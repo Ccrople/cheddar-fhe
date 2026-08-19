@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "core/Mlwe.h"
 #include "core/Pcmm.h"
 
 using word = uint32_t;
@@ -166,6 +167,108 @@ TEST_P(Testbed32, ProfilePcmm) {
               << mult_ms * p.out / kOutChannels << " ms online, ~"
               << encode_ms * p.out / kOutChannels / 1000.0 << " s setup"
               << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The configuration [SYLPH] table 4 actually specifies: ring degree 256, MLWE.
+//
+// The RLWE-at-4096 measurement above is not what Sylph runs. Table 4 puts PCMM
+// at ring degree 256 in coefficient encoding, and section 3.3 spells out the
+// route: "ring-switching followed by an MLWE decomposition keeps all the token
+// values of one given channel co-located in one ciphertext". ModDecomp takes a
+// degree-4096 ciphertext to k = 16 MLWE ciphertexts of rank 16 at degree 256.
+//
+// The product is a scalar linear combination, so it commutes with ModDecomp:
+// decompose every channel, then run one PCMM per MLWE component. A full 4096
+// channel set is therefore 16 of these, and the per-product number below is
+// what scales.
+// ---------------------------------------------------------------------------
+TEST_P(Testbed32, ProfilePcmmMlwe) {
+  constexpr int kTokens = 128;
+  constexpr int kColumns = 4096;
+  constexpr int kOutChannels = 128;
+  constexpr int kSmallDegree = 256;
+  constexpr double kWeightScale = 1073741824.0;
+
+  const int degree = param_->degree_;
+  const int level = default_encryption_level_;
+  const double ct_scale = DetermineScale(level);
+  const int k = degree / kSmallDegree;
+  ASSERT_EQ(kColumns % k, 0);
+
+  PcmmHandler<word> pcmm(*param_);
+  MlweHandler<word> mlwe(*param_);
+
+  // 4096 columns = 4096/k source ciphertexts, each decomposing into k parts.
+  std::vector<MlweCiphertext<word>> cts;
+  cts.reserve(kColumns);
+  {
+    std::vector<double> coeffs(degree, 0.0);
+    Plaintext<word> pt;
+    Ciphertext<word> ct;
+    std::vector<MlweCiphertext<word>> parts;
+    for (int s = 0; s < kColumns / k; s++) {
+      for (int i = 0; i < kTokens; i++) coeffs[i] = 0.01 * ((s + i) % 97);
+      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+      interface_->Encrypt(ct, pt);
+      mlwe.ModDecomp(parts, ct, kSmallDegree);
+      ASSERT_EQ(static_cast<int>(parts.size()), k);
+      for (auto &p : parts) cts.push_back(std::move(p));
+    }
+  }
+  const int rank = cts[0].GetRank();
+  const int primes = cts[0].GetNP().GetNumTotal();
+  // rank * N' words for a_, N' for b_, per limb.
+  const size_t mlwe_bytes = static_cast<size_t>(primes) *
+                            (static_cast<size_t>(rank) * kSmallDegree +
+                             kSmallDegree) *
+                            sizeof(word);
+  std::cout << "MLWE: degree " << cts[0].GetDegree() << ", rank " << rank
+            << ", " << primes << " primes -> " << mlwe_bytes / 1e3
+            << " KB each; " << kColumns << " columns = "
+            << GiB(mlwe_bytes * kColumns) << " GiB" << std::endl;
+
+  std::vector<double> u_values(static_cast<size_t>(kOutChannels) * kColumns);
+  for (size_t i = 0; i < u_values.size(); i++) {
+    u_values[i] = 0.001 * static_cast<double>((i * 7919) % 211);
+  }
+  PlainMatrix<word> u;
+  const double encode_ms = TimeMs(
+      [&] {
+        pcmm.EncodeMatrix(u, level, kWeightScale, u_values, kOutChannels,
+                          kColumns);
+      },
+      1, 2);
+
+  std::vector<MlweCiphertext<word>> res;
+  const double mult_ms =
+      TimeMs([&] { pcmm.Multiply(res, u, cts); }, kWarmUp, kReps);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "SETUP  EncodeMatrix " << kOutChannels << "x" << kColumns << ": "
+            << encode_ms << " ms" << std::endl;
+  std::cout << "ONLINE Multiply (MLWE, N'=" << kSmallDegree << ", rank " << rank
+            << "): " << mult_ms << " ms" << std::endl;
+  std::cout << "one component of " << k << "; a full channel set is "
+            << k << "x that = " << mult_ms * k << " ms for "
+            << kOutChannels << " outputs" << std::endl;
+
+  const double per_out = mult_ms * k / kOutChannels;
+  std::cout << "scaled linearly in output width (a projection, not a "
+               "measurement), against [SYLPH] table 6 on one GPU:"
+            << std::endl;
+  const struct {
+    const char *name;
+    int out;
+    int sylph_ms;
+  } projections[] = {{"QKV  4096->6144", 6144, 326},
+                     {"O    4096->4096", 4096, 315},
+                     {"gate/up 4096->28672", 28672, 1040}};
+  for (const auto &p : projections) {
+    std::cout << "  " << p.name << "  ~" << per_out * p.out
+              << " ms  ([SYLPH] " << p.sylph_ms << " ms)" << std::endl;
   }
 }
 
