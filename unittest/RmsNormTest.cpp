@@ -192,9 +192,9 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
       const double recovered = got0[s].real() / (xv * w[best_c]);
       const double truth =
           1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
-      printf("  %5d  %12.5f  %12.5f  %9.2e
-", t, recovered, truth,
-             std::abs(recovered - truth) / truth);
+      std::cout << "  t" << (kFirstToken + t) << "  recovered " << recovered
+                << "  true " << truth << "  rel "
+                << (std::abs(recovered - truth) / truth) << std::endl;
     }
   }
 
