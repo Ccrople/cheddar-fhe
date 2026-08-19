@@ -36,7 +36,11 @@ constexpr double kRange = 21.0; // M, measured
 constexpr int kIters = 1;       // k
 constexpr int kExpDegree = 9;
 constexpr int kInvSqrtDegree = 8;
-constexpr double kNormLo = 1.5, kNormHi = 7.0;  // measured [1.544, 6.82]
+// The calibrated interval must come from the same distribution the operator is
+// fed. On the real layer-2 scores it is [1.544, 6.82]; the synthetic rows below
+// have a different distribution, so the test measures their interval instead of
+// borrowing the real one. Getting this wrong is not a small error: a degree-8
+// Chebyshev evaluated four interval-widths outside its domain returns 1e10.
 constexpr double kTargetBits = 12.0;
 // Below this the circuit, not the approximation, sets the accuracy -- measured
 // for SiLU across bootparam_30/35/40 and it is a property of the scale.
@@ -59,6 +63,35 @@ std::vector<double> MakeRow(int row, int valid) {
   return x;
 }
 
+// The interval ||y||_2^2 actually occupies, which is what offline calibration
+// produces. Uses the exact exponential, as the calibration pass would.
+void NormInterval(const std::vector<std::vector<double>> &rows,
+                  const std::vector<int> &valid, int iters, double *lo,
+                  double *hi) {
+  *lo = 1e300;
+  *hi = 0.0;
+  for (size_t r = 0; r < rows.size(); r++) {
+    std::vector<double> y(valid[r]);
+    for (int i = 0; i < valid[r]; i++) {
+      y[i] = std::exp(rows[r][i] / std::pow(2.0, iters));
+    }
+    for (int j = 0; j < iters; j++) {
+      double sq = 0.0;
+      for (double v : y) sq += v * v;
+      *lo = std::min(*lo, sq);
+      *hi = std::max(*hi, sq);
+      const double inv = 1.0 / std::sqrt(sq);
+      for (double &v : y) {
+        v *= inv;
+        v = v * v;
+      }
+    }
+  }
+  // a little margin, since the polynomial exponential is not the exact one
+  *lo *= 0.98;
+  *hi *= 1.02;
+}
+
 std::vector<double> TrueSoftMax(const std::vector<double> &x, int valid) {
   std::vector<double> y(x.size(), 0.0);
   double s = 0.0;
@@ -77,16 +110,28 @@ std::vector<double> TrueSoftMax(const std::vector<double> &x, int valid) {
 // ---------------------------------------------------------------------------
 TEST_P(Testbed32, SoftMaxPlainOracle) {
   const int level = default_encryption_level_;
+
+  std::vector<std::vector<double>> rows;
+  std::vector<int> valid_v;
+  for (int r = 0; r < 64; r++) {
+    rows.push_back(MakeRow(r, kKeys));
+    valid_v.push_back(kKeys);
+  }
+  double lo, hi;
+  NormInterval(rows, valid_v, kIters, &lo, &hi);
+  std::cout << "calibrated ||y||^2 interval for this data: [" << lo << ", "
+            << hi << "]  (real layer-2 scores give [1.54, 6.82])" << std::endl;
+
   SoftMaxHandler<word> sm(context_, kKeys, kRange, level, kIters,
-                          std::vector<double>(kIters, kNormLo),
-                          std::vector<double>(kIters, kNormHi), kExpDegree,
+                          std::vector<double>(kIters, lo),
+                          std::vector<double>(kIters, hi), kExpDegree,
                           kInvSqrtDegree);
 
   double worst = 0.0;
   int worst_row = -1;
   for (int row = 0; row < 64; row++) {
-    const int valid = kKeys;  // the oracle takes a full row
-    auto x = MakeRow(row, valid);
+    const int valid = kKeys;
+    const auto &x = rows[row];
     auto got = sm.PlainSoftMax(x);
     auto want = TrueSoftMax(x, valid);
     for (int i = 0; i < valid; i++) {
@@ -117,24 +162,31 @@ TEST_P(Testbed32, SoftMaxOnEncrypted) {
   const int slots = param_->degree_ / 2;
   const int rows = slots / kKeys;
 
-  SoftMaxHandler<word> sm(context_, kKeys, kRange, level, kIters,
-                          std::vector<double>(kIters, kNormLo),
-                          std::vector<double>(kIters, kNormHi), kExpDegree,
-                          kInvSqrtDegree);
-  for (int d : sm.GetRotationDistances()) {
-    interface_->PrepareRotationKey(d, level);
-  }
-
   // Causal rows of varying length, which is what attention actually produces.
   // A row shorter than d makes the norm smaller, so this exercises the whole
   // calibrated interval rather than one point in it.
   std::vector<int> valid(rows);
   for (int r = 0; r < rows; r++) valid[r] = kKeys - (r % (kKeys / 2));
+  std::vector<std::vector<double>> row_data;
+  for (int r = 0; r < rows; r++) row_data.push_back(MakeRow(r, valid[r]));
+
+  double lo, hi;
+  NormInterval(row_data, valid, kIters, &lo, &hi);
+  std::cout << "calibrated ||y||^2 interval for this data: [" << lo << ", "
+            << hi << "]" << std::endl;
+
+  SoftMaxHandler<word> sm(context_, kKeys, kRange, level, kIters,
+                          std::vector<double>(kIters, lo),
+                          std::vector<double>(kIters, hi), kExpDegree,
+                          kInvSqrtDegree);
+  for (int d : sm.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, level);
+  }
 
   std::vector<double> x(slots, 0.0);
   std::vector<Complex> msg(slots), mask(slots);
   for (int r = 0; r < rows; r++) {
-    auto row = MakeRow(r, valid[r]);
+    const auto &row = row_data[r];
     for (int i = 0; i < kKeys; i++) {
       const int s = r * kKeys + i;
       x[s] = row[i];
