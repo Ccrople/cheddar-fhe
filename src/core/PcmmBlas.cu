@@ -82,8 +82,7 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
                                             int rows, int cols,
                                             int num_aux /*= 0*/) const {
   AssertTrue(rows > 0 && cols > 0, "PcmmBlas: invalid matrix shape");
-  AssertTrue(static_cast<int>(values.size()) ==
-                 static_cast<size_t>(rows) * cols,
+  AssertTrue(values.size() == static_cast<size_t>(rows) * cols,
              "PcmmBlas: values size does not match rows * cols");
 
   NPInfo np = param_.LevelToNP(level, num_aux);

@@ -154,6 +154,8 @@ template class DeviceVector<const uint32_t *>;
 template class DeviceVector<const uint64_t *>;
 
 // Explicit instantiation of the template functions
+template void CopyHostToDevice(DeviceVector<int8_t> &dst,
+                               const HostVector<int8_t> &src);
 template void CopyHostToDevice(DeviceVector<int32_t> &dst,
                                const HostVector<int32_t> &src);
 template void CopyHostToDevice(DeviceVector<int64_t> &dst,
