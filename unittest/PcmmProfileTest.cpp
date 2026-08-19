@@ -14,9 +14,14 @@
 //    Llama-3-8B weights at 52.0 GiB against 13.0 GiB of FP16, on a machine with
 //    eight GPUs holding 1/g each. One A6000 has 48 GiB. Before planning around
 //    per-layer streaming I want our own bytes, not the paper's: the arithmetic
-//    I did by hand says llama_pcmm_test's 4096 ciphertexts at level 34 should
-//    need 103 GB, and that test passes on this card. One of those is wrong, and
-//    printing the sizes says which.
+//    I did by hand says 4096 degree-65536 ciphertexts need 48 GiB against a
+//    47.5 GiB card. Measured: it is right, and the allocation dies at ~3072.
+//    What was wrong was the ring. PCMM does not run at 2^16 -- [SYLPH] table 4
+//    puts it at ring degree 256 in coefficient encoding, and `llama_pcmm_test`
+//    instantiates on `ringdegree12_30`, degree 4096. There a ciphertext is
+//    98 KB rather than 12.6 MB and 4096 of them are 403 MB. This test therefore
+//    runs where PCMM actually runs; profiling it at 2^16 was measuring a
+//    configuration the pipeline never uses.
 
 #include <algorithm>
 #include <chrono>
@@ -123,6 +128,26 @@ TEST_P(Testbed32, ProfilePcmm) {
   std::cout << "ONLINE Multiply     " << kOutChannels << "x" << kInChannels
             << " by " << kTokens << " tokens: " << mult_ms << " ms" << std::endl;
 
+  // The converted weights are what [SYLPH] table 5 measures at 52.0 GiB for the
+  // whole model. Ours, from the encoded matrix rather than from arithmetic.
+  {
+    const size_t u_words = static_cast<size_t>(u.GetRows()) * u.GetCols() *
+                           u.GetNP().GetNumTotal();
+    const double per_value = static_cast<double>(u_words) * sizeof(word) /
+                             (static_cast<double>(u.GetRows()) * u.GetCols());
+    std::cout << "converted weights: " << kOutChannels << "x" << kInChannels
+              << " = " << u_words * sizeof(word) / 1e6 << " MB, "
+              << per_value << " bytes per weight" << std::endl;
+    const long long per_layer_values =
+        4096LL * 6144 + 4096LL * 4096 + 4096LL * 28672 + 14336LL * 4096;
+    std::cout << "  scaled to one Llama-3-8B layer ("
+              << per_layer_values / 1e6 << "M weights): "
+              << per_layer_values * per_value / 1e9 << " GB; 32 layers: "
+              << per_layer_values * per_value * 32 / 1e9
+              << " GB against [SYLPH] table 5's 55.8 GB and this card's 47.5"
+              << std::endl;
+  }
+
   // Scale to the real projections, which is the number the level budget wants.
   // Cost is linear in the output width for a fixed input width, so this is a
   // scaling of a measurement rather than a new one -- and it is labelled as
@@ -145,7 +170,7 @@ TEST_P(Testbed32, ProfilePcmm) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, Testbed32, testing::Values("bootparam_35.json"),
+    Cheddar, Testbed32, testing::Values("ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
