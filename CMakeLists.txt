@@ -32,6 +32,7 @@ message(STATUS "RMM source dir: ${rmm_SOURCE_DIR}")
 option(ENABLE_EXTENSION "Enable extension sources" ON)
 option(BUILD_UNITTEST "Build unit tests" ON)
 option(USE_GMP "Use GMP instead of libtommath" OFF)
+option(USE_CUBLAS "Use cuBLAS for the plaintext matrix products in PCMM" OFF)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -89,6 +90,20 @@ message(STATUS "CKKS_GPU_SOURCES: ${CKKS_GPU_SOURCES}")
 
 # build library
 add_library(cheddar SHARED ${CKKS_GPU_SOURCES})
+
+if(USE_CUBLAS)
+  # cuBLAS is not part of the CUDA toolkit prefix on every machine here, so the
+  # location is configurable rather than assumed. [SYLPH] section 2.2 credits
+  # its linear-algebra speed to BLAS offload, and the measured alternative on
+  # this card is 3-4x slower.
+  find_library(CUBLAS_LIB cublas
+               HINTS ${CUBLAS_ROOT}/lib ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
+  target_compile_definitions(cheddar PUBLIC USE_CUBLAS)
+  target_link_libraries(cheddar PUBLIC ${CUBLAS_LIB})
+  if(CUBLAS_ROOT)
+    target_include_directories(cheddar PUBLIC ${CUBLAS_ROOT}/include)
+  endif()
+endif()
 
 if(USE_GMP)
   find_library(GMP gmp REQUIRED)

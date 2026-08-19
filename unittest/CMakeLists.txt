@@ -166,6 +166,12 @@ if (ENABLE_EXTENSION)
   add_executable(pcmm_profile_test PcmmProfileTest.cpp)
   target_link_libraries(pcmm_profile_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The cuBLAS PCMM against the hand kernel. Builds either way; the test body
+  # compiles out without USE_CUBLAS.
+  add_executable(pcmm_blas_test PcmmBlasTest.cpp)
+  target_link_libraries(pcmm_blas_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
