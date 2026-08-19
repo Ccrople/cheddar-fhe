@@ -82,6 +82,7 @@ class SoftMaxHandler {
   ConstContextPtr<word> context_;
   int num_keys_;
   int num_slots_;
+  int num_rows_;
   double range_;
   int input_level_;
   int num_iters_;
@@ -100,7 +101,11 @@ class SoftMaxHandler {
   /**
    * @param context the evaluation context
    * @param num_keys d, the number of entries in one SoftMax row; must be a
-   * power of two, and the row must occupy d consecutive slots
+   * power of two. **The key axis is strided, not contiguous**: key i of row r
+   * sits at slot `r + i * (num_slots / d)`. Cheddar rotates cyclically over
+   * the whole slot vector, so a contiguous row would have the rotate-and-add
+   * straddle row boundaries; striding makes the wrap-around exactly right, and
+   * it is the axis convention RmsNormHandler already uses.
    * @param range M, the half-open input span after translation: the argument
    * is taken to lie in [-M, 0]
    * @param input_level level of the input ciphertext

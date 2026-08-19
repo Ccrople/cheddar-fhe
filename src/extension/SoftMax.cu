@@ -60,11 +60,24 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
   num_slots_ = context_->param_.degree_ / 2;
   AssertTrue(num_slots_ % num_keys_ == 0,
              "SoftMax: the row length must divide the slot count");
+  num_rows_ = num_slots_ / num_keys_;
 
-  // One row occupies num_keys consecutive slots, so summing it is a
-  // rotate-and-add over 1, 2, ... num_keys/2. The same sequence reduces and
-  // broadcasts, so afterwards every slot already holds its own row's sum.
-  for (int d = 1; d < num_keys_; d *= 2) rotation_distances_.push_back(d);
+  // THE KEY AXIS IS STRIDED, NOT CONTIGUOUS: slot = row + key * num_rows.
+  //
+  // Cheddar's rotation is cyclic over the whole slot vector, not within a
+  // block. With the keys of a row in num_keys *consecutive* slots, rotating by
+  // 1, 2, ... num_keys/2 gives each slot the sum of the num_keys slots that
+  // follow it, which straddles two rows for every slot but the first of each.
+  // The corrupted norm then lands outside the calibrated interval and the
+  // inverse square root diverges -- and the result is squared afterwards.
+  //
+  // Striding the key axis makes the wrap-around exactly right, because the
+  // pattern is periodic in the rotation distance: rotating by num_rows moves
+  // to the next key of the same row. This is also the axis convention
+  // RmsNormHandler already reduces along, so the two operators agree.
+  for (int d = num_rows_; d < num_slots_; d *= 2) {
+    rotation_distances_.push_back(d);
+  }
 
   // The exponential on [-M/2^k, 0], reached from v in [-1, 1] by
   // x' = M (v - 1) / 2^(k+1).
