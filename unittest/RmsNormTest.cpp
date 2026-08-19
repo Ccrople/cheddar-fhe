@@ -99,8 +99,33 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   std::cout << "alpha_L = " << alpha << ", so the argument sits in ["
             << (alpha * lo) << ", " << (alpha * hi) << "]" << std::endl;
 
+  // RANGE CONTROL, standing in for [SYLPH]'s calibration.
+  //
+  // CKKS precision is absolute, not relative: a value only gets as many bits
+  // as it occupies below the scaling factor. On this uncalibrated bundle the
+  // user tokens have |x| ~ 0.022, so x^2 ~ 4e-4 and the square uses about 19
+  // of the 30 bits the scale offers. The eleven wasted bits show up directly:
+  // the reduction alone lands at 0.3-0.5% relative, and because the error is
+  // correlated across slots, summing 4096 terms does not average it away.
+  //
+  // [SYLPH] does not meet this, because after calibration its RMSNorm input is
+  // 7.65 (table 2) -- order one, where the scale is well spent. Our data is
+  // some 400x smaller.
+  //
+  // RMSNorm is invariant under x -> beta*x, so scaling the input to order one
+  // is exactly free mathematically. Feeding beta*x with alpha/beta^2 and
+  // eps*beta^2 leaves the polynomial's argument bit-for-bit identical, and the
+  // beta cancels in the output. Choosing beta = sqrt(alpha) makes the layer
+  // constant exactly 1, which is what a calibrated model would have handed us.
+  const double beta = std::sqrt(alpha);
+  const double alpha_scaled = alpha / (beta * beta);
+  const double eps_scaled = kEps * beta * beta;
+  std::cout << "beta = " << beta << " puts |x| near one; alpha_L becomes "
+            << alpha_scaled << std::endl;
+
   const int level = default_encryption_level_;
-  RmsNormHandler<word> rms(context_, kTokens, kChannels, alpha, level, kEps);
+  RmsNormHandler<word> rms(context_, kTokens, kChannels, alpha_scaled, level,
+                           eps_scaled);
   const int num_ct = rms.GetNumCiphertexts();
   std::cout << "T=" << kTokens << " H=" << kChannels << " -> " << num_ct
             << " ciphertexts, " << rms.GetRotationDistances().size()
@@ -120,14 +145,14 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   const int channels_per_ct = slots / kTokens;
   std::vector<Ciphertext<word>> cts(num_ct);
   std::vector<std::vector<Complex>> wts(num_ct);
-  const double root_alpha = std::sqrt(alpha);
+  const double root_alpha = std::sqrt(alpha_scaled);
   for (int i = 0; i < num_ct; i++) {
     std::vector<Complex> msg(slots);
     wts[i].assign(slots, Complex(0.0, 0.0));
     for (int s = 0; s < slots; s++) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = kFirstToken + (s % kTokens);
-      msg[s] = Complex(x[static_cast<size_t>(t) * kChannels + c], 0.0);
+      msg[s] = Complex(beta * x[static_cast<size_t>(t) * kChannels + c], 0.0);
       wts[i][s] = Complex(w[c] * root_alpha, 0.0);
     }
     EncodeAndEncrypt(cts[i], msg, level);
@@ -189,7 +214,7 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
       const int s = best_c * kTokens + t;
       const double xv =
           x[static_cast<size_t>(kFirstToken + t) * kChannels + best_c];
-      const double recovered = got0[s].real() / (xv * w[best_c]);
+      const double recovered = got0[s].real() / (xv * w[best_c]);  // beta cancels
       const double truth =
           1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
       std::cout << "  t" << (kFirstToken + t) << "  recovered " << recovered
