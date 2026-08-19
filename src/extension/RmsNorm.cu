@@ -2,37 +2,10 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "extension/ChebyshevFit.h"
 #include "extension/RmsNorm.h"
 
 namespace cheddar {
-
-namespace {
-
-// Chebyshev interpolation of f on [-1, 1] at degree n, returned in the
-// Chebyshev basis. Interpolating at the Chebyshev nodes rather than fitting in
-// the monomial basis is not a stylistic choice: on this window the monomial
-// coefficients of an inverse square root span many orders of magnitude, and
-// EvalPoly silently drops any coefficient below 1e-9 (Doing.md 1.4).
-template <typename F>
-std::vector<double> ChebyshevInterpolate(F f, int n) {
-  const int m = n + 1;
-  std::vector<double> node(m), value(m);
-  for (int j = 0; j < m; j++) {
-    node[j] = std::cos(M_PI * (j + 0.5) / m);
-    value[j] = f(node[j]);
-  }
-  std::vector<double> c(m, 0.0);
-  for (int k = 0; k < m; k++) {
-    double acc = 0.0;
-    for (int j = 0; j < m; j++) {
-      acc += value[j] * std::cos(M_PI * k * (j + 0.5) / m);
-    }
-    c[k] = (k == 0 ? 1.0 : 2.0) * acc / m;
-  }
-  return c;
-}
-
-}  // namespace
 
 template <typename word>
 RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
@@ -74,7 +47,7 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   // v = (u - b) / a with a, b the half-width and centre of the window.
   const double a = 0.5 * (window_hi_ - window_lo_);
   const double b = 0.5 * (window_hi_ + window_lo_);
-  auto coeffs = ChebyshevInterpolate(
+  auto coeffs = chebfit::Interpolate(
       [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
 
   // The multiplicative half of the affine map is applied by *reinterpreting the
