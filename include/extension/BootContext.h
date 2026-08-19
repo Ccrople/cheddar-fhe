@@ -148,6 +148,32 @@ class BootContext : public Context<word>,
   void Boot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
             bool min_ks = false) const;
 
+  /**
+   * @brief Bootstrapping stopped before SlotToCoeff: coefficients in, slots out.
+   *
+   * This is [BAE]'s HalfBTS, and for this project it is not an optimisation but
+   * the only way across the domain boundary. `EvalSpecialFFT` compiles
+   * SlotToCoeff at `GetStCStartLevel()`, which is exactly
+   * `default_encryption_level`, so an ordinary ciphertext can feed it. It
+   * compiles CoeffToSlot at `GetCtSStartLevel()` = `max_level`, which nothing
+   * but a ModUp'd ciphertext reaches. So slot -> coefficient is a plain call and
+   * **coefficient -> slot exists only inside bootstrapping** -- which is why
+   * [SYLPH] section 3.2 fuses encoding conversions into it.
+   *
+   * The level arithmetic closes exactly, which is the sign the parameter set
+   * was built for this flow:
+   *
+   *     slot @19 --StC(3)--> coeff @16 --[ring descent, PCMM, ascent]-->
+   *     --ModUp--> @31 --CtS(4)--> @27 --EvalMod(8)--> slot @19
+   *
+   * @param res output, slot-encoded at `GetEvalModStartLevel() - EvalMod`
+   * @param input coefficient-encoded, brought to level 0 as `Boot` does
+   * @param evk_map client-provided EvkMap
+   * @param min_ks whether to use minimum key-switching
+   */
+  void HalfBoot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
+                bool min_ks = false) const;
+
   // Other functions...
 
   /**

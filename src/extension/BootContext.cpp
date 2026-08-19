@@ -383,6 +383,83 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
 }
 
 template <typename word>
+void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
+                             const EvkMap<word> &evk_map, bool min_ks) const {
+  int half_degree = this->param_.degree_ / 2;
+  int input_num_slots = input.GetNumSlots();
+  int num_slots = GetBootEnabledNumSlots(input_num_slots);
+  bool full_slot = (num_slots == half_degree);
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+
+  Ct main_ct;
+  int input_level = this->param_.NPToLevel(input.GetNP());
+  if (input_level > 0) {
+    this->LevelDown(main_ct, input, 0);
+    HalfBoot(res, main_ct, evk_map, min_ks);
+    return;
+  }
+
+  // 0. Scale up
+  NPInfo min_np = this->param_.LevelToNP(-1);
+  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+
+  // 1. ModUp with optional DtS/StD key-switch + Trace.
+  //
+  // Climb only to the level this BootContext's BootParameter asks for, not to
+  // the parameter set's maximum. CoeffToSlot, EvalMod and SlotToCoeff are
+  // already compiled against boot_param_ (GetCtSStartLevel, GetEvalModStartLevel,
+  // GetStCStartLevel all derive from its max_level_), and the rotation keys are
+  // requested at boot_param_.GetMaxLevel() too -- ModUp was the one place still
+  // hard-wired to param_.max_level_. A BootParameter built with a smaller
+  // max_level therefore yields a bootstrap that lands at a chosen level and
+  // does every limb operation in between on fewer primes.
+  ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel());
+
+  // Perform trace
+  main_ct.SetNumSlots(half_degree);
+  Trace(main_ct, num_slots, (half_degree / num_slots), main_ct, evk_map);
+  main_ct.SetNumSlots(num_slots);
+
+  // 2. Perform CtS
+  CoeffToSlot(main_ct, num_slots, main_ct, evk_map, min_ks);
+
+  // 3. Extract real/imag part and perform EvalMod
+  main_ct.SetScale(eval_mod_->start_scale_);
+  if (full_slot) {
+    Ct ct_conj;
+    this->HConj(ct_conj, main_ct, evk_map.GetConjugationKey());
+    // Perform eval mod on real and imag part separately
+    this->Add(res, main_ct, ct_conj);
+    this->Sub(ct_conj, ct_conj, main_ct);
+    this->MultImaginaryUnit(ct_conj, ct_conj);
+    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
+    EvaluateMod(ct_conj, ct_conj, evk_map.GetMultiplicationKey());
+    this->MultImaginaryUnit(ct_conj, ct_conj);
+    this->Add(res, res, ct_conj);
+  } else {
+    // Can merge real and imag part using extra slots
+    this->HConjAdd(res, main_ct, main_ct, evk_map.GetConjugationKey());
+    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
+  }
+
+  // 4. NO StC. Boot's CoeffToSlot/SlotToCoeff pair is what makes it
+  // domain-preserving; stopping here leaves the input's *coefficients* sitting
+  // in the output's *slots*, which is the conversion the pipeline needs and
+  // cannot get any other way -- CoeffToSlot alone is compiled at max_level and
+  // only a ModUp'd ciphertext lives there.
+  //
+  // kImaginaryRemoving's extra HConjAdd belongs after StC, so it is not applied
+  // here; a variant needing it would have to be handled by the caller.
+  AssertTrue(boot_variant_.at(num_slots) != BootVariant::kImaginaryRemoving,
+             "HalfBoot: kImaginaryRemoving folds work into StC, which this "
+             "does not run");
+
+  res.SetNumSlots(input_num_slots);
+  res.SetScale(this->param_.GetScale(boot_param_.GetStCStartLevel()));
+}
+
+template <typename word>
 void BootContext<word>::Trace(Ct &res, int start_rot_dist, int num_accum,
                               const Ct &input,
                               const EvkMap<word> &evk_map) const {

@@ -172,6 +172,11 @@ if (ENABLE_EXTENSION)
   add_executable(pcmm_blas_test PcmmBlasTest.cpp)
   target_link_libraries(pcmm_blas_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # HalfBoot: the only route from coefficient encoding back to slots.
+  add_executable(half_boot_test HalfBootTest.cpp)
+  target_link_libraries(half_boot_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
