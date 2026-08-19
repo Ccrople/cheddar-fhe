@@ -43,11 +43,12 @@ template <typename word>
 RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
                                      int num_tokens, int num_channels,
                                      double layer_constant, int input_level,
-                                     int degree)
+                                     double eps, int degree)
     : context_{std::move(context)},
       num_tokens_{num_tokens},
       num_channels_{num_channels},
       layer_constant_{layer_constant},
+      eps_{eps},
       input_level_{input_level} {
   AssertTrue(num_tokens_ > 0 && IsPowOfTwo(num_tokens_),
              "RmsNorm: num_tokens must be a power of two");
@@ -121,7 +122,12 @@ void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
 
   // 3. Affine map onto the polynomial's domain, folded into one constant
   //    multiply and one constant add:
-  //        v = (alpha_L / H) * S / a  -  b / a
+  //        u = alpha_L * (S / H + eps),   v = (u - b) / a
+  //    so the multiplicative half is alpha_L / (H * a) and the additive half
+  //    carries the epsilon: (alpha_L * eps - b) / a. Llama's epsilon is not
+  //    negligible at this scale -- mean square ~5e-4 against eps 1e-5 -- and it
+  //    rides along for free, since constant addition costs no level.
+  //
   //    [SYLPH] fuses scalings like this into the operation that produced x;
   //    kept explicit here so the caller can see -- and move -- the level it
   //    costs.
@@ -136,7 +142,7 @@ void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
   const int v_level = context_->param_.NPToLevel(acc.GetNP());
   context_->encoder_.EncodeConstant(shift_const, v_level,
                                     context_->param_.GetScale(v_level),
-                                    -b / a);
+                                    (layer_constant_ * eps_ - b) / a);
   context_->Add(acc, acc, shift_const);
 
   // 4. The inverse square root.

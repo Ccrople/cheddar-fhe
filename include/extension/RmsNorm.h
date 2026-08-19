@@ -80,6 +80,7 @@ class RmsNormHandler {
   int num_slots_;
   int num_ct_;
   double layer_constant_;
+  double eps_;
   int input_level_;
   std::vector<int> rotation_distances_;
   std::unique_ptr<EvalPoly<word>> inv_sqrt_;
@@ -95,12 +96,16 @@ class RmsNormHandler {
    * per-token mean square is the natural choice and is what the accompanying
    * test uses.
    * @param input_level level of the input ciphertexts
+   * @param eps Llama's RMSNorm epsilon. It is not negligible here: the
+   * measured mean square is around 5e-4 against an eps of 1e-5, a two percent
+   * effect on the norm. It costs nothing, because alpha_L * eps folds into the
+   * additive half of the affine map and constant addition is level-free.
    * @param degree Chebyshev degree for the inverse square root; 23 reaches the
    * 12-bit target on this window
    */
   RmsNormHandler(ConstContextPtr<word> context, int num_tokens,
                  int num_channels, double layer_constant, int input_level,
-                 int degree = 23);
+                 double eps = 1e-5, int degree = 23);
 
   // disable copying (or moving also)
   RmsNormHandler(const RmsNormHandler &) = delete;

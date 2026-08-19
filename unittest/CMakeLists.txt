@@ -129,6 +129,12 @@ if (ENABLE_EXTENSION)
   add_executable(chain_probe ChainProbe.cpp)
   target_link_libraries(chain_probe
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Llama RMSNorm on the real layer-2 residual stream. Needs ENABLE_EXTENSION
+  # for EvalPoly, and LLAMA3_REAL_DIR for the weight bundle.
+  add_executable(rms_norm_test RmsNormTest.cpp)
+  target_link_libraries(rms_norm_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
