@@ -112,6 +112,24 @@ TEST_P(Testbed32, ProfileNonLinearOperators) {
   Ciphertext<word> boot_in;
   EncodeAndEncrypt(boot_in, msg, 0);
 
+  // ---- plaintext conversion, explicitly in setup --------------------------
+  //
+  // [SYLPH] section 5.3 makes the model's plaintext conversion its own stage
+  // and section 5.1 keeps the result on the GPU for the whole run. Doing it
+  // here rather than letting Apply do it lazily is what makes the timings
+  // below online numbers rather than a first-call encode in disguise.
+  rope.Prepare(0, level);
+  sm_fused.Prepare(mask);
+  sm_boot.Prepare(mask);
+  rms.Prepare(wts);
+  const size_t pt_bytes = rope.GetPlaintextBytes() +
+                          sm_fused.GetPlaintextBytes() +
+                          rms.GetPlaintextBytes();
+  std::cout << "resident plaintexts: RoPE " << rope.GetPlaintextBytes() / 1e6
+            << " MB, SoftMax mask " << sm_fused.GetPlaintextBytes() / 1e6
+            << " MB, RMSNorm weights " << rms.GetPlaintextBytes() / 1e6
+            << " MB, total " << pt_bytes / 1e6 << " MB" << std::endl;
+
   // ---- online evaluation --------------------------------------------------
   std::cout << "online, " << kWarmUp << " warm-up then mean of " << kReps
             << ":" << std::endl;

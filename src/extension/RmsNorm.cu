@@ -81,6 +81,10 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
       coeffs, poly_level, poly_scale, context_->param_.GetScale(out_level),
       /*chebyshev=*/true);
   inv_sqrt_->Compile(context_);
+  // The weights meet the data one level under the inverse square root's own
+  // output, because Apply multiplies by it first. Knowing that here is what
+  // lets the weight plaintexts be built in setup rather than on first use.
+  weight_level_ = out_level - 1;
 }
 
 template <typename word>
@@ -88,6 +92,32 @@ double RmsNormHandler<word>::PlainInvSqrt(double u) const {
   const double a = affine_scale_;
   const double b = 0.5 * (window_hi_ + window_lo_);
   return inv_sqrt_->PlainEvaluate((u - b) / a);
+}
+
+template <typename word>
+void RmsNormHandler<word>::Prepare(
+    const std::vector<std::vector<Complex>> &weight) const {
+  AssertTrue(static_cast<int>(weight.size()) == num_ct_,
+             "RmsNorm: one weight vector per input ciphertext");
+  if (cached_weight_level_ == weight_level_ && cached_weight_ == weight) return;
+  weight_pt_.clear();
+  weight_pt_.resize(num_ct_);
+  const double scale = context_->param_.GetScale(weight_level_);
+  for (int i = 0; i < num_ct_; i++) {
+    context_->encoder_.Encode(weight_pt_[i], weight_level_, scale, weight[i]);
+  }
+  cached_weight_ = weight;
+  cached_weight_level_ = weight_level_;
+}
+
+template <typename word>
+size_t RmsNormHandler<word>::GetPlaintextBytes() const {
+  if (cached_weight_level_ < 0) return 0;
+  const size_t words =
+      static_cast<size_t>(
+          context_->param_.LevelToNP(cached_weight_level_).GetNumTotal()) *
+      context_->param_.degree_;
+  return static_cast<size_t>(num_ct_) * words * sizeof(word);
 }
 
 template <typename word>
@@ -172,14 +202,10 @@ void RmsNormHandler<word>::Apply(
   const int r_level = context_->param_.NPToLevel(r.GetNP());
   // The weight plaintexts sit at the level the multiply below leaves, which is
   // one under r's. Rebuild them only when that level or the weights move.
-  const bool reuse = (cached_weight_level_ == r_level - 1) &&
-                     (cached_weight_ == weight);
-  if (!reuse) {
-    weight_pt_.clear();
-    weight_pt_.resize(num_ct_);
-    cached_weight_ = weight;
-    cached_weight_level_ = r_level - 1;
-  }
+  AssertTrue(r_level - 1 == weight_level_,
+             "RmsNorm: the inverse square root did not land where Prepare "
+             "assumed");
+  Prepare(weight);
   Ct levelled;
   for (int i = 0; i < num_ct_; i++) {
     context_->LevelDown(levelled, x[i], r_level);
@@ -189,13 +215,6 @@ void RmsNormHandler<word>::Apply(
     // degree. Making the caller supply a plaintext at the right level makes an
     // internal detail of the circuit part of its interface, and getting it
     // wrong surfaces as "Number of primes differ" from inside the multiply.
-    const int y_level = context_->param_.NPToLevel(res[i].GetNP());
-    if (!reuse) {
-      AssertTrue(y_level == cached_weight_level_,
-                 "RmsNorm: the weight level moved between ciphertexts");
-      context_->encoder_.Encode(weight_pt_[i], y_level,
-                                context_->param_.GetScale(y_level), weight[i]);
-    }
     context_->Mult(res[i], res[i], weight_pt_[i]);
   }
 }

@@ -167,6 +167,28 @@ std::vector<double> SoftMaxHandler<word>::PlainSoftMax(
 }
 
 template <typename word>
+void SoftMaxHandler<word>::Prepare(
+    const std::vector<Complex> &causal_mask) const {
+  // The mask meets y right after the exponential, so that is the level it must
+  // be encoded at -- known at construction, which is what lets this run in
+  // setup rather than on the first Apply.
+  const int level = exp_out_level_;
+  if (level == cached_mask_level_ && causal_mask == cached_mask_) return;
+  context_->encoder_.Encode(mask_pt_, level, context_->param_.GetScale(level),
+                            causal_mask);
+  cached_mask_ = causal_mask;
+  cached_mask_level_ = level;
+}
+
+template <typename word>
+size_t SoftMaxHandler<word>::GetPlaintextBytes() const {
+  if (cached_mask_level_ < 0) return 0;
+  return static_cast<size_t>(
+             context_->param_.LevelToNP(cached_mask_level_).GetNumTotal()) *
+         context_->param_.degree_ * sizeof(word);
+}
+
+template <typename word>
 void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
                                  const std::vector<Complex> &causal_mask,
                                  const EvkMap<word> &evk_map,
@@ -186,13 +208,9 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
   //    have to be zeroed explicitly or they would join the norm and the
   //    output. Causality is public, hence a plaintext.
   {
-    const int level = context_->param_.NPToLevel(y.GetNP());
-    if (level != cached_mask_level_ || causal_mask != cached_mask_) {
-      context_->encoder_.Encode(mask_pt_, level,
-                                context_->param_.GetScale(level), causal_mask);
-      cached_mask_ = causal_mask;
-      cached_mask_level_ = level;
-    }
+    AssertTrue(context_->param_.NPToLevel(y.GetNP()) == exp_out_level_,
+               "SoftMax: the exponential did not land where Prepare assumed");
+    Prepare(causal_mask);
     Ct masked;
     context_->Mult(masked, y, mask_pt_);
     context_->Rescale(y, masked);

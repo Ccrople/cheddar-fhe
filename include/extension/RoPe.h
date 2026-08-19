@@ -118,6 +118,24 @@ class RoPeHandler {
                   int first_position) const;
 
   /**
+   * @brief Build the three plaintexts up front, so their cost sits in setup.
+   *
+   * [SYLPH] converts the model's plaintexts offline and keeps them on the GPU
+   * for the whole run (section 5.1, "they need to reside in GPU memory
+   * throughout the computation"); section 5.3 puts that conversion in its own
+   * stage. Apply will do the same work lazily on its first call, which is
+   * correct but hides tens of milliseconds of host encoding inside what looks
+   * like an online measurement.
+   *
+   * @param first_position the position Apply will be called with
+   * @param level level of the input; -1 uses the constructor's input_level
+   */
+  void Prepare(int first_position, int level = -1) const;
+
+  /** @brief Device bytes the cached plaintexts hold, 0 before Prepare. */
+  size_t GetPlaintextBytes() const;
+
+  /**
    * @brief res = RoPE(x), costing one level.
    *
    * @param res output

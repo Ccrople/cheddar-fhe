@@ -92,6 +92,30 @@ void RoPeHandler<word>::PlainApply(std::vector<double> &res,
 }
 
 template <typename word>
+void RoPeHandler<word>::Prepare(int first_position, int level) const {
+  if (level < 0) level = input_level_;
+  if (first_position == cached_position_ && level == cached_level_) return;
+  const double scale = context_->param_.GetScale(level);
+  auto t =
+      BuildTables(num_slots_, num_tokens_, head_dim_, first_position, theta_);
+  context_->encoder_.Encode(cos_pt_, level, scale, t.cos_t);
+  context_->encoder_.Encode(lower_pt_, level, scale, t.lower);
+  context_->encoder_.Encode(upper_pt_, level, scale, t.upper);
+  cached_position_ = first_position;
+  cached_level_ = level;
+}
+
+template <typename word>
+size_t RoPeHandler<word>::GetPlaintextBytes() const {
+  if (cached_level_ < 0) return 0;
+  const size_t words =
+      static_cast<size_t>(context_->param_.LevelToNP(cached_level_)
+                              .GetNumTotal()) *
+      context_->param_.degree_;
+  return 3 * words * sizeof(word);
+}
+
+template <typename word>
 void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
                               const EvkMap<word> &evk_map) const {
   const int level = context_->param_.NPToLevel(x.GetNP());
@@ -102,15 +126,7 @@ void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
   // same table at a different level is a different object with a different
   // prime count, and reusing one across levels fails inside the multiply with
   // "Number of primes differ".
-  if (first_position != cached_position_ || level != cached_level_) {
-    auto t =
-        BuildTables(num_slots_, num_tokens_, head_dim_, first_position, theta_);
-    context_->encoder_.Encode(cos_pt_, level, scale, t.cos_t);
-    context_->encoder_.Encode(lower_pt_, level, scale, t.lower);
-    context_->encoder_.Encode(upper_pt_, level, scale, t.upper);
-    cached_position_ = first_position;
-    cached_level_ = level;
-  }
+  Prepare(first_position, level);
   const Pt &cos_pt = cos_pt_, &lower_pt = lower_pt_, &upper_pt = upper_pt_;
 
   // Both rotations read the input, so they run at the input level and neither

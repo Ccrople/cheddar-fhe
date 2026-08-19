@@ -103,6 +103,7 @@ class RmsNormHandler {
   mutable std::vector<std::vector<Complex>> cached_weight_;
   mutable std::vector<Pt> weight_pt_;
   mutable int cached_weight_level_ = -1;
+  int weight_level_ = -1;
   std::unique_ptr<EvalPoly<word>> inv_sqrt_;
 
  public:
@@ -146,6 +147,21 @@ class RmsNormHandler {
   }
 
   int GetNumCiphertexts() const { return num_ct_; }
+
+  /**
+   * @brief Encode the weight plaintexts up front, so their cost sits in setup.
+   *
+   * [SYLPH] section 5.1 keeps the model's plaintexts resident on the GPU for
+   * the whole run and section 5.3 makes that conversion its own stage, at a
+   * measured 4x expansion over the raw weights (table 5: 13.0 GiB to 52.0).
+   * Apply does this lazily on first call, which is correct but puts one
+   * ~50 ms host encode per ciphertext inside what reads as an online
+   * measurement -- eight of them were 264 of RMSNorm's 271 ms.
+   */
+  void Prepare(const std::vector<std::vector<Complex>> &weight) const;
+
+  /** @brief Device bytes the cached weights hold, 0 before Prepare. */
+  size_t GetPlaintextBytes() const;
 
   /**
    * @brief Evaluate the compiled inverse-square-root polynomial in the clear,

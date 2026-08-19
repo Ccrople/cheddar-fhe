@@ -206,6 +206,19 @@ class SoftMaxHandler {
 
   /** @brief Levels the auxiliary track spends per iteration. */
   int GetAuxTrackDepth() const;
+
+  /**
+   * @brief Encode the causal mask up front, so its cost sits in setup.
+   *
+   * [SYLPH] section 5.1 keeps the model's plaintexts resident on the GPU for
+   * the whole run and section 5.3 makes that conversion its own stage. Apply
+   * does the same work lazily on first call, which is correct but hides a
+   * ~50 ms host encode inside what reads as an online measurement.
+   */
+  void Prepare(const std::vector<Complex> &causal_mask) const;
+
+  /** @brief Device bytes the cached mask holds, 0 before Prepare. */
+  size_t GetPlaintextBytes() const;
 };
 
 }  // namespace cheddar
