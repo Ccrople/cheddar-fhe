@@ -156,6 +156,11 @@ if (ENABLE_EXTENSION)
   add_executable(rope_test RoPeTest.cpp)
   target_link_libraries(rope_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Online timings for the non-linear operators. Performance, not correctness.
+  add_executable(profile_test ProfileTest.cpp)
+  target_link_libraries(profile_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
