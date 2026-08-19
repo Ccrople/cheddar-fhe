@@ -42,14 +42,15 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
                                      const std::vector<double> &norm_lo,
                                      const std::vector<double> &norm_hi,
                                      int exp_degree, int inv_sqrt_degree,
-                                     int early_inv_sqrt_degree)
+                                     int early_inv_sqrt_degree, bool boot_aux)
     : context_{std::move(context)},
       num_keys_{num_keys},
       range_{range},
       input_level_{input_level},
       num_iters_{num_iters},
       norm_lo_{norm_lo},
-      norm_hi_{norm_hi} {
+      norm_hi_{norm_hi},
+      boot_aux_{boot_aux} {
   AssertTrue(num_keys_ > 1 && (num_keys_ & (num_keys_ - 1)) == 0,
              "SoftMax: num_keys must be a power of two");
   AssertTrue(range_ > 0.0, "SoftMax: range must be positive");
@@ -104,6 +105,7 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
   // normalisation, one square. [SYLPH] figure 2 keeps the first three off the
   // main track by bootstrapping the auxiliary track separately; without that
   // they land here, which is why the depth below exceeds section 4.3's 8.
+  exp_out_level_ = exp_out;
   int level = exp_out - 1;  // the causal mask multiply
   for (int j = 0; j < num_iters_; j++) {
     const int norm_level = level - 1;   // square for ||y||^2
@@ -112,12 +114,33 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
         (j + 1 == num_iters_) ? inv_sqrt_degree : early_inv_sqrt_degree;
     inv_sqrt_.push_back(
         MakeInvSqrt(norm_lo_[j], norm_hi_[j], degree, poly_in));
-    // the main track meets the normalisation at the polynomial's output level
     int used = 0;
     while ((1 << used) < degree + 1) used++;
-    level = poly_in - used - 2;  // multiply by 1/||y||, then square
+    if (boot_aux_) {
+      // The normalisation comes back at the bootstrap's landing level and is
+      // brought down to the main track, so the auxiliary depth never lands
+      // here: the main track pays only the multiply and the square. This is
+      // what [SYLPH] figure 2's orange triangles buy.
+      level -= 2;
+    } else {
+      // Fused into one track: the main track meets the normalisation at the
+      // polynomial's output level, so all of the auxiliary depth lands here.
+      level = poly_in - used - 2;
+    }
     AssertTrue(level >= 0, "SoftMax: does not fit below the input level");
   }
+}
+
+template <typename word>
+int SoftMaxHandler<word>::GetMainTrackDepth() const {
+  // exp, the causal mask, then k times (multiply by the normalisation, square).
+  return (input_level_ - exp_out_level_) + 1 + 2 * num_iters_;
+}
+
+template <typename word>
+int SoftMaxHandler<word>::GetAuxTrackDepth() const {
+  // the norm square, the affine map, and the inverse square root
+  return 2 + Log2Ceil(inv_sqrt_.back()->GetPolyDegree() + 1);
 }
 
 template <typename word>
@@ -146,9 +169,12 @@ std::vector<double> SoftMaxHandler<word>::PlainSoftMax(
 template <typename word>
 void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
                                  const std::vector<Complex> &causal_mask,
-                                 const EvkMap<word> &evk_map) const {
+                                 const EvkMap<word> &evk_map,
+                                 const BootContext<word> *boot_context) const {
   AssertTrue(static_cast<int>(causal_mask.size()) == num_slots_,
              "SoftMax: the mask must cover every slot");
+  AssertTrue(!boot_aux_ || boot_context != nullptr,
+             "SoftMax: boot_aux was requested, so Apply needs a BootContext");
   const auto &mult_key = evk_map.GetMultiplicationKey();
 
   // 1. y = exp(x'). The argument arrives already on [-1, 1]; see the header
@@ -203,7 +229,23 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     //    constant, and the next normalisation divides it straight back out.
     inv_sqrt_[j]->Evaluate(context_, r, sq, mult_key);
 
-    // 6. y <- (y * r)^2. Now sum(y) = 1 for the last iteration, with no
+    // 6. Bring the normalisation back up, if asked. r = 1/||y||_2 with
+    //    ||y||_2^2 in the calibrated interval, so r is already inside the
+    //    [-1, 1] that CKKS bootstrapping needs -- [SYLPH] section 3.1.3's 1/B
+    //    pre-scaling is unnecessary here. The main track then never sees the
+    //    auxiliary depth.
+    if (boot_aux_) {
+      const int y_level = context_->param_.NPToLevel(y.GetNP());
+      Ct boosted;
+      boot_context->Boot(boosted, r, evk_map);
+      const int boosted_level = context_->param_.NPToLevel(boosted.GetNP());
+      AssertTrue(boosted_level >= y_level,
+                 "SoftMax: the bootstrap landed below the main track, so it "
+                 "cannot carry the normalisation back");
+      context_->LevelDown(r, boosted, y_level);
+    }
+
+    // 7. y <- (y * r)^2. Now sum(y) = 1 for the last iteration, with no
     //    further normalisation needed.
     const int r_level = context_->param_.NPToLevel(r.GetNP());
     Ct levelled;

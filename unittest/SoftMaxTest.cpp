@@ -270,6 +270,110 @@ TEST_P(Testbed32, SoftMaxOnEncrypted) {
   EXPECT_GT(Bits(err_true, 1.0), kTargetBits);
 }
 
+// ---------------------------------------------------------------------------
+// 3. The auxiliary track bootstrapped, as [SYLPH] figure 2 does it.
+//
+// This is the whole point of that orange triangle: the norm square, the affine
+// map and the inverse square root stop landing on the main track, which drops
+// from 13 levels to 7 -- one better than [SYLPH]'s 8, because k=1 needs one
+// normalisation where k=2 needs two.
+//
+// No new library capability is involved. CKKS bootstrapping needs its input in
+// [-1, 1] and [SYLPH] section 3.1.3 pre-scales by 1/B to guarantee it, but the
+// normalisation is 1/||y||_2 with ||y||_2^2 calibrated to a few units, so it is
+// already inside. An ordinary Boot() carries it.
+// ---------------------------------------------------------------------------
+TEST_P(Testbed32, SoftMaxWithBootstrappedAuxTrack) {
+  auto boot_context = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  if (boot_context == nullptr) GTEST_SKIP() << "not a bootstrapping preset";
+
+  const int level = default_encryption_level_;
+  const int slots = param_->degree_ / 2;
+  const int rows = slots / kKeys;
+
+  std::vector<int> valid(rows);
+  for (int r = 0; r < rows; r++) valid[r] = kKeys - (r % (kKeys / 2));
+  std::vector<std::vector<double>> row_data;
+  for (int r = 0; r < rows; r++) row_data.push_back(MakeRow(r, valid[r]));
+  double lo, hi;
+  NormInterval(row_data, valid, kIters, &lo, &hi);
+  // The normalisation the bootstrap has to carry, which must already be inside
+  // the interval CKKS bootstrapping assumes.
+  std::cout << "1/||y|| lies in [" << 1.0 / std::sqrt(hi) << ", "
+            << 1.0 / std::sqrt(lo) << "], and bootstrapping needs [-1, 1]"
+            << std::endl;
+  EXPECT_LT(1.0 / std::sqrt(lo), 1.0)
+      << "the normalisation leaves the bootstrappable range, so it would need "
+         "[SYLPH] 3.1.3's 1/B pre-scaling first";
+
+  SoftMaxHandler<word> sm(context_, kKeys, kRange, level, kIters,
+                          std::vector<double>(kIters, lo),
+                          std::vector<double>(kIters, hi), kExpDegree,
+                          kInvSqrtDegree, /*early=*/4, /*boot_aux=*/true);
+  std::cout << "main track " << sm.GetMainTrackDepth() << " levels, auxiliary "
+            << sm.GetAuxTrackDepth() << " ([SYLPH] 4.3 reports 8 in the main "
+            << "track at k=2)" << std::endl;
+  EXPECT_EQ(sm.GetMainTrackDepth(), 7);
+
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, slots);
+  interface_->PrepareRotationKey(req);
+  for (int d : sm.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, level);
+  }
+
+  std::vector<double> x(slots, 0.0);
+  std::vector<Complex> msg(slots), mask(slots);
+  for (int r = 0; r < rows; r++) {
+    const auto &row = row_data[r];
+    for (int i = 0; i < kKeys; i++) {
+      const int s = r + i * rows;
+      x[s] = row[i];
+      msg[s] = Complex(2.0 * row[i] / kRange + 1.0, 0.0);
+      mask[s] = Complex(i < valid[r] ? 1.0 : 0.0, 0.0);
+    }
+  }
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, msg, level);
+  Ciphertext<word> res;
+  sm.Apply(res, ct, mask, interface_->GetEvkMap(), boot_context.get());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  const int out_level = param_->NPToLevel(res.GetNP());
+  std::cout << "output level " << out_level << " from " << level << ", depth "
+            << (level - out_level) << std::endl;
+  EXPECT_EQ(level - out_level, 7)
+      << "the auxiliary depth is still landing on the main track";
+
+  std::vector<Complex> got;
+  DecryptAndDecode(got, res);
+  const double ref = 1.0 / kKeys;
+  double err = 0.0, worst_sum = 0.0;
+  for (int r = 0; r < rows; r++) {
+    std::vector<double> row(kKeys);
+    for (int i = 0; i < kKeys; i++) row[i] = x[r + i * rows];
+    auto want = TrueSoftMax(row, valid[r]);
+    double sum = 0.0;
+    for (int i = 0; i < kKeys; i++) {
+      const double g = got[r + i * rows].real();
+      sum += g;
+      err = std::max(err, std::abs(g - (i < valid[r] ? want[i] : 0.0)));
+    }
+    worst_sum = std::max(worst_sum, std::abs(sum - 1.0));
+  }
+  std::cout << "circuit vs true SoftMax: " << err << "  ("
+            << Bits(err, 1.0) << " bits vs the largest value, "
+            << Bits(err, ref) << " vs 1/d);  worst |sum-1| " << worst_sum
+            << std::endl;
+  EXPECT_LT(worst_sum, 1e-2);
+  if (param_->base_scale_ >= kMinUsableScale) {
+    EXPECT_GT(Bits(err, 1.0), kTargetBits);
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_35.json",

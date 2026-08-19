@@ -6,6 +6,7 @@
 #include "core/Container.h"
 #include "core/Context.h"
 #include "core/EvkMap.h"
+#include "extension/BootContext.h"
 #include "extension/EvalPoly.h"
 
 namespace cheddar {
@@ -57,13 +58,27 @@ namespace cheddar {
  * As section 4.3 puts it, the iteration count follows from calibrated estimates
  * of the inverse-square-root range, and ours are not [SYLPH]'s.
  *
- * ## What is not here
+ * ## The auxiliary track, and why it needs no new machinery
  *
- * [SYLPH] figure 2 bootstraps the auxiliary track separately, which is what
- * keeps its depth off the main track; that needs level-targeted bootstrapping,
- * which Cheddar does not have. Here both tracks run in one parameter set, so
- * `GetDepth()` reports the honest total and it is larger than 8. The main-track
- * count above is what this becomes once that bootstrap exists.
+ * [SYLPH] figure 2 bootstraps the auxiliary track separately -- that is what
+ * keeps the norm square, the affine map and the inverse square root off the
+ * main track. Fused into one track the total is 13 levels; separated, the main
+ * track is **7**, one better than [SYLPH]'s 8 because k=1 needs one
+ * normalisation rather than two.
+ *
+ * An ordinary `Boot()` suffices, which was not obvious. CKKS bootstrapping
+ * needs its input inside [-1, 1] and [SYLPH] section 3.1.3 scales ciphertexts
+ * by 1/B with B = 128 to guarantee it. Here no scaling is needed: the
+ * normalisation is `1 / ||y||_2` with `||y||_2^2` calibrated to [1.54, 6.82],
+ * so it lies in [0.38, 0.81] already. Pass a BootContext to Apply and the main
+ * track stays at 7.
+ *
+ * What remains unimplemented is section 3.4's *slim* evaluation. The
+ * normalisation is one value per row, so it belongs in a sparsely-packed
+ * ciphertext whose bootstrap is much cheaper than a full one; here it is
+ * broadcast across every slot by the reduction and bootstrapped at full width.
+ * That is a cost optimisation, not a level one -- theorem 1 keeps k+1 levels
+ * for degree 2^k either way.
  *
  * Section 3.4's slim polynomial evaluation is an auxiliary-track optimisation.
  * By its own theorem 1 it does not reduce levels (still k+1 for degree 2^k) --
@@ -90,6 +105,8 @@ class SoftMaxHandler {
   // norm^2 interval entering each inverse square root, from calibration
   std::vector<double> norm_lo_, norm_hi_;
 
+  bool boot_aux_;
+  int exp_out_level_;
   std::unique_ptr<EvalPoly<word>> exp_poly_;
   std::vector<std::unique_ptr<EvalPoly<word>>> inv_sqrt_;
   std::vector<int> rotation_distances_;
@@ -117,12 +134,17 @@ class SoftMaxHandler {
    * earlier ones use `early_inv_sqrt_degree`, which can be far smaller
    * @param early_inv_sqrt_degree degree of every inverse square root but the
    * last, which only has to keep the magnitudes in range
+   * @param boot_aux bootstrap the normalisation before it meets the main
+   * track, as [SYLPH] figure 2 does. This changes the level each polynomial is
+   * compiled at, so it is fixed here rather than per call, and Apply then
+   * requires a BootContext.
    */
   SoftMaxHandler(ConstContextPtr<word> context, int num_keys, double range,
                  int input_level, int num_iters,
                  const std::vector<double> &norm_lo,
                  const std::vector<double> &norm_hi, int exp_degree,
-                 int inv_sqrt_degree, int early_inv_sqrt_degree = 4);
+                 int inv_sqrt_degree, int early_inv_sqrt_degree = 4,
+                 bool boot_aux = false);
 
   // disable copying (or moving also)
   SoftMaxHandler(const SoftMaxHandler &) = delete;
@@ -154,10 +176,26 @@ class SoftMaxHandler {
    * in the same slot layout as the input. Causality is public, so this is a
    * plaintext.
    * @param evk_map supplies the multiplication and rotation keys
+   * @param boot_context if given, the normalisation is bootstrapped before it
+   * meets the main track, which is what keeps the main track at 7 levels
+   * instead of 13. See GetMainTrackDepth().
    */
   void Apply(Ct &res, const Ct &x_scaled,
              const std::vector<Complex> &causal_mask,
-             const EvkMap<word> &evk_map) const;
+             const EvkMap<word> &evk_map,
+             const BootContext<word> *boot_context = nullptr) const;
+
+  /**
+   * @brief Levels the main track spends, which is what a level budget counts.
+   *
+   * exp, the causal mask, then k times (multiply by the normalisation, square).
+   * The auxiliary work -- the norm square, the affine map and the inverse
+   * square root -- only lands on the main track when it is not bootstrapped.
+   */
+  int GetMainTrackDepth() const;
+
+  /** @brief Levels the auxiliary track spends per iteration. */
+  int GetAuxTrackDepth() const;
 };
 
 }  // namespace cheddar
