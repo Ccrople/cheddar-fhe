@@ -198,7 +198,7 @@ TEST_P(Testbed32, ProfilePcmmMlwe) {
   ASSERT_EQ(kColumns % k, 0);
 
   PcmmHandler<word> pcmm(*param_);
-  MlweHandler<word> mlwe(*param_);
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
 
   // 4096 columns = 4096/k source ciphertexts, each decomposing into k parts.
   std::vector<MlweCiphertext<word>> cts;
