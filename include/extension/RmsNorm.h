@@ -131,12 +131,15 @@ class RmsNormHandler {
    *
    * @param res output, resized to x.size()
    * @param x input, T x H over `num_ct` ciphertexts, token index fastest
-   * @param weight the per-channel weights already encoded with sqrt(alpha_L)
-   * folded in, one plaintext per input ciphertext
+   * @param weight the per-channel weights with sqrt(alpha_L) folded in, as
+   * slot vectors rather than plaintexts: the level they must be encoded at is
+   * whatever the polynomial happens to leave, which is an internal detail of
+   * this circuit and not something a caller should have to track.
    * @param evk_map supplies the rotation and multiplication keys
    */
   void Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
-             const std::vector<Pt> &weight, const EvkMap<word> &evk_map) const;
+             const std::vector<std::vector<Complex>> &weight,
+             const EvkMap<word> &evk_map) const;
 };
 
 }  // namespace cheddar

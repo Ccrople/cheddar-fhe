@@ -119,18 +119,18 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   const int slots = param_->degree_ / 2;
   const int channels_per_ct = slots / kTokens;
   std::vector<Ciphertext<word>> cts(num_ct);
-  std::vector<Plaintext<word>> wts(num_ct);
+  std::vector<std::vector<Complex>> wts(num_ct);
   const double root_alpha = std::sqrt(alpha);
   for (int i = 0; i < num_ct; i++) {
-    std::vector<Complex> msg(slots), wmsg(slots);
+    std::vector<Complex> msg(slots);
+    wts[i].assign(slots, Complex(0.0, 0.0));
     for (int s = 0; s < slots; s++) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = kFirstToken + (s % kTokens);
       msg[s] = Complex(x[static_cast<size_t>(t) * kChannels + c], 0.0);
-      wmsg[s] = Complex(w[c] * root_alpha, 0.0);
+      wts[i][s] = Complex(w[c] * root_alpha, 0.0);
     }
     EncodeAndEncrypt(cts[i], msg, level);
-    Encode(wts[i], wmsg, level);
   }
 
   std::vector<Ciphertext<word>> res;

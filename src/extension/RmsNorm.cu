@@ -94,9 +94,10 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
 }
 
 template <typename word>
-void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
-                                 const std::vector<Pt> &weight,
-                                 const EvkMap<word> &evk_map) const {
+void RmsNormHandler<word>::Apply(
+    std::vector<Ct> &res, const std::vector<Ct> &x,
+    const std::vector<std::vector<Complex>> &weight,
+    const EvkMap<word> &evk_map) const {
   AssertTrue(static_cast<int>(x.size()) == num_ct_,
              "RmsNorm: wrong number of input ciphertexts");
   AssertTrue(weight.size() == x.size(),
@@ -166,10 +167,19 @@ void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
   res.resize(num_ct_);
   const int r_level = context_->param_.NPToLevel(r.GetNP());
   Ct levelled;
+  Pt w_pt;
   for (int i = 0; i < num_ct_; i++) {
     context_->LevelDown(levelled, x[i], r_level);
     context_->HMult(res[i], levelled, r, mult_key);
-    context_->Mult(res[i], res[i], weight[i]);
+    // Encode the weight here rather than take it pre-encoded: it has to sit at
+    // the level the polynomial left behind, and that depends on the Chebyshev
+    // degree. Making the caller supply a plaintext at the right level makes an
+    // internal detail of the circuit part of its interface, and getting it
+    // wrong surfaces as "Number of primes differ" from inside the multiply.
+    const int y_level = context_->param_.NPToLevel(res[i].GetNP());
+    context_->encoder_.Encode(w_pt, y_level,
+                              context_->param_.GetScale(y_level), weight[i]);
+    context_->Mult(res[i], res[i], w_pt);
   }
 }
 
