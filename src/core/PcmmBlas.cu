@@ -173,12 +173,12 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
 
   const size_t src_n = static_cast<size_t>(cols) * degree;
   const size_t dst_n = static_cast<size_t>(rows) * degree;
-  const int num_groups = 2 * pieces - 1;
+  const int num_groups = pieces * pieces;
   DeviceVector<int8_t> src_split(static_cast<int>(pieces * src_n));
   DeviceVector<int32_t> groups(static_cast<int>(num_groups * dst_n));
 
   const auto primes = param_.GetPrimeVector(np);
-  const int one = 1;
+  const int one = 1, zero = 0;
   constexpr int kBlock = 256;
 
   for (int comp = 0; comp < 2; comp++) {
@@ -191,33 +191,43 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
               src_split.data(), src_ptrs, cols, degree, limb_offset, pieces,
               kPieceBits);
 
-      cudaMemset(groups.data(), 0, num_groups * dst_n * sizeof(int32_t));
       for (int l = 0; l < pieces; l++) {
         const int8_t *b = src_split.data() + static_cast<size_t>(l) * src_n;
         for (int k = 0; k < pieces; k++) {
           const int8_t *a = u.data.data() +
                             (static_cast<size_t>(k) * num_primes + j) *
                                 static_cast<size_t>(rows) * cols;
-          int32_t *c = groups.data() + static_cast<size_t>(k + l) * dst_n;
-          // beta = 1 accumulates the products that share a shift, which keeps
-          // every group inside int32 and leaves one 64-bit recombination for
-          // the kernel below.
+          int32_t *c =
+              groups.data() + static_cast<size_t>(l * pieces + k) * dst_n;
+          // One buffer per (k, l) and beta = 0. Accumulating several GEMMs into
+          // one buffer with beta = 1 was the first thing to suspect when 0.46%
+          // of the words came out wrong: cuBLAS's integer path does not
+          // guarantee read-modify-write on C the way the floating-point one
+          // does. Each product now lands in its own slab and the recombination
+          // kernel does all of the summing.
           const cublasStatus_t st = cublasGemmEx(
               handle_, CUBLAS_OP_N, CUBLAS_OP_N, degree, rows, cols, &one, b,
-              CUDA_R_8I, degree, a, CUDA_R_8I, cols, &one, c, CUDA_R_32I,
+              CUDA_R_8I, degree, a, CUDA_R_8I, cols, &zero, c, CUDA_R_32I,
               degree, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
           AssertTrue(st == CUBLAS_STATUS_SUCCESS, "PcmmBlas: GemmEx failed");
         }
       }
 
       // 2^(7t) mod p for each shift group.
+      // 2^(7*(k+l)) mod p, laid out to match the (l * pieces + k) buffer order.
       HostVector<word> h_shift(num_groups);
       {
-        uint64_t acc = 1;
         const uint64_t p = primes[j];
-        for (int t = 0; t < num_groups; t++) {
-          h_shift[t] = static_cast<word>(acc);
-          for (int s = 0; s < kPieceBits; s++) acc = (acc * 2) % p;
+        std::vector<uint64_t> pow(2 * pieces - 1);
+        uint64_t acc = 1;
+        for (int s = 0; s < 2 * pieces - 1; s++) {
+          pow[s] = acc;
+          for (int b2 = 0; b2 < kPieceBits; b2++) acc = (acc * 2) % p;
+        }
+        for (int l = 0; l < pieces; l++) {
+          for (int k = 0; k < pieces; k++) {
+            h_shift[l * pieces + k] = static_cast<word>(pow[k + l]);
+          }
         }
       }
       DeviceVector<word> d_shift(num_groups);
