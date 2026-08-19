@@ -78,9 +78,18 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   auto coeffs = ChebyshevInterpolate(
       [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
 
-  const double scale = context_->param_.GetScale(input_level_);
-  inv_sqrt_ = std::make_unique<EvalPoly<word>>(coeffs, input_level_ - 1, scale,
-                                               scale, /*chebyshev=*/true);
+  // The multiplicative half of the affine map is applied by *reinterpreting the
+  // scale*, not by a constant multiplication. A ciphertext holding round(S*D)
+  // and declared to be at scale D/k decodes as k*S -- no kernel, no level, and
+  // no loss. Cheddar's Mult(Ct, Const) does not rescale either, so taking that
+  // route would have left the scale at D^2 and forced a Rescale to recover, at
+  // the cost of the level this avoids.
+  affine_scale_ = 0.5 * (kWindowHi - kWindowLo);
+  const double k = layer_constant_ / (num_channels_ * affine_scale_);
+  const double poly_scale = context_->param_.GetScale(input_level_ - 1) / k;
+  inv_sqrt_ = std::make_unique<EvalPoly<word>>(
+      coeffs, input_level_ - 1, poly_scale,
+      context_->param_.GetScale(input_level_ - 1), /*chebyshev=*/true);
   inv_sqrt_->Compile(context_);
 }
 
@@ -131,17 +140,19 @@ void RmsNormHandler<word>::Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
   //    [SYLPH] fuses scalings like this into the operation that produced x;
   //    kept explicit here so the caller can see -- and move -- the level it
   //    costs.
-  const double a = 0.5 * (kWindowHi - kWindowLo);
+  const double a = affine_scale_;
   const double b = 0.5 * (kWindowHi + kWindowLo);
+  const double k = layer_constant_ / (num_channels_ * a);
   const int acc_level = context_->param_.NPToLevel(acc.GetNP());
-  Constant<word> k_const, shift_const;
-  context_->encoder_.EncodeConstant(
-      k_const, acc_level, context_->param_.GetScale(acc_level),
-      layer_constant_ / (num_channels_ * a));
-  context_->Mult(acc, acc, k_const);
-  const int v_level = context_->param_.NPToLevel(acc.GetNP());
-  context_->encoder_.EncodeConstant(shift_const, v_level,
-                                    context_->param_.GetScale(v_level),
+
+  // Multiplicative half: pure scale bookkeeping, so it costs nothing.
+  acc.SetScale(acc.GetScale() / k);
+
+  // Additive half, at whatever scale the reinterpretation just produced.
+  // Constant addition is level-free, which is why the epsilon rides along at
+  // no cost.
+  Constant<word> shift_const;
+  context_->encoder_.EncodeConstant(shift_const, acc_level, acc.GetScale(),
                                     (layer_constant_ * eps_ - b) / a);
   context_->Add(acc, acc, shift_const);
 

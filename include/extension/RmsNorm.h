@@ -52,6 +52,13 @@ namespace cheddar {
  * Doing.md section 2 for a hand-scheduled version that fuses the weight
  * multiplication into a neighbour.
  *
+ * The affine map onto the polynomial's domain is *not* among those levels. Its
+ * multiplicative half is applied by reinterpreting the ciphertext's scale,
+ * which is free, and its additive half is a constant addition, which is also
+ * free. Doing it the obvious way would have cost a level, and in Cheddar a
+ * further one: Mult(Ct, Const) does not rescale, so the scale would have been
+ * left at D^2 and needed a Rescale to recover.
+ *
  * ## Packing
  *
  * [SYLPH] table 4 puts the non-linear operators at ring degree 65536 in slot
@@ -81,6 +88,7 @@ class RmsNormHandler {
   int num_ct_;
   double layer_constant_;
   double eps_;
+  double affine_scale_ = 0.0;
   int input_level_;
   std::vector<int> rotation_distances_;
   std::unique_ptr<EvalPoly<word>> inv_sqrt_;
