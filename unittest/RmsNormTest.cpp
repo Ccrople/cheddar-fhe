@@ -208,6 +208,78 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   EXPECT_LT(rel, std::pow(2.0, -12)) << "below Sylph's 12-bit precision target";
 }
 
+// Isolate the reduction. The full test showed the recovered inverse square
+// root wrong by 0.4% to 23% with no dependence on the argument -- t80 sits mid
+// interval and is the worst, t88 sits near the edge and is nearly right -- so
+// the polynomial cannot be what is wrong. Either the square or the
+// rotate-and-add is not producing sum_c x[t][c]^2.
+//
+// This checks exactly that quantity and nothing else.
+TEST_P(Testbed32, RmsNormReductionIsExact) {
+  const std::string dir = DataDir();
+  if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
+
+  std::vector<double> x;
+  ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
+
+  const int level = default_encryption_level_;
+  const int slots = param_->degree_ / 2;
+  const int channels_per_ct = slots / kTokens;
+  const int num_ct = kChannels / channels_per_ct;
+
+  std::vector<int> dists;
+  for (int d = kTokens; d < slots; d *= 2) dists.push_back(d);
+  for (int d : dists) interface_->PrepareRotationKey(d, level);
+
+  std::vector<Ciphertext<word>> cts(num_ct);
+  for (int i = 0; i < num_ct; i++) {
+    std::vector<Complex> msg(slots);
+    for (int s = 0; s < slots; s++) {
+      const int c = i * channels_per_ct + s / kTokens;
+      const int tk = kFirstToken + (s % kTokens);
+      msg[s] = Complex(x[static_cast<size_t>(tk) * kChannels + c], 0.0);
+    }
+    EncodeAndEncrypt(cts[i], msg, level);
+  }
+
+  const auto &mult_key = interface_->GetMultiplicationKey();
+  Ciphertext<word> acc, sq, rotated;
+  for (int i = 0; i < num_ct; i++) {
+    context_->HMult(sq, cts[i], cts[i], mult_key);
+    if (i == 0) {
+      context_->Copy(acc, sq);
+    } else {
+      context_->Add(acc, acc, sq);
+    }
+  }
+  for (int d : dists) {
+    context_->HRotAdd(rotated, acc, acc, interface_->GetRotationKey(d), d);
+    context_->Copy(acc, rotated);
+  }
+
+  std::vector<Complex> got;
+  DecryptAndDecode(got, acc);
+
+  double worst = 0.0;
+  int worst_t = -1;
+  for (int tk = 0; tk < kTokens; tk++) {
+    double want = 0.0;
+    for (int c = 0; c < kChannels; c++) {
+      const double v = x[static_cast<size_t>(kFirstToken + tk) * kChannels + c];
+      want += v * v;
+    }
+    const double rel = std::abs(got[tk].real() - want) / want;
+    if (rel > worst) { worst = rel; worst_t = tk; }
+    if (tk % 16 == 0) {
+      std::cout << "  t" << (kFirstToken + tk) << "  got " << got[tk].real()
+                << "  want " << want << "  rel " << rel << std::endl;
+    }
+  }
+  std::cout << "reduction worst relative error " << worst << " at token "
+            << (kFirstToken + worst_t) << std::endl;
+  EXPECT_LT(worst, 1e-6);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32, testing::Values("bootparam_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
