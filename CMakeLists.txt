@@ -59,6 +59,7 @@ set(CKKS_GPU_SOURCES
   src/core/Cmt.cu
   src/core/Parameter.cu
   src/core/Pcmm.cu
+  src/core/PcmmBlas.cu
   src/core/RingSwitch.cu
   src/UserInterface.cu
 )

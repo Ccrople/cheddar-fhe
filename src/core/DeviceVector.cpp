@@ -141,6 +141,9 @@ template class DvConstView<uint32_t *>;
 template class DvConstView<uint64_t *>;
 template class DvConstView<const uint32_t *>;
 template class DvConstView<const uint64_t *>;
+// int8_t carries the split plaintext matrices for the cuBLAS PCMM path, which
+// feeds int8 tensor cores; the other widths predate it.
+template class DeviceVector<int8_t>;
 template class DeviceVector<int32_t>;
 template class DeviceVector<int64_t>;
 template class DeviceVector<uint32_t>;
