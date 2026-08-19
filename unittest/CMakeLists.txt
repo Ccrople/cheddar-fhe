@@ -151,6 +151,11 @@ if (ENABLE_EXTENSION)
   add_executable(boot_level_test BootLevelTest.cpp)
   target_link_libraries(boot_level_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Llama RoPE, [SYLPH] section 3.2. The real-weight case needs LLAMA3_REAL_DIR.
+  add_executable(rope_test RoPeTest.cpp)
+  target_link_libraries(rope_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
