@@ -124,8 +124,18 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
             << alpha_scaled << std::endl;
 
   const int level = default_encryption_level_;
+  // The window is not Sylph's 30x here. Sylph sizes it to what its calibrated
+  // data spans across layers; ours is measured at 4.18x on this segment, and
+  // the degree needed falls sharply with the window -- 23 at 30x, 9 at 6x, 7 at
+  // 4.18x -- while every two degrees is a level. Degree 7 clears 12 bits only
+  // up to 4.18x and drops to 11.9 bits at 5x, so depth 7 is reachable with no
+  // margin at all; degree 9 keeps 12 bits out to 6x for one more level.
+  const double kWindowRatio = 6.0;
+  const int kDegree = 9;
   RmsNormHandler<word> rms(context_, kTokens, kChannels, alpha_scaled, level,
-                           eps_scaled);
+                           eps_scaled, kWindowRatio, kDegree);
+  std::cout << "window " << kWindowRatio << "x, Chebyshev degree " << kDegree
+            << std::endl;
   const int num_ct = rms.GetNumCiphertexts();
   std::cout << "T=" << kTokens << " H=" << kChannels << " -> " << num_ct
             << " ciphertexts, " << rms.GetRotationDistances().size()
@@ -247,9 +257,13 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
 // mismatch there would look exactly like a broken circuit from the outside.
 // This settles it without touching a ciphertext.
 TEST_P(Testbed32, RmsNormPolynomialIsCorrectInTheClear) {
+  const double kWindowRatio = 6.0;
+  const int kDegree = 9;
   RmsNormHandler<word> rms(context_, kTokens, kChannels, 1.0,
-                           default_encryption_level_, kEps);
-  const double lo = 1.0 / std::sqrt(30.0), hi = std::sqrt(30.0);
+                           default_encryption_level_, kEps, kWindowRatio,
+                           kDegree);
+  const double lo = 1.0 / std::sqrt(kWindowRatio),
+               hi = std::sqrt(kWindowRatio);
   double worst = 0.0;
   double worst_u = 0.0;
   for (int i = 0; i <= 40; i++) {
@@ -264,7 +278,7 @@ TEST_P(Testbed32, RmsNormPolynomialIsCorrectInTheClear) {
     }
   }
   std::cout << "polynomial worst relative error " << worst << " at u "
-            << worst_u << " (the fit alone should be 13.8 bits = 7e-5)"
+            << worst_u << " (degree 9 on a 6x window should be 13.4 bits)"
             << std::endl;
   EXPECT_LT(worst, 1e-4);
 }

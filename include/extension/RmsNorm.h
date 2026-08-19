@@ -88,6 +88,8 @@ class RmsNormHandler {
   int num_ct_;
   double layer_constant_;
   double eps_;
+  double window_lo_ = 0.0;
+  double window_hi_ = 0.0;
   double affine_scale_ = 0.0;
   int input_level_;
   std::vector<int> rotation_distances_;
@@ -108,12 +110,21 @@ class RmsNormHandler {
    * measured mean square is around 5e-4 against an eps of 1e-5, a two percent
    * effect on the norm. It costs nothing, because alpha_L * eps folds into the
    * additive half of the affine map and constant addition is level-free.
-   * @param degree Chebyshev degree for the inverse square root; 23 reaches the
-   * 12-bit target on this window
+   * @param window_ratio the width of the approximation window, as the ratio
+   * between its ends. [SYLPH] uses 30, which is what its calibrated data spans
+   * across layers; a caller whose measured spread is narrower should say so,
+   * because the degree needed falls quickly with it and every two degrees is a
+   * level. Measured on this bundle's user tokens the spread is 4.18.
+   * @param degree Chebyshev degree for the inverse square root. Measured
+   * against a 12-bit target: ratio 30 needs 23 (5 levels), ratio 6 needs 9
+   * (4 levels), ratio 4.18 needs 7 (3 levels). Degree 7 clears 12 bits only up
+   * to ratio 4.18 and falls to 11.9 bits at 5, so depth 7 is reachable but has
+   * no margin.
    */
   RmsNormHandler(ConstContextPtr<word> context, int num_tokens,
                  int num_channels, double layer_constant, int input_level,
-                 double eps = 1e-5, int degree = 23);
+                 double eps = 1e-5, double window_ratio = 30.0,
+                 int degree = 23);
 
   // disable copying (or moving also)
   RmsNormHandler(const RmsNormHandler &) = delete;

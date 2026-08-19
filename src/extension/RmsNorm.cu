@@ -32,18 +32,14 @@ std::vector<double> ChebyshevInterpolate(F f, int n) {
   return c;
 }
 
-// [SYLPH]'s window for the inverse square root, from the companion Llama-2
-// paper's table 4: the range of alpha_L * mean(x^2) after the layer constant.
-constexpr double kWindowLo = 0.18257418583505536;  // 1 / sqrt(30)
-constexpr double kWindowHi = 5.477225575051661;    // sqrt(30)
-
 }  // namespace
 
 template <typename word>
 RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
                                      int num_tokens, int num_channels,
                                      double layer_constant, int input_level,
-                                     double eps, int degree)
+                                     double eps, double window_ratio,
+                                     int degree)
     : context_{std::move(context)},
       num_tokens_{num_tokens},
       num_channels_{num_channels},
@@ -55,6 +51,9 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   AssertTrue(num_channels_ > 0 && IsPowOfTwo(num_channels_),
              "RmsNorm: num_channels must be a power of two");
   AssertTrue(layer_constant_ > 0.0, "RmsNorm: layer constant must be positive");
+  AssertTrue(window_ratio > 1.0, "RmsNorm: window ratio must exceed one");
+  window_lo_ = 1.0 / std::sqrt(window_ratio);
+  window_hi_ = std::sqrt(window_ratio);
 
   num_slots_ = context_->param_.degree_ / 2;
   AssertTrue(num_slots_ % num_tokens_ == 0,
@@ -73,8 +72,8 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
 
   // The polynomial lives on [-1, 1], so the argument is mapped there first:
   // v = (u - b) / a with a, b the half-width and centre of the window.
-  const double a = 0.5 * (kWindowHi - kWindowLo);
-  const double b = 0.5 * (kWindowHi + kWindowLo);
+  const double a = 0.5 * (window_hi_ - window_lo_);
+  const double b = 0.5 * (window_hi_ + window_lo_);
   auto coeffs = ChebyshevInterpolate(
       [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
 
@@ -84,7 +83,7 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   // no loss. Cheddar's Mult(Ct, Const) does not rescale either, so taking that
   // route would have left the scale at D^2 and forced a Rescale to recover, at
   // the cost of the level this avoids.
-  affine_scale_ = 0.5 * (kWindowHi - kWindowLo);
+  affine_scale_ = 0.5 * (window_hi_ - window_lo_);
   // The polynomial is compiled at the canonical scale of its own level. An
   // earlier version applied the affine map by reinterpreting the scale, which
   // is free and arithmetically sound, but left EvalPoly with a non-canonical
@@ -101,7 +100,7 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
 template <typename word>
 double RmsNormHandler<word>::PlainInvSqrt(double u) const {
   const double a = affine_scale_;
-  const double b = 0.5 * (kWindowHi + kWindowLo);
+  const double b = 0.5 * (window_hi_ + window_lo_);
   return inv_sqrt_->PlainEvaluate((u - b) / a);
 }
 
@@ -154,7 +153,7 @@ void RmsNormHandler<word>::Apply(
   //    kept explicit here so the caller can see -- and move -- the level it
   //    costs.
   const double a = affine_scale_;
-  const double b = 0.5 * (kWindowHi + kWindowLo);
+  const double b = 0.5 * (window_hi_ + window_lo_);
   const double k = layer_constant_ / (num_channels_ * a);
   const int acc_level = context_->param_.NPToLevel(acc.GetNP());
 
