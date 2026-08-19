@@ -38,13 +38,31 @@ namespace cheddar {
  * interval with margin. The Llama-2 companion's table 4 lists +-16 and +-24 as
  * the layer-wise and dimension-wise choices across the whole model.
  *
+ * ## The scaling factor has to be at least 2^35
+ *
+ * Measured on bootparam_30/35/40, the error this circuit adds on top of its own
+ * polynomial is a fixed integer magnitude divided by the scaling factor, so it
+ * falls by very nearly five bits for every five bits of scale:
+ *
+ *     scale   circuit vs its own polynomial   end to end vs true SiLU
+ *     2^30    2.74e-03   12.10 bits           11.79 bits   under the bar
+ *     2^35    1.01e-04   16.86 bits           13.47 bits   fit limited
+ *     2^40    2.89e-06   21.99 bits           13.54 bits   fit limited
+ *
+ * At 2^30 it is the circuit and not the approximation that misses [SYLPH]'s
+ * 12-bit bar, so raising the degree cannot recover it -- the fit is already
+ * 13.54 bits there. From 2^35 the circuit stops mattering and the fit alone
+ * sets the accuracy, which is why 2^40 gains nothing while costing three levels
+ * (max level 19 against 16). **2^35 is the preset this operator wants.**
+ *
  * ## What this bundle cannot tell us
  *
  * The true input is RMSNorm_ffn(h) @ W_gate with h the post-attention hidden
  * state, which the layer-2 bundle does not contain. Substituting the layer
  * input gives |gate| ~ 0.67 with a dimension-wise spread of only 1.7x -- far
  * milder than [SYLPH]'s 10.82, because those numbers are maxima over all 32
- * layers and layer 2 is early. So the interval has to come from per-layer
+ * layers and layer 2 is early. Measured in the test on 64 tokens x 512 dims,
+ * |g| reaches 1.23 with an rms of 0.16. So the interval has to come from per-layer
  * calibration; nothing here can supply it, and a caller that guesses low will
  * be wrong without any diagnostic.
  *
