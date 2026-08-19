@@ -90,6 +90,75 @@ TEST_P(Testbed32, PcmmBlasMatchesTheHandKernel) {
 
   EXPECT_NEAR(got[0].GetScale() / want[0].GetScale(), 1.0, 1e-12);
 }
+
+// Equality established above, so the timing means something. Same shape as
+// PcmmProfileTest's, so the two numbers are directly comparable.
+TEST_P(Testbed32, PcmmBlasIsFasterThanTheHandKernel) {
+  constexpr int kTokens = 128;
+  constexpr int kCols = 4096;
+  constexpr int kRows = 128;
+  constexpr double kWeightScale = 1073741824.0;
+  constexpr int kWarm = 2, kReps = 5;
+
+  const int degree = param_->degree_;
+  const int level = default_encryption_level_;
+  const double ct_scale = DetermineScale(level);
+
+  PcmmHandler<word> pcmm(*param_);
+  PcmmBlasHandler<word> blas(*param_);
+
+  std::vector<Ciphertext<word>> cts(kCols);
+  {
+    std::vector<double> coeffs(degree, 0.0);
+    Plaintext<word> pt;
+    for (int c = 0; c < kCols; c++) {
+      for (int t = 0; t < kTokens; t++) coeffs[t] = 0.01 * ((c + t) % 97);
+      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+      interface_->Encrypt(cts[c], pt);
+    }
+  }
+  std::vector<double> values(static_cast<size_t>(kRows) * kCols);
+  for (size_t i = 0; i < values.size(); i++) {
+    values[i] = 0.001 * static_cast<double>((i * 7919) % 211);
+  }
+
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, kWeightScale, values, kRows, kCols);
+  typename PcmmBlasHandler<word>::SplitMatrix us;
+  blas.SplitMatrixFrom(us, level, kWeightScale, values, kRows, kCols);
+
+  auto time_ms = [&](auto &&f) {
+    for (int i = 0; i < kWarm; i++) f();
+    cudaDeviceSynchronize();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kReps; i++) f();
+    cudaDeviceSynchronize();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count() / kReps;
+  };
+
+  std::vector<Ciphertext<word>> r1, r2;
+  const double hand = time_ms([&] { pcmm.Multiply(r1, u, cts); });
+  const double gemm = time_ms([&] { blas.Multiply(r2, us, cts); });
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << kRows << "x" << kCols << " by " << kTokens << " tokens:"
+            << std::endl;
+  std::cout << "  PcmmAccum (hand kernel) " << hand << " ms" << std::endl;
+  std::cout << "  cuBLAS int8             " << gemm << " ms   "
+            << (hand / gemm) << "x" << std::endl;
+  std::cout << "scaled to the projections, against [SYLPH] table 6 on 1 GPU:"
+            << std::endl;
+  const struct { const char *n; int out; int sylph; } proj[] = {
+      {"QKV  4096->6144", 6144, 326},
+      {"O    4096->4096", 4096, 315},
+      {"gate/up 4096->28672", 28672, 1040}};
+  for (const auto &p : proj) {
+    std::cout << "  " << p.n << "  " << gemm * p.out / kRows << " ms  ([SYLPH] "
+              << p.sylph << ")" << std::endl;
+  }
+}
 #endif
 
 INSTANTIATE_TEST_SUITE_P(
