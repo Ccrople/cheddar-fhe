@@ -93,6 +93,16 @@ class RmsNormHandler {
   double affine_scale_ = 0.0;
   int input_level_;
   std::vector<int> rotation_distances_;
+
+  // One full-width Encode per input ciphertext, every call, was most of
+  // RMSNorm's measured 288 ms for eight ciphertexts. The weights are fixed for
+  // a layer and the level the polynomial leaves is deterministic, so the
+  // plaintexts are cached and rebuilt only when the weights or that level
+  // actually change -- which keeps Apply's signature and stays correct if a
+  // caller does change them.
+  mutable std::vector<std::vector<Complex>> cached_weight_;
+  mutable std::vector<Pt> weight_pt_;
+  mutable int cached_weight_level_ = -1;
   std::unique_ptr<EvalPoly<word>> inv_sqrt_;
 
  public:

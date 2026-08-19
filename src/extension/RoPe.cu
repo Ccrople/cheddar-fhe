@@ -96,13 +96,22 @@ void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
                               const EvkMap<word> &evk_map) const {
   const int level = context_->param_.NPToLevel(x.GetNP());
   const double scale = context_->param_.GetScale(level);
-  auto t =
-      BuildTables(num_slots_, num_tokens_, head_dim_, first_position, theta_);
 
-  Pt cos_pt, lower_pt, upper_pt;
-  context_->encoder_.Encode(cos_pt, level, scale, t.cos_t);
-  context_->encoder_.Encode(lower_pt, level, scale, t.lower);
-  context_->encoder_.Encode(upper_pt, level, scale, t.upper);
+  // Build the plaintexts only when (first_position, level) has moved. A
+  // Plaintext is fixed by its values, its level and its scale together -- the
+  // same table at a different level is a different object with a different
+  // prime count, and reusing one across levels fails inside the multiply with
+  // "Number of primes differ".
+  if (first_position != cached_position_ || level != cached_level_) {
+    auto t =
+        BuildTables(num_slots_, num_tokens_, head_dim_, first_position, theta_);
+    context_->encoder_.Encode(cos_pt_, level, scale, t.cos_t);
+    context_->encoder_.Encode(lower_pt_, level, scale, t.lower);
+    context_->encoder_.Encode(upper_pt_, level, scale, t.upper);
+    cached_position_ = first_position;
+    cached_level_ = level;
+  }
+  const Pt &cos_pt = cos_pt_, &lower_pt = lower_pt_, &upper_pt = upper_pt_;
 
   // Both rotations read the input, so they run at the input level and neither
   // depends on the other.

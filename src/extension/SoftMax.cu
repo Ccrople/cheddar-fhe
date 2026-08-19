@@ -187,11 +187,14 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
   //    output. Causality is public, hence a plaintext.
   {
     const int level = context_->param_.NPToLevel(y.GetNP());
-    Pt mask_pt;
-    context_->encoder_.Encode(mask_pt, level, context_->param_.GetScale(level),
-                              causal_mask);
+    if (level != cached_mask_level_ || causal_mask != cached_mask_) {
+      context_->encoder_.Encode(mask_pt_, level,
+                                context_->param_.GetScale(level), causal_mask);
+      cached_mask_ = causal_mask;
+      cached_mask_level_ = level;
+    }
     Ct masked;
-    context_->Mult(masked, y, mask_pt);
+    context_->Mult(masked, y, mask_pt_);
     context_->Rescale(y, masked);
   }
 

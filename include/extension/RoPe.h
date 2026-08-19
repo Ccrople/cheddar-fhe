@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <vector>
 
 #include "core/Container.h"
@@ -73,6 +74,18 @@ class RoPeHandler {
   int num_slots_;
   int up_, down_;  // rotation distances for the two halves
   std::vector<int> rotation_distances_;
+
+  // The three plaintexts depend only on (first_position, level), so they are
+  // built once and reused. Encoder::Encode runs SpecialIFFT over every slot and
+  // then num_primes * degree BigInt reductions, single-threaded on the host,
+  // before anything reaches the GPU -- three of those per call was the whole of
+  // RoPE's measured 171 ms against SiLU's 7.8 ms for a much heavier circuit.
+  // Prefill holds first_position fixed across a segment, so the cache hits
+  // every time after the first; decode moves it per token, so it is a memo
+  // rather than a constructor argument.
+  mutable int cached_position_ = INT_MIN;
+  mutable int cached_level_ = -1;
+  mutable Pt cos_pt_, lower_pt_, upper_pt_;
 
  public:
   /**

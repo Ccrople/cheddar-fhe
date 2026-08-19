@@ -170,8 +170,17 @@ void RmsNormHandler<word>::Apply(
   res.clear();
   res.resize(num_ct_);
   const int r_level = context_->param_.NPToLevel(r.GetNP());
+  // The weight plaintexts sit at the level the multiply below leaves, which is
+  // one under r's. Rebuild them only when that level or the weights move.
+  const bool reuse = (cached_weight_level_ == r_level - 1) &&
+                     (cached_weight_ == weight);
+  if (!reuse) {
+    weight_pt_.clear();
+    weight_pt_.resize(num_ct_);
+    cached_weight_ = weight;
+    cached_weight_level_ = r_level - 1;
+  }
   Ct levelled;
-  Pt w_pt;
   for (int i = 0; i < num_ct_; i++) {
     context_->LevelDown(levelled, x[i], r_level);
     context_->HMult(res[i], levelled, r, mult_key);
@@ -181,9 +190,13 @@ void RmsNormHandler<word>::Apply(
     // internal detail of the circuit part of its interface, and getting it
     // wrong surfaces as "Number of primes differ" from inside the multiply.
     const int y_level = context_->param_.NPToLevel(res[i].GetNP());
-    context_->encoder_.Encode(w_pt, y_level,
-                              context_->param_.GetScale(y_level), weight[i]);
-    context_->Mult(res[i], res[i], w_pt);
+    if (!reuse) {
+      AssertTrue(y_level == cached_weight_level_,
+                 "RmsNorm: the weight level moved between ciphertexts");
+      context_->encoder_.Encode(weight_pt_[i], y_level,
+                                context_->param_.GetScale(y_level), weight[i]);
+    }
+    context_->Mult(res[i], res[i], weight_pt_[i]);
   }
 }
 

@@ -111,6 +111,16 @@ class SoftMaxHandler {
   std::vector<std::unique_ptr<EvalPoly<word>>> inv_sqrt_;
   std::vector<int> rotation_distances_;
 
+  // The causal mask is a full-width plaintext, and Encoder::Encode costs tens
+  // of milliseconds on the host -- SpecialIFFT over every slot, then
+  // num_primes * degree BigInt reductions, single-threaded, before anything
+  // reaches the GPU. Caching it keyed on the mask's own values keeps Apply's
+  // signature honest: a caller that changes the mask gets a new plaintext, and
+  // comparing 32768 values costs about 0.03 ms against a 35 ms encode.
+  mutable std::vector<Complex> cached_mask_;
+  mutable int cached_mask_level_ = -1;
+  mutable Pt mask_pt_;
+
   std::unique_ptr<EvalPoly<word>> MakeInvSqrt(double lo, double hi, int degree,
                                               int level);
 
