@@ -456,7 +456,12 @@ void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
              "does not run");
 
   res.SetNumSlots(input_num_slots);
-  res.SetScale(this->param_.GetScale(boot_param_.GetStCStartLevel()));
+  // The honest scale: EvaluateMod asserts its own end_scale_, and skipping StC
+  // means none of StC's constant has been applied. Declaring
+  // GetScale(GetStCStartLevel()) here -- as if StC had run -- put the values
+  // out by ~2.6e5. What the remaining constant is gets measured rather than
+  // derived through cts_const_, stc_const_ and q0.
+  res.SetScale(eval_mod_->end_scale_);
 }
 
 template <typename word>

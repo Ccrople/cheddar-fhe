@@ -68,10 +68,29 @@ TEST_P(Testbed32, HalfBootTurnsCoefficientsIntoSlots) {
   DecryptAndDecode(got, res);
   ASSERT_EQ(static_cast<int>(got.size()), num_slots);
 
+  // Identify the constant StC would have applied, instead of deriving it
+  // through cts_const_, stc_const_ and q0. If the structure is right the ratio
+  // is one number for every slot, and its spread says so.
+  double rlo = 1e300, rhi = -1e300, rsum = 0.0;
+  int counted = 0;
+  for (int i = 0; i < num_slots; i++) {
+    if (std::abs(coeffs[i]) < 0.05) continue;  // ratios of near-zeros are noise
+    const double r = got[i].real() / coeffs[i];
+    rlo = std::min(rlo, r);
+    rhi = std::max(rhi, r);
+    rsum += r;
+    counted++;
+  }
+  const double ratio = rsum / counted;
+  std::cout << "slot/coefficient ratio over " << counted << " slots: mean "
+            << ratio << ", spread [" << rlo << ", " << rhi << "]" << std::endl;
+  EXPECT_LT((rhi - rlo) / std::abs(ratio), 1e-2)
+      << "the ratio is not a constant, so this is not a missing scale factor";
+
   double worst = 0.0, absmax = 0.0, worst_imag = 0.0;
   for (int i = 0; i < num_slots; i++) {
-    worst = std::max(worst, std::abs(got[i].real() - coeffs[i]));
-    worst_imag = std::max(worst_imag, std::abs(got[i].imag()));
+    worst = std::max(worst, std::abs(got[i].real() / ratio - coeffs[i]));
+    worst_imag = std::max(worst_imag, std::abs(got[i].imag() / ratio));
     absmax = std::max(absmax, std::abs(coeffs[i]));
   }
   std::cout << "coefficient i -> slot i: max abs err " << worst << " ("
