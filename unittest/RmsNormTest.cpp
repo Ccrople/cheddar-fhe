@@ -168,6 +168,36 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
       sum_abs += d;
     }
   }
+  // Separate the polynomial from the application. Since
+  //     y[t][c] = x[t][c] * r[t] * sqrt(alpha) * w[c],
+  // any channel with a non-tiny x recovers r[t]*sqrt(alpha), and comparing that
+  // to the true 1/sqrt(mean + eps) says whether the inverse square root or the
+  // surrounding circuit is at fault.
+  {
+    std::vector<Complex> got0;
+    DecryptAndDecode(got0, res[0]);
+    std::cout << "  token   recovered r      true r        rel" << std::endl;
+    for (int t = 0; t < kTokens; t += 8) {
+      // pick the channel in ciphertext 0 with the largest |x| for this token
+      int best_c = 0;
+      double best = 0.0;
+      for (int cc = 0; cc < channels_per_ct; cc++) {
+        const double v =
+            std::abs(x[static_cast<size_t>(kFirstToken + t) * kChannels + cc]);
+        if (v > best) { best = v; best_c = cc; }
+      }
+      const int s = best_c * kTokens + t;
+      const double xv =
+          x[static_cast<size_t>(kFirstToken + t) * kChannels + best_c];
+      const double recovered = got0[s].real() / (xv * w[best_c]);
+      const double truth =
+          1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
+      printf("  %5d  %12.5f  %12.5f  %9.2e
+", t, recovered, truth,
+             std::abs(recovered - truth) / truth);
+    }
+  }
+
   const double rel = max_abs / want_absmax;
   std::cout << "RMSNorm: |y| max " << want_absmax << ", max abs err " << max_abs
             << ", mean " << (sum_abs / (1.0 * kTokens * kChannels))
