@@ -85,11 +85,16 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   // route would have left the scale at D^2 and forced a Rescale to recover, at
   // the cost of the level this avoids.
   affine_scale_ = 0.5 * (kWindowHi - kWindowLo);
-  const double k = layer_constant_ / (num_channels_ * affine_scale_);
-  const double poly_scale = context_->param_.GetScale(input_level_ - 1) / k;
+  // The polynomial is compiled at the canonical scale of its own level. An
+  // earlier version applied the affine map by reinterpreting the scale, which
+  // is free and arithmetically sound, but left EvalPoly with a non-canonical
+  // input scale; the encrypted error then grew monotonically with the
+  // argument while the same coefficients were exact in the clear. The
+  // multiply-and-rescale below costs a level and keeps every scale canonical.
+  const int poly_level = input_level_ - 2;
+  const double poly_scale = context_->param_.GetScale(poly_level);
   inv_sqrt_ = std::make_unique<EvalPoly<word>>(
-      coeffs, input_level_ - 1, poly_scale,
-      context_->param_.GetScale(input_level_ - 1), /*chebyshev=*/true);
+      coeffs, poly_level, poly_scale, poly_scale, /*chebyshev=*/true);
   inv_sqrt_->Compile(context_);
 }
 
@@ -153,14 +158,21 @@ void RmsNormHandler<word>::Apply(
   const double k = layer_constant_ / (num_channels_ * a);
   const int acc_level = context_->param_.NPToLevel(acc.GetNP());
 
-  // Multiplicative half: pure scale bookkeeping, so it costs nothing.
-  acc.SetScale(acc.GetScale() / k);
+  // Multiplicative half. Mult(Ct, Const) does not rescale in Cheddar, so the
+  // scale has to be brought back explicitly; that is the level this costs.
+  Constant<word> k_const;
+  context_->encoder_.EncodeConstant(
+      k_const, acc_level, context_->param_.GetScale(acc_level), k);
+  Ct scaled;
+  context_->Mult(scaled, acc, k_const);
+  context_->Rescale(acc, scaled);
 
-  // Additive half, at whatever scale the reinterpretation just produced.
-  // Constant addition is level-free, which is why the epsilon rides along at
-  // no cost.
+  // Additive half. Constant addition is level-free, which is why the epsilon
+  // rides along at no cost.
+  const int v_level = context_->param_.NPToLevel(acc.GetNP());
   Constant<word> shift_const;
-  context_->encoder_.EncodeConstant(shift_const, acc_level, acc.GetScale(),
+  context_->encoder_.EncodeConstant(shift_const, v_level,
+                                    context_->param_.GetScale(v_level),
                                     (layer_constant_ * eps_ - b) / a);
   context_->Add(acc, acc, shift_const);
 
