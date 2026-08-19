@@ -3,10 +3,9 @@
 #include <cmath>
 
 #include "common/Assert.h"
-#include "common/BasicOps.cuh"
+#include "common/CommonUtils.h"
 #include "core/BigInt.h"
 #include "core/PcmmBlas.h"
-#include "core/PrimeUtils.h"
 
 namespace cheddar {
 
