@@ -54,6 +54,7 @@ set(CKKS_GPU_SOURCES
   src/core/Mlwe.cu
   src/core/SubringMatrix.cu
   src/core/SubringCtMatrix.cu
+  src/core/BatchCcmm.cu
   src/core/Cmt.cu
   src/core/Parameter.cu
   src/core/Pcmm.cu

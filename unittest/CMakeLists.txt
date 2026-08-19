@@ -60,6 +60,11 @@ add_executable(subring_ct_matrix_test SubringCtMatrixTest.cpp)
 target_link_libraries(subring_ct_matrix_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [KANG] Algorithm 4, the whole batch CC-MM. Degree 4096, its own binary.
+add_executable(batch_ccmm_test BatchCcmmTest.cpp)
+target_link_libraries(batch_ccmm_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test

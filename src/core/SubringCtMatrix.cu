@@ -42,18 +42,20 @@ __global__ void GatherVec(word *dst, const word *const *src_ptrs, int rows,
 template <typename word>
 __global__ void ScatterVec(word *const *dst_ptrs, const word *src, int rows,
                            int cols, int sub_degree, int vec_dim, int degree,
-                           int num_total_primes) {
+                           int num_total_primes, bool transpose) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   const int entry = blockIdx.y;
   const int limb = blockIdx.z;
 
   const int row = entry / cols;
   const int col = entry - row * cols;
+  const int ct_index = transpose ? row : col;
+  const int vec_index = transpose ? col : row;
 
   const word value = basic::StreamingLoad(
       src + (static_cast<size_t>(entry) * num_total_primes + limb) *
                 sub_degree + t);
-  dst_ptrs[col][limb * degree + row + t * vec_dim] = value;
+  dst_ptrs[ct_index][limb * degree + vec_index + t * vec_dim] = value;
 }
 
 // res[i][l][t] = sum_j ( lhs[i][j] * rhs[j][l] )[t], the product taken in
@@ -365,8 +367,8 @@ void SubringCtMatrixHandler<word>::MultiplyMatricesReference(
 template <typename word>
 void SubringCtMatrixHandler<word>::ToCiphertexts(
     std::vector<Ct> &res, const SubringCoeffMatrix<word> &b_mat,
-    const SubringCoeffMatrix<word> &a_mat, double scale,
-    int num_slots) const {
+    const SubringCoeffMatrix<word> &a_mat, double scale, int num_slots,
+    bool transpose) const {
   const int degree = param_.degree_;
   AssertTrue(b_mat.rows_ == a_mat.rows_ && b_mat.cols_ == a_mat.cols_ &&
                  b_mat.sub_degree_ == a_mat.sub_degree_ &&
@@ -379,20 +381,21 @@ void SubringCtMatrixHandler<word>::ToCiphertexts(
   const NPInfo np = b_mat.np_;
   const int num_total_primes = np.GetNumTotal();
   const int vec_dim = degree / sub_degree;
-  AssertTrue(rows == vec_dim,
-             "ToCiphertexts: the row count must be the Vec dimension");
+  const int num_cts = transpose ? rows : cols;
+  AssertTrue((transpose ? cols : rows) == vec_dim,
+             "ToCiphertexts: the Vec side must have the Vec dimension");
 
   const size_t entries = static_cast<size_t>(rows) * cols;
 
-  std::vector<DeviceVector<word>> b_coeffs(cols), a_coeffs(cols);
-  HostVector<word *> h_b(cols), h_a(cols);
-  for (int l = 0; l < cols; l++) {
+  std::vector<DeviceVector<word>> b_coeffs(num_cts), a_coeffs(num_cts);
+  HostVector<word *> h_b(num_cts), h_a(num_cts);
+  for (int l = 0; l < num_cts; l++) {
     b_coeffs[l].resize(num_total_primes * degree);
     a_coeffs[l].resize(num_total_primes * degree);
     h_b[l] = b_coeffs[l].data();
     h_a[l] = a_coeffs[l].data();
   }
-  DeviceVector<word *> d_b(cols), d_a(cols);
+  DeviceVector<word *> d_b(num_cts), d_a(num_cts);
   CopyHostToDevice(d_b, h_b);
   CopyHostToDevice(d_a, h_a);
 
@@ -401,13 +404,13 @@ void SubringCtMatrixHandler<word>::ToCiphertexts(
                   num_total_primes);
   kernel::ScatterVec<word><<<grid, block>>>(
       d_b.data(), b_mat.data_.data(), rows, cols, sub_degree, vec_dim, degree,
-      num_total_primes);
+      num_total_primes, transpose);
   kernel::ScatterVec<word><<<grid, block>>>(
       d_a.data(), a_mat.data_.data(), rows, cols, sub_degree, vec_dim, degree,
-      num_total_primes);
+      num_total_primes, transpose);
 
-  res.resize(cols);
-  for (int l = 0; l < cols; l++) {
+  res.resize(num_cts);
+  for (int l = 0; l < num_cts; l++) {
     res[l].RemoveRx();
     res[l].ModifyNP(np);
     res[l].SetScale(scale);

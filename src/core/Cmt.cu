@@ -2,6 +2,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "common/PrimeUtils.h"
 #include "core/Cmt.h"
 
 namespace cheddar {
@@ -267,10 +268,31 @@ void CmtHandler<word>::Cmt(ConstContextPtr<word> context,
   std::vector<Ct> transformed;
   Tweak(context, transformed, staged, sub_degree, 1);
 
-  // Adjust, second half: d^-1. The scale is host metadata, so this is a
-  // relabelling -- no kernel, no level, and exact.
+  // Adjust, second half: d^-1, as [KANG] Algorithm 3 line 5 writes it -- the
+  // inverse of d modulo each prime, which exists because d is a power of two
+  // and the primes are odd. That divides the message exactly, at scale 1, so
+  // it costs no level and leaves the scale where it was.
+  //
+  // Relabelling the scale instead would decode to the same value, but it
+  // leaves the recorded scale d times larger, and the batch CC-MM composes
+  // three of these before a single rescale.
+  Constant<word> inv_d;
+  {
+    const auto primes = param_.GetPrimeVector(np);
+    const int num_total_primes = np.GetNumTotal();
+    HostVector<word> host(num_total_primes);
+    for (int i = 0; i < num_total_primes; i++) {
+      host[i] = primeutil::ToMontgomery<word>(
+          primeutil::InvMod<word>(static_cast<word>(d), primes[i]), primes[i]);
+    }
+    inv_d.ModifyNP(np);
+    inv_d.SetScale(1.0);
+    CopyHostToDevice(inv_d.cx_, host);
+  }
+  Ct scaled;
   for (auto &ct : transformed) {
-    ct.SetScale(ct.GetScale() * d);
+    context->Mult(scaled, ct, inv_d);
+    ct = std::move(scaled);
   }
 
   std::vector<Ct> scrambled;

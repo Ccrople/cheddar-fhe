@@ -186,19 +186,24 @@ class SubringCtMatrixHandler {
                                  const SubringCoeffMatrix<word> &rhs) const;
 
   /**
-   * @brief The inverse of `ToMatrices` with `row_wise = false`: rebuild one
-   * ciphertext per column from a b-part and an a-part matrix.
+   * @brief The inverse of `ToMatrices`: rebuild one ciphertext per column
+   * from a b-part and an a-part matrix.
    *
    * @param res output ciphertexts, resized to the matrices' column count
    * @param b_mat the b-part matrix
    * @param a_mat the a-part matrix
+   * With `transpose = true` each **row** becomes a ciphertext instead, which
+   * is how a row-wise pair is handed to CMT: a row-wise encryption of M is a
+   * column-wise encryption of M transposed, and this flag is that reading.
+   *
    * @param scale the scale to record on the outputs
    * @param num_slots the slot count to record on the outputs
+   * @param transpose whether rows rather than columns become ciphertexts
    */
   void ToCiphertexts(std::vector<Ct> &res,
                      const SubringCoeffMatrix<word> &b_mat,
                      const SubringCoeffMatrix<word> &a_mat, double scale,
-                     int num_slots) const;
+                     int num_slots, bool transpose = false) const;
 };
 
 }  // namespace cheddar
