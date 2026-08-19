@@ -128,9 +128,14 @@ TEST_P(BootToDefault, LandsWhereItsBootParameterAsks) {
 TEST_P(BootToDefault, ALowerTargetNeedsItsOwnParameterSet) {
   // Documented as a checked property, not left as a crash for the next person
   // to rediscover. bootparam_30 lands at 19 and nowhere else.
-  const int stc_start = param_->default_encryption_level_;
-  EXPECT_EQ(stc_start + kBootStcLevels, param_->max_level_ - kBootCtsEvalMod)
+  // GetStCStartLevel() = max_level - (CtS + EvalMod) = 22 here, and
+  // BootContext.cpp:42 pins default_encryption_level to it. The bootstrap then
+  // lands StC's own levels lower, at 19.
+  EXPECT_EQ(param_->default_encryption_level_,
+            param_->max_level_ - kBootCtsEvalMod)
       << "the preset's default encryption level is pinned to the StC start";
+  EXPECT_EQ(param_->default_encryption_level_ - kBootStcLevels, 19)
+      << "which fixes the landing level at 19 for this preset";
 
   // The double-prime block sits exactly on CtS + EvalMod. If that ever stops
   // being true, a lower landing level may have become reachable in this preset
