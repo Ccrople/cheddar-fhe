@@ -54,6 +54,12 @@ add_executable(cmt_test CmtTest.cpp)
 target_link_libraries(cmt_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [KANG] Algorithm 4 step 2: the subring matrix product, transform path
+# checked against the direct convolution. Degree 4096, its own binary.
+add_executable(subring_ct_matrix_test SubringCtMatrixTest.cpp)
+target_link_libraries(subring_ct_matrix_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Bae et al. plaintext-ciphertext matrix product (RLWE format).
 add_executable(pcmm_test PcmmTest.cpp)
 target_link_libraries(pcmm_test
