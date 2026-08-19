@@ -105,7 +105,15 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
   std::cout << "T=" << kTokens << " H=" << kChannels << " -> " << num_ct
             << " ciphertexts, " << rms.GetRotationDistances().size()
             << " rotations" << std::endl;
-  for (int d : rms.GetRotationDistances()) interface_->PrepareRotationKey(d);
+  // The max_level argument is not optional in practice. PrepareRotationKey
+  // defaults it to -1, and GetNPForEvk reserves -1 for the dense-to-sparse
+  // short base -- two auxiliary primes, not the full range. A key built that
+  // way fails deep inside the rotation with "QSize mismatch", nowhere near the
+  // call that asked for it. PrepareModPackKeys remaps -1 for exactly this
+  // reason; PrepareRotationKey does not.
+  for (int d : rms.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, level);
+  }
 
   // Pack token-fastest, matching [SYLPH] section 3.2.
   const int slots = param_->degree_ / 2;
