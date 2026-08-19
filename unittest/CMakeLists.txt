@@ -146,6 +146,11 @@ if (ENABLE_EXTENSION)
   add_executable(softmax_test SoftMaxTest.cpp)
   target_link_libraries(softmax_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Level-targeted bootstrapping: one landing level per fixture.
+  add_executable(boot_level_test BootLevelTest.cpp)
+  target_link_libraries(boot_level_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

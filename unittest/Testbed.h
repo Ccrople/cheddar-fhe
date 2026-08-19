@@ -210,7 +210,7 @@ class Testbed : public testing::TestWithParam<const char *> {
       int num_stc_levels = json_data["num_stc_levels"];
       context_ = BootContext<word>::Create(
           *param_,
-          BootParameter(param_->max_level_, num_cts_levels, num_stc_levels));
+          BootParameter(BootMaxLevel(), num_cts_levels, num_stc_levels));
     } else {
       context_ = Context<word>::Create(*param_);
     }
@@ -219,6 +219,13 @@ class Testbed : public testing::TestWithParam<const char *> {
 #endif
     interface_ = std::make_unique<UserInterface<word>>(context_);
   }
+
+  // Level-targeted bootstrapping. A BootContext lands exactly where its
+  // BootParameter's max_level puts it -- GetEndLevel() is max_level minus
+  // CtS + EvalMod + StC -- so a test that wants a different landing level
+  // overrides this. Climbing less far also makes every limb operation in
+  // between shorter, which is the point.
+  virtual int BootMaxLevel() const { return param_->max_level_; }
 
   void TearDown() override {
     interface_.reset();

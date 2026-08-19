@@ -1638,11 +1638,15 @@ void ElementWiseHandler<word>::CPAccumWorker(
 }
 
 template <typename word>
-void ElementWiseHandler<word>::ModUpToMax(DvView<word> &dst,
-                                          const DvConstView<word> &src1) const {
-  // Warn("ModUpToMax kernel is not very optimal.");
+void ElementWiseHandler<word>::ModUpToLevel(DvView<word> &dst,
+                                           const DvConstView<word> &src1,
+                                           int target_level) const {
+  // Warn("ModUpToLevel kernel is not very optimal.");
   int num_aux = dst.AuxSize() / param_.degree_;
-  NPInfo max_np = param_.LevelToNP(param_.max_level_, num_aux);
+  if (target_level < 0) target_level = param_.max_level_;
+  AssertTrue(target_level > 0 && target_level <= param_.max_level_,
+             "ModUpToLevel: target level out of range");
+  NPInfo max_np = param_.LevelToNP(target_level, num_aux);
   NPInfo min_np = param_.LevelToNP(-1);
   std::vector<word> base_primes = param_.GetPrimeVector(min_np);
   auto dst_temp = std::vector<DvView<word>>{dst};
@@ -1660,7 +1664,7 @@ void ElementWiseHandler<word>::ModUpToMax(DvView<word> &dst,
     kernel::ModUpToMax1<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst.data(), primes, base_primes.at(0), src1.data());
   } else {
-    Fail("ModUpToMax: Invalid base primes size");
+    Fail("ModUpToLevel: Invalid base primes size");
   }
 }
 

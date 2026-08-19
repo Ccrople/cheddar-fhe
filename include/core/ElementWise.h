@@ -108,7 +108,20 @@ class ElementWiseHandler {
               const std::vector<DvConstView<word>> &const_srcs) const;
 
   // Special functions, only use it when you know what you are doing
-  void ModUpToMax(DvView<word> &dst, const DvConstView<word> &src1) const;
+  /**
+   * @brief Lift from the level-zero base to the basis of `target_level`.
+   *
+   * The kernel iterates over the primes of `dst`, so the target basis is not
+   * special -- it was only ever the parameter set's maximum because that is
+   * what a full bootstrap needs. Climbing no higher than the levels actually
+   * required makes every limb operation in CoeffToSlot, EvalMod and
+   * SlotToCoeff shorter.
+   *
+   * @param target_level the level to lift to; -1 means the parameter set's
+   * maximum, which is the previous behaviour
+   */
+  void ModUpToLevel(DvView<word> &dst, const DvConstView<word> &src1,
+                    int target_level = -1) const;
 
   void MultImaginaryUnit(std::vector<DvView<word>> &dst, const NPInfo &np,
                          const std::vector<DvConstView<word>> &src1,

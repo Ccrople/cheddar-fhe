@@ -184,14 +184,21 @@ void BootContext<word>::AddRequiredRotations(EvkRequest &req, int num_slots,
 }
 
 template <typename word>
-void BootContext<word>::ModUpToMax(Ct &res, const Ct &input,
-                                   const EvkMap<word> &evk_map) const {
-  const int L = this->param_.L_;
+void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
+                                     const EvkMap<word> &evk_map,
+                                     int target_level) const {
+  if (target_level < 0) target_level = boot_param_.GetMaxLevel();
+  AssertTrue(target_level > 0 && target_level <= this->param_.max_level_,
+             "ModUpToLevel: target level out of range");
+  // The number of q primes at the target, which was param_.L_ back when the
+  // target was always the parameter set's maximum.
+  NPInfo target_np = this->param_.LevelToNP(target_level);
+  const int L = target_np.GetNumQ();
   const int alpha = this->param_.alpha_;
   const int degree = this->param_.degree_;
   NPInfo np = this->param_.LevelToNP(-1);
-  AssertTrue(input.GetNP() == np, "ModUpToMax: input NP mismatch");
-  AssertTrue(!input.HasRx(), "ModUpToMax: input has Rx");
+  AssertTrue(input.GetNP() == np, "ModUpToLevel: input NP mismatch");
+  AssertTrue(!input.HasRx(), "ModUpToLevel: input has Rx");
   res.RemoveRx();
   res.ModifyNP(np);
   res.SetNumSlots(input.GetNumSlots());
@@ -209,7 +216,7 @@ void BootContext<word>::ModUpToMax(Ct &res, const Ct &input,
     this->MultKey(res, input, dts_key);
     working_ct = &res;
   }
-  // ModUpToMax sequence
+  // ModUp sequence
   Dv tmp_bx(L * degree);
   int tmp_ax_num_aux = sse ? alpha : 0;
   Dv tmp_ax((L + tmp_ax_num_aux) * degree);
@@ -220,20 +227,22 @@ void BootContext<word>::ModUpToMax(Ct &res, const Ct &input,
   DvView<word> tmp_ax_view = tmp_ax.View(tmp_ax_num_aux * degree);
 
   // TODO(jongmin.kim): We can remove some redundant NTT here.
-  // ModUpToMax(bx)
-  NPInfo max_level_np = this->param_.LevelToNP(this->param_.max_level_);
+  // ModUpToLevel(bx)
+  NPInfo max_level_np = target_np;
   this->ntt_handler_.INTTAndMultConst(res_bx_view, np,
                                       working_ct->BxConstView(),
                                       mod_max_intt_const_.ConstView(0));
-  this->elem_handler_.ModUpToMax(tmp_bx_view, res.BxConstView());
+  this->elem_handler_.ModUpToLevel(tmp_bx_view, res.BxConstView(),
+                                   target_level);
   this->ntt_handler_.NTT(tmp_bx_view, max_level_np, tmp_bx.ConstView(0), true);
 
-  // ModUpToMax(ax)
+  // ModUpToLevel(ax)
   max_level_np.num_aux_ = tmp_ax_num_aux;
   this->ntt_handler_.INTTAndMultConst(res_ax_view, np,
                                       working_ct->AxConstView(),
                                       mod_max_intt_const_.ConstView(0));
-  this->elem_handler_.ModUpToMax(tmp_ax_view, res.AxConstView());
+  this->elem_handler_.ModUpToLevel(tmp_ax_view, res.AxConstView(),
+                                   target_level);
   this->ntt_handler_.NTT(tmp_ax_view, max_level_np,
                          tmp_ax.ConstView(tmp_ax_num_aux * degree), true);
 
@@ -318,8 +327,17 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
   AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
   this->MultUnsafe(main_ct, input, scaleup_const_, -1);
 
-  // 1. ModUpToMax with optional DtS/StD key-switch + Trace
-  ModUpToMax(main_ct, main_ct, evk_map);
+  // 1. ModUp with optional DtS/StD key-switch + Trace.
+  //
+  // Climb only to the level this BootContext's BootParameter asks for, not to
+  // the parameter set's maximum. CoeffToSlot, EvalMod and SlotToCoeff are
+  // already compiled against boot_param_ (GetCtSStartLevel, GetEvalModStartLevel,
+  // GetStCStartLevel all derive from its max_level_), and the rotation keys are
+  // requested at boot_param_.GetMaxLevel() too -- ModUp was the one place still
+  // hard-wired to param_.max_level_. A BootParameter built with a smaller
+  // max_level therefore yields a bootstrap that lands at a chosen level and
+  // does every limb operation in between on fewer primes.
+  ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel());
 
   // Perform trace
   main_ct.SetNumSlots(half_degree);
