@@ -503,8 +503,15 @@ void EvalPolyNode<word>::Compile(ConstContextPtr<word> context,
     auto [_, split_scale] = basis_eval.GetBaseLevelAndScale(split_degree_);
     double high_scale = working_scale / split_scale;
     if (is_high_constant_) {
-      context->encoder_.EncodeConstant(high_constant_, high_scale,
-                                       working_level,
+      // EncodeConstant takes (constant, level, scale, value). The level and
+      // the scale were the other way round here, so a double scale was
+      // narrowed to int and used as a level -- LevelToNP then indexed
+      // level_config_ with INT_MIN. Every other call site in this file has the
+      // right order; this branch only runs when a tree node's high part is a
+      // constant, which no polynomial in the library or the bootstrap happens
+      // to produce, so it had never been reached.
+      context->encoder_.EncodeConstant(high_constant_, working_level,
+                                       high_scale,
                                        coefficients_[split_degree_]);
     } else {
       high_->Compile(context, basis_eval, working_level, high_scale, true);
