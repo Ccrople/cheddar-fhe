@@ -141,6 +141,11 @@ if (ENABLE_EXTENSION)
   add_executable(silu_test SiLuTest.cpp)
   target_link_libraries(silu_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Llama SoftMax, [SYLPH] section 2.3.
+  add_executable(softmax_test SoftMaxTest.cpp)
+  target_link_libraries(softmax_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

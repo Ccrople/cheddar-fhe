@@ -79,6 +79,7 @@ if(ENABLE_EXTENSION)
     src/extension/LinearTransform.cpp
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
+    src/extension/SoftMax.cu
     src/extension/StripedMatrix.cpp
   )
 endif()
