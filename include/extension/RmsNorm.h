@@ -127,6 +127,16 @@ class RmsNormHandler {
   int GetNumCiphertexts() const { return num_ct_; }
 
   /**
+   * @brief Evaluate the compiled inverse-square-root polynomial in the clear,
+   * on an argument u in the window.
+   *
+   * This is the plaintext oracle for the polynomial alone. Without it, a wrong
+   * Chebyshev convention and a wrong circuit look identical from the outside:
+   * both give a decrypted answer that is off by some amount.
+   */
+  double PlainInvSqrt(double u) const;
+
+  /**
    * @brief Evaluate RMSNorm.
    *
    * @param res output, resized to x.size()

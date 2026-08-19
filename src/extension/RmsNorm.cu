@@ -94,6 +94,13 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
 }
 
 template <typename word>
+double RmsNormHandler<word>::PlainInvSqrt(double u) const {
+  const double a = affine_scale_;
+  const double b = 0.5 * (kWindowHi + kWindowLo);
+  return inv_sqrt_->PlainEvaluate((u - b) / a);
+}
+
+template <typename word>
 void RmsNormHandler<word>::Apply(
     std::vector<Ct> &res, const std::vector<Ct> &x,
     const std::vector<std::vector<Complex>> &weight,

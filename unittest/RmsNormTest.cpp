@@ -240,6 +240,35 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
 // rotate-and-add is not producing sum_c x[t][c]^2.
 //
 // This checks exactly that quantity and nothing else.
+// The polynomial, in the clear. The encrypted error rises monotonically with
+// the argument -- 3% at u = 0.44, 29% at u = 1.50 -- while the reduction that
+// feeds it is only 0.45% off, so the inverse square root itself is suspect.
+// Cheddar's EvalPoly takes Chebyshev coefficients on [-1, 1], and a convention
+// mismatch there would look exactly like a broken circuit from the outside.
+// This settles it without touching a ciphertext.
+TEST_P(Testbed32, RmsNormPolynomialIsCorrectInTheClear) {
+  RmsNormHandler<word> rms(context_, kTokens, kChannels, 1.0,
+                           default_encryption_level_, kEps);
+  const double lo = 1.0 / std::sqrt(30.0), hi = std::sqrt(30.0);
+  double worst = 0.0;
+  double worst_u = 0.0;
+  for (int i = 0; i <= 40; i++) {
+    const double u = lo + (hi - lo) * i / 40.0;
+    const double got = rms.PlainInvSqrt(u);
+    const double want = 1.0 / std::sqrt(u);
+    const double rel = std::abs(got - want) / want;
+    if (rel > worst) { worst = rel; worst_u = u; }
+    if (i % 8 == 0) {
+      std::cout << "  u " << u << "  got " << got << "  want " << want
+                << "  rel " << rel << std::endl;
+    }
+  }
+  std::cout << "polynomial worst relative error " << worst << " at u "
+            << worst_u << " (the fit alone should be 13.8 bits = 7e-5)"
+            << std::endl;
+  EXPECT_LT(worst, 1e-4);
+}
+
 TEST_P(Testbed32, RmsNormReductionIsExact) {
   const std::string dir = DataDir();
   if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
