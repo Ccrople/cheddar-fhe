@@ -289,10 +289,12 @@ TEST_P(CycleTestbed, TheTransportPreservesTheMessage) {
 
 // THE SCALE DROP, WITH NOTHING ELSE IN THE PICTURE.
 //
-// WhereCanonicalisationCosts localised 9.6 bits to Canonicalise, but every
-// number in it came out of a bootstrap, so "the rescale is at fault" and "the
-// bootstrap's noise interacts badly with the rescale" are still the same
-// measurement. This removes the bootstrap: a freshly encrypted ciphertext,
+// A bisection against Boot appeared to localise 9.6 bits to Canonicalise. It
+// was wrong -- Boot shares ToSlot's bootstrap exactly, so its error cancels
+// for whichever variant shares Boot's own path and the gaps were correlation,
+// not precision. That test has been deleted. What survives is the question it
+// could not answer, because every number in it came out of a bootstrap: is
+// the rescale at fault, or the noise it is handed? This removes the bootstrap: a freshly encrypted ciphertext,
 // scaled up by a known amount and then rescaled back down to canonical, which
 // is exactly the shape of Canonicalise and nothing else.
 //
@@ -469,174 +471,6 @@ TEST_P(CycleTestbed, WhatTheScaleDropDoesToABootstrappedCiphertext) {
   }
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-}
-
-// ---------------------------------------------------------------------------
-
-// WHERE CANONICALISATION'S TEN BITS GO.
-//
-// THEY DO NOT EXIST. Kept because the reasoning below is wrong in an
-// instructive way and the test is still the right regression.
-//
-// Every variant here is compared against `Boot`, and `Boot` runs its own
-// ModRaise/CtS/EvalMod on the same ciphertext with the same keys -- so it is
-// deterministic and *identical* to the one inside ToSlot. The bootstrap's
-// error therefore cancels exactly for a variant that shares Boot's
-// post-EvalMod handling and not at all for one that does not, and the gaps
-// below are differences in error correlation rather than in precision.
-//
-// TheScaleDropIsWhereTheBitsGo and
-// WhatTheScaleDropDoesToABootstrappedCiphertext measure the same operations
-// against references that owe nothing to another ciphertext, and both say
-// Canonicalise costs 0.4 bits: 11.68 in, 11.27 out. Read this test as a
-// same-shape comparison against Boot, which is what it is, and not as a
-// precision measurement, which it is not.
-//
-// Measured, all at slack 8 on bootparam_35: Boot alone reaches 16.94 bits and
-// SlackScheduleTest's HalfBoot + gap + StC -- which never leaves EvalMod's end
-// scale -- reaches 15.86. The cycle, whose only additions are Canonicalise and
-// the scale-up that undoes it, reaches 5.63. So the slack is not the problem
-// and StC is not the problem; carrying the ciphertext at 2^35 is.
-//
-// Two candidates, and they are separated by *when* the scale goes back up:
-//
-//   B: canonicalise and immediately scale back up, then descend at 2^58.
-//      Isolates the down-and-up round trip from everything else.
-//   C: canonicalise, descend seven levels at 2^35, scale up at StC's level.
-//      This is what ToCoeff does today.
-//
-// If B is clean and C is not, the cost is the descent at a low scale -- every
-// LevelDown rescale adds a rounding error that is absolute, so it is 2^23
-// larger relative to a message at 2^35 than to one at 2^58. If B is also dirty,
-// the round trip itself is lossy and Canonicalise is the wrong instrument.
-//
-// A is the control: no canonicalisation at all, which should reproduce
-// SlackScheduleTest's 15.86 through this file's own code path.
-TEST_P(CycleTestbed, WhereCanonicalisationCosts) {
-  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
-  ASSERT_NE(boot, nullptr);
-  const int num_slots = param_->degree_ / 2;
-  boot->PrepareEvalMod();
-  boot->PrepareEvalSpecialFFT(num_slots);
-  EvkRequest req;
-  boot->AddRequiredRotations(req, num_slots);
-  interface_->PrepareRotationKey(req);
-  SylphSchedule<word> sched(boot, num_slots);
-
-  std::vector<Complex> msg;
-  GenerateRandomMessage(msg, num_slots);
-  Ciphertext<word> ct;
-  EncodeAndEncrypt(ct, msg, 0);
-
-  Ciphertext<word> want;
-  boot->Boot(want, ct, interface_->GetEvkMap());
-  std::vector<Complex> a;
-  DecryptAndDecode(a, want);
-
-  // Multiply by an exact 1.0 at whatever scale is asked for. At `factor`
-  // equal to the level's rescale product this is scale-preserving; at any
-  // other value it moves the declared scale and the integers together.
-  auto scale_by = [&](Ciphertext<word> &res, const Ciphertext<word> &x,
-                      double factor) {
-    const int level = param_->NPToLevel(x.GetNP());
-    Constant<word> c;
-    context_->encoder_.EncodeConstant(c, level, factor, 1.0);
-    context_->Mult(res, x, c);
-  };
-
-  // TWO NUMBERS, NOT ONE, and the distinction is the whole point.
-  //
-  // A wrong declared scale and a lost bit are both "the answer differs from
-  // Boot", and the first bisection could not tell them apart -- which is why
-  // its control came back at 11.82 against SlackScheduleTest's 15.86 for what
-  // should be the same computation. The difference is that SlackScheduleTest
-  // ends with `got.SetScale(want.GetScale())`, copying Boot's declared scale
-  // outright and so erasing any factor before it measures anything.
-  //
-  // So: fit the best single scalar first (least squares over every slot), then
-  // report the residual around it. The fitted factor is bookkeeping and costs
-  // nothing that a SetScale cannot repair; the residual is precision and is
-  // gone for good.
-  auto report = [&](const char *name, const Ciphertext<word> &got) {
-    std::vector<Complex> b;
-    DecryptAndDecode(b, got);
-    double num = 0.0, den = 0.0, absmax = 0.0;
-    for (int i = 0; i < num_slots; i++) {
-      num += b[i].real() * a[i].real() + b[i].imag() * a[i].imag();
-      den += a[i].real() * a[i].real() + a[i].imag() * a[i].imag();
-      absmax = std::max(absmax, std::abs(a[i]));
-    }
-    const double fit = num / den;
-    double worst = 0.0;
-    for (int i = 0; i < num_slots; i++) {
-      worst = std::max({worst, std::abs(fit * a[i].real() - b[i].real()),
-                        std::abs(fit * a[i].imag() - b[i].imag())});
-    }
-    const double bits = -std::log2(worst / (absmax * std::abs(fit)));
-    std::cout << "  " << name << ": factor " << fit << " (1 - factor = "
-              << (1.0 - fit) << "), residual " << bits << " bits" << std::endl;
-    return bits;
-  };
-
-  Ciphertext<word> landed;
-  sched.ToSlot(landed, ct, interface_->GetEvkMap());
-
-  // Before any variant: what did HalfBoot deliver, and what does Canonicalise
-  // do to it on its own? These are one operation apart, so if the round trip
-  // is lossy it shows here with nothing else in the picture. The comparison is
-  // against Boot's slot values, which differ from HalfBoot's by StC's
-  // compensation -- a constant, which is exactly what the fitted factor
-  // absorbs.
-  report("HalfBoot output", landed);
-  {
-    Ciphertext<word> canon_only;
-    sched.Canonicalise(canon_only, landed);
-    report("after Canonicalise alone", canon_only);
-  }
-
-  // A -- control. Never leaves EvalMod's end scale.
-  double bits_a = 0.0;
-  {
-    Ciphertext<word> v;
-    scale_by(v, landed, param_->GetRescalePrimeProd(sched.GetSlotLevel()));
-    context_->Rescale(v, v);
-    Ciphertext<word> out;
-    sched.ToCoeff(out, v, interface_->GetEvkMap());
-    bits_a = report("A no canonicalisation", out);
-  }
-
-  // B -- down to 2^35 and straight back to 2^58, then descend.
-  double bits_b = 0.0;
-  {
-    Ciphertext<word> canon;
-    sched.Canonicalise(canon, landed);
-    Ciphertext<word> up;
-    scale_by(up, canon, sched.GetSlotScale() / canon.GetScale());
-    Ciphertext<word> out;
-    sched.ToCoeff(out, up, interface_->GetEvkMap());
-    bits_b = report("B canonicalise then undo it at once", out);
-  }
-
-  // C -- what ToCoeff does today: descend at the canonical scale.
-  double bits_c = 0.0;
-  {
-    Ciphertext<word> canon;
-    sched.Canonicalise(canon, landed);
-    Ciphertext<word> out;
-    sched.ToCoeff(out, canon, interface_->GetEvkMap());
-    bits_c = report("C descend at 2^35, scale up at StC", out);
-  }
-  cudaDeviceSynchronize();
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-
-  std::cout << "verdict: "
-            << (bits_b - bits_c > 4.0
-                    ? "the descent at a low scale is the cost"
-                    : (bits_a - bits_b > 4.0
-                           ? "the down-and-up round trip is itself lossy"
-                           : "neither variant explains it"))
-            << std::endl;
-  EXPECT_GT(bits_a, 12.0) << "the control should reproduce SlackScheduleTest";
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,54 +938,94 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
   interface_->PrepareRotationKey(req);
   SylphSchedule<word> sched(boot, num_slots);
 
-  double lo = 1e300, hi = 0.0, log_sum = 0.0;
-  for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
-    const double ms = MeanSquare(x, t);
-    lo = std::min(lo, ms);
-    hi = std::max(hi, ms);
-    log_sum += std::log(ms);
-  }
-  const double alpha = 1.0 / std::exp(log_sum / kTokens);
-  const double beta = std::sqrt(alpha);
-  const double r = std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
-
   const int op_level = sched.GetSlotLevel() - 1;
   const int channels_per_ct = num_slots / kTokens;
 
-  // Turn one's operator is calibrated on the input; turn two's on turn one's
-  // output, whose mean square the host computes exactly. Two handlers, because
-  // alpha_L is a per-call property of the data and not of the circuit.
-  RmsNormHandler<word> rms1(context_, kTokens, kChannels, alpha / (r * r),
-                            op_level, kEps * beta * beta * r * r, 6.0, 9);
+  // EVERY TURN'S OUTPUT HAS TO FIT THE NEXT TURN'S BOOTSTRAP.
+  //
+  // The single-stage test established that ModRaise cannot carry a message
+  // much past 0.5: at max 9.4 the arriving residual was 1.20 bits, and at 0.5
+  // it was 10.95. A stage's output is the next stage's input, so its magnitude
+  // is a scheduling constraint rather than a detail of the operator -- and it
+  // bites immediately, because RMSNorm's output reaches 6.43 while its input
+  // was sized to 0.5.
+  //
+  // Sizing it costs nothing. RMSNorm already multiplies by a per-channel
+  // plaintext, so a scalar folds into that weight for free, exactly as
+  // sqrt(alpha_L) already does. What the host has to do is track it, which is
+  // what s1 and s2 are below.
+  auto host_rmsnorm = [&](const std::vector<double> &in, int first_token,
+                          std::vector<double> &out) {
+    out.assign(static_cast<size_t>(kTokens) * kChannels, 0.0);
+    for (int t = 0; t < kTokens; t++) {
+      double sq = 0.0;
+      for (int c = 0; c < kChannels; c++) {
+        const double v =
+            in[static_cast<size_t>(first_token + t) * kChannels + c];
+        sq += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(sq / kChannels + kEps);
+      for (int c = 0; c < kChannels; c++) {
+        out[static_cast<size_t>(t) * kChannels + c] =
+            in[static_cast<size_t>(first_token + t) * kChannels + c] * inv *
+            w[c];
+      }
+    }
+  };
+  auto max_abs = [](const std::vector<double> &v, size_t off, size_t n) {
+    double m = 0.0;
+    for (size_t k = 0; k < n; k++) m = std::max(m, std::abs(v[off + k]));
+    return m;
+  };
+  auto geomean_ms = [&](const std::vector<double> &v, int first_token) {
+    double ls = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      double sq = 0.0;
+      for (int c = 0; c < kChannels; c++) {
+        const double u =
+            v[static_cast<size_t>(first_token + t) * kChannels + c];
+        sq += u * u;
+      }
+      ls += std::log(sq / kChannels);
+    }
+    return std::exp(ls / kTokens);
+  };
+
+  const double kBootSafeMax = 0.5;
+
+  // Turn one, on the real residual stream.
+  std::vector<double> y1;
+  host_rmsnorm(x, kFirstToken, y1);
+  const double b1 =
+      kBootSafeMax /
+      max_abs(x, static_cast<size_t>(kFirstToken) * kChannels,
+              static_cast<size_t>(kTokens) * kChannels);
+  const double s1 = kBootSafeMax / max_abs(y1, 0, y1.size());
+  const double a1 = 1.0 / geomean_ms(x, kFirstToken) / (b1 * b1);
+
+  // Turn two, on turn one's scaled output.
+  std::vector<double> y1s(y1.size());
+  for (size_t k = 0; k < y1.size(); k++) y1s[k] = s1 * y1[k];
+  std::vector<double> y2;
+  host_rmsnorm(y1s, 0, y2);
+  const double s2 = kBootSafeMax / max_abs(y2, 0, y2.size());
+  const double a2 = 1.0 / geomean_ms(y1s, 0);
+
+  std::cout << "input sizing b1 " << b1 << ", output sizing s1 " << s1
+            << " and s2 " << s2 << "; alpha_L " << a1 << " then " << a2
+            << std::endl;
+
+  RmsNormHandler<word> rms1(context_, kTokens, kChannels, a1, op_level,
+                            kEps * b1 * b1, 6.0, 9);
+  RmsNormHandler<word> rms2(context_, kTokens, kChannels, a2, op_level,
+                            kEps * s1 * s1, 6.0, 9);
   const int num_ct = rms1.GetNumCiphertexts();
   for (int d : rms1.GetRotationDistances()) {
     interface_->PrepareRotationKey(d, op_level);
   }
 
-  // Host reference for turn one, and its mean square for turn two's alpha.
-  std::vector<double> y1(static_cast<size_t>(kTokens) * kChannels);
-  for (int t = 0; t < kTokens; t++) {
-    const double inv = 1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
-    for (int c = 0; c < kChannels; c++) {
-      y1[static_cast<size_t>(t) * kChannels + c] =
-          x[static_cast<size_t>(kFirstToken + t) * kChannels + c] * inv * w[c];
-    }
-  }
-  double log_sum2 = 0.0;
-  for (int t = 0; t < kTokens; t++) {
-    double s = 0.0;
-    for (int c = 0; c < kChannels; c++) {
-      const double v = y1[static_cast<size_t>(t) * kChannels + c];
-      s += v * v;
-    }
-    log_sum2 += std::log(s / kChannels);
-  }
-  const double alpha2 = 1.0 / std::exp(log_sum2 / kTokens);
-  RmsNormHandler<word> rms2(context_, kTokens, kChannels, alpha2 / (r * r),
-                            op_level, kEps * r * r, 6.0, 9);
-
-  // Encrypt turn one's input in the coefficient domain at level 0, which is
-  // where the previous turn's product would have left it.
+  // Turn one's input, coefficient-encoded at level 0 -- where the previous
+  // turn's product would have left it.
   std::vector<Ciphertext<word>> state(num_ct);
   for (int i = 0; i < num_ct; i++) {
     std::vector<double> coeffs(degree, 0.0);
@@ -1159,39 +1033,36 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = kFirstToken + (s % kTokens);
       coeffs[AttentionPacking::CoeffOfSlot({s, false}, degree)] =
-          beta * x[static_cast<size_t>(t) * kChannels + c];
+          b1 * x[static_cast<size_t>(t) * kChannels + c];
     }
     Plaintext<word> ptxt;
     context_->encoder_.EncodeCoeff(ptxt, 0, DetermineScale(0), coeffs);
     interface_->Encrypt(state[i], ptxt);
   }
 
-  auto weights_for = [&](double a, std::vector<std::vector<Complex>> &wts) {
-    const double root = std::sqrt(a / (r * r));
-    wts.assign(num_ct, std::vector<Complex>(num_slots, Complex(0.0, 0.0)));
+  for (int turn = 1; turn <= 2; turn++) {
+    RmsNormHandler<word> &rms = (turn == 1) ? rms1 : rms2;
+    // sqrt(alpha_L) is what the handler expects folded in; the output sizing
+    // rides along on the same plaintext.
+    const double root = std::sqrt(turn == 1 ? a1 : a2);
+    const double out_scale = (turn == 1) ? s1 : s2;
+    std::vector<std::vector<Complex>> wts(
+        num_ct, std::vector<Complex>(num_slots, Complex(0.0, 0.0)));
     for (int i = 0; i < num_ct; i++) {
       for (int s = 0; s < num_slots; s++) {
         const int c = i * channels_per_ct + s / kTokens;
-        wts[i][s] = Complex(w[c] * root, 0.0);
+        wts[i][s] = Complex(w[c] * root * out_scale, 0.0);
       }
     }
-  };
-
-  // Turn two normalises turn one's output, so its "weights" are the ones that
-  // reproduce y2 = RMSNorm(y1) * w on the host below.
-  for (int turn = 1; turn <= 2; turn++) {
-    RmsNormHandler<word> &rms = (turn == 1) ? rms1 : rms2;
-    std::vector<std::vector<Complex>> wts;
-    weights_for(turn == 1 ? alpha : alpha2, wts);
 
     std::vector<Ciphertext<word>> slots(num_ct);
     for (int i = 0; i < num_ct; i++) {
       Ciphertext<word> landed;
-      const double drift = sched.ToSlot(landed, state[i], interface_->GetEvkMap());
+      const double drift =
+          sched.ToSlot(landed, state[i], interface_->GetEvkMap());
       if (i == 0) {
         std::cout << "turn " << turn << ": ToSlot landed at level "
-                  << param_->NPToLevel(landed.GetNP()) << ", scale "
-                  << landed.GetScale() << ", descent drift " << drift
+                  << param_->NPToLevel(landed.GetNP()) << ", drift " << drift
                   << std::endl;
         EXPECT_EQ(param_->NPToLevel(landed.GetNP()), sched.GetSlotLevel());
       }
@@ -1221,25 +1092,8 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
         << "turn " << turn << " did not return to the level it started at";
   }
 
-  // Turn two's host reference.
-  std::vector<double> y2(static_cast<size_t>(kTokens) * kChannels);
-  double absmax = 0.0;
-  for (int t = 0; t < kTokens; t++) {
-    double s = 0.0;
-    for (int c = 0; c < kChannels; c++) {
-      const double v = y1[static_cast<size_t>(t) * kChannels + c];
-      s += v * v;
-    }
-    const double inv = 1.0 / std::sqrt(s / kChannels + kEps);
-    for (int c = 0; c < kChannels; c++) {
-      const double v = y1[static_cast<size_t>(t) * kChannels + c] * inv * w[c];
-      y2[static_cast<size_t>(t) * kChannels + c] = v;
-      absmax = std::max(absmax, std::abs(v));
-    }
-  }
-
-  // The state is coefficient-encoded at level 0, r^2 down after two turns.
-  double worst = 0.0;
+  // The state is coefficient-encoded at level 0, carrying s2 * y2.
+  double worst = 0.0, absmax = 0.0;
   for (int i = 0; i < num_ct; i++) {
     Plaintext<word> ptxt;
     interface_->Decrypt(ptxt, state[i]);
@@ -1248,10 +1102,11 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
     for (int s = 0; s < num_slots; s++) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = s % kTokens;
+      const double want = y2[static_cast<size_t>(t) * kChannels + c];
       const double got =
-          coeffs[AttentionPacking::CoeffOfSlot({s, false}, degree)] / (r * r);
-      worst = std::max(
-          worst, std::abs(got - y2[static_cast<size_t>(t) * kChannels + c]));
+          coeffs[AttentionPacking::CoeffOfSlot({s, false}, degree)] / s2;
+      worst = std::max(worst, std::abs(got - want));
+      absmax = std::max(absmax, std::abs(want));
     }
   }
   std::cout << "two full turns vs the host: max abs err " << worst
