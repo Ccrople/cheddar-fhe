@@ -56,9 +56,6 @@ class BootContext : public Context<word>,
   BootContext(const Parameter<word> &, const BootParameter &);
 
   int GetBootEnabledNumSlots(int num_slots) const;
-  double GetCtSConst() const;
-  double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
-  void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
 
   ContextPtr<word> GetContext();
   ConstContextPtr<word> GetContext() const;
@@ -131,6 +128,16 @@ class BootContext : public Context<word>,
    * @param evk_map client-provided EvkMap
    * @param min_ks whether to use minimum key-switching
    */
+  // The scaling constants the CtS and StC transforms bake in, and EvalMod
+  // itself. Public for the same reason as the conversions below: standalone
+  // SlotToCoeff leaves stc_const_ applied, and inside Boot that is undone by
+  // scaleup_const_ and EvalMod. A caller crossing the boundary outside
+  // bootstrapping has to compensate it explicitly, which it cannot do without
+  // being able to read the constant.
+  double GetCtSConst() const;
+  double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
+  void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
+
   // The encoding conversions, public because the Llama pipeline needs them and
   // not only Boot does. SlotToCoeff is compiled at GetStCStartLevel(), which is
   // the default encryption level, so an ordinary ciphertext can feed it;
