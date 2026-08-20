@@ -273,6 +273,124 @@ TEST_P(CycleTestbed, TheTransportPreservesTheMessage) {
 
 // ---------------------------------------------------------------------------
 
+// WHERE CANONICALISATION'S TEN BITS GO.
+//
+// Measured, all at slack 8 on bootparam_35: Boot alone reaches 16.94 bits and
+// SlackScheduleTest's HalfBoot + gap + StC -- which never leaves EvalMod's end
+// scale -- reaches 15.86. The cycle, whose only additions are Canonicalise and
+// the scale-up that undoes it, reaches 5.63. So the slack is not the problem
+// and StC is not the problem; carrying the ciphertext at 2^35 is.
+//
+// Two candidates, and they are separated by *when* the scale goes back up:
+//
+//   B: canonicalise and immediately scale back up, then descend at 2^58.
+//      Isolates the down-and-up round trip from everything else.
+//   C: canonicalise, descend seven levels at 2^35, scale up at StC's level.
+//      This is what ToCoeff does today.
+//
+// If B is clean and C is not, the cost is the descent at a low scale -- every
+// LevelDown rescale adds a rounding error that is absolute, so it is 2^23
+// larger relative to a message at 2^35 than to one at 2^58. If B is also dirty,
+// the round trip itself is lossy and Canonicalise is the wrong instrument.
+//
+// A is the control: no canonicalisation at all, which should reproduce
+// SlackScheduleTest's 15.86 through this file's own code path.
+TEST_P(CycleTestbed, WhereCanonicalisationCosts) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+  SylphSchedule<word> sched(boot, num_slots);
+
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots);
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, msg, 0);
+
+  Ciphertext<word> want;
+  boot->Boot(want, ct, interface_->GetEvkMap());
+  std::vector<Complex> a;
+  DecryptAndDecode(a, want);
+
+  // Multiply by an exact 1.0 at whatever scale is asked for. At `factor`
+  // equal to the level's rescale product this is scale-preserving; at any
+  // other value it moves the declared scale and the integers together.
+  auto scale_by = [&](Ciphertext<word> &res, const Ciphertext<word> &x,
+                      double factor) {
+    const int level = param_->NPToLevel(x.GetNP());
+    Constant<word> c;
+    context_->encoder_.EncodeConstant(c, level, factor, 1.0);
+    context_->Mult(res, x, c);
+  };
+
+  auto report = [&](const char *name, const Ciphertext<word> &got) {
+    std::vector<Complex> b;
+    DecryptAndDecode(b, got);
+    double worst = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max({worst, std::abs(a[i].real() - b[i].real()),
+                        std::abs(a[i].imag() - b[i].imag())});
+      absmax = std::max(absmax, std::abs(a[i]));
+    }
+    std::cout << "  " << name << ": " << -std::log2(worst / absmax)
+              << " bits vs Boot" << std::endl;
+    return -std::log2(worst / absmax);
+  };
+
+  Ciphertext<word> landed;
+  sched.ToSlot(landed, ct, interface_->GetEvkMap());
+
+  // A -- control. Never leaves EvalMod's end scale.
+  double bits_a = 0.0;
+  {
+    Ciphertext<word> v;
+    scale_by(v, landed, param_->GetRescalePrimeProd(sched.GetSlotLevel()));
+    context_->Rescale(v, v);
+    Ciphertext<word> out;
+    sched.ToCoeff(out, v, interface_->GetEvkMap());
+    bits_a = report("A no canonicalisation", out);
+  }
+
+  // B -- down to 2^35 and straight back to 2^58, then descend.
+  double bits_b = 0.0;
+  {
+    Ciphertext<word> canon;
+    sched.Canonicalise(canon, landed);
+    Ciphertext<word> up;
+    scale_by(up, canon, sched.GetSlotScale() / canon.GetScale());
+    Ciphertext<word> out;
+    sched.ToCoeff(out, up, interface_->GetEvkMap());
+    bits_b = report("B canonicalise then undo it at once", out);
+  }
+
+  // C -- what ToCoeff does today: descend at the canonical scale.
+  double bits_c = 0.0;
+  {
+    Ciphertext<word> canon;
+    sched.Canonicalise(canon, landed);
+    Ciphertext<word> out;
+    sched.ToCoeff(out, canon, interface_->GetEvkMap());
+    bits_c = report("C descend at 2^35, scale up at StC", out);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "verdict: "
+            << (bits_b - bits_c > 4.0
+                    ? "the descent at a low scale is the cost"
+                    : (bits_a - bits_b > 4.0
+                           ? "the down-and-up round trip is itself lossy"
+                           : "neither variant explains it"))
+            << std::endl;
+  EXPECT_GT(bits_a, 12.0) << "the control should reproduce SlackScheduleTest";
+}
+
+// ---------------------------------------------------------------------------
+
 TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   const std::string dir = DataDir();
   if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
