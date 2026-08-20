@@ -394,13 +394,6 @@ TEST_P(Testbed32, TheLegProjectsThroughSeveralModPackGroups) {
   std::vector<const EvaluationKey<word> *> keys(rank);
   for (int j = 0; j < rank; j++) keys[j] = &interface_->GetModPackKey(rank, j);
 
-  cheddar::CoeffLinearLeg<word>::Config lcfg;
-  lcfg.num_tokens = kTokens;
-  lcfg.product_level = kLevel;
-  ProjectOnlyLeg leg(context_, lcfg, keys);
-  EXPECT_EQ(leg.GetRank(), rank);
-  EXPECT_EQ(leg.GetSmallDegree(), kSmallDegree);
-
   std::vector<Ciphertext<word>> parents(num_parents);
   for (int p = 0; p < num_parents; p++) {
     std::vector<double> coeffs(degree, 0.0);
@@ -415,33 +408,65 @@ TEST_P(Testbed32, TheLegProjectsThroughSeveralModPackGroups) {
     interface_->Encrypt(parents[p], pt);
   }
 
-  std::vector<Ciphertext<word>> out;
-  leg.Project(out, parents, kInChannels, kLegOut, w, w_scale, "legQ");
-  ASSERT_EQ(static_cast<int>(out.size()), kLegOut / rank);
+  // ONCE WITHOUT TILING AND ONCE WITH, and the two must agree.
+  //
+  // Tiling is what keeps the down projection's 14336-channel contraction off
+  // the 11.3 GB of module components it would otherwise hold at once, and it
+  // is the one part of the leg that changes the *order* of the arithmetic: the
+  // partial products are ModPacked and added as ordinary ciphertexts before a
+  // single rescale. 3 parents against 16 gives six tiles with a remainder of
+  // one, so the short last tile is exercised too. `num_parents` is 16 here, so
+  // the untiled run really is a single tile.
+  std::vector<std::vector<double>> decoded;
+  for (int tile : {0, 3}) {
+    cheddar::CoeffLinearLeg<word>::Config lcfg;
+    lcfg.num_tokens = kTokens;
+    lcfg.product_level = kLevel;
+    lcfg.parents_per_tile = tile;
+    ProjectOnlyLeg leg(context_, lcfg, keys);
+    EXPECT_EQ(leg.GetRank(), rank);
+    EXPECT_EQ(leg.GetSmallDegree(), kSmallDegree);
 
-  double max_err = 0.0;
-  for (int g = 0; g < kLegOut / rank; g++) {
-    EXPECT_EQ(param_->NPToLevel(out[g].GetNP()), kLevel - 1)
-        << "the leg owes LinearLeg a result one level below the product";
-    EXPECT_NEAR(out[g].GetScale() / param_->GetScale(kLevel - 1), 1.0, 1e-9)
-        << "and it owes it canonically scaled";
-    Plaintext<word> pt;
-    interface_->Decrypt(pt, out[g]);
-    std::vector<double> got;
-    context_->encoder_.DecodeCoeff(got, pt);
-    for (int c = 0; c < rank; c++) {
-      for (int t = 0; t < kTokens; t++) {
-        const double v = got[CoeffOfTokenChannel(t, c, num_slots)];
-        max_err = std::max(
-            max_err,
-            std::abs(v - want[static_cast<size_t>(t) * kLegOut + g * rank + c]));
+    std::vector<Ciphertext<word>> out;
+    leg.Project(out, parents, kInChannels, kLegOut, w, w_scale, "legQ");
+    ASSERT_EQ(static_cast<int>(out.size()), kLegOut / rank);
+
+    std::vector<double> flat(static_cast<size_t>(kTokens) * kLegOut, 0.0);
+    double max_err = 0.0;
+    for (int g = 0; g < kLegOut / rank; g++) {
+      EXPECT_EQ(param_->NPToLevel(out[g].GetNP()), kLevel - 1)
+          << "the leg owes LinearLeg a result one level below the product";
+      EXPECT_NEAR(out[g].GetScale() / param_->GetScale(kLevel - 1), 1.0, 1e-9)
+          << "and it owes it canonically scaled";
+      Plaintext<word> pt;
+      interface_->Decrypt(pt, out[g]);
+      std::vector<double> got;
+      context_->encoder_.DecodeCoeff(got, pt);
+      for (int c = 0; c < rank; c++) {
+        for (int t = 0; t < kTokens; t++) {
+          const double v = got[CoeffOfTokenChannel(t, c, num_slots)];
+          flat[static_cast<size_t>(t) * kLegOut + g * rank + c] = v;
+          max_err = std::max(
+              max_err, std::abs(v - want[static_cast<size_t>(t) * kLegOut +
+                                         g * rank + c]));
+        }
       }
     }
+    std::cout << "  leg: " << (kLegOut / rank) << " ModPack groups, "
+              << (tile == 0 ? num_parents : tile) << " parents per tile, |Y| max "
+              << want_max << ", max abs err " << max_err << "  ("
+              << -std::log2(max_err / want_max) << " bits)" << std::endl;
+    EXPECT_LT(max_err / want_max, 1e-3);
+    decoded.push_back(std::move(flat));
   }
-  std::cout << "  leg: " << (kLegOut / rank) << " ModPack groups, |Y| max "
-            << want_max << ", max abs err " << max_err << "  ("
-            << -std::log2(max_err / want_max) << " bits)" << std::endl;
-  EXPECT_LT(max_err / want_max, 1e-3);
+
+  double drift = 0.0;
+  for (size_t i = 0; i < decoded[0].size(); i++) {
+    drift = std::max(drift, std::abs(decoded[0][i] - decoded[1][i]));
+  }
+  std::cout << "  tiled vs untiled: max abs difference " << drift << std::endl;
+  EXPECT_LT(drift, 1e-6 * want_max)
+      << "tiling reordered the contraction into a different answer";
 }
 
 INSTANTIATE_TEST_SUITE_P(
