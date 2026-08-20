@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "extension/AttentionPacking.h"
 
 using word = uint32_t;
 
@@ -49,6 +50,9 @@ class SlackTestbed : public Testbed32 {
  protected:
   int BootSlackLevels() const override { return kSlack; }
 };
+
+// Slack zero, so nothing is recompiled and the descent is measured on its own.
+class DescentTestbed : public Testbed32 {};
 
 // The arithmetic the knob is supposed to produce, before any ciphertext moves.
 TEST_P(SlackTestbed, TheGapOpensWhereItShould) {
@@ -213,6 +217,145 @@ TEST_P(SlackTestbed, WorkInTheGapReachesStC) {
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, SlackTestbed, testing::Values("bootparam_35.json"),
     [](const testing::TestParamInfo<SlackTestbed::ParamType> &info) {
+      std::string p = info.param;
+      std::replace(p.begin(), p.end(), '.', '_');
+      return p;
+    });
+
+// WHERE THE 6.5 BITS GO, isolated from the slack mechanism entirely.
+//
+// The gap measurement lost precision (16.8 -> 10.24 bits) and two things could
+// be responsible: descending four levels while carrying EvalMod's end scale, or
+// StC being compiled below where EvalMod ends. This separates them by removing
+// StC from the picture -- slack is zero here, nothing is recompiled, and the
+// only thing that happens is a descent.
+//
+// My first guess was modulus headroom, and it does not survive arithmetic:
+// EvalMod's end scale is 2^58 against a level-15 modulus of roughly 2^460, so
+// there is no shortage to run out of. Rather than guess again, this reports the
+// precision after every single level so the shape of the loss is visible --
+// linear in the level count means the descent, a step at the first level means
+// something about the first operation.
+//
+// The reference is exact and needs no crypto: the plaintext HalfBoot is given
+// is decoded on the host with DecodeCoeff, and AttentionPacking::SlotOfCoeff
+// says which slot each coefficient lands in -- measured on this hardware, 0 of
+// 32768 disagreeing. So the expected slot vector is known outright, and the
+// only unknown is the constant HalfBoot leaves, which is read off as the mean
+// ratio before any precision claim is made.
+TEST_P(DescentTestbed, EvalModScaleThroughADescent) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int degree = param_->degree_;
+  const int num_slots = degree / 2;
+  ASSERT_EQ(boot->GetBootParameter().GetNumSlackLevels(), 0);
+
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots);
+  Plaintext<word> ptxt;
+  Encode(ptxt, msg, 0);
+  std::vector<double> coeffs;
+  context_->encoder_.DecodeCoeff(coeffs, ptxt);
+  ASSERT_EQ(static_cast<int>(coeffs.size()), degree);
+
+  // What HalfBoot should put in each slot, up to one constant.
+  std::vector<Complex> expected(num_slots);
+  for (int p = 0; p < degree; p++) {
+    const auto pos = AttentionPacking::SlotOfCoeff(p, degree);
+    Complex &slot = expected[pos.slot];
+    slot = pos.imaginary ? Complex(slot.real(), coeffs[p])
+                         : Complex(coeffs[p], slot.imag());
+  }
+
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, ptxt);
+  Ciphertext<word> half;
+  boot->HalfBoot(half, ct, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // bits of agreement with `expected`, after dividing out the constant
+  auto report = [&](const std::string &label, const Ciphertext<word> &c) {
+    std::vector<Complex> got;
+    DecryptAndDecode(got, c);
+    double rsum = 0.0;
+    int counted = 0;
+    for (int i = 0; i < num_slots; i++) {
+      if (std::abs(expected[i].real()) < 1e-4) continue;
+      rsum += got[i].real() / expected[i].real();
+      counted++;
+    }
+    const double ratio = rsum / counted;
+    double worst = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max({worst,
+                        std::abs(got[i].real() / ratio - expected[i].real()),
+                        std::abs(got[i].imag() / ratio - expected[i].imag())});
+      absmax = std::max(absmax, std::abs(expected[i]));
+    }
+    const double bits = -std::log2(worst / absmax);
+    std::cout << "  " << label << ": level "
+              << param_->NPToLevel(c.GetNP()) << ", scale " << c.GetScale()
+              << ", constant " << ratio << ", **" << bits << " bits**"
+              << std::endl;
+    return bits;
+  };
+
+  std::cout << "descent by LevelDown (multiply by a level-down constant, "
+               "rescale; scale preserved)" << std::endl;
+  const double base = report("HalfBoot", half);
+  EXPECT_GT(base, 15.0) << "HalfBoot itself regressed, so nothing below this "
+                           "measurement means anything";
+
+  std::vector<double> down_bits;
+  Ciphertext<word> cur;
+  context_->Copy(cur, half);
+  for (int i = 1; i <= 4; i++) {
+    const int level = param_->NPToLevel(cur.GetNP());
+    Ciphertext<word> next;
+    context_->LevelDown(next, cur, level - 1);
+    context_->Copy(cur, next);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    down_bits.push_back(report("after LevelDown x" + std::to_string(i), cur));
+  }
+
+  std::cout << "descent by multiply-by-one at the canonical scale, then rescale"
+            << std::endl;
+  std::vector<double> mult_bits;
+  context_->Copy(cur, half);
+  for (int i = 1; i <= 4; i++) {
+    const int level = param_->NPToLevel(cur.GetNP());
+    Constant<word> one;
+    context_->encoder_.EncodeConstant(one, level, param_->GetScale(level), 1.0);
+    Ciphertext<word> tmp;
+    context_->Mult(tmp, cur, one);
+    context_->Rescale(cur, tmp);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    mult_bits.push_back(report("after Mult+Rescale x" + std::to_string(i), cur));
+  }
+
+  std::cout << "loss over four levels: LevelDown " << base - down_bits.back()
+            << " bits, Mult+Rescale " << base - mult_bits.back() << " bits"
+            << std::endl;
+  // Not an assertion about which is better -- an assertion that the descent is
+  // where the loss lives, which is the thing the gap measurement could not see.
+  EXPECT_LT(base - down_bits.back(), 1.0)
+      << "descending four levels with EvalMod's end scale costs "
+      << base - down_bits.back()
+      << " bits on its own, so the gap's loss is the descent and not StC";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Cheddar, DescentTestbed, testing::Values("bootparam_35.json"),
+    [](const testing::TestParamInfo<DescentTestbed::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
       return p;
