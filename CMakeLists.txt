@@ -62,6 +62,7 @@ set(CKKS_GPU_SOURCES
   src/core/PcmmBlas.cu
   src/core/RingSwitch.cu
   src/core/SwitchedCcmm.cu
+  src/core/CtAxisExchange.cu
   src/UserInterface.cu
 )
 if(USE_GMP)

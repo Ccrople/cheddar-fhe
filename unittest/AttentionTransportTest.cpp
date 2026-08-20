@@ -67,13 +67,34 @@
 // output scale instead is not merely unnecessary, it breaks that chain, because
 // the constants assume a canonical input. Measured, at a cost of one run.
 //
-// K IS SUPPLIED IN ITS OWN LAYOUT, NOT TRANSPORTED. Q's operand wants the
-// channel on the column axis, which is where the projection can put it; K's
-// wants the KEY there, three of whose bits therefore land on the ciphertext
-// axis. That is a cross-ciphertext move, it is a separate piece of machinery,
-// and it is not built yet. So K is encoded on the host in the layout the
-// product needs and the test pins the Q half of the chain, which is the half
-// the permutation and the SinC transform live in.
+// K COSTS ONE MOVE MORE THAN Q, AND IT IS NOT A PERMUTATION. Q's operand wants
+// the channel on the column axis, which is where the projection can put it;
+// K's wants the KEY there, three of whose bits therefore land on the
+// ciphertext axis. No LinearTransform can move them: it is a map inside one
+// ciphertext. `CtAxisExchange` is that move, and K's chain is
+//
+//   2 cts, slot = [c | kv1 | key]
+//     --[4|4]@3 then [4|4]@7, i.e. the [8|4]@3 swap-->      2 levels
+//   2 cts, slot = [key>>3 | c | kv1 | key&7]
+//     --CtAxisExchange, three bits at offset 0-->           1 level
+//   8 cts, ct = key&7, slot = [key>>3 | c | kv1 | kv0 | rep]
+//     --SlotToSinC(32)-->                                   3 levels
+//
+// GQA RIDES ALONG FREE. Llama-3-8B has 8 KV heads against 32 query heads, so
+// this call group's 16 lanes need 4 KV heads four times each -- 2 source
+// ciphertexts becoming 8. The exchange takes a source array shorter than its
+// output, and the copy index lands in the LOW bits of the exchanged field,
+// which after the exchange is where the lane index wants it: the four lanes
+// sharing a KV head are adjacent. No rotation is added for it.
+//
+// AND THE NAMING OF THE KEY AXIS IS WHAT MAKES BOTH ENDS WORK. The column
+// index of the right operand is ours to name, and the choice is
+// `column = BitRev7(key)` -- the same reversal Q's channel axis uses. It puts
+// `BitRev4(column mod 16) = key >> 3` in the high slot bits, which is where
+// the swap leaves it, and `column / 16 = BitRev3(key & 7)` on the ciphertext
+// axis, which is a relabelling of the exchange's output array and therefore
+// free. The same choice is what will let the Values product read the scores
+// with no permutation at all: `BitRev7(column)` is then `key` itself.
 
 #include <gtest/gtest.h>
 
@@ -84,12 +105,14 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/CtAxisExchange.h"
 #include "core/SwitchedCcmm.h"
 #include "extension/SlotPermute.h"
 
 using word = uint32_t;
 using cheddar::Ciphertext;
 using cheddar::Complex;
+using cheddar::CtAxisExchange;
 using cheddar::EvkRequest;
 using cheddar::Plaintext;
 using cheddar::SlotPermute;
@@ -105,6 +128,8 @@ constexpr int kTokens = 128;    // T
 constexpr int kHeadDim = 128;   // per-head channels
 constexpr int kLanes = 16;      // heads per CC-MM call
 constexpr int kSubDegree = 32;  // k: 4096/32 = 128 wide, 16 lanes
+constexpr int kKvHeads = 4;     // KV heads this call group draws on
+constexpr int kGqaGroup = kLanes / kKvHeads;  // query heads per KV head
 
 // Where the transforms are compiled. The permutation takes two levels and the
 // SinC transform three, and every standalone LinearTransform has a floor
@@ -160,14 +185,38 @@ struct BlockPacking {
   }
 };
 
+// K'S PACKING, and why it is not Q's.
+//
+//     ciphertext    = kv mod 2
+//     channel_in_ct = c * 2 + kv / 2
+//
+// so the slot index reads `[c (8..14) | kv1 (7) | key (0..6)]` and this call
+// group's four KV heads fill exactly two ciphertexts. K spends NOTHING on the
+// ciphertext axis, because after the exchange that axis belongs to the key --
+// which also means the whole channel index stays in the slots, so RoPE's pair
+// (c, c + 64) is inside one ciphertext for free rather than by construction.
+struct KeyPacking {
+  int tokens = kTokens;
+
+  void Locate(int kv, int c, int key, int &ct, int &slot) const {
+    ct = kv & 1;
+    slot = (c * 2 + (kv >> 1)) * tokens + key;
+  }
+};
+
 }  // namespace
 
 TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
   const int kSinCLevel = EnvInt("CHEDDAR_SINC_LEVEL", 9);
   const int kPermuteLevel = EnvInt("CHEDDAR_PERMUTE_LEVEL", kSinCLevel + 2);
+  // K's leg is one move longer than Q's and has to arrive at the same place,
+  // so it starts a level higher: two swaps and then the exchange.
+  const int kKeyLevel = kPermuteLevel + 1;
   std::cout << "permute at " << kPermuteLevel << "/" << kPermuteLevel - 1
-            << ", SinC at " << kSinCLevel << ".." << kSinCLevel - kSinCPhases + 1
-            << ", product at " << kProductLevel << std::endl;
+            << ", K at " << kKeyLevel << "/" << kKeyLevel - 1 << "/"
+            << kKeyLevel - 2 << ", SinC at " << kSinCLevel << ".."
+            << kSinCLevel - kSinCPhases + 1 << ", product at " << kProductLevel
+            << std::endl;
 
   // ---- the three rings, and one secret between the two big ones ----------
   Ring big(Env("CHEDDAR_BLOCK_PARAM", "sylphflow16_35.json"), {}, 8);
@@ -261,9 +310,42 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
             << swap_b.GetBS() << "x" << swap_b.GetGS() << ", shift "
             << swap_b.GetShift() << std::endl;
 
+  // ---- K's leg: the [8|4]@3 swap, then the cross-ciphertext exchange ----
+  //
+  // `[8|4]@3` in one transform is 511 diagonals; as two `[4|4]` swaps it is
+  // 31 and 31, for one more level -- the same trade `[4|7]` makes above, and
+  // the level is there because K's leg starts one higher anyway.
+  const std::vector<int> k_step_a = SwapAdjacentFields(num_slots, 4, 4, 3);
+  const std::vector<int> k_step_b = SwapAdjacentFields(num_slots, 4, 4, 7);
+  {
+    std::vector<int> composed(num_slots);
+    for (int t = 0; t < num_slots; t++) composed[t] = k_step_b[k_step_a[t]];
+    const std::vector<int> direct = SwapAdjacentFields(num_slots, 4, 8, 3);
+    int mismatch = 0;
+    for (int t = 0; t < num_slots; t++) {
+      if (direct[t] != composed[t]) mismatch++;
+    }
+    ASSERT_EQ(mismatch, 0)
+        << "the two [4|4] swaps do not compose to the [8|4] one";
+  }
+  SlotPermute<word> k_swap_a(big.context, k_step_a, kKeyLevel);
+  SlotPermute<word> k_swap_b(big.context, k_step_b, kKeyLevel - 1);
+  CtAxisExchange<word> exchange(big.context, /*log_num_cts=*/3,
+                                /*field_offset=*/0, kKeyLevel - 2,
+                                /*log_num_src_cts=*/1);
+  std::cout << "K swap 1: " << k_swap_a.GetNumDiagonals() << " diagonals, K "
+            << "swap 2: " << k_swap_b.GetNumDiagonals()
+            << " diagonals; exchange: " << exchange.GetNumSrcCts() << " -> "
+            << exchange.GetNumCts() << " cts, "
+            << exchange.RotationIndices().size() << " rotations, "
+            << exchange.GetNumMults() << " plaintext mults" << std::endl;
+
   EvkRequest req;
   swap_a.AddRequiredRotations(req);
   swap_b.AddRequiredRotations(req);
+  k_swap_a.AddRequiredRotations(req);
+  k_swap_b.AddRequiredRotations(req);
+  exchange.AddRequiredRotations(req);
   boot->AddRequiredSinCRotations(req, num_slots);
   size_t free_before = 0, total = 0;
   cudaMemGetInfo(&free_before, &total);
@@ -277,11 +359,12 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
   // ---- the tensors ------------------------------------------------------
   std::mt19937_64 gen(0xA77E4);
   std::uniform_real_distribution<double> dist(-0.08, 0.08);
-  // q[head][token][c] and k[head][token][c], one call group of 16 heads. GQA
-  // repetition is the projection's business and is not modelled here; each
-  // head simply gets its own keys.
+  // q[head][token][c] over 16 query heads and k[kv][token][c] over the 4 KV
+  // heads they share -- Llama-3-8B's grouped-query attention, at the real
+  // ratio. Lane `head` reads KV head `head / 4`, and that fourfold replication
+  // is carried by the exchange rather than by the projection.
   std::vector<double> q(static_cast<size_t>(kLanes) * kTokens * kHeadDim);
-  std::vector<double> k(q.size());
+  std::vector<double> k(static_cast<size_t>(kKvHeads) * kTokens * kHeadDim);
   for (auto &v : q) v = dist(gen);
   for (auto &v : k) v = dist(gen);
   auto at = [](const std::vector<double> &t, int head, int token, int c) {
@@ -405,29 +488,94 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
         << "the transport did not put Q where SwitchedCcmmLayout says it goes";
   }
 
-  // ---- K, encoded on the host in the layout the product wants -----------
-  //
-  // row = the contraction index BitRev(c), column = BitRev(key), lane = head.
+  // ---- K, through the swap, the exchange and the SinC transform ---------
   const double product_scale = sw.param->GetScale(kProductLevel);
+  KeyPacking kpack;
+  const int num_k_src = kKvHeads * kHeadDim / pack.ChannelsPerCt();
+  ASSERT_EQ(num_k_src, 2);
+  std::vector<std::vector<Complex>> k_slots(
+      num_k_src, std::vector<Complex>(num_slots, Complex(0)));
+  for (int kv = 0; kv < kKvHeads; kv++) {
+    for (int key = 0; key < kTokens; key++) {
+      for (int c = 0; c < kHeadDim; c++) {
+        int ct, slot;
+        kpack.Locate(kv, c, key, ct, slot);
+        ASSERT_LT(ct, num_k_src);
+        k_slots[ct][slot] = Complex(at(k, kv, key, c), 0.0);
+      }
+    }
+  }
+
+  std::vector<Ciphertext<word>> k_swapped(num_k_src);
+  for (int i = 0; i < num_k_src; i++) {
+    Plaintext<word> pt;
+    big.context->encoder_.Encode(pt, kKeyLevel, big.param->GetScale(kKeyLevel),
+                                 k_slots[i]);
+    Ciphertext<word> ct, a;
+    big.ui->Encrypt(ct, pt);
+    k_swap_a.Evaluate(big.context, a, ct, big.ui->GetEvkMap());
+    k_swap_b.Evaluate(big.context, k_swapped[i], a, big.ui->GetEvkMap());
+    ASSERT_EQ(big.param->NPToLevel(k_swapped[i].GetNP()), kKeyLevel - 2);
+  }
+
+  std::vector<Ciphertext<word>> exchanged;
+  exchange.Evaluate(exchanged, k_swapped, big.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(exchanged.size()), layout.num_cts);
+  ASSERT_EQ(big.param->NPToLevel(exchanged[0].GetNP()), kSinCLevel);
+
+  // The exchange delivers the key's low three bits as its ARRAY index; the
+  // layout wants `column / rank = BitRev3(key & 7)` there. That is a
+  // relabelling of eight pointers, which is why the naming above is free.
   std::vector<Ciphertext<word>> k_operand(layout.num_cts);
+  for (int y = 0; y < layout.num_cts; y++) {
+    Ciphertext<word> sinc;
+    boot->SlotToSinC(sinc, num_slots, exchanged[y], big.ui->GetEvkMap());
+    big.context->LevelDown(k_operand[BitRev(y, 3)], sinc, kProductLevel);
+  }
+  exchanged.clear();
+
+  // The same split as for Q: check the transport before the product runs on
+  // it, because a layout mistake and a product mistake look identical at the
+  // end and have nothing in common as bugs.
   {
-    std::vector<std::vector<Complex>> msg(
-        layout.num_cts, std::vector<Complex>(num_slots, Complex(0)));
-    for (int head = 0; head < kLanes; head++) {
-      for (int key = 0; key < kTokens; key++) {
-        for (int c = 0; c < kHeadDim; c++) {
-          int ct, index;
-          layout.LocateSinC(BitRev(c, 7), BitRev(key, 7), head, ct, index);
-          msg[ct][index] = Complex(at(k, head, key, c), 0.0);
+    double worst = 0.0, biggest = 0.0, unreplicated = 0.0;
+    for (int i = 0; i < layout.num_cts; i++) {
+      Plaintext<word> pt;
+      big.ui->Decrypt(pt, k_operand[i]);
+      std::vector<Complex> got;
+      big.context->encoder_.DecodeSinC(got, pt, kSubDegree);
+      for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
+      for (int head = 0; head < kLanes; head++) {
+        for (int key = 0; key < kTokens; key++) {
+          for (int c = 0; c < kHeadDim; c++) {
+            int ct, index;
+            layout.LocateSinC(BitRev(c, 7), BitRev(key, 7), head, ct, index);
+            if (ct != i) continue;
+            const double want = at(k, head / kGqaGroup, key, c);
+            worst = std::max(worst, std::abs(got[index].real() - want));
+            // The control: what a lane would hold if the four copies of a KV
+            // head had not been made, i.e. if lane `head` read KV head
+            // `head mod 4` instead.
+            unreplicated = std::max(
+                unreplicated,
+                std::abs(got[index].real() - at(k, head % kKvHeads, key, c)));
+          }
         }
       }
     }
-    for (int i = 0; i < layout.num_cts; i++) {
-      Plaintext<word> pt;
-      sw.context->encoder_.EncodeSinC(pt, kProductLevel, product_scale, msg[i],
-                                      kSubDegree);
-      sw.ui->Encrypt(k_operand[i], pt);
-    }
+    std::cout << "K operand after swap + exchange + SinC + LevelDown: max "
+                 "|diff| = "
+              << worst << ", |got| <= " << biggest << std::endl;
+    std::cout << "  control (lanes not replicated by KV head): "
+              << unreplicated << std::endl;
+    EXPECT_LT(worst, 1e-3)
+        << "the transport did not put K where SwitchedCcmmLayout says it goes";
+    EXPECT_GT(unreplicated, 1e-2)
+        << "every lane holds the same keys, so this test is not checking that "
+           "GQA replication happened";
+    EXPECT_NEAR(k_operand[0].GetScale() / product_scale, 1.0, 1e-3);
   }
 
   // Q must have landed on the same scale K was encoded at, or the product's
@@ -473,7 +621,7 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
       for (int key = 0; key < kTokens; key++) {
         double want = 0.0;
         for (int c = 0; c < kHeadDim; c++) {
-          want += at(q, head, query, c) * at(k, head, key, c);
+          want += at(q, head, query, c) * at(k, head / kGqaGroup, key, c);
         }
         biggest = std::max(biggest, std::abs(want));
         int ct, index;

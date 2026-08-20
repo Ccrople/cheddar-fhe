@@ -122,6 +122,13 @@ add_executable(switched_ccmm_test SwitchedCcmmTest.cpp)
 target_link_libraries(switched_ccmm_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# A slot field traded for the ciphertext index: the cross-ciphertext move the
+# score product's right operand needs, because its column axis is the key token
+# and no weight matrix can place a token. One ring, one level.
+add_executable(ct_axis_exchange_test CtAxisExchangeTest.cpp)
+target_link_libraries(ct_axis_exchange_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   # The block's packing all the way into a score product: SlotPermute, then
   # SlotToSinC, then the switched CC-MM. Three Contexts and one secret between
