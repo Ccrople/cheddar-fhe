@@ -4,6 +4,7 @@
 
   "boot": false,
   "dense_hamming_weight": 2048,
+  "sparse_hamming_weight": 2048,
 
   "terminal_primes": [],
   "main_primes": [
