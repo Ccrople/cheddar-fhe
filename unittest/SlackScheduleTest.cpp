@@ -262,7 +262,8 @@ TEST_P(SlackTestbed, WorkInTheGapReachesStC) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, SlackTestbed, testing::Values("bootparam_35.json"),
+    Cheddar, SlackTestbed,
+    testing::Values("bootparam_35.json", "sylphflow16_35.json"),
     [](const testing::TestParamInfo<SlackTestbed::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
@@ -401,7 +402,8 @@ TEST_P(DescentTestbed, EvalModScaleThroughADescent) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, DescentTestbed, testing::Values("bootparam_35.json"),
+    Cheddar, DescentTestbed,
+    testing::Values("bootparam_35.json", "sylphflow16_35.json"),
     [](const testing::TestParamInfo<DescentTestbed::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
