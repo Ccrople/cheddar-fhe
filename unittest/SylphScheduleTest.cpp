@@ -883,10 +883,32 @@ TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
   const double alpha = 1.0 / std::exp(log_sum / kTokens);
   const double beta = std::sqrt(alpha);
 
-  // Two magnitudes, one calibration each, both mathematically exact. m = 1 is
-  // the order-one input RmsNormTest uses; m = r is what HalfBoot delivers.
-  for (double m : {1.0, std::pow(2.0, -boot->GetBootParameter()
-                                           .GetLogMessageRatio())}) {
+  // HOW MUCH INPUT PRECISION DOES RMSNORM NEED?
+  //
+  // Magnitude turned out not to matter -- 13.51 bits at m = 1 and 13.48 at
+  // m = r -- so the only difference left between this and the stage is that
+  // the stage's input comes out of a bootstrap at 11.27 bits. Rather than
+  // assume that is the cause, inject noise of a known size into a clean input
+  // and find the threshold. `noise_bits` is the error added relative to the
+  // largest value in the ciphertext, which is how the bootstrap's own residual
+  // was measured, so the numbers are comparable.
+  //
+  // If 11.3 reproduces the stage's 0.45 bits, the story is settled and the
+  // question becomes where to find the missing precision. If it stays clean,
+  // then input precision is not the cause and something specific to
+  // bootstrapped ciphertexts is.
+  const double r_ratio =
+      std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
+  struct Case {
+    double m;
+    double noise_bits;
+  };
+  for (const Case &cs : std::vector<Case>{{1.0, 0.0},
+                                          {r_ratio, 0.0},
+                                          {r_ratio, 16.0},
+                                          {r_ratio, 13.0},
+                                          {r_ratio, 11.3}}) {
+    const double m = cs.m;
     const double a_used = 1.0 / (m * m);
     const double eps_used = kEps * beta * beta * m * m;
     RmsNormHandler<word> rms(context_, kTokens, kChannels, a_used, op_level,
@@ -897,6 +919,23 @@ TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
     }
 
     const double root = std::sqrt(a_used);
+    // The largest packed value, which is what noise_bits is measured against.
+    double packed_max = 0.0;
+    for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
+      for (int c = 0; c < kChannels; c++) {
+        packed_max = std::max(
+            packed_max,
+            std::abs(m * beta * x[static_cast<size_t>(t) * kChannels + c]));
+      }
+    }
+    const double noise =
+        cs.noise_bits > 0.0 ? packed_max * std::pow(2.0, -cs.noise_bits) : 0.0;
+    unsigned seed = 12345u;
+    auto next = [&seed]() {
+      seed = seed * 1103515245u + 12345u;
+      return (static_cast<double>((seed >> 16) & 0x7fff) / 16383.5) - 1.0;
+    };
+
     std::vector<Ciphertext<word>> cts(num_ct);
     std::vector<std::vector<Complex>> wts(num_ct);
     for (int i = 0; i < num_ct; i++) {
@@ -905,7 +944,8 @@ TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
       for (int s = 0; s < num_slots; s++) {
         const int c = i * channels_per_ct + s / kTokens;
         const int t = kFirstToken + (s % kTokens);
-        msg[s] = Complex(m * beta * x[static_cast<size_t>(t) * kChannels + c],
+        msg[s] = Complex(m * beta * x[static_cast<size_t>(t) * kChannels + c] +
+                             noise * next(),
                          0.0);
         wts[i][s] = Complex(w[c] * root, 0.0);
       }
@@ -932,9 +972,11 @@ TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
         absmax = std::max(absmax, std::abs(want));
       }
     }
-    std::cout << "  magnitude " << m << " (alpha_L " << a_used
-              << "): max abs err " << worst << " against " << absmax << " ("
-              << -std::log2(worst / absmax) << " bits)" << std::endl;
+    std::cout << "  magnitude " << m << ", input noise "
+              << (cs.noise_bits > 0.0 ? std::to_string(cs.noise_bits) + " bits"
+                                      : std::string("none"))
+              << ": max abs err " << worst << " against " << absmax << " ("
+              << -std::log2(worst / absmax) << " bits out)" << std::endl;
   }
 }
 
