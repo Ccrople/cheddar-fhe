@@ -461,6 +461,23 @@ TEST_P(CycleTestbed, WhatTheScaleDropDoesToABootstrappedCiphertext) {
 
 // WHERE CANONICALISATION'S TEN BITS GO.
 //
+// THEY DO NOT EXIST. Kept because the reasoning below is wrong in an
+// instructive way and the test is still the right regression.
+//
+// Every variant here is compared against `Boot`, and `Boot` runs its own
+// ModRaise/CtS/EvalMod on the same ciphertext with the same keys -- so it is
+// deterministic and *identical* to the one inside ToSlot. The bootstrap's
+// error therefore cancels exactly for a variant that shares Boot's
+// post-EvalMod handling and not at all for one that does not, and the gaps
+// below are differences in error correlation rather than in precision.
+//
+// TheScaleDropIsWhereTheBitsGo and
+// WhatTheScaleDropDoesToABootstrappedCiphertext measure the same operations
+// against references that owe nothing to another ciphertext, and both say
+// Canonicalise costs 0.4 bits: 11.68 in, 11.27 out. Read this test as a
+// same-shape comparison against Boot, which is what it is, and not as a
+// precision measurement, which it is not.
+//
 // Measured, all at slack 8 on bootparam_35: Boot alone reaches 16.94 bits and
 // SlackScheduleTest's HalfBoot + gap + StC -- which never leaves EvalMod's end
 // scale -- reaches 15.86. The cycle, whose only additions are Canonicalise and

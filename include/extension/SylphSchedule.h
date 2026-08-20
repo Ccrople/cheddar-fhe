@@ -38,6 +38,18 @@ namespace cheddar {
  * So a canonicalisation step exists, it costs one level, and it is the reason
  * the non-linear budget is `slack - 1` rather than `slack`. See `Canonicalise`.
  *
+ * It is not avoidable by teaching the handlers an input scale. `BasisEval`'s
+ * `final_scale_` is `working_scale / GetRescalePrimeProd(working_level)`
+ * (`EvalPoly.cpp:151`), so squaring a basis element maps `s` to `s^2 / prod`
+ * and the canonical scale is that map's fixed point. Started at 2^58 the chain
+ * runs 2^81, 2^127 and overruns the modulus in three squarings. The shrink is
+ * what keeps the polynomial's own scale bounded, not a convention.
+ *
+ * Measured against a host reference -- `DecodeCoeff` of the plaintext HalfBoot
+ * was handed, placed by `AttentionPacking::SlotOfCoeff` -- it costs **0.4
+ * bits**: 11.68 in, 11.27 out, against a scale-preserving rescale that is
+ * bit-identical to its input at 11.68.
+ *
  * **StC is not scale-free, and a stage arrives at the wrong scale.**
  * `stc_const_` is folded into the phase matrices' *values*, not their encoding
  * scale (`EvalSpecialFFT.cpp:282` multiplies the striped matrix), and it is
