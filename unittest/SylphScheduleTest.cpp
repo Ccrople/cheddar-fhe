@@ -683,11 +683,38 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   //     x' / sqrt(mean(x'^2) + eps') = r*x / sqrt(r^2 (mean(x^2) + eps))
   //
   // which is the same scale invariance that justified beta in the first place.
+  // AND SIZE THE INPUT FOR THE BOOTSTRAP, NOT FOR THE OPERATOR.
+  //
+  // beta was chosen to put the *RMS* near one, which is what RmsNormTest wants
+  // because CKKS precision is absolute. The bootstrap wants something else: its
+  // message has to stay inside the range EvalMod approximates, which is what
+  // log_message_ratio reserves. On this segment max|beta*x| is about 9.4, and
+  // feeding that through HalfBoot returned an arriving residual of **1.20
+  // bits** -- the input to RMSNorm was already destroyed, before the operator
+  // ran, which is why calibrating the window and matching the magnitude both
+  // changed nothing.
+  //
+  // The characterisation run that reached 11.27 bits used a cosine of
+  // amplitude 0.5, so 0.5 is a magnitude this bootstrap is known to carry.
+  // Size the encoded input to that and let RMSNorm's scale invariance absorb
+  // it: with v = B*x arriving as r*B*x, alpha_L = alpha / (r*B)^2 and
+  // eps = kEps * (r*B)^2 leave the argument and the output unchanged.
+  double max_abs_x = 0.0;
+  for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
+    for (int c = 0; c < kChannels; c++) {
+      max_abs_x = std::max(
+          max_abs_x, std::abs(x[static_cast<size_t>(t) * kChannels + c]));
+    }
+  }
   const double r = std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
-  alpha_scaled /= r * r;
-  eps_scaled *= r * r;
-  std::cout << "HalfBoot's message ratio r = " << r
-            << ", so alpha_L becomes " << alpha_scaled << std::endl;
+  const double kBootSafeMax = 0.5;
+  const double B = kBootSafeMax / max_abs_x;
+  alpha_scaled = alpha / (r * B) / (r * B);
+  eps_scaled = kEps * (r * B) * (r * B);
+  std::cout << "input scaled by B = " << B << " so max|B*x| = "
+            << kBootSafeMax << " (beta would have given "
+            << (beta * max_abs_x) << "); r = " << r << ", alpha_L = "
+            << alpha_scaled << std::endl;
 
   // The operator's input level is where Canonicalise leaves HalfBoot's output,
   // one below the landing level. This is the joint the whole class exists for.
@@ -725,7 +752,7 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = kFirstToken + (s % kTokens);
       const int p = AttentionPacking::CoeffOfSlot({s, false}, degree);
-      coeffs[p] = beta * x[static_cast<size_t>(t) * kChannels + c];
+      coeffs[p] = B * x[static_cast<size_t>(t) * kChannels + c];
       wts[i][s] = Complex(w[c] * root_alpha, 0.0);
     }
     Plaintext<word> ptxt;
@@ -761,7 +788,7 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
     for (int s = 0; s < num_slots; s++) {
       const int c = s / kTokens;  // ciphertext 0, so no channel offset
       const int t = kFirstToken + (s % kTokens);
-      const double want_v = beta * x[static_cast<size_t>(t) * kChannels + c];
+      const double want_v = B * x[static_cast<size_t>(t) * kChannels + c];
       num += got0[s].real() * want_v;
       den += want_v * want_v;
     }
@@ -786,7 +813,7 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
       const int c = s / kTokens;
       const int t = kFirstToken + (s % kTokens);
       const double want_v =
-          ratio * beta * x[static_cast<size_t>(t) * kChannels + c];
+          ratio * B * x[static_cast<size_t>(t) * kChannels + c];
       resid = std::max(resid, std::abs(got0[s].real() - want_v));
       want_absmax = std::max(want_absmax, std::abs(want_v));
     }
