@@ -101,9 +101,16 @@ std::string SylphSchedule<word>::DescribePlan(
   std::ostringstream os;
   os << "[SYLPH] figure 2 cycle on a max_level " << boot_->param_.max_level_
      << " parameter set, slack " << GetSlack() << "\n";
-  os << "  ModRaise/CtS/EvalMod land slots at level " << GetSlotLevel()
-     << ", scale " << GetSlotScale() << " (canonical there is "
-     << GetCanonicalSlotScale() << ")\n";
+  os << "  ModRaise/CtS/EvalMod land slots at level " << GetSlotLevel();
+  if (boot_->IsEvalModPrepared()) {
+    os << ", scale " << GetSlotScale() << " (canonical there is "
+       << GetCanonicalSlotScale() << ")";
+  } else {
+    // The plan is level arithmetic and must not need a prepared context. Only
+    // the landing scale does, because it comes out of EvalMod's compiled chain.
+    os << ", at a scale only PrepareEvalMod() can report";
+  }
+  os << "\n";
   os << "  canonicalise: " << GetSlotLevel() << " -> " << (GetSlotLevel() - 1)
      << ", so the non-linear budget is " << GetNonlinearBudget() << "\n";
   os << "  StC spans " << GetStCLevel() << " -> " << GetCoeffLevel()
@@ -155,22 +162,45 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
                  " levels too many. StC cannot be moved after the fact; the "
                  "slack is a BootParameter setting.");
 
-  double stc_input_scale = 0.0;
+  Ct descended;
+  const Ct *src = &x;
   if (level > stc_level) {
-    boot_->LevelDown(res, x, stc_level);
-    stc_input_scale = res.GetScale();
-    boot_->SlotToCoeff(res, num_slots_, res, evk_map, min_ks);
-  } else {
-    stc_input_scale = x.GetScale();
-    boot_->SlotToCoeff(res, num_slots_, x, evk_map, min_ks);
+    boot_->LevelDown(descended, x, stc_level);
+    src = &descended;
   }
-  res.SetNumSlots(num_slots_);
 
-  // See the header: linear in the input scale, anchored on Boot. The descent's
-  // drift needs no separate term because it is already inside
-  // `stc_input_scale`, which is read after LevelDown rather than before.
-  res.SetScale(boot_->param_.GetScale(GetCoeffLevel()) * stc_input_scale /
-               boot_->GetStCInputScale());
+  // THE SCALE-UP, and why it is not optional. Measured on the first run of
+  // TheTransportPreservesTheMessage: a canonical 2^35 input produced a result
+  // at scale 2^12 -- 2^-23 of Boot's -- and the message came back buried, at
+  // -6.25 bits against Boot's answer.
+  //
+  // StC is not scale-free. `stc_const_` is folded into the phase matrices'
+  // values (`EvalSpecialFFT.cpp:282`) and is calibrated so that an input at
+  // EvalMod's end scale lands on the canonical scale of `GetEndLevel()`. Feed
+  // it anything smaller and the output scale shrinks with it, which is
+  // arithmetically correct -- the declared scale tracks it exactly -- and
+  // numerically ruinous, because the message then occupies twelve bits above a
+  // noise floor that did not move.
+  //
+  // EvalMod's inflated end scale is what buys StC that headroom, so the fix is
+  // to arrive with it. A multiply by an exact 1.0 encoded at the ratio moves
+  // the ciphertext's integers up and its declared scale with them, and costs
+  // no level because nothing is rescaled. At level 11 on `bootparam_35` this
+  // puts a message of order one at 2^58 against a modulus near 2^435.
+  //
+  // It also removes the need to carry LevelDown's drift. The drift was never a
+  // bookkeeping error -- the declared scale after a descent is exact, it is
+  // just not the nominal 2^35 -- so dividing by that same declared scale here
+  // lands on `GetStCInputScale()` however far the ciphertext fell.
+  const double up_factor = boot_->GetStCInputScale() / src->GetScale();
+  Constant<word> up;
+  boot_->encoder_.EncodeConstant(up, stc_level, up_factor, 1.0);
+  boot_->Mult(res, *src, up);
+
+  boot_->SlotToCoeff(res, num_slots_, res, evk_map, min_ks);
+  res.SetNumSlots(num_slots_);
+  // Now exactly Boot's situation, so exactly Boot's constant.
+  res.SetScale(boot_->param_.GetScale(GetCoeffLevel()));
 }
 
 template <typename word>

@@ -38,30 +38,36 @@ namespace cheddar {
  * So a canonicalisation step exists, it costs one level, and it is the reason
  * the non-linear budget is `slack - 1` rather than `slack`. See `Canonicalise`.
  *
- * **StC is compiled at one level and one input scale, and a stage arrives at
- * neither.** `EvalSpecialFFT` pins the three StC phases to
- * `GetStCStartLevel()` downward, so a stage that spends fewer levels than the
- * slack has to descend to meet it. `LevelDown`'s rescales divide by the actual
- * prime products, which miss the nominal 2^35 by up to a part in 800, so the
- * scale that arrives is not the scale that was declared -- and that drift is
- * not cosmetic. It was worth up to 10 bits of the bootstrap's precision until
- * `Boot` was taught to carry it (`BootContext.cpp:405`). `ToCoeff` does the
- * descent and the arithmetic in one place so no stage has to remember.
+ * **StC is not scale-free, and a stage arrives at the wrong scale.**
+ * `stc_const_` is folded into the phase matrices' *values*, not their encoding
+ * scale (`EvalSpecialFFT.cpp:282` multiplies the striped matrix), and it is
+ * calibrated so that an input at EvalMod's end scale lands on the canonical
+ * scale of `GetEndLevel()`. A stage that has been through `Canonicalise`
+ * arrives at 2^35 instead of 2^58, and the output scale shrinks by that same
+ * 2^-23. The declared scale tracks it exactly, so this is not an arithmetic
+ * error -- it is a numerical one, and it is total: measured on the first run
+ * of `TheTransportPreservesTheMessage`, the message came back at **-6.25 bits**
+ * against Boot, buried under a noise floor that had not moved with it.
  *
- * ## What ToCoeff declares, and where that comes from
+ * `ToCoeff` therefore scales back up to `GetStCInputScale()` before calling
+ * StC. That is a multiply by an exact 1.0 encoded at the ratio: it moves the
+ * ciphertext's integers and its declared scale together, and costs no level
+ * because nothing is rescaled. EvalMod's inflated end scale is exactly the
+ * headroom StC was built to consume, so arriving with it makes a stage
+ * indistinguishable from `Boot` at that point -- and `Boot` is verified, to a
+ * max absolute difference of 0 against HalfBoot + StC. `ToCoeff` can then
+ * declare Boot's own constant, `GetScale(GetEndLevel())`.
  *
- * StC folds `stc_const_` into the phase matrices' *values*, not their encoding
- * scale (`EvalSpecialFFT.cpp:282` multiplies the striped matrix), so the
- * message comes out scaled by it and `Hoist`'s scale tracking cannot see it.
- * `Boot` compensates by declaring the nominal end scale outright. Every step
- * of the chain is linear in the input scale, so the one anchor point that is
- * verified -- `Boot`, whose result `half_boot_test` matches to a max absolute
- * difference of 0 -- extends to any other input scale by its ratio:
- *
- *     declared = GetScale(GetEndLevel()) * (arriving scale / GetStCInputScale())
- *
- * At `arriving == GetStCInputScale()` that is `Boot`'s own formula, drift
- * included, because the drift is already inside the arriving scale.
+ * The scale-up also disposes of `LevelDown`'s drift. StC is pinned to
+ * `GetStCStartLevel()`, so a stage shallower than the slack has to descend to
+ * meet it, and `LevelDown`'s rescales divide by the actual prime products
+ * rather than the nominal 2^35 -- a part in 800 per level, worth up to 10 bits
+ * of `Boot`'s precision until it was carried explicitly
+ * (`BootContext.cpp:405`). That drift was never a bookkeeping error: the
+ * declared scale after a descent is exact, it is simply not the nominal value.
+ * Dividing by that same declared scale to compute the scale-up factor lands on
+ * `GetStCInputScale()` however far the ciphertext fell, so no separate drift
+ * term survives.
  *
  * ## What this does not do
  *
@@ -150,8 +156,11 @@ class SylphSchedule {
    *
    * A multiply by an exact 1.0 and a rescale. The constant is encoded at
    * whatever scale makes the product land canonical, which for a HalfBoot
-   * output is around 2^6 -- small, but 1.0 is exact at any scale, so nothing
-   * is lost that an ordinary rescale would not also lose.
+   * output on `bootparam_35` is 2^35 * 2^35 / 2^58 = 2^12 -- small, but 1.0 is
+   * exact at any scale, so nothing is lost that an ordinary rescale would not
+   * also lose. Measured exact: `canon.GetScale() / canonical - 1.0` came back
+   * at 0, because the multiply and the rescale use the same actual prime
+   * product.
    *
    * @param res output, at `level - 1` and `param_.GetScale(level - 1)`
    * @param x input at any scale

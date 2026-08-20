@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "extension/AttentionPacking.h"
 #include "extension/RmsNorm.h"
 #include "extension/SylphSchedule.h"
 
@@ -133,6 +134,11 @@ TEST_P(CycleTestbed, ThePlanClosesForAWholeBlock) {
   auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
   ASSERT_NE(boot, nullptr);
   SylphSchedule<word> sched(boot, param_->degree_ / 2);
+
+  // The levels need no preparation, but the landing scale is EvalMod's own
+  // and this test asserts on it. PrepareEvalMod compiles the polynomial and
+  // touches no rotation key, so it is not what makes bootstrapping slow.
+  boot->PrepareEvalMod();
 
   const auto stages = BlockStages();
   std::cout << sched.DescribePlan(stages);
@@ -235,13 +241,17 @@ TEST_P(CycleTestbed, TheTransportPreservesTheMessage) {
   ASSERT_EQ(param_->NPToLevel(got.GetNP()), sched.GetCoeffLevel());
   ASSERT_EQ(param_->NPToLevel(got.GetNP()), param_->NPToLevel(want.GetNP()));
 
-  // No SetScale here. Boot's answer and this one were fed StC at different
-  // scales on purpose, so if the two decode to the same message then
-  // ToCoeff's formula tracked the difference; forcing the scales equal would
-  // throw away exactly the thing being tested.
+  // No SetScale here. ToCoeff scales up to StC's compiled input scale, so the
+  // two answers should now agree on the scale as well as the message; the
+  // first run of this test had them 2^-23 apart, which is what the scale-up
+  // exists to remove. Boot's own value carries its LevelDown drift and the
+  // cycle's does not, so they are close rather than equal.
   std::cout << "Boot declares scale " << want.GetScale() << ", the cycle "
             << got.GetScale() << " (ratio " << got.GetScale() / want.GetScale()
             << ")" << std::endl;
+  EXPECT_LT(std::abs(got.GetScale() / want.GetScale() - 1.0), 1e-2)
+      << "the two are no longer at comparable scales, so ToCoeff's scale-up "
+         "did not land where StC was calibrated";
 
   std::vector<Complex> a, b;
   DecryptAndDecode(a, want);
@@ -315,22 +325,35 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
     interface_->PrepareRotationKey(d, op_level);
   }
 
-  // Encrypt in the coefficient domain at level 0, which is where a real cycle
-  // hands the data over: the previous stage's product ends there.
+  // Encrypt in the COEFFICIENT domain at level 0, which is where a real cycle
+  // hands the data over: the previous stage's product ends there. The first
+  // run of this test used the slot encoder here and RMSNorm returned noise --
+  // ToSlot is HalfBoot, coefficients in and slots out, so slot-encoded input
+  // arrives at the operator permuted by the bit reversal and its per-token
+  // reduction sums over the wrong grouping.
+  //
+  // AttentionPacking::CoeffOfSlot is the inverse of that permutation, measured
+  // on this hardware with 0 of 32768 slots disagreeing, so writing the value
+  // for slot s into coefficient CoeffOfSlot({s, false}) makes HalfBoot deliver
+  // the token-fastest layout RmsNormHandler documents.
   const int channels_per_ct = num_slots / kTokens;
+  const int degree = param_->degree_;
   std::vector<Ciphertext<word>> coeff_cts(num_ct);
   std::vector<std::vector<Complex>> wts(num_ct);
   const double root_alpha = std::sqrt(alpha_scaled);
   for (int i = 0; i < num_ct; i++) {
-    std::vector<Complex> msg(num_slots);
+    std::vector<double> coeffs(degree, 0.0);
     wts[i].assign(num_slots, Complex(0.0, 0.0));
     for (int s = 0; s < num_slots; s++) {
       const int c = i * channels_per_ct + s / kTokens;
       const int t = kFirstToken + (s % kTokens);
-      msg[s] = Complex(beta * x[static_cast<size_t>(t) * kChannels + c], 0.0);
+      const int p = AttentionPacking::CoeffOfSlot({s, false}, degree);
+      coeffs[p] = beta * x[static_cast<size_t>(t) * kChannels + c];
       wts[i][s] = Complex(w[c] * root_alpha, 0.0);
     }
-    EncodeAndEncrypt(coeff_cts[i], msg, 0);
+    Plaintext<word> ptxt;
+    context_->encoder_.EncodeCoeff(ptxt, 0, DetermineScale(0), coeffs);
+    interface_->Encrypt(coeff_cts[i], ptxt);
   }
 
   // Leg one: up into the slot domain, then onto the operator's scale.
@@ -343,6 +366,37 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   ASSERT_EQ(param_->NPToLevel(slot_cts[0].GetNP()), op_level);
+
+  // WHAT ACTUALLY ARRIVED, before the operator gets a chance to hide it.
+  //
+  // RMSNorm is calibrated on the clear input's magnitude -- alpha_L puts the
+  // mean square inside the polynomial's window -- so a bootstrap that returns
+  // the message at some fraction of its input silently moves the argument out
+  // of that window. BootParameter::GetLogMessageRatio documents exactly this
+  // for a round trip through the encoding boundary. Rather than assume the
+  // factor is 1, or assume it is 2^-5, measure it: the ratio is reported and
+  // asserted near 1, so a mismatch names itself instead of appearing as a
+  // wrong RMSNorm.
+  {
+    std::vector<Complex> got0;
+    DecryptAndDecode(got0, slot_cts[0]);
+    double num = 0.0, den = 0.0;
+    for (int s = 0; s < num_slots; s++) {
+      const int c = s / kTokens;  // ciphertext 0, so no channel offset
+      const int t = kFirstToken + (s % kTokens);
+      const double want_v = beta * x[static_cast<size_t>(t) * kChannels + c];
+      num += got0[s].real() * want_v;
+      den += want_v * want_v;
+    }
+    const double ratio = num / den;
+    std::cout << "HalfBoot round trip: the message came back at " << ratio
+              << "x of what went in (log2 " << std::log2(std::abs(ratio))
+              << ")" << std::endl;
+    EXPECT_LT(std::abs(ratio - 1.0), 0.05)
+        << "the bootstrap moved the magnitude, so RMSNorm's window no longer "
+           "matches its calibration and its output cannot be read as a "
+           "failure of the operator";
+  }
 
   // NOTE. ToSlot is a bootstrap, so what reaches RMSNorm is the *bootstrapped*
   // message, not the plaintext one. The reference below is still the clear

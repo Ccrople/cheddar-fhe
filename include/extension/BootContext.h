@@ -217,6 +217,16 @@ class BootContext : public Context<word>,
   bool IsBootPrepared(int num_slots) const;
 
   /**
+   * @brief Whether PrepareEvalMod() has run, and so whether the scales derived
+   * from it -- GetStCInputScale() in particular -- are known yet.
+   *
+   * A caller that only wants the level arithmetic should not have to prepare
+   * anything, and without this it cannot tell the difference between "not
+   * prepared" and a wrong scale except by tripping the assert.
+   */
+  bool IsEvalModPrepared() const { return eval_mod_ != nullptr; }
+
+  /**
    * @brief Performs the trace operation. For s = start_rot_dist, and n =
    * num_accum, res = (input << s) + (input << 2s) + ... + (input << ns).
    *
