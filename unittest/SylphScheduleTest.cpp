@@ -706,15 +706,21 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
           max_abs_x, std::abs(x[static_cast<size_t>(t) * kChannels + c]));
     }
   }
+  // Canonicalise now restores the factor r that HalfBoot divides out, so the
+  // operator sees the same magnitude that was encoded and the calibration is
+  // in terms of B alone. The prediction, from the no-bootstrap sweep: an
+  // arriving max near 0.5 with about 11 bits of relative precision gave 9.64
+  // bits out, so that is what this should read, against 5.22 before.
   const double r = std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
   const double kBootSafeMax = 0.5;
   const double B = kBootSafeMax / max_abs_x;
-  alpha_scaled = alpha / (r * B) / (r * B);
-  eps_scaled = kEps * (r * B) * (r * B);
+  alpha_scaled = alpha / (B * B);
+  eps_scaled = kEps * B * B;
   std::cout << "input scaled by B = " << B << " so max|B*x| = "
             << kBootSafeMax << " (beta would have given "
-            << (beta * max_abs_x) << "); r = " << r << ", alpha_L = "
-            << alpha_scaled << std::endl;
+            << (beta * max_abs_x) << "); r = " << r
+            << " restored by Canonicalise, alpha_L = " << alpha_scaled
+            << std::endl;
 
   // The operator's input level is where Canonicalise leaves HalfBoot's output,
   // one below the landing level. This is the joint the whole class exists for.
@@ -812,8 +818,10 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
     for (int s = 0; s < num_slots; s++) {
       const int c = s / kTokens;
       const int t = kFirstToken + (s % kTokens);
+      // Canonicalise restored r, so what arrives is B*x and not r*B*x. The
+      // fitted `ratio` still divides out whatever residual factor remains.
       const double want_v =
-          ratio * B * x[static_cast<size_t>(t) * kChannels + c];
+          (ratio / r) * B * x[static_cast<size_t>(t) * kChannels + c];
       resid = std::max(resid, std::abs(got0[s].real() - want_v));
       want_absmax = std::max(want_absmax, std::abs(want_v));
     }

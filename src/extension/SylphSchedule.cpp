@@ -135,6 +135,23 @@ void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x) const {
              "Canonicalise: nothing below level " + std::to_string(level) +
                  " to rescale into");
   const double target = boot_->param_.GetScale(level - 1);
+  // Restore the magnitude HalfBoot divided out. The two legs of the cycle want
+  // opposite things: ModRaise needs the message a factor
+  // 2^-log_message_ratio below q0, which is what that parameter reserves, and
+  // the operators need it as large as possible because CKKS precision is
+  // absolute and a value only gets the bits it occupies below the scale.
+  //
+  // Measured, sizing the input so the bootstrap could carry it at all: the
+  // message arrived at max 0.0094 and RMSNorm returned 5.22 bits, against 9.64
+  // bits for the same operator fed the same relative precision at max 0.48 in
+  // a no-bootstrap sweep. The 51x is the whole difference.
+  //
+  // So the slot leg runs at operator magnitude and the coefficient leg at
+  // bootstrap magnitude, and the two constants are exact inverses that ride
+  // along on multiplies already being paid for -- this one, and ToCoeff's
+  // scale-up. Neither costs a level.
+  const double restore =
+      std::pow(2.0, boot_->GetBootParameter().GetLogMessageRatio());
   // Mult multiplies the scales and Rescale divides by the level's actual
   // prime product, so this factor is exactly what lands on `target`. Both
   // halves use the same `GetRescalePrimeProd`, which is the *actual* product
@@ -142,7 +159,7 @@ void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x) const {
   const double factor =
       target * boot_->param_.GetRescalePrimeProd(level) / x.GetScale();
   Constant<word> one;
-  boot_->encoder_.EncodeConstant(one, level, factor, 1.0);
+  boot_->encoder_.EncodeConstant(one, level, factor, restore);
   Ct tmp;
   boot_->Mult(tmp, x, one);
   boot_->Rescale(res, tmp);
@@ -192,9 +209,17 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
   // bookkeeping error -- the declared scale after a descent is exact, it is
   // just not the nominal 2^35 -- so dividing by that same declared scale here
   // lands on `GetStCInputScale()` however far the ciphertext fell.
+  // The value carried here is `r`, not 1.0, which undoes the magnitude
+  // Canonicalise restored. StC supplies the 1/r that makes `Boot` message
+  // preserving, so without this the loop would gain a factor of
+  // 2^log_message_ratio every turn and the state would leave the range
+  // ModRaise can carry after a couple of them. Riding on the scale-up's own
+  // multiply, it is free.
   const double up_factor = boot_->GetStCInputScale() / src->GetScale();
+  const double undo_restore =
+      std::pow(2.0, -boot_->GetBootParameter().GetLogMessageRatio());
   Constant<word> up;
-  boot_->encoder_.EncodeConstant(up, stc_level, up_factor, 1.0);
+  boot_->encoder_.EncodeConstant(up, stc_level, up_factor, undo_restore);
   boot_->Mult(res, *src, up);
 
   boot_->SlotToCoeff(res, num_slots_, res, evk_map, min_ks);
