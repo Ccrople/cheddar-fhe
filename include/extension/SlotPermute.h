@@ -77,7 +77,7 @@ class SlotPermute {
    * @param level the level the transform is compiled at
    */
   SlotPermute(ConstContextPtr<word> context, const std::vector<int> &perm,
-              int level);
+              int level, bool allow_shift = true);
 
   // disable copying (or moving also)
   SlotPermute(const SlotPermute &) = delete;

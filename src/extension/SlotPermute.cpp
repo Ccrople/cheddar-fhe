@@ -35,7 +35,8 @@ std::vector<int> SwapAdjacentFields(int num_slots, int low_bits, int high_bits,
 
 template <typename word>
 SlotPermute<word>::SlotPermute(ConstContextPtr<word> context,
-                              const std::vector<int> &perm, int level)
+                              const std::vector<int> &perm, int level,
+                              bool allow_shift /*= true*/)
     : num_slots_{static_cast<int>(perm.size())}, level_{level} {
   AssertTrue(IsPowOfTwo(num_slots_),
              "SlotPermute: the slot count must be a power of two");
@@ -108,7 +109,7 @@ SlotPermute<word>::SlotPermute(ConstContextPtr<word> context,
 
   const auto plain = cost(0);
   const auto shifted = cost(gap_start);
-  const bool use_shift = shifted.first < plain.first;
+  const bool use_shift = allow_shift && shifted.first < plain.first;
   shift_ = use_shift ? gap_start : 0;
   const auto chosen = use_shift ? shifted : plain;
   stride_ = chosen.second;

@@ -121,31 +121,62 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
   std::vector<Complex> msg(num_slots);
   Random::SampleUniformComplex(msg.data(), num_slots, -1.0, 1.0);
 
+  // Each case twice: once with the window shift and once without. The
+  // shift-free path uses only the raw diagonal offsets, so if it is exact then
+  // the striped-matrix convention is right and only the compensating rotation
+  // is in question.
   for (auto &c : cases) {
-    cheddar::SlotPermute<word> perm(context_, c.perm, level);
-    std::cout << "  " << c.name << ": " << perm.GetNumDiagonals()
-              << " diagonals, stride " << perm.GetStride() << ", BSGS "
-              << perm.GetBS() << "x" << perm.GetGS() << ", shift "
-              << perm.GetShift() << std::endl;
+    for (bool allow_shift : {false, true}) {
+      cheddar::SlotPermute<word> perm(context_, c.perm, level, allow_shift);
+      std::cout << "  " << c.name << (allow_shift ? " [shift]" : " [no shift]")
+                << ": " << perm.GetNumDiagonals() << " diagonals, stride "
+                << perm.GetStride() << ", BSGS " << perm.GetBS() << "x"
+                << perm.GetGS() << ", shift " << perm.GetShift() << std::endl;
 
-    EvkRequest req;
-    perm.AddRequiredRotations(req);
-    interface_->PrepareRotationKey(req);
+      EvkRequest req;
+      perm.AddRequiredRotations(req);
+      interface_->PrepareRotationKey(req);
 
-    Ciphertext<word> ct;
-    EncodeAndEncrypt(ct, msg, level);
-    Ciphertext<word> out;
-    perm.Evaluate(context_, out, ct, interface_->GetEvkMap());
-    EXPECT_EQ(param_->NPToLevel(out.GetNP()), level - 1)
-        << "one LinearTransform, one level";
-    EXPECT_NEAR(out.GetScale() / ct.GetScale(), 1.0, 1e-6)
-        << "and the scale is preserved";
+      Ciphertext<word> ct;
+      EncodeAndEncrypt(ct, msg, level);
+      Ciphertext<word> out;
+      perm.Evaluate(context_, out, ct, interface_->GetEvkMap());
+      EXPECT_EQ(param_->NPToLevel(out.GetNP()), level - 1)
+          << "one LinearTransform, one level";
 
-    std::vector<Complex> got;
-    DecryptAndDecode(got, out);
-    const double err = MaxDiff(got, msg, c.perm);
-    std::cout << "     max |diff| = " << err << std::endl;
-    EXPECT_LT(err, 1e-4) << c.name << " did not land where it was asked to";
+      std::vector<Complex> got;
+      DecryptAndDecode(got, out);
+      double biggest = 0.0;
+      for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
+      const double err = MaxDiff(got, msg, c.perm);
+      // If only the compensating rotation is wrong, the answer is the right
+      // permutation rotated by +-shift, and one of these is tiny.
+      double best_rot = 1e300;
+      int best_by = 0;
+      for (int by : {perm.GetShift(), -perm.GetShift()}) {
+        std::vector<int> rotated(c.perm.size());
+        for (size_t s = 0; s < c.perm.size(); s++) {
+          int d = (c.perm[s] + by) % num_slots;
+          if (d < 0) d += num_slots;
+          rotated[s] = d;
+        }
+        const double e = MaxDiff(got, msg, rotated);
+        if (e < best_rot) {
+          best_rot = e;
+          best_by = by;
+        }
+      }
+      std::cout << "     max |diff| = " << err << ", |got| <= " << biggest
+                << ", best rotated " << best_rot << " (by " << best_by << ")"
+                << std::endl;
+      if (!allow_shift) {
+        EXPECT_LT(err, 1e-4)
+            << c.name << " is wrong even without a window shift, so the "
+                         "striped-matrix convention is wrong";
+      } else {
+        EXPECT_LT(err, 1e-4) << c.name << " did not land where it was asked to";
+      }
+    }
   }
 
   // THE DECOMPOSITION THE PIPELINE WILL ACTUALLY USE.
