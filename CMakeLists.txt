@@ -82,6 +82,7 @@ if(ENABLE_EXTENSION)
     src/extension/LinearTransform.cpp
     src/extension/LlamaBlock.cu
     src/extension/LlamaLinear.cu
+  src/extension/SlotPermute.cpp
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
     src/extension/SoftMax.cu

@@ -129,6 +129,13 @@ if (ENABLE_EXTENSION)
   # Slots <-> SinC, homomorphically: the last stages of SlotToCoeff and nothing
   # else. One level against SlotToCoeff's three, and the piece the batch CC-MM
   # needs before it can take an operand that arrived encrypted.
+  # An arbitrary slot permutation as one LinearTransform -- the transpose
+  # [SYLPH] 3.2 says survives its layout choice, and the move the CC-MM's
+  # operands need to get the token off the low slot bits.
+  add_executable(slot_permute_test SlotPermuteTest.cpp)
+  target_link_libraries(slot_permute_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(sinc_transform_test SinCTransformTest.cpp)
   target_link_libraries(sinc_transform_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
