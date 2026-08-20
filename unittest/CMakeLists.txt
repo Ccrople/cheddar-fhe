@@ -189,6 +189,13 @@ if (ENABLE_EXTENSION)
   add_executable(slack_schedule_test SlackScheduleTest.cpp)
   target_link_libraries(slack_schedule_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # [SYLPH] figure 2's cycle assembled: the level and scale bookkeeping between
+  # the slot and coefficient legs. ThePlanClosesForAWholeBlock is arithmetic
+  # only; the other two bootstrap, and the third needs LLAMA3_REAL_DIR.
+  add_executable(sylph_schedule_test SylphScheduleTest.cpp)
+  target_link_libraries(sylph_schedule_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

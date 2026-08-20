@@ -85,6 +85,7 @@ if(ENABLE_EXTENSION)
     src/extension/SoftMax.cu
     src/extension/RoPe.cu
     src/extension/StripedMatrix.cpp
+    src/extension/SylphSchedule.cpp
   )
 endif()
 
