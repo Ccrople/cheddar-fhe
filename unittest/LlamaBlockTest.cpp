@@ -126,7 +126,8 @@ struct Packing {
 struct ClearRun {
   std::vector<double> normed, q, k, v, scores, probs, attn, proj, hidden;
   std::vector<double> fnormed, gate, up, down, out;
-  double score_max = 0.0, score_min = 0.0;
+  std::vector<double> row_max;  //!< the per-row shift, head * T + query
+  double score_max = 0.0, score_min = 0.0, span = 0.0;
   double norm_lo = 0.0, norm_hi = 0.0;
   double attn_alpha = 1.0, ffn_alpha = 1.0;
   double attn_window = 1.0, ffn_window = 1.0;
@@ -209,11 +210,14 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
 
   const double inv_root = 1.0 / std::sqrt(static_cast<double>(D));
   r.scores.assign(static_cast<size_t>(heads) * T * T, 0.0);
+  r.row_max.assign(static_cast<size_t>(heads) * T, 0.0);
   r.score_max = -1e300;
   r.score_min = 1e300;
+  r.span = 0.0;
   for (int hd = 0; hd < heads; hd++) {
     const int kvh = hd / group;
     for (int t = 0; t < T; t++) {
+      double hi = -1e300, lo = 1e300;
       for (int u = 0; u < T; u++) {
         double dot = 0.0;
         for (int d = 0; d < D; d++) {
@@ -222,30 +226,37 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
         }
         const double s = dot * inv_root;
         r.scores[(static_cast<size_t>(hd) * T + t) * T + u] = s;
-        // The range has to cover every entry, not only the causal ones: an
-        // argument outside a Chebyshev interval is evaluated as whatever the
-        // polynomial does out there, and although the causal mask zeroes those
-        // slots afterwards, a Chebyshev blow-up before the mask would still
-        // have to fit under the modulus.
-        r.score_max = std::max(r.score_max, s);
-        r.score_min = std::min(r.score_min, s);
+        // The row maximum is taken over *every* entry, not only the causal
+        // ones. The mask zeroes the others after the exponential, but the
+        // exponential still runs on them, and an argument above the interval
+        // is a Chebyshev blow-up that has to fit under the modulus before
+        // anything zeroes it.
+        hi = std::max(hi, s);
+        lo = std::min(lo, s);
       }
+      r.row_max[static_cast<size_t>(hd) * T + t] = hi;
+      r.span = std::max(r.span, hi - lo);
+      r.score_max = std::max(r.score_max, hi);
+      r.score_min = std::min(r.score_min, lo);
     }
   }
 
-  // ||y||_2^2 per row, with y = exp(s - c) and the causal mask applied, which
-  // is what the first inverse square root of the iteration sees.
+  // ||y||_2^2 per row, with y = exp((s - c_r)/2) -- the half is the k = 1
+  // iteration's own, since exp is evaluated on [-M/2, 0] and the squaring at
+  // the end of the iteration restores the other half -- and the causal mask
+  // applied. This is what the inverse square root actually sees.
   r.probs.assign(r.scores.size(), 0.0);
   r.norm_lo = 1e300;
   r.norm_hi = 0.0;
   for (int hd = 0; hd < heads; hd++) {
     for (int t = 0; t < T; t++) {
+      const double c = r.row_max[static_cast<size_t>(hd) * T + t];
       double sq = 0.0, sum = 0.0;
       for (int u = 0; u <= t; u++) {
-        const double y =
-            std::exp(r.scores[(static_cast<size_t>(hd) * T + t) * T + u] -
-                     r.score_max);
-        sq += y * y;
+        const double half = std::exp(
+            0.5 * (r.scores[(static_cast<size_t>(hd) * T + t) * T + u] - c));
+        sq += half * half;
+        const double y = half * half;
         sum += y;
         r.probs[(static_cast<size_t>(hd) * T + t) * T + u] = y;
       }
@@ -318,7 +329,7 @@ class HostLinearLeg : public Block::LinearLeg {
   void Scores(std::vector<Ciphertext<word>> &res,
               const std::vector<Ciphertext<word>> &q,
               const std::vector<Ciphertext<word>> &k, double scale,
-              double shift) const override {
+              const std::vector<double> &shift) const override {
     std::vector<double> qa, ka;
     Gather(qa, q, cfg_.num_channels);
     Gather(ka, k, cfg_.num_kv_channels);
@@ -335,7 +346,8 @@ class HostLinearLeg : public Block::LinearLeg {
             dot += qa[static_cast<size_t>(t) * cfg_.num_channels + hd * D + d] *
                    ka[static_cast<size_t>(u) * cfg_.num_kv_channels + kvh * D + d];
           }
-          s[(static_cast<size_t>(hd) * T + t) * T + u] = dot * scale + shift;
+          s[(static_cast<size_t>(hd) * T + t) * T + u] =
+              dot * scale + shift[static_cast<size_t>(hd) * T + t];
         }
       }
     }
@@ -521,11 +533,14 @@ class LlamaBlockFixture : public Testbed32 {
     cal.rms_window = std::max(r.attn_window, r.ffn_window);
     cal.rms_degree = 7;
 
-    cal.softmax_shift = r.score_max;
-    cal.softmax_range = r.score_max - r.score_min;
+    // One shift per row, its own maximum. The range only has to cover the
+    // widest single row, not the dispersion across rows, which is the other
+    // half of what the per-row shift buys.
+    cal.softmax_shift = r.row_max;
+    cal.softmax_range = r.span;
     cal.softmax_iters = 1;
     cal.softmax_exp_degree = 9;
-    cal.softmax_inv_sqrt_degree = 8;
+    cal.softmax_inv_sqrt_degree = 31;
     cal.softmax_early_inv_sqrt_degree = 4;
     cal.softmax_norm_lo = {r.norm_lo};
     cal.softmax_norm_hi = {r.norm_hi};
@@ -600,11 +615,18 @@ TEST_P(LlamaBlockFixture, TheCalibrationIsReachable) {
   std::cout << "RMSNorm layer constants: attn " << cal.attn_alpha << ", ffn "
             << cal.ffn_alpha << std::endl;
   std::cout << "SoftMax: scores in [" << r.score_min << ", " << r.score_max
-            << "], range M " << cal.softmax_range << "  (SoftMax.h's k=1 row "
-            << "was calibrated at M = 21)" << std::endl;
+            << "] globally; widest single row " << cal.softmax_range
+            << " -> range M" << std::endl;
+  std::cout << "SoftMax per-row shift: " << cal.softmax_shift.size()
+            << " constants, in ["
+            << *std::min_element(r.row_max.begin(), r.row_max.end()) << ", "
+            << *std::max_element(r.row_max.begin(), r.row_max.end())
+            << "] -- that spread is what one global shift would have to absorb"
+            << std::endl;
   std::cout << "SoftMax ||y||^2 over rows: [" << r.norm_lo << ", " << r.norm_hi
-            << "], spread " << (r.norm_hi / r.norm_lo) << "x  (SoftMax.h's k=1 "
-            << "row: [1.54, 6.82], 4.4x)" << std::endl;
+            << "], spread " << (r.norm_hi / r.norm_lo)
+            << "x  (with one global shift this measured 5.39e9x, which no "
+            << "degree covers)" << std::endl;
   std::cout << "SiLU: |gate| " << MaxAbs(r.gate) << " -> range "
             << cal.silu_range << std::endl;
   std::cout << "crossing magnitudes: |q| " << MaxAbs(r.q) << ", |k| "

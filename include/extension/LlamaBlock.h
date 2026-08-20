@@ -150,14 +150,41 @@ class LlamaBlock {
     double rms_window = 4.18;
     int rms_degree = 7;
 
-    // SoftMax: the argument is taken to lie in [shift - range, shift].
+    // SoftMax: row R's argument is taken to lie in [shift[R] - range, shift[R]].
+    //
+    // THE SHIFT IS PER ROW AND THAT IS NOT AN OPTIMISATION.
+    //
+    // With one global shift, measured on the real layer-2 scores, ||y||_2^2
+    // spans **5.39e9x** across rows -- the rows differ in their own maximum by
+    // about twelve nats, so a row whose scores all sit far below the global
+    // maximum exponentiates to almost nothing. No polynomial covers that, at
+    // any degree, and the failure is not gradual: the normalisation for such a
+    // row is wrong by orders of magnitude and the squaring that follows makes
+    // it worse.
+    //
+    // Shifting each row by its own calibrated maximum puts every row's largest
+    // exponential at 1 by construction, so `||y||_2^2` lands in [1, keys] and
+    // the spread is the row length rather than the score dispersion. That is
+    // 64x here against 5.39e9x, and 64x is an ordinary Chebyshev problem.
+    //
+    // It costs nothing. The shift is added by the score product in the
+    // coefficient domain, where a per-row plaintext and a uniform one are the
+    // same `Add(Ct, Pt)`. And it is legitimate: [SYLPH] section 3.1.3's
+    // calibration is exactly this -- offline statistics of the activations,
+    // per layer, used as public constants.
     double softmax_range = 21.0;
-    double softmax_shift = 0.0;
-    std::vector<double> softmax_norm_lo{1.54};
-    std::vector<double> softmax_norm_hi{6.82};
+    std::vector<double> softmax_shift;  //!< one per row, head * T + query
+    std::vector<double> softmax_norm_lo{1.0};
+    std::vector<double> softmax_norm_hi{64.0};
     int softmax_iters = 1;
     int softmax_exp_degree = 9;
-    int softmax_inv_sqrt_degree = 8;
+    // The inverse square root rides the auxiliary track, which comes back from
+    // a bootstrap with the operator's whole level budget, so its degree is
+    // nearly free -- but not entirely. It leaves the auxiliary value at
+    // `aux_return_level - ceil(log2(d+1))`, and the main track then spends two
+    // more levels, so `d = 31` (five levels) is the ceiling on a slack-8 set
+    // and `d = 63` lands the result one level below StC.
+    int softmax_inv_sqrt_degree = 31;
     int softmax_early_inv_sqrt_degree = 4;
 
     // SiLU: the fit half-interval. Set it to twice the measured maximum, so
@@ -222,11 +249,12 @@ class LlamaBlock {
      * @param k the rotated keys, `num_kv_channels` wide
      * @param scale multiplies every entry, and carries 1/sqrt(head_dim), the
      * SoftMax range, and both operands' crossing constants
-     * @param shift added to every entry after scaling
+     * @param shift added after scaling, one entry per row in the order
+     * `head * T + query`; see `Calibration::softmax_shift`
      */
     virtual void Scores(std::vector<Ct> &res, const std::vector<Ct> &q,
                         const std::vector<Ct> &k, double scale,
-                        double shift) const = 0;
+                        const std::vector<double> &shift) const = 0;
 
     /**
      * @brief res = scale * (P V), per head, with GQA repetition.

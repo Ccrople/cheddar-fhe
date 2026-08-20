@@ -269,8 +269,16 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   const double score_scale = cal_.size_scores /
                              (cal_.softmax_range * std::sqrt(cfg_.head_dim) *
                               cal_.size_q * cal_.size_k);
-  const double score_shift =
-      -cal_.size_scores * cal_.softmax_shift / cal_.softmax_range;
+  const int num_rows = (cfg_.num_channels / cfg_.head_dim) * cfg_.num_tokens;
+  AssertTrue(static_cast<int>(cal_.softmax_shift.size()) == num_rows,
+             "LlamaBlock: SoftMax needs one calibrated shift per row -- see "
+             "Calibration::softmax_shift for why a single global one does not "
+             "work on real scores");
+  std::vector<double> score_shift(num_rows);
+  for (int i = 0; i < num_rows; i++) {
+    score_shift[i] =
+        -cal_.size_scores * cal_.softmax_shift[i] / cal_.softmax_range;
+  }
   leg.Scores(scores, q_coeff, k_coeff, score_scale, score_shift);
 
   // ---- turn C: SoftMax, and V carried across ----------------------------
