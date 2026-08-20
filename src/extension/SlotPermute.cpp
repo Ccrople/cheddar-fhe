@@ -9,23 +9,26 @@
 
 namespace cheddar {
 
-std::vector<int> SwapAdjacentFields(int num_slots, int low_bits,
-                                    int high_bits) {
-  AssertTrue(low_bits > 0 && high_bits > 0,
+std::vector<int> SwapAdjacentFields(int num_slots, int low_bits, int high_bits,
+                                    int offset /*= 0*/) {
+  AssertTrue(low_bits > 0 && high_bits > 0 && offset >= 0,
              "SwapAdjacentFields: both fields must be non-empty");
   const int window = 1 << (low_bits + high_bits);
-  AssertTrue(num_slots % window == 0,
+  const int below = 1 << offset;
+  AssertTrue(num_slots % (window * below) == 0,
              "SwapAdjacentFields: the two fields must fit the slot index");
   const int low = 1 << low_bits;
   const int high = 1 << high_bits;
 
   std::vector<int> perm(num_slots);
   for (int s = 0; s < num_slots; s++) {
-    const int rest = s / window;
-    const int in = s % window;
-    const int a = in / low;  // the high field
-    const int b = in % low;  // the low field
-    perm[s] = rest * window + b * high + a;
+    const int keep = s % below;             // the bits below the pair
+    const int up = s / below;
+    const int rest = up / window;           // the bits above the pair
+    const int in = up % window;
+    const int a = in / low;                 // the high field
+    const int b = in % low;                 // the low field
+    perm[s] = (rest * window + b * high + a) * below + keep;
   }
   return perm;
 }

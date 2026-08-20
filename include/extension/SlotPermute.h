@@ -121,11 +121,19 @@ class SlotPermute {
  * `[channel-nibble | token]` in the low slot bits and the CC-MM wants
  * `[token | head-nibble]`.
  *
+ * Splitting a wide swap into two narrow ones is usually the right move: a
+ * `[4 | 7]` swap is 2048 diagonals and therefore 2048 plaintexts, while
+ * `[4 | 4]` at offset 3 followed by `[4 | 3]` at offset 0 is 256 + 128 for the
+ * same permutation. That is one more level and an eighth of the memory, and
+ * the memory is what binds -- a diagonal is a full plaintext at the transform's
+ * level.
+ *
  * @param num_slots the ciphertext's slot count
  * @param low_bits `b`, the width of the field that ends up on top
  * @param high_bits `a`, the width of the field that ends up at the bottom
+ * @param offset how many slot bits below the pair are left untouched
  */
 std::vector<int> SwapAdjacentFields(int num_slots, int low_bits,
-                                    int high_bits);
+                                    int high_bits, int offset = 0);
 
 }  // namespace cheddar
