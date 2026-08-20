@@ -389,8 +389,24 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
   // LevelDown is a multiply by a level-down constant plus a rescale, which
   // leaves the declared scale alone. That matters here: what StC receives
   // inside Boot is still EvalMod's end scale, exactly as with no slack.
+  //
+  // The drift is not cosmetic. LevelDown's rescales divide by the actual prime
+  // products, which miss the nominal 2^35 per level by up to a part in 800, so
+  // the scale it leaves is not the scale it was handed. The message is
+  // untouched -- the scale field tracks it exactly -- but the canonical scale
+  // this function declares at the end no longer describes the data, and the
+  // whole of that mismatch shows up as error.
+  //
+  // Measured before this line existed, over slack 1 to 4: predicted error
+  // -log2|drift - 1| of 11.30, 10.43, 6.89, 9.75 bits against measured 11.78,
+  // 10.92, 7.39, 10.24 -- the same +0.49 offset four times over, which is what
+  // a pure constant bias looks like under a max-absolute metric. So the gap
+  // costs no precision at all; declaring the wrong scale afterwards did.
+  double leveldown_drift = 1.0;
   if (boot_param_.GetNumSlackLevels() > 0) {
+    const double before = res.GetScale();
     this->LevelDown(res, res, boot_param_.GetStCStartLevel());
+    leveldown_drift = res.GetScale() / before;
   }
   SlotToCoeff(res, num_slots, res, evk_map, min_ks);
 
@@ -403,7 +419,8 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
 
   // Restore num slots and set scale (just in case)
   res.SetNumSlots(input_num_slots);
-  double final_scale = this->param_.GetScale(boot_param_.GetEndLevel());
+  double final_scale =
+      this->param_.GetScale(boot_param_.GetEndLevel()) * leveldown_drift;
   res.SetScale(final_scale);
 }
 
