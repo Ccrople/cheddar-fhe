@@ -1191,6 +1191,201 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
   EXPECT_GT(-std::log2(worst / absmax), 6.0);
 }
 
+// ---------------------------------------------------------------------------
+
+// WHERE RMSNORM'S BITS GO, STAGE BY STAGE.
+//
+// "The polynomial dominates" came from a black-box sweep: input noise of none,
+// 16, 13 and 11.3 bits all produced 9.12 bits out, so whatever binds is inside
+// the operator. That says where it is not. This says where it is.
+//
+// RmsNorm.cu's Apply is five steps, and the first three are public Context
+// calls, so they can be replayed here and decrypted between. The fourth is
+// EvalPoly, which is private -- but PlainInvSqrt is public and is the
+// polynomial evaluated in the clear, so the *fit's* own error can be measured
+// on the host over the arguments this data actually produces, with no crypto
+// at all. That separates the approximation from the circuit around it, which
+// is the distinction the black-box number cannot make.
+//
+// No bootstrap here on purpose: the input is a fresh encryption, so every bit
+// lost below is the operator's own.
+//
+//   A  input, fresh
+//   B  after square and accumulate across the 8 ciphertexts
+//   C  after the 9-rotation all-reduce, holding H * mean(x^2)
+//   D  the Chebyshev fit alone, on the host, over the real argument range
+//
+// Each is reported against a host reference computed at that exact point, so
+// the drops between rows are attributable.
+TEST_P(CycleTestbed, WhereRmsNormsBitsGo) {
+  const std::string dir = DataDir();
+  if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
+
+  std::vector<double> x, w;
+  ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
+  ASSERT_TRUE(ReadF32(dir + "/attn_norm.f32", kChannels, w));
+
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  const int op_level = boot->GetBootParameter().GetEvalModEndLevel() - 1;
+  const int channels_per_ct = num_slots / kTokens;
+
+  // The same sizing the stage uses: the bootstrap's magnitude bound, not the
+  // RMS-to-one that RmsNormTest would pick.
+  double max_abs_x = 0.0, log_sum = 0.0, lo = 1e300, hi = 0.0;
+  for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
+    const double ms = MeanSquare(x, t);
+    lo = std::min(lo, ms);
+    hi = std::max(hi, ms);
+    log_sum += std::log(ms);
+    for (int c = 0; c < kChannels; c++) {
+      max_abs_x = std::max(
+          max_abs_x, std::abs(x[static_cast<size_t>(t) * kChannels + c]));
+    }
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+  const double B = 0.5 / max_abs_x;
+  const double a_used = alpha / (B * B);
+  const double eps_used = kEps * B * B;
+
+  // THE WINDOW, measured against what the handler was told.
+  //
+  // RmsNorm.h puts degree 7's 12-bit reach at a window ratio of 4.18 and says
+  // it falls to 11.9 at 5. The handler is constructed with kRmsNormWindow, and
+  // if the segment is wider than that the polynomial is being evaluated
+  // outside the interval it was fitted on -- which is a silent, and entirely
+  // sufficient, explanation for a low output.
+  std::cout << "segment mean-square spread " << (hi / lo) << "x, handler built "
+            << "for " << kRmsNormWindow << "x, argument range ["
+            << (a_used * B * B * lo) << ", " << (a_used * B * B * hi) << "]"
+            << std::endl;
+
+  RmsNormHandler<word> rms(context_, kTokens, kChannels, a_used, op_level,
+                           eps_used, kRmsNormWindow, kRmsNormDegree);
+  const int num_ct = rms.GetNumCiphertexts();
+  for (int d : rms.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, op_level);
+  }
+
+  // D. THE FIT ALONE, on the host, over the arguments this data produces.
+  {
+    double worst = 0.0, at = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double ms = MeanSquare(x, kFirstToken + t);
+      const double u = a_used * (B * B * ms + eps_used);
+      const double got = rms.PlainInvSqrt(u);
+      const double want = 1.0 / std::sqrt(u);
+      const double rel = std::abs(got - want) / std::abs(want);
+      if (rel > worst) {
+        worst = rel;
+        at = u;
+      }
+    }
+    std::cout << "D  Chebyshev fit alone (host, no crypto): "
+              << -std::log2(worst) << " bits, worst at argument " << at
+              << std::endl;
+  }
+
+  // Encrypt, fresh, at the operator's level.
+  std::vector<Ciphertext<word>> cts(num_ct);
+  for (int i = 0; i < num_ct; i++) {
+    std::vector<Complex> msg(num_slots);
+    for (int s = 0; s < num_slots; s++) {
+      const int c = i * channels_per_ct + s / kTokens;
+      const int t = kFirstToken + (s % kTokens);
+      msg[s] = Complex(B * x[static_cast<size_t>(t) * kChannels + c], 0.0);
+    }
+    EncodeAndEncrypt(cts[i], msg, op_level);
+  }
+
+  auto report = [&](const char *name, const Ciphertext<word> &ct,
+                    const std::vector<double> &want) {
+    std::vector<Complex> got;
+    DecryptAndDecode(got, ct);
+    double e = 0.0, m = 0.0, typ = 0.0;
+    for (int s = 0; s < num_slots; s++) {
+      e = std::max(e, std::abs(got[s].real() - want[s]));
+      m = std::max(m, std::abs(want[s]));
+      typ += std::abs(want[s]);
+    }
+    typ /= num_slots;
+    std::cout << "   " << name << ": " << -std::log2(e / m) << " bits vs max "
+              << m << "  (" << -std::log2(e / typ) << " bits vs the typical "
+              << typ << ")" << std::endl;
+  };
+
+  // A. The input.
+  {
+    std::vector<double> want(num_slots);
+    for (int s = 0; s < num_slots; s++) {
+      const int c = s / kTokens;
+      const int t = kFirstToken + (s % kTokens);
+      want[s] = B * x[static_cast<size_t>(t) * kChannels + c];
+    }
+    report("A  input, fresh encryption", cts[0], want);
+  }
+
+  const auto &mult_key = interface_->GetEvkMap().GetMultiplicationKey();
+
+  // B. Square and accumulate across the ciphertexts -- RmsNorm.cu step 1.
+  Ciphertext<word> acc, sq;
+  for (int i = 0; i < num_ct; i++) {
+    context_->HMult(sq, cts[i], cts[i], mult_key);
+    if (i == 0) {
+      context_->Copy(acc, sq);
+    } else {
+      context_->Add(acc, acc, sq);
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  {
+    std::vector<double> want(num_slots, 0.0);
+    for (int s = 0; s < num_slots; s++) {
+      const int t = kFirstToken + (s % kTokens);
+      for (int i = 0; i < num_ct; i++) {
+        const double v =
+            B * x[static_cast<size_t>(t) * kChannels + i * channels_per_ct +
+                  s / kTokens];
+        want[s] += v * v;
+      }
+    }
+    report("B  after square + accumulate", acc, want);
+  }
+
+  // C. The all-reduce -- RmsNorm.cu step 2.
+  Ciphertext<word> rotated;
+  for (int d : rms.GetRotationDistances()) {
+    context_->HRotAdd(rotated, acc, acc,
+                      interface_->GetEvkMap().GetRotationKey(d), d);
+    context_->Copy(acc, rotated);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  {
+    std::vector<double> want(num_slots, 0.0);
+    for (int s = 0; s < num_slots; s++) {
+      const int t = kFirstToken + (s % kTokens);
+      double sum = 0.0;
+      for (int c = 0; c < kChannels; c++) {
+        const double v = B * x[static_cast<size_t>(t) * kChannels + c];
+        sum += v * v;
+      }
+      want[s] = sum;
+    }
+    report("C  after the 9-rotation all-reduce", acc, want);
+    // How much of the scale is this actually using? CKKS precision is
+    // absolute, so a value's bits are what it occupies below the scale.
+    std::cout << "   C occupies log2(value * scale) = "
+              << std::log2(want[0] * param_->GetScale(
+                                         param_->NPToLevel(acc.GetNP())))
+              << " of the " << std::log2(param_->GetScale(param_->NPToLevel(
+                                    acc.GetNP())))
+              << " bits the scale offers" << std::endl;
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CycleTestbed, testing::Values("bootparam_35.json"),
     [](const testing::TestParamInfo<CycleTestbed::ParamType> &info) {
