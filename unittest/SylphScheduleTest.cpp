@@ -355,6 +355,110 @@ TEST_P(CycleTestbed, TheScaleDropIsWhereTheBitsGo) {
 
 // ---------------------------------------------------------------------------
 
+// THE SAME DROP, ON BOOTSTRAP OUTPUT, AGAINST AN EXACT REFERENCE.
+//
+// TheScaleDropIsWhereTheBitsGo came back flat -- 18.59 to 19.01 bits across a
+// 2^0 to 2^23 shrink -- so the rescale, the regraft and the small constant are
+// all clean and the operation floors at about 18.7 bits. Yet the same
+// arithmetic applied to HalfBoot's output cost 9.6. Those two facts are only
+// compatible if something about the bootstrapped ciphertext, and not the
+// operation, is what the shrink exposes.
+//
+// So measure it directly, one operation at a time, against a reference that
+// owes nothing to another ciphertext: the plaintext handed to HalfBoot is
+// decoded on the host with DecodeCoeff, and AttentionPacking::SlotOfCoeff says
+// which slot each coefficient lands in -- measured on this hardware with 0 of
+// 32768 disagreeing. Three readings, all in the slot domain, all against that:
+//
+//   1. HalfBoot's output as it lands
+//   2. after a scale-preserving rescale   (what variant A did)
+//   3. after Canonicalise                 (what variant B did)
+//
+// The fitted factor absorbs the log_message_ratio, so only the residual is
+// compared. If 2 and 3 are equal, the drop is not the cause and the next
+// suspect is downstream of it. If 3 is nine bits below 2, then the bootstrap
+// leaves something in the ciphertext that a scale-preserving rescale carries
+// harmlessly and a shrinking one does not.
+TEST_P(CycleTestbed, WhatTheScaleDropDoesToABootstrappedCiphertext) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  const int degree = param_->degree_;
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+  SylphSchedule<word> sched(boot, num_slots);
+
+  // Coefficient domain in, because that is what HalfBoot takes.
+  std::vector<double> coeffs(degree);
+  for (int p = 0; p < degree; p++) {
+    coeffs[p] = 0.5 * std::cos(0.7 * p + 1.0);
+  }
+  Plaintext<word> ptxt;
+  context_->encoder_.EncodeCoeff(ptxt, 0, DetermineScale(0), coeffs);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, ptxt);
+
+  // The exact reference: what the host says those coefficients become.
+  std::vector<double> round_trip;
+  context_->encoder_.DecodeCoeff(round_trip, ptxt);
+  std::vector<Complex> want(num_slots);
+  for (int p = 0; p < degree; p++) {
+    const auto pos = AttentionPacking::SlotOfCoeff(p, degree);
+    if (pos.imaginary) {
+      want[pos.slot] = Complex(want[pos.slot].real(), round_trip[p]);
+    } else {
+      want[pos.slot] = Complex(round_trip[p], want[pos.slot].imag());
+    }
+  }
+
+  auto report = [&](const char *name, const Ciphertext<word> &got_ct) {
+    std::vector<Complex> got;
+    DecryptAndDecode(got, got_ct);
+    double num = 0.0, den = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      num += got[i].real() * want[i].real() + got[i].imag() * want[i].imag();
+      den += want[i].real() * want[i].real() + want[i].imag() * want[i].imag();
+      absmax = std::max(absmax, std::abs(want[i]));
+    }
+    const double fit = num / den;
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max({worst, std::abs(fit * want[i].real() - got[i].real()),
+                        std::abs(fit * want[i].imag() - got[i].imag())});
+    }
+    std::cout << "  " << name << ": factor " << fit << ", residual "
+              << -std::log2(worst / (absmax * std::abs(fit))) << " bits"
+              << std::endl;
+  };
+
+  Ciphertext<word> landed;
+  sched.ToSlot(landed, ct, interface_->GetEvkMap());
+  const int level = param_->NPToLevel(landed.GetNP());
+  report("1 HalfBoot as it lands", landed);
+
+  {
+    Constant<word> keep;
+    context_->encoder_.EncodeConstant(
+        keep, level, param_->GetRescalePrimeProd(level), 1.0);
+    Ciphertext<word> tmp, out;
+    context_->Mult(tmp, landed, keep);
+    context_->Rescale(out, tmp);
+    report("2 scale-preserving rescale", out);
+  }
+  {
+    Ciphertext<word> out;
+    sched.Canonicalise(out, landed);
+    report("3 Canonicalise", out);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+}
+
+// ---------------------------------------------------------------------------
+
 // WHERE CANONICALISATION'S TEN BITS GO.
 //
 // Measured, all at slack 8 on bootparam_35: Boot alone reaches 16.94 bits and
