@@ -226,11 +226,20 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
   // `[4|4]` at offset 3 followed by `[4|3]` is the same permutation for 31 and
   // 127, at the cost of one more level. SlotPermuteTest checks the equality
   // exactly.
-  SlotPermute<word> swap_a(big.context,
-                           SwapAdjacentFields(num_slots, 4, 4, 3),
-                           kPermuteLevel);
-  SlotPermute<word> swap_b(big.context, SwapAdjacentFields(num_slots, 3, 4),
-                           kPermuteLevel - 1);
+  const std::vector<int> step_a = SwapAdjacentFields(num_slots, 4, 4, 3);
+  const std::vector<int> step_b = SwapAdjacentFields(num_slots, 3, 4);
+  std::vector<int> wide(num_slots);
+  for (int t = 0; t < num_slots; t++) wide[t] = step_b[step_a[t]];
+  {
+    const std::vector<int> direct = SwapAdjacentFields(num_slots, 7, 4);
+    int mismatch = 0;
+    for (int t = 0; t < num_slots; t++) {
+      if (direct[t] != wide[t]) mismatch++;
+    }
+    ASSERT_EQ(mismatch, 0) << "the two narrow swaps are not the wide one";
+  }
+  SlotPermute<word> swap_a(big.context, step_a, kPermuteLevel);
+  SlotPermute<word> swap_b(big.context, step_b, kPermuteLevel - 1);
   std::cout << "permute step 1: " << swap_a.GetNumDiagonals()
             << " diagonals, stride " << swap_a.GetStride() << ", BSGS "
             << swap_a.GetBS() << "x" << swap_a.GetGS() << ", shift "
@@ -296,8 +305,54 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
     swap_a.Evaluate(big.context, a, ct, big.ui->GetEvkMap());
     swap_b.Evaluate(big.context, b, a, big.ui->GetEvkMap());
     ASSERT_EQ(big.param->NPToLevel(b.GetNP()), kPermuteLevel - 2);
+
+    // Stage by stage on the first ciphertext only: three transforms compose
+    // here and each fails the same way, so the ledger is worth one decryption.
+    if (i == 0) {
+      auto slot_check = [&](const Ciphertext<word> &c,
+                            const std::vector<int> &perm, const char *name) {
+        Plaintext<word> pt;
+        big.ui->Decrypt(pt, c);
+        std::vector<Complex> got;
+        big.context->encoder_.Decode(got, pt);
+        double worst = 0.0, biggest = 0.0;
+        for (int t = 0; t < num_slots; t++) {
+          biggest = std::max(biggest, std::abs(got[t]));
+          worst = std::max(worst, std::abs(got[perm[t]] - q_slots[0][t]));
+        }
+        std::cout << "  " << name << ": max |diff| = " << worst
+                  << ", |got| <= " << biggest << std::endl;
+      };
+      slot_check(a, step_a, "after swap [4|4]@3");
+      slot_check(b, wide, "after swap [4|3] (composed)");
+    }
+
     boot->SlotToSinC(sinc, num_slots, b, big.ui->GetEvkMap());
     ASSERT_EQ(big.param->NPToLevel(sinc.GetNP()), kSinCLevel - kSinCPhases);
+    if (i == 0) {
+      Plaintext<word> pt;
+      big.ui->Decrypt(pt, sinc);
+      std::vector<Complex> got;
+      big.context->encoder_.DecodeSinC(got, pt, kSubDegree);
+      double worst = 0.0, biggest = 0.0;
+      for (int t = 0; t < num_slots; t++) {
+        biggest = std::max(biggest, std::abs(got[t]));
+      }
+      for (int head = 0; head < kLanes; head++) {
+        for (int query = 0; query < kTokens; query++) {
+          for (int c = 0; c < kHeadDim; c++) {
+            int ct_i, index;
+            layout.LocateSinC(BitRev(query, 7), BitRev(c, 7), head, ct_i,
+                              index);
+            if (ct_i != 0) continue;
+            worst = std::max(
+                worst, std::abs(got[index].real() - at(q, head, query, c)));
+          }
+        }
+      }
+      std::cout << "  after SlotToSinC: max |diff| = " << worst
+                << ", |got| <= " << biggest << std::endl;
+    }
     big.context->LevelDown(q_operand[i], sinc, kProductLevel);
     // LevelDown is five multiply-and-rescale steps and each one rounds, so
     // the canonical value is met to about 3e-4 rather than exactly.
