@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -45,8 +46,20 @@ using Ring = ringfixture::Ring<word>;
 
 namespace {
 
-constexpr const char *kSwitchParam = "ringswitch16_30.json";
-constexpr const char *kSmallParam = "ringdegree12_30.json";
+// The pair is selected by environment so the same suite can be run against
+// either scale. `ringswitch16_30`/`ringdegree12_30` is the pair this file was
+// written for; `ringswitch16_35`/`ringdegree12_35` is the 2^35 pair, whose
+// terminal primes sit near 2^25 rather than 2^30 so that log2(PQ) clears the
+// degree-4096 budget -- which is exactly what bootparam_35's own bottom levels
+// could not do.
+const char *ParamFromEnv(const char *var, const char *fallback) {
+  const char *env = std::getenv(var);
+  return (env != nullptr && env[0] != 0) ? env : fallback;
+}
+const char *kSwitchParam = ParamFromEnv("CHEDDAR_SWITCH_PARAM",
+                                        "ringswitch16_30.json");
+const char *kSmallParam = ParamFromEnv("CHEDDAR_SMALL_PARAM",
+                                       "ringdegree12_30.json");
 
 }  // namespace
 

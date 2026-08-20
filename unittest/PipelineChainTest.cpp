@@ -43,6 +43,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -63,8 +64,13 @@ using cheddar::RingSwitchHandler;
 using Ring = ringfixture::Ring<word>;
 
 TEST(PipelineChain, DescendMultiplyAndReturn) {
-  Ring big("ringswitch16_30.json");
-  Ring small("ringdegree12_30.json");
+  // Selected by environment, as in RingSwitchTest: the 2^30 pair by default,
+  // the 2^35 pair when CHEDDAR_SWITCH_PARAM / CHEDDAR_SMALL_PARAM say so.
+  const char *big_param = std::getenv("CHEDDAR_SWITCH_PARAM");
+  const char *small_param = std::getenv("CHEDDAR_SMALL_PARAM");
+  Ring big(big_param && big_param[0] ? big_param : "ringswitch16_30.json");
+  Ring small(small_param && small_param[0] ? small_param
+                                           : "ringdegree12_30.json");
 
   const int degree = big.Degree();          // 65536
   const int mid_degree = small.Degree();    // 4096
