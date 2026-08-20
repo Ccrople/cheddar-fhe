@@ -81,6 +81,18 @@ int SlackFromEnv() {
 }
 const int kSlack = SlackFromEnv();
 
+// How many input ciphertexts CoeffLinearLeg decomposes at once. Each one costs
+// `rank` module components of the parent's own size -- about 201 MB at level 1
+// on bootparam_35 -- and the block is already holding a dozen tensors and
+// every bootstrap key by the time the O projection runs. Four is 0.8 GB.
+// Bigger is faster (one ModPack per output group per tile is the whole cost of
+// a tile) and this is the knob to turn when a card has room.
+int TileFromEnv() {
+  const char *env = std::getenv("CHEDDAR_PARENTS_PER_TILE");
+  return env ? std::atoi(env) : 4;
+}
+const int kParentsPerTile = TileFromEnv();
+
 constexpr int kAllTokens = 128;
 constexpr int kChannels = 4096;
 constexpr int kKvChannels = 1024;
@@ -1025,13 +1037,17 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
     // 14336 input channels is 56 parents and about 11.3 GB of module
     // components held at once. Bounding it costs one extra ModPack per output
     // group per tile and nothing else; see LlamaLinear.h.
-    lcfg.parents_per_tile = 16;
+    lcfg.parents_per_tile = kParentsPerTile;
 
     const int small_degree = Leg::SmallDegreeFor(kTokens);
     const int rank = param_->degree_ / small_degree;
+    size_t dev_free = 0, dev_total = 0;
+    cudaMemGetInfo(&dev_free, &dev_total);
     std::cout << "preparing " << rank << " ModPack keys at level "
-              << lcfg.product_level << " (small degree " << small_degree << ")"
-              << std::endl;
+              << lcfg.product_level << " (small degree " << small_degree
+              << "), " << lcfg.parents_per_tile << " parents per tile; device "
+              << (dev_free >> 20) << " MiB free of " << (dev_total >> 20)
+              << " MiB before keygen" << std::endl;
     interface_->PrepareModPackKeys(small_degree, lcfg.product_level);
     modpack_keys.resize(rank);
     for (int j = 0; j < rank; j++) {
@@ -1040,6 +1056,9 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
     real_leg = std::make_unique<EncryptedProjectionLeg>(context_, lcfg,
                                                         modpack_keys, host);
     leg = real_leg.get();
+    cudaMemGetInfo(&dev_free, &dev_total);
+    std::cout << "device " << (dev_free >> 20) << " MiB free after the "
+              << rank << " ModPack keys" << std::endl;
   }
 
   std::vector<Ciphertext<word>> out;
