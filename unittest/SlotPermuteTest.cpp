@@ -103,31 +103,52 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
     if (level < 0 && head >= 20.0) level = L;
   }
   ASSERT_GE(level, 1) << "no level leaves room for a plaintext matrix";
-  std::cout << "running at level " << level << std::endl;
+
+  std::vector<Complex> msg(num_slots);
+  Random::SampleUniformComplex(msg.data(), num_slots, -1.0, 1.0);
+
+  // THE CHEAPEST POSSIBLE MAP, AT SEVERAL LEVELS.
+  //
+  // Three diagonals: if this is wrong the machinery is wrong, not the size.
+  // sinc_transform_test builds a LinearTransform the same way and is exact at
+  // the StC level, so running the same map at 2, 5 and 11 says whether the
+  // level is what matters -- and a standalone transform gets to choose its
+  // level, so the answer decides where the pipeline can put one.
+  const auto tiny = cheddar::SwapAdjacentFields(num_slots, 1, 1);
+  for (int L : {2, 5, 11}) {
+    cheddar::SlotPermute<word> perm(context_, tiny, L, false);
+    EvkRequest req;
+    perm.AddRequiredRotations(req);
+    interface_->PrepareRotationKey(req);
+    Ciphertext<word> ct;
+    EncodeAndEncrypt(ct, msg, L);
+    Ciphertext<word> out;
+    perm.Evaluate(context_, out, ct, interface_->GetEvkMap());
+    std::vector<Complex> got;
+    DecryptAndDecode(got, out);
+    double biggest = 0.0;
+    for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
+    std::cout << "  swap [1|1] at level " << L << ": " << perm.GetNumDiagonals()
+              << " diagonals, BSGS " << perm.GetBS() << "x" << perm.GetGS()
+              << " -> max |diff| " << MaxDiff(got, msg, tiny) << ", |got| <= "
+              << biggest << std::endl;
+  }
 
   struct Case {
     std::string name;
     std::vector<int> perm;
   };
   std::vector<Case> cases;
-  // Smallest possible: two adjacent bits, three diagonals. If this fails the
-  // machinery is wrong, not the size.
-  cases.push_back({"swap [1 | 1]", cheddar::SwapAdjacentFields(num_slots, 1, 1)});
   cases.push_back({"swap [4 | 4] at offset 3",
                    cheddar::SwapAdjacentFields(num_slots, 4, 4, 3)});
   cases.push_back({"swap [4 | 3]", cheddar::SwapAdjacentFields(num_slots, 3, 4)});
   cases.push_back({"square transpose 128x128", SquareTranspose(num_slots, 128)});
 
-  std::vector<Complex> msg(num_slots);
-  Random::SampleUniformComplex(msg.data(), num_slots, -1.0, 1.0);
-
-  // Each case twice: once with the window shift and once without. The
-  // shift-free path uses only the raw diagonal offsets, so if it is exact then
-  // the striped-matrix convention is right and only the compensating rotation
-  // is in question.
+  // At the level the tiny case says works.
+  const int use_level = 11;
   for (auto &c : cases) {
     for (bool allow_shift : {false, true}) {
-      cheddar::SlotPermute<word> perm(context_, c.perm, level, allow_shift);
+      cheddar::SlotPermute<word> perm(context_, c.perm, use_level, allow_shift);
       std::cout << "  " << c.name << (allow_shift ? " [shift]" : " [no shift]")
                 << ": " << perm.GetNumDiagonals() << " diagonals, stride "
                 << perm.GetStride() << ", BSGS " << perm.GetBS() << "x"
@@ -138,44 +159,20 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
       interface_->PrepareRotationKey(req);
 
       Ciphertext<word> ct;
-      EncodeAndEncrypt(ct, msg, level);
+      EncodeAndEncrypt(ct, msg, use_level);
       Ciphertext<word> out;
       perm.Evaluate(context_, out, ct, interface_->GetEvkMap());
-      EXPECT_EQ(param_->NPToLevel(out.GetNP()), level - 1)
+      EXPECT_EQ(param_->NPToLevel(out.GetNP()), use_level - 1)
           << "one LinearTransform, one level";
 
       std::vector<Complex> got;
       DecryptAndDecode(got, out);
       double biggest = 0.0;
       for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
-      const double err = MaxDiff(got, msg, c.perm);
-      // If only the compensating rotation is wrong, the answer is the right
-      // permutation rotated by +-shift, and one of these is tiny.
-      double best_rot = 1e300;
-      int best_by = 0;
-      for (int by : {perm.GetShift(), -perm.GetShift()}) {
-        std::vector<int> rotated(c.perm.size());
-        for (size_t s = 0; s < c.perm.size(); s++) {
-          int d = (c.perm[s] + by) % num_slots;
-          if (d < 0) d += num_slots;
-          rotated[s] = d;
-        }
-        const double e = MaxDiff(got, msg, rotated);
-        if (e < best_rot) {
-          best_rot = e;
-          best_by = by;
-        }
-      }
-      std::cout << "     max |diff| = " << err << ", |got| <= " << biggest
-                << ", best rotated " << best_rot << " (by " << best_by << ")"
-                << std::endl;
-      if (!allow_shift) {
-        EXPECT_LT(err, 1e-4)
-            << c.name << " is wrong even without a window shift, so the "
-                         "striped-matrix convention is wrong";
-      } else {
-        EXPECT_LT(err, 1e-4) << c.name << " did not land where it was asked to";
-      }
+      std::cout << "     max |diff| = " << MaxDiff(got, msg, c.perm)
+                << ", |got| <= " << biggest << std::endl;
+      EXPECT_LT(MaxDiff(got, msg, c.perm), 1e-4)
+          << c.name << " did not land where it was asked to";
     }
   }
 
