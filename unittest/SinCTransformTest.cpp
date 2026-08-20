@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "common/CommonUtils.h"
 
 using word = uint32_t;
 
