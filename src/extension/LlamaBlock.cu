@@ -6,6 +6,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "extension/AttentionPacking.h"
 
 namespace cheddar {
 
@@ -218,10 +219,52 @@ void LlamaBlock<word>::SpreadNormWeight(
 }
 
 template <typename word>
+void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
+                                   const std::vector<double> &want,
+                                   const std::vector<double> &got, int channels,
+                                   double scale) const {
+  const int sinks = cfg_.num_sink_tokens;
+  if (sinks <= 0) return;
+  const size_t expect = static_cast<size_t>(sinks) * channels;
+  AssertTrue(want.size() == expect && got.size() == expect,
+             "LlamaBlock::InjectSinks: the public sink rows must be "
+             "[num_sink_tokens][channels]");
+  AssertTrue(static_cast<int>(cts.size()) == NumCiphertexts(channels),
+             "LlamaBlock::InjectSinks: wrong ciphertext count");
+
+  const int degree = boot_->param_.degree_;
+  const int level = 0;
+  for (size_t i = 0; i < cts.size(); i++) {
+    AssertTrue(boot_->param_.NPToLevel(cts[i].GetNP()) == level,
+               "LlamaBlock::InjectSinks: the projection must have landed at "
+               "level 0 before a plaintext can be added to it");
+    std::vector<double> coeffs(degree, 0.0);
+    bool any = false;
+    for (int t = 0; t < sinks; t++) {
+      for (int c = 0; c < channels_per_ct_; c++) {
+        const int channel = static_cast<int>(i) * channels_per_ct_ + c;
+        const size_t idx = static_cast<size_t>(t) * channels + channel;
+        const double d = scale * (want[idx] - got[idx]);
+        if (d == 0.0) continue;
+        const int slot = t + cfg_.num_tokens * c;
+        coeffs[AttentionPacking::CoeffOfSlot({slot, false}, degree)] = d;
+        any = true;
+      }
+    }
+    if (!any) continue;
+    Plaintext<word> pt;
+    boot_->encoder_.EncodeCoeff(pt, level, cts[i].GetScale(), coeffs);
+    Ct sum;
+    boot_->Add(sum, cts[i], pt);
+    cts[i] = std::move(sum);
+  }
+}
+
+template <typename word>
 void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
                            const Weights &w,
                            const std::vector<std::vector<Complex>> &causal_mask,
-                           const LinearLeg &leg,
+                           const PublicSinks &sinks, const LinearLeg &leg,
                            const EvkMap<word> &evk_map) const {
   std::string why;
   AssertTrue(Fits(&why), "LlamaBlock: the plan does not close -- " + why);
@@ -256,6 +299,16 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
               cal_.size_k, "K");
   leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels, w.wv,
               cal_.size_v, "V");
+
+  // The sink tokens' K and V, put back. Their hidden state never reached the
+  // encrypted RMSNorm -- a public filler stood in for it, which is the only
+  // way the layer constant covers every token at once -- so what the
+  // projection just produced on those rows is a public number, and so is what
+  // it should have been. Adding the difference is a plaintext addition and
+  // costs nothing. It happens before RoPE, which then rotates the sink keys by
+  // their own positions exactly as it would have.
+  InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k);
+  InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v);
 
   // ---- turn B: RoPE on Q and K, then the score product ------------------
   //

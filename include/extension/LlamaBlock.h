@@ -102,12 +102,12 @@ namespace cheddar {
  * at all until it did. With the interface, the same block runs today against
  * any implementation and against the real one when it exists.
  *
- * Also not here: attention sinks. [SYLPH] section 3.1.1 removes them from the
- * encrypted path entirely and injects their KV states from a static cache, and
- * `RmsNorm.h` records why -- on this bundle the sink tokens make the per-token
- * mean square span 285,946x against the 30x window a layer constant can cover.
- * `num_tokens` is the count of *user* tokens and the caller must have excluded
- * them already.
+ * Attention sinks, on the other hand, ARE here, and they have to be: a query
+ * that does not attend to the sink keys is computing a different function.
+ * What is not here is their *hidden state*, which cannot pass the encrypted
+ * RMSNorm at any polynomial degree -- see `Config::num_sink_tokens` for the
+ * measurement and `PublicSinks` for what replaces it. [SYLPH] section 3.1.1 is
+ * the same arrangement.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -119,14 +119,59 @@ class LlamaBlock {
  public:
   /** @brief Shape. Everything here is a property of the model, not the run. */
   struct Config {
-    int num_tokens = 64;       //!< T, user tokens; sinks already excluded
+    int num_tokens = 128;      //!< T, every token of the prompt, sinks included
     int num_channels = 4096;   //!< H
     int num_kv_channels = 1024;  //!< H_kv = num_kv_heads * head_dim
     int hidden = 14336;        //!< the FFN inner dimension
     int head_dim = 128;
-    int first_position = 0;    //!< RoPE position of the first user token
+    int first_position = 0;    //!< RoPE position of the first token
     double rope_theta = 500000.0;
     double eps = 1e-5;
+
+    /**
+     * @brief How many leading tokens are attention sinks, [SYLPH] 3.1.1.
+     *
+     * These occupy their token slots like any other -- they are *keys* that
+     * every query attends to, and dropping them changes the function -- but
+     * their hidden state never goes through the encrypted RMSNorm, because it
+     * cannot. Measured on the real layer-2 bundle: the two leading
+     * beginning-of-sequence tokens carry a per-token mean square of 33.1
+     * against 3.4e-4 for the rest, a **285,946x** window, and one layer
+     * constant plus one Chebyshev interval has to cover every token at once.
+     * `RmsNorm.h` puts degree 23 at 30x. There is no degree that reaches
+     * 285,946x, and the failure is not graceful: a Chebyshev polynomial
+     * outside its interval grows like cosh(d arccosh(v)), so the sink slots
+     * would not merely be wrong, they would take the whole ciphertext out of
+     * the next bootstrap's range.
+     *
+     * So the caller substitutes a **public** filler for those tokens' hidden
+     * state -- a rescaled copy of the true one, which is itself public,
+     * because a prefix of beginning-of-sequence tokens is prompt-independent
+     * and its trajectory through every layer is a constant of the model -- and
+     * hands over `PublicSinks` to put the true K and V back. With the window
+     * down to 5.2x the encrypted run then reproduces the true layer **exactly**
+     * on every non-sink token: only the sink rows of Q, of the attention
+     * output and of the FFN differ, and those are discarded.
+     */
+    int num_sink_tokens = 0;
+  };
+
+  /**
+   * @brief The sink tokens' true K and V, and what the block will compute for
+   * them from the public filler, so the difference can be added back.
+   *
+   * Both are **pre-RoPE** and unscaled: the block folds in the crossing
+   * constants itself, and RoPE runs afterwards at the sink tokens' own
+   * positions, which is what it would have done anyway.
+   *
+   * Every entry here is public. The correction is a plaintext addition in the
+   * coefficient domain, so it costs no level and no key.
+   */
+  struct PublicSinks {
+    std::vector<double> k;  //!< [num_sink_tokens][H_kv], the true keys
+    std::vector<double> v;  //!< [num_sink_tokens][H_kv], the true values
+    std::vector<double> computed_k;  //!< what the filler produces, same shape
+    std::vector<double> computed_v;  //!< what the filler produces, same shape
   };
 
   /**
@@ -333,12 +378,15 @@ class LlamaBlock {
    * @param w the layer's weights
    * @param causal_mask 1 where key <= query and 0 elsewhere, in the score
    * packing, one vector per score ciphertext
+   * @param sinks the public K and V of the first `Config::num_sink_tokens`
+   * tokens, and what the filler produces for them; empty when there are none
    * @param leg the product implementation
    * @param evk_map every key the block needs
    */
   void Run(std::vector<Ct> &res, const std::vector<Ct> &x, const Weights &w,
            const std::vector<std::vector<Complex>> &causal_mask,
-           const LinearLeg &leg, const EvkMap<word> &evk_map) const;
+           const PublicSinks &sinks, const LinearLeg &leg,
+           const EvkMap<word> &evk_map) const;
 
   /**
    * @brief The same block in the clear, for a reference the encrypted run can
@@ -380,6 +428,14 @@ class LlamaBlock {
   // folded in the way RmsNormHandler asks for.
   void SpreadNormWeight(std::vector<std::vector<Complex>> &res,
                         const std::vector<double> &w, double alpha) const;
+
+  // Add `scale * (want - got)` on the sink tokens' slots and nothing anywhere
+  // else. Both operands are public, so this is a coefficient-domain plaintext
+  // addition: no level, no key, and it lands before RoPE, which is where the
+  // cached K of a sink token belongs.
+  void InjectSinks(std::vector<Ct> &cts, const std::vector<double> &want,
+                   const std::vector<double> &got, int channels,
+                   double scale) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   Config cfg_;

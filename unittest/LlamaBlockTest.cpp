@@ -8,10 +8,21 @@
 //
 // WHAT IS COMPUTED, stated plainly and up front.
 //
-// The whole 128-token prompt, T = 128, first position 0. Query 127 attends to
-// keys 0..127. That is the Llama-3 function; the earlier 64-token window
-// starting at token 64 was not, and no error figure taken against an equally
-// truncated reference could have said so.
+// Llama-3-8B layer 2 on a 128-token prompt, T = 128, first position 0. Query
+// 127 attends to keys 0..127, sinks included. The final comparison is against
+// the true layer -- the one computed on the real hidden state of every token,
+// with nothing substituted -- over tokens 2..127, which are the tokens the
+// encrypted layer is being run for.
+//
+// This ran at kTokens = 64 from token 64 until now, which is attention over a
+// 64-token window with no key history and is a different function. Because the
+// clear reference truncated identically, no error figure could see it.
+//
+// The two leading tokens are attention sinks and their hidden state does not
+// go through the encrypted RMSNorm, because no polynomial degree covers a
+// 285,946x window. See kSinkTokens below for what happens instead; the
+// arrangement is exact off the sink rows and the test checks that in the clear
+// before it encrypts anything.
 //
 // WHAT IS ENCRYPTED AND WHAT IS NOT.
 //
@@ -91,6 +102,30 @@ constexpr int kHeadDim = 128;
 // else (Doing.md 1.5ac). Two holes, one constant.
 constexpr int kTokens = kAllTokens;
 constexpr int kFirstToken = 0;
+
+// THE SINKS, AND WHY THEY ARE NOT MERELY SKIPPED.
+//
+// The prompt of `input_nosink.f32` is two beginning-of-sequence tokens
+// followed by 126 text tokens. Those two are attention sinks and their hidden
+// state is enormous: measured on this bundle, per-token mean square 33.1
+// against 3.4e-4 for every other token, a 285,946x window. RmsNorm.h puts
+// degree 23 at 30x, so no degree covers it, and a Chebyshev polynomial outside
+// its interval grows like cosh(d arccosh(v)) -- the sink slots would take the
+// whole ciphertext out of the next bootstrap's range, not just be wrong.
+//
+// They cannot be dropped either. Query t attends to keys 0..t, sinks included,
+// and a query that does not is computing a different function -- which is the
+// whole complaint against the 64-token window this test used to run.
+//
+// So they are handled the way [SYLPH] 3.1.1 handles them. A prefix of
+// beginning-of-sequence tokens is prompt-independent, so its hidden state at
+// every layer is a constant of the model and therefore public. A public
+// rescaled copy of it stands in for the encrypted RMSNorm's input -- which
+// brings the window down to 5.2x -- and the true K and V are added back as a
+// plaintext correction straight after the projection. Nothing else changes,
+// and the result is exact: only the sink rows of Q, of the attention output
+// and of the FFN differ from the true layer, and those are discarded.
+constexpr int kSinkTokens = 2;
 constexpr double kEps = 1e-5;
 constexpr double kBootMax = 0.5;
 
@@ -148,6 +183,10 @@ struct Packing {
 // constant is read off one of them.
 struct ClearRun {
   std::vector<double> normed, q, k, v, scores, probs, attn, proj, hidden;
+  //! K and V as the projection leaves them: before RoPE and before the sink
+  //! override. The block injects its correction at exactly this point, so
+  //! these are the two halves the correction is built from.
+  std::vector<double> k_pre, v_pre;
   std::vector<double> fnormed, gate, up, down, out;
   std::vector<double> row_max;  //!< the per-row shift, head * T + query
   double score_max = 0.0, score_min = 0.0, span = 0.0, mask_gap = 0.0;
@@ -219,7 +258,9 @@ void ApplyRoPe(std::vector<double> &m, int rows, int width, int head_dim,
 // encrypted path's iteration reproduces it exactly in exact arithmetic, so any
 // difference is approximation and not algorithm (SoftMax.h).
 void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
-                     const std::vector<double> &x, ClearRun &r) {
+                     const std::vector<double> &x, ClearRun &r,
+                     const std::vector<double> *sink_k = nullptr,
+                     const std::vector<double> *sink_v = nullptr) {
   const int T = cfg.num_tokens, H = cfg.num_channels, KV = cfg.num_kv_channels;
   const int D = cfg.head_dim, F = cfg.hidden;
   const int heads = H / D, group = heads / (KV / D);
@@ -228,6 +269,17 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
   Gemm(r.normed, w.wq, T, H, H, r.q);
   Gemm(r.normed, w.wk, T, H, KV, r.k);
   Gemm(r.normed, w.wv, T, H, KV, r.v);
+  // Kept before anything touches them: the block's sink correction is built
+  // from exactly these rows, and it is added at exactly this point.
+  r.k_pre = r.k;
+  r.v_pre = r.v;
+  // The sinks' true K and V, in the same place LlamaBlock::InjectSinks puts
+  // them -- after the projection, before RoPE.
+  if (sink_k != nullptr && cfg.num_sink_tokens > 0) {
+    const size_t n = static_cast<size_t>(cfg.num_sink_tokens) * KV;
+    std::copy(sink_k->begin(), sink_k->begin() + n, r.k.begin());
+    std::copy(sink_v->begin(), sink_v->begin() + n, r.v.begin());
+  }
   ApplyRoPe(r.q, T, H, D, cfg.first_position, cfg.rope_theta);
   ApplyRoPe(r.k, T, KV, D, cfg.first_position, cfg.rope_theta);
 
@@ -622,6 +674,7 @@ class LlamaBlockFixture : public Testbed32 {
     cfg.hidden = kHidden;
     cfg.head_dim = kHeadDim;
     cfg.first_position = kFirstToken;
+    cfg.num_sink_tokens = kSinkTokens;
     cfg.eps = kEps;
     return cfg;
   }
@@ -629,9 +682,14 @@ class LlamaBlockFixture : public Testbed32 {
   bool LoadWeights(Block::Weights &w, std::vector<double> &x) {
     const std::string d = DataDir();
     if (d.empty()) return false;
+    // input_nosink.f32, not input.f32. Both are 128-token layer-2 bundles;
+    // this one's prompt is `<bos> <bos> The ...`, so its sinks are exactly the
+    // two leading tokens. input.f32's prompt has a third BOS at position 3, so
+    // its sinks are {0, 1, 3} -- non-contiguous, and a leading-prefix
+    // treatment would not cover it.
     std::vector<double> all;
-    if (!ReadF32(d + "/input.f32", static_cast<size_t>(kAllTokens) * kChannels,
-                 all))
+    if (!ReadF32(d + "/input_nosink.f32",
+                 static_cast<size_t>(kAllTokens) * kChannels, all))
       return false;
     x.assign(
         all.begin() + static_cast<size_t>(kFirstToken) * kChannels,
@@ -652,6 +710,76 @@ class LlamaBlockFixture : public Testbed32 {
                    w.wup) &&
            ReadF32(d + "/wdown.f32", static_cast<size_t>(kHidden) * kChannels,
                    w.wdown);
+  }
+
+  // The public stand-in for the sink tokens' hidden state.
+  //
+  // A rescaled copy of the true one. That is public -- a prefix of
+  // beginning-of-sequence tokens is prompt-independent, so its hidden state at
+  // layer 2 is a constant of the model -- and the scale is chosen to put its
+  // mean square at the geometric centre of the other tokens' band, which is
+  // where the layer constant will place the Chebyshev interval. It widens the
+  // RMSNorm window by nothing.
+  static std::vector<double> WithFilledSinks(const std::vector<double> &x) {
+    std::vector<double> out(x);
+    double log_sum = 0.0;
+    for (int t = kSinkTokens; t < kTokens; t++) {
+      double sq = 0.0;
+      for (int c = 0; c < kChannels; c++) {
+        const double u = x[static_cast<size_t>(t) * kChannels + c];
+        sq += u * u;
+      }
+      log_sum += std::log(sq / kChannels);
+    }
+    const double target = std::exp(log_sum / (kTokens - kSinkTokens));
+    for (int t = 0; t < kSinkTokens; t++) {
+      double sq = 0.0;
+      for (int c = 0; c < kChannels; c++) {
+        const double u = x[static_cast<size_t>(t) * kChannels + c];
+        sq += u * u;
+      }
+      const double f = std::sqrt(target / (sq / kChannels));
+      for (int c = 0; c < kChannels; c++) {
+        out[static_cast<size_t>(t) * kChannels + c] *= f;
+      }
+    }
+    return out;
+  }
+
+  // The four public row blocks the block needs: the sinks' true K and V, and
+  // what the filler makes the projection produce for them.
+  static Block::PublicSinks MakeSinks(const ClearRun &truth,
+                                      const ClearRun &filled) {
+    const size_t n = static_cast<size_t>(kSinkTokens) * kKvChannels;
+    Block::PublicSinks s;
+    s.k.assign(truth.k_pre.begin(), truth.k_pre.begin() + n);
+    s.v.assign(truth.v_pre.begin(), truth.v_pre.begin() + n);
+    s.computed_k.assign(filled.k_pre.begin(), filled.k_pre.begin() + n);
+    s.computed_v.assign(filled.v_pre.begin(), filled.v_pre.begin() + n);
+    return s;
+  }
+
+  // Both clear runs, the filler and the public sink rows, in one place.
+  //
+  // `truth` is the layer as Llama-3 computes it, on the real hidden state of
+  // every token. `filled` is what the encrypted path computes: the same layer
+  // on the filled input, with the sinks' true K and V put back. They agree
+  // exactly on every non-sink token, and the test asserts that rather than
+  // assuming it -- it is the whole justification for the arrangement.
+  static void BuildReference(const Block::Config &cfg,
+                             const Block::Weights &w,
+                             const std::vector<double> &x_true,
+                             std::vector<double> &x_fill, ClearRun &truth,
+                             ClearRun &filled, Block::PublicSinks &sinks) {
+    Block::Config plain = cfg;
+    plain.num_sink_tokens = 0;
+    TraceClearBlock(plain, w, x_true, truth);
+
+    x_fill = WithFilledSinks(x_true);
+    ClearRun probe;
+    TraceClearBlock(plain, w, x_fill, probe);  // no override: the "computed"
+    sinks = MakeSinks(truth, probe);
+    TraceClearBlock(cfg, w, x_fill, filled, &sinks.k, &sinks.v);
   }
 
   // Every constant [SYLPH] calls calibration, read off the clear run.
@@ -744,11 +872,35 @@ TEST_P(LlamaBlockFixture, TheCalibrationIsReachable) {
   if (!LoadWeights(w, x)) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
 
   const auto cfg = MakeConfig();
-  ClearRun r;
-  TraceClearBlock(cfg, w, x, r);
-  const auto cal = Calibrate(r, x);
+  ClearRun truth, r;
+  std::vector<double> x_fill;
+  Block::PublicSinks sinks;
+  BuildReference(cfg, w, x, x_fill, truth, r, sinks);
+  const auto cal = Calibrate(r, x_fill);
 
-  std::cout << "residual chain: |x| " << MaxAbs(x) << ", |h| "
+  // THE CLAIM THE WHOLE SINK ARRANGEMENT RESTS ON, checked rather than
+  // asserted: substituting a public filler for the sink tokens' hidden state
+  // and putting their true K and V back changes nothing at all on the tokens
+  // the layer is being run for.
+  double sink_err = 0.0, sink_mag = 0.0;
+  for (int t = kSinkTokens; t < kTokens; t++) {
+    for (int c = 0; c < kChannels; c++) {
+      const size_t i = static_cast<size_t>(t) * kChannels + c;
+      sink_err = std::max(sink_err, std::abs(r.out[i] - truth.out[i]));
+      sink_mag = std::max(sink_mag, std::abs(truth.out[i]));
+    }
+  }
+  std::cout << "sinks: " << kSinkTokens << " public tokens; the filled run vs "
+            << "the true layer on tokens " << kSinkTokens << ".." << (kTokens - 1)
+            << ": max abs diff " << sink_err << " against |out| " << sink_mag
+            << std::endl;
+  EXPECT_LT(sink_err, 1e-12 * std::max(sink_mag, 1e-12))
+      << "the public-filler substitution must be exact off the sink rows";
+  std::cout << "RMSNorm window without the substitution: attn "
+            << truth.attn_window << "x, ffn " << truth.ffn_window
+            << "x -- which is why there is one" << std::endl;
+
+  std::cout << "residual chain: |x| " << MaxAbs(x_fill) << ", |h| "
             << MaxAbs(r.hidden) << ", |out| " << MaxAbs(r.out)
             << " -> residual constant " << cal.residual << std::endl;
   std::cout << "RMSNorm windows: attn " << r.attn_window << "x, ffn "
@@ -797,9 +949,11 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   const int num_slots = param_->degree_ / 2;
   const auto cfg = MakeConfig();
 
-  ClearRun r;
-  TraceClearBlock(cfg, w, x, r);
-  const auto cal = Calibrate(r, x);
+  ClearRun truth, r;
+  std::vector<double> x_fill;
+  Block::PublicSinks sinks;
+  BuildReference(cfg, w, x, x_fill, truth, r, sinks);
+  const auto cal = Calibrate(r, x_fill);
 
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(num_slots);
@@ -827,7 +981,7 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
       const int t = s % kTokens;
       const int c = i * pack.channels_per_ct() + s / kTokens;
       coeffs[pack.coeff(s)] =
-          cal.residual * x[static_cast<size_t>(t) * kChannels + c];
+          cal.residual * x_fill[static_cast<size_t>(t) * kChannels + c];
     }
     Plaintext<word> ptxt;
     context_->encoder_.EncodeCoeff(ptxt, 0, param_->GetScale(0), coeffs);
@@ -889,7 +1043,7 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   }
 
   std::vector<Ciphertext<word>> out;
-  block.Run(out, state, w, mask, *leg, interface_->GetEvkMap());
+  block.Run(out, state, w, mask, sinks, *leg, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
@@ -952,6 +1106,11 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   }
 
   // The output carries `residual`, coefficient encoded at level 0.
+  //
+  // Compared against `truth` -- the layer on the real hidden state of every
+  // token, with nothing substituted anywhere -- and over the tokens the layer
+  // is being run for. The sink rows are skipped because their hidden state was
+  // never in the ciphertext; their K and V were, and every query used them.
   double worst = 0.0, absmax = 0.0;
   for (int i = 0; i < num_ct; i++) {
     Plaintext<word> ptxt;
@@ -960,14 +1119,17 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
     context_->encoder_.DecodeCoeff(coeffs, ptxt);
     for (int s = 0; s < num_slots; s++) {
       const int t = s % kTokens;
+      if (t < kSinkTokens) continue;
       const int c = i * pack.channels_per_ct() + s / kTokens;
-      const double want = r.out[static_cast<size_t>(t) * kChannels + c];
+      const double want = truth.out[static_cast<size_t>(t) * kChannels + c];
       const double got = coeffs[pack.coeff(s)] / cal.residual;
       worst = std::max(worst, std::abs(got - want));
       absmax = std::max(absmax, std::abs(want));
     }
   }
-  std::cout << "one whole block vs the clear model: max abs err " << worst
+  std::cout << "one whole Llama-3-8B layer-2 block, tokens " << kSinkTokens
+            << ".." << (kTokens - 1) << " of a " << kTokens
+            << "-token prompt, vs the true layer: max abs err " << worst
             << " against |out| <= " << absmax << " ("
             << -std::log2(worst / absmax) << " bits)" << std::endl;
   EXPECT_GT(-std::log2(worst / absmax), 4.0);
