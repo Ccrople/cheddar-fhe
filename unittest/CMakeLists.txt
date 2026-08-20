@@ -116,6 +116,16 @@ target_link_libraries(pipeline_chain_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
 if (ENABLE_EXTENSION)
+  # A Llama-3 projection, encrypted, in the block's own packing on
+  # bootparam_35, with no ring switch. ModDecomp isolates the channel axis
+  # because the block's slot layout bit-reverses the channel into the low
+  # coefficient bits; see the file header. Needs the extension only for
+  # AttentionPacking -- it undefines ENABLE_EXTENSION so Testbed builds a plain
+  # Context and no bootstrapping key is generated.
+  add_executable(llama_projection_test LlamaProjectionTest.cpp)
+  target_link_libraries(llama_projection_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
