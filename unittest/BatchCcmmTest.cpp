@@ -22,11 +22,23 @@
 #undef ENABLE_EXTENSION
 
 #include <cmath>
+#include <cstdlib>
 
 #include "Testbed.h"
 #include "core/BatchCcmm.h"
 
 using word = uint32_t;
+
+namespace {
+// The small ring is selected by environment so the same suite runs against
+// either scale: ringdegree12_30 by default, ringdegree12_35 -- the 2^35 pair
+// [SYLPH]'s ladder needs -- when CHEDDAR_SMALL_PARAM says so.
+std::vector<const char *> SmallRingParams() {
+  const char *env = std::getenv("CHEDDAR_SMALL_PARAM");
+  if (env != nullptr && env[0] != 0) return {env};
+  return {"ringdegree12_30.json"};
+}
+}  // namespace
 
 namespace {
 
@@ -185,7 +197,7 @@ TEST_P(Testbed32, BatchCcmmLanesStayIndependent) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    BatchCcmm, Testbed32, testing::Values("ringdegree12_30.json"),
+    BatchCcmm, Testbed32, testing::ValuesIn(SmallRingParams()),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
