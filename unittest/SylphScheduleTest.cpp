@@ -76,10 +76,22 @@ constexpr int kTokens = 64;      // encrypted user segment, clear of the sinks
 constexpr int kFirstToken = 64;
 constexpr double kEps = 1e-5;
 
-// RMSNorm at Chebyshev degree 9: one level for the square, ceil(log2(10)) = 4
-// for the polynomial, two to apply the result and the weight. RmsNorm.h states
-// the rule; test 3 measures the number rather than trusting it.
-constexpr int kRmsNormDepth = 7;
+// RMSNorm at Chebyshev degree 7: one level for the square, ceil(log2(8)) = 3
+// for the polynomial, two to apply the result and the weight -- six consumed --
+// **plus one owed**. Apply ends with Mult(res, res, weight_pt_) and no Rescale
+// (RmsNorm.cu), which is Cheddar's convention but means the output carries
+// scale^2 and the caller has to spend a level settling it. A schedule that
+// budgets only what the operator consumes puts the ciphertext on StC's level
+// still owing a rescale, and ToCoeff then has nowhere to spend it.
+//
+// Degree 9 was measured landing exactly there, and the failure was silent: the
+// scale-up constant rounded to zero and every coefficient came back 0 while
+// every level assertion passed. Degree 7 costs one level less and fits, at the
+// price of margin -- RmsNorm.h puts its 12-bit reach at a window ratio of
+// 4.18, so the segment's measured spread is asserted below.
+constexpr int kRmsNormDegree = 7;
+constexpr double kRmsNormWindow = 4.18;
+constexpr int kRmsNormDepth = 7;  // 6 consumed + 1 owed
 
 // The four turns of figure 2's loop that make one Llama-3-8B decoder block.
 // Depths are the handlers' own documented costs, not estimates:
@@ -574,7 +586,7 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   // one below the landing level. This is the joint the whole class exists for.
   const int op_level = sched.GetSlotLevel() - 1;
   RmsNormHandler<word> rms(context_, kTokens, kChannels, alpha_scaled, op_level,
-                           eps_scaled, 6.0, 9);
+                           eps_scaled, kRmsNormWindow, kRmsNormDegree);
   const int num_ct = rms.GetNumCiphertexts();
   std::cout << "T=" << kTokens << " H=" << kChannels << " -> " << num_ct
             << " ciphertexts; RMSNorm compiled at level " << op_level
@@ -707,14 +719,16 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
   const int out_level = param_->NPToLevel(res[0].GetNP());
-  std::cout << "RMSNorm measured depth " << (op_level - out_level)
-            << ", the plan says " << kRmsNormDepth << std::endl;
-  EXPECT_EQ(op_level - out_level, kRmsNormDepth)
+  std::cout << "RMSNorm consumed " << (op_level - out_level)
+            << " levels and owes a rescale (scale " << res[0].GetScale()
+            << " against a canonical " << param_->GetScale(out_level)
+            << "), so the plan budgets " << kRmsNormDepth << std::endl;
+  EXPECT_EQ(op_level - out_level, kRmsNormDepth - 1)
       << "the stage table in this file disagrees with the circuit; the plan "
          "is what sized the slack";
-  EXPECT_EQ(out_level, sched.GetStCLevel())
-      << "the stage did not land on StC's level, so ToCoeff will have to "
-         "descend or will refuse";
+  EXPECT_EQ(out_level, sched.GetStCLevel() + 1)
+      << "the stage must land one above StC so ToCoeff can settle the rescale "
+         "the operator owes";
 
   // Reference, in double.
   std::vector<double> want(static_cast<size_t>(kTokens) * kChannels);
@@ -828,7 +842,7 @@ TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
     const double a_used = 1.0 / (m * m);
     const double eps_used = kEps * beta * beta * m * m;
     RmsNormHandler<word> rms(context_, kTokens, kChannels, a_used, op_level,
-                             eps_used, 6.0, 9);
+                             eps_used, kRmsNormWindow, kRmsNormDegree);
     const int num_ct = rms.GetNumCiphertexts();
     for (int d : rms.GetRotationDistances()) {
       interface_->PrepareRotationKey(d, op_level);
@@ -1016,9 +1030,9 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
             << std::endl;
 
   RmsNormHandler<word> rms1(context_, kTokens, kChannels, a1, op_level,
-                            kEps * b1 * b1, 6.0, 9);
+                            kEps * b1 * b1, kRmsNormWindow, kRmsNormDegree);
   RmsNormHandler<word> rms2(context_, kTokens, kChannels, a2, op_level,
-                            kEps * s1 * s1, 6.0, 9);
+                            kEps * s1 * s1, kRmsNormWindow, kRmsNormDegree);
   const int num_ct = rms1.GetNumCiphertexts();
   for (int d : rms1.GetRotationDistances()) {
     interface_->PrepareRotationKey(d, op_level);
@@ -1073,8 +1087,10 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
     rms.Apply(normed, slots, wts, interface_->GetEvkMap());
     cudaDeviceSynchronize();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    ASSERT_EQ(param_->NPToLevel(normed[0].GetNP()), sched.GetStCLevel())
-        << "turn " << turn << " did not land on StC's level";
+    ASSERT_EQ(param_->NPToLevel(normed[0].GetNP()), sched.GetStCLevel() + 1)
+        << "turn " << turn
+        << " must land one above StC, so ToCoeff can settle the rescale the "
+           "operator owes";
 
     // Read the turn's output on both sides of the descent. Nothing else in
     // this file goes below level 8, and on bootparam_35 level 0 is [0, 2] --

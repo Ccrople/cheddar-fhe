@@ -179,10 +179,40 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
                  " levels too many. StC cannot be moved after the fact; the "
                  "slack is a BootParameter setting.");
 
-  Ct descended;
+  // SETTLE A PENDING RESCALE FIRST.
+  //
+  // `RmsNormHandler::Apply` ends with `Mult(res, res, weight_pt_)` and no
+  // Rescale (`RmsNorm.cu`), so its output carries scale^2 -- 2^70 where the
+  // level's canonical scale is 2^35. Cheddar's convention is that Mult does
+  // not rescale and the caller does, so this is the operator's contract and
+  // not a defect, but it means an operator's stated depth is levels *consumed*
+  // and there is one more owed.
+  //
+  // Left alone it is silent and total. The scale-up below would ask for a
+  // factor of 2^58 / 2^70 = 2^-12, and with the message-ratio factor the
+  // constant handed to EncodeConstant is 2^-17, which rounds to **zero** --
+  // annihilating the ciphertext. Measured: every coefficient came back 0, and
+  // the level assertions all still passed, which is exactly how it hid.
+  Ct settled;
   const Ct *src = &x;
-  if (level > stc_level) {
-    boot_->LevelDown(descended, x, stc_level);
+  int cur = level;
+  if (x.GetScale() > boot_->GetStCInputScale()) {
+    AssertTrue(cur > stc_level,
+               "ToCoeff: the input owes a rescale -- its scale is " +
+                   std::to_string(x.GetScale()) + " against StC's " +
+                   std::to_string(boot_->GetStCInputScale()) +
+                   " -- but it is already at StC's level " +
+                   std::to_string(stc_level) +
+                   ", so there is nowhere to spend it. Budget the operator at "
+                   "one level more than it consumes.");
+    boot_->Rescale(settled, x);
+    src = &settled;
+    cur = boot_->param_.NPToLevel(settled.GetNP());
+  }
+
+  Ct descended;
+  if (cur > stc_level) {
+    boot_->LevelDown(descended, *src, stc_level);
     src = &descended;
   }
 
@@ -218,6 +248,17 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
   const double up_factor = boot_->GetStCInputScale() / src->GetScale();
   const double undo_restore =
       std::pow(2.0, -boot_->GetBootParameter().GetLogMessageRatio());
+  // Never encode a constant that rounds to zero. EncodeConstant stores
+  // round(number * scale), so a product below 1/2 is a silent annihilation --
+  // the failure this guard exists to name, which cost a day precisely because
+  // every level assertion downstream of it still passed.
+  AssertTrue(up_factor * undo_restore >= 1.0,
+             "ToCoeff: the scale-up constant would encode as " +
+                 std::to_string(up_factor * undo_restore) +
+                 ", which rounds to zero and annihilates the ciphertext. The "
+                 "input's scale is " + std::to_string(src->GetScale()) +
+                 " against StC's " + std::to_string(boot_->GetStCInputScale()) +
+                 "; an input above StC's scale owes a rescale.");
   Constant<word> up;
   boot_->encoder_.EncodeConstant(up, stc_level, up_factor, undo_restore);
   boot_->Mult(res, *src, up);
