@@ -115,7 +115,7 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
   // level is what matters -- and a standalone transform gets to choose its
   // level, so the answer decides where the pipeline can put one.
   const auto tiny = cheddar::SwapAdjacentFields(num_slots, 1, 1);
-  for (int L : {2, 5, 11}) {
+  for (int L : {2, 4, 6, 7, 8, 9, 10, 11}) {
     cheddar::SlotPermute<word> perm(context_, tiny, L, false);
     EvkRequest req;
     perm.AddRequiredRotations(req);
@@ -147,7 +147,12 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
   // At the level the tiny case says works.
   const int use_level = 11;
   for (auto &c : cases) {
-    for (bool allow_shift : {false, true}) {
+    // Shift only. Without it the BSGS grid is 128x256, and although only the
+    // occupied cells become plaintexts, every distinct giant and baby step
+    // still needs a rotation key -- up to 382 of them at ~126 MiB each, which
+    // is what took the card out on the previous run. The shift is not a
+    // micro-optimisation; it is what makes the transform fit.
+    for (bool allow_shift : {true}) {
       cheddar::SlotPermute<word> perm(context_, c.perm, use_level, allow_shift);
       std::cout << "  " << c.name << (allow_shift ? " [shift]" : " [no shift]")
                 << ": " << perm.GetNumDiagonals() << " diagonals, stride "

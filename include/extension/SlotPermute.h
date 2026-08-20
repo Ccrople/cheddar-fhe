@@ -54,6 +54,20 @@ namespace cheddar {
  * takes it only when it wins -- a shift can destroy a common stride, and the
  * transpose above would rather keep its 127.
  *
+ * ## The level is not free to choose
+ *
+ * Measured: the same three-diagonal map is **wrong at levels 2 and 5 and exact
+ * at level 11**, and the construction does not change between them. A
+ * standalone transform therefore has to sit high enough, which makes the
+ * plaintext count -- one full plaintext per diagonal, at the transform's limb
+ * count -- the binding cost. That is why a wide field swap is decomposed:
+ * 2048 diagonals at eleven limbs is 5.9 GB and 256 + 128 is not.
+ *
+ * The rotation keys are the other half. Without a window shift the BSGS grid
+ * is 128x256, and although only the occupied cells become plaintexts, every
+ * distinct giant and baby step still needs a key -- up to 382 at ~126 MiB
+ * each. The shift is what makes the transform fit at all.
+ *
  * It is deliberately **not** `LinearTransform::pre_rotation`. That parameter
  * reduces the offsets and then rotates by the reduced amount, so it assumes
  * the input already arrives rotated -- free inside `EvalSpecialFFT`, where the
