@@ -213,3 +213,101 @@ TEST(RingSwitch, RoundTripsThroughTheSmallRing) {
   // Two key switches now, so a little looser than the one-way bound.
   EXPECT_LT(worst, 2e-3);
 }
+
+// ---------------------------------------------------------------------------
+// [SYLPH] section 3.3: ring switching works on SinC-encoded ciphertexts too.
+//
+// THIS IS THE JOINT THE ATTENTION PATH TURNS ON, and nothing in this repo has
+// ever checked it. [SYLPH] Table 4 puts the batch CC-MM at ring degree 4096 in
+// the SinC encoding, and the only way a tensor that lives at 65536 gets there
+// is: partial SlotToCoeff (BootContext::SlotToSinC, measured in
+// sinc_transform_test) and then this switch. The two halves are each verified
+// on their own; this is the composition.
+//
+// THE CLAIM, STATED AS AN INDEX IDENTITY. Ecd_SinC_{k,N} puts block i at the
+// coefficients congruent to i mod d, d = N/k. The switch of rank r sends
+// coefficient p to position p/r of ciphertext p mod r. So with the SAME k on
+// both sides -- d' = N'/k = d/r -- big block i splits as
+//
+//     i = j + r * i'      j = which small ciphertext, i' = its own block
+//
+// and the lane index is untouched. That is [SYLPH]'s "k' | k" condition at
+// k' = k, and it is what makes the switch free of any re-encoding.
+//
+// WHAT WOULD SLIP THROUGH A NORM CHECK. Every value survives a switch that
+// scrambled the blocks, so the comparison is entrywise against the exact
+// prediction above, and a control that omits the `j + r * i'` interleave has
+// to fail.
+TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
+  Ring big(kSwitchParam);
+  Ring small(kSmallParam);
+
+  const int degree = big.Degree();
+  const int small_degree = small.Degree();
+  const int rank = degree / small_degree;
+  const int level = big.param->max_level_;
+
+  big.ui->PrepareRingSwitchKey(small_degree, small.ui->GetSecretCoeffs(),
+                               level);
+  RingSwitchHandler<word> rs(big.context, small.context);
+
+  // k = 32 makes the small ring's matrix 4096/32 = 128 wide, which is exactly
+  // Llama-3's per-head 128x128 attention product with 16 lanes for 16 heads.
+  // k = 128 is [SYLPH]'s own instance: 32 blocks, 64 lanes.
+  for (int k : {32, 128}) {
+    const int d_big = degree / k;
+    const int d_small = small_degree / k;
+    const int lanes = k / 2;
+    ASSERT_EQ(d_big, rank * d_small);
+
+    std::mt19937_64 gen(0x51C0DEULL ^ static_cast<unsigned long long>(k));
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    std::vector<cheddar::Complex> msg(degree / 2);
+    for (auto &z : msg) z = cheddar::Complex(dist(gen), dist(gen));
+
+    Plaintext<word> pt;
+    big.context->encoder_.EncodeSinC(pt, level, big.param->GetScale(level),
+                                     msg, k);
+    Ciphertext<word> ct;
+    big.ui->Encrypt(ct, pt);
+
+    std::vector<Ciphertext<word>> parts;
+    rs.Switch(parts, ct, big.ui->GetRingSwitchKey(rank));
+    ASSERT_EQ(static_cast<int>(parts.size()), rank);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    double worst = 0.0, control = 0.0;
+    for (int j = 0; j < rank; j++) {
+      Plaintext<word> back;
+      small.ui->Decrypt(back, parts[j]);
+      std::vector<cheddar::Complex> got;
+      small.context->encoder_.DecodeSinC(got, back, k);
+      ASSERT_EQ(static_cast<int>(got.size()), small_degree / 2);
+
+      for (int ip = 0; ip < d_small; ip++) {
+        for (int t = 0; t < lanes; t++) {
+          const auto v = got[ip * lanes + t];
+          worst = std::max(
+              worst, std::abs(v - msg[(j + rank * ip) * lanes + t]));
+          // The same index without the interleave: blocks laid out
+          // contiguously per ciphertext instead of strided.
+          control = std::max(
+              control,
+              std::abs(v - msg[(j * d_small + ip) * lanes + t]));
+        }
+      }
+    }
+
+    std::cout << "SinC k=" << k << ": " << degree << " (" << d_big
+              << " blocks) -> " << rank << " x " << small_degree << " ("
+              << d_small << " blocks, " << lanes
+              << " lanes): max |diff| = " << worst
+              << ", control (no interleave) = " << control << std::endl;
+
+    EXPECT_LT(worst, 2e-3) << "the switch did not carry SinC(" << k << ")";
+    EXPECT_GT(control, 1e-2)
+        << "the blocks are NOT interleaved, so this test would pass against a "
+           "switch that laid them out contiguously";
+  }
+}
