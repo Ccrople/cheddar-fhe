@@ -1082,6 +1082,24 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
     // drops eleven and adds two, which is a regraft nothing here has
     // exercised. Measuring both sides says whether a zero output came out of
     // the cycle or out of the descent standing in for the product.
+    // ToCoeff builds its scale-up constant as
+    // EncodeConstant(1.0 * r, stc_level, GetStCInputScale() / src.GetScale()),
+    // and EncodeConstant rounds `number * scale` to an integer -- so if that
+    // product falls below 1/2 the constant is zero and the ciphertext is
+    // annihilated, which is exactly what an all-zero coefficient vector looks
+    // like. These are the three numbers that decide it.
+    {
+      const double got_scale = normed[0].GetScale();
+      const double up = boot->GetStCInputScale() / got_scale;
+      const double rr =
+          std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
+      std::cout << "    turn " << turn << " RMSNorm out scale " << got_scale
+                << ", canonical at " << sched.GetStCLevel() << " is "
+                << param_->GetScale(sched.GetStCLevel())
+                << ", StC wants " << boot->GetStCInputScale()
+                << " -> up_factor " << up << ", constant integer " << (rr * up)
+                << std::endl;
+    }
     const std::vector<double> &ref = (turn == 1) ? y1s : y2;
     const double ref_scale = (turn == 1) ? 1.0 : s2;
     for (int i = 0; i < num_ct; i++) {
