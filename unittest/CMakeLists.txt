@@ -205,3 +205,7 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_30.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/sylphflow16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/sylphflow16_35.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_35.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_35.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_35.json COPYONLY)
