@@ -66,8 +66,25 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   Ciphertext<word> ct;
   EncodeAndEncrypt(ct, msg, level);
 
+  // SlotToCoeff's three phases are LinearTransforms pinned to levels with
+  // per-phase scales, and stc_const_ is split across them as its cube root. So
+  // a wrong input scale does not shift the answer by a constant -- it stops the
+  // phases composing, which is why three successive constant compensations each
+  // reduced the error and none removed it. Inside Boot the input carries
+  // EvalMod's end scale, not the canonical scale of its level.
+  //
+  // Reinterpreting the scale is free: no level, no kernel, only the declared
+  // value changes. That is the same technique that broke RMSNorm by handing
+  // EvalPoly a non-canonical scale -- here it is the opposite, matching the
+  // scale the library asks for rather than inventing one.
+  Ciphertext<word> in = std::move(ct);
+  std::cout << "reinterpreting scale " << in.GetScale() << " as "
+            << boot->GetStCInputScale() << " (ratio "
+            << (boot->GetStCInputScale() / in.GetScale()) << ")" << std::endl;
+  in.SetScale(boot->GetStCInputScale());
+
   Ciphertext<word> coeff_ct;
-  boot->SlotToCoeff(coeff_ct, num_slots, ct, interface_->GetEvkMap());
+  boot->SlotToCoeff(coeff_ct, num_slots, in, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const int coeff_level = param_->NPToLevel(coeff_ct.GetNP());
@@ -90,12 +107,14 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
     // up as the round trip coming back exactly 1/32.06 of its input. Feeding
     // EvalMod an argument 32x below what it is built for also costs five bits,
     // which is what the residual 15.7% ratio spread was.
+    // The previous run divided by this where it should have multiplied, which
+    // is why the ratio moved 32x the wrong way.
     const double msg_ratio =
         static_cast<double>(1 << boot->GetBootParameter().GetLogMessageRatio());
     std::cout << "compensating stc_const_ " << boot->GetStCConst()
               << " and message ratio " << msg_ratio << std::endl;
     context_->encoder_.EncodeConstant(inv_stc, cl, param_->GetScale(cl),
-                                      1.0 / (boot->GetStCConst() * msg_ratio));
+                                      msg_ratio / boot->GetStCConst());
     Ciphertext<word> scaled;
     context_->Mult(scaled, coeff_ct, inv_stc);
     context_->Rescale(coeff_ct, scaled);

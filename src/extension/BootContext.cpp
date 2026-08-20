@@ -108,6 +108,14 @@ BootContext<word>::BootContext(const Parameter<word> &param,
 }
 
 template <typename word>
+double BootContext<word>::GetStCInputScale() const {
+  AssertTrue(eval_mod_ != nullptr,
+             "GetStCInputScale: EvalMod not prepared, so the scale StC expects "
+             "is not known yet");
+  return eval_mod_->end_scale_;
+}
+
+template <typename word>
 double BootContext<word>::GetCtSConst() const {
   return cts_const_;
 }

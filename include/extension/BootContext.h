@@ -137,6 +137,20 @@ class BootContext : public Context<word>,
   /** @brief The BootParameter this context was built with. */
   const BootParameter &GetBootParameter() const { return boot_param_; }
 
+  /**
+   * @brief The input scale SlotToCoeff's phases were compiled against.
+   *
+   * `stc_phases_` are LinearTransforms pinned to levels
+   * `GetStCStartLevel() - i` with per-phase scales, and `stc_const_` is split
+   * across them as its cube root -- so a wrong input scale does not shift the
+   * result by a constant, it stops the three phases composing. Inside Boot the
+   * input is whatever EvalMod left, not the canonical scale of that level, so a
+   * caller invoking SlotToCoeff standalone has to reinterpret its ciphertext's
+   * scale to this. That costs no level and no kernel: it changes the declared
+   * scale, not the data.
+   */
+  double GetStCInputScale() const;
+
   double GetCtSConst() const;
   double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
   void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
