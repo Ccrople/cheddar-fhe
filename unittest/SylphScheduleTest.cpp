@@ -769,6 +769,36 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
     std::cout << "HalfBoot round trip: the message came back at " << ratio
               << "x of what went in (log2 " << std::log2(std::abs(ratio))
               << "), designed against r = " << r << std::endl;
+
+    // THE RESIDUAL, which is the number I should have taken first.
+    //
+    // The ratio alone says the layout and the magnitude are right and says
+    // nothing about whether the values are. Three hypotheses died today from
+    // being argued instead of measured -- the window, the magnitude, the input
+    // precision -- and each time the missing measurement was this one. A
+    // no-bootstrap sweep established that RMSNorm turns an 11.3-bit input into
+    // 9.64 bits out, so if this reads near 11 then the operator is being handed
+    // something reasonable and the fault is downstream; if it reads far worse,
+    // the bootstrap on real Llama data is worse than on the synthetic input it
+    // was characterised with, and that is the answer.
+    double resid = 0.0, want_absmax = 0.0;
+    for (int s = 0; s < num_slots; s++) {
+      const int c = s / kTokens;
+      const int t = kFirstToken + (s % kTokens);
+      const double want_v =
+          ratio * beta * x[static_cast<size_t>(t) * kChannels + c];
+      resid = std::max(resid, std::abs(got0[s].real() - want_v));
+      want_absmax = std::max(want_absmax, std::abs(want_v));
+    }
+    std::cout << "  arriving residual " << -std::log2(resid / want_absmax)
+              << " bits relative to a max of " << want_absmax
+              << "; imaginary leakage ";
+    double imag_max = 0.0;
+    for (int s = 0; s < num_slots; s++) {
+      imag_max = std::max(imag_max, std::abs(got0[s].imag()));
+    }
+    std::cout << imag_max << " (" << (imag_max / want_absmax) << " of max)"
+              << std::endl;
     // The calibration above is built on the documented constant, so what has
     // to hold is that the measured factor matches it -- not that it is one.
     // The window is 6x wide and the argument moves as the square, so a few
