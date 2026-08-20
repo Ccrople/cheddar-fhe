@@ -174,10 +174,27 @@ class SylphSchedule {
    * at 0, because the multiply and the rescale use the same actual prime
    * product.
    *
+   * `magnitude` multiplies the message on the way through, and it is the
+   * other half of the crossing constant. The two legs of the cycle want
+   * opposite magnitudes -- ModRaise needs a small message, an operator's
+   * polynomial wants exactly the interval it was fitted on -- and this
+   * multiply is already being paid for, so growing the message back here
+   * costs nothing. Without it the only ways to hand `SiLuHandler` an argument
+   * on [-1, 1] while the bootstrap before it sees at most 0.5 are a constant
+   * multiply (a level) or a fit interval twice as wide (a doubled degree,
+   * which is also a level).
+   *
+   * The constant encoded is `restore * magnitude` at scale `factor`, and
+   * `EncodeConstant` stores `round(number * scale)`, so a magnitude small
+   * enough to round that product to zero is rejected rather than silently
+   * annihilating the ciphertext -- the failure mode `ToCoeff` already guards
+   * against.
+   *
    * @param res output, at `level - 1` and `param_.GetScale(level - 1)`
    * @param x input at any scale
+   * @param magnitude an extra factor on the message; 1.0 leaves it alone
    */
-  void Canonicalise(Ct &res, const Ct &x) const;
+  void Canonicalise(Ct &res, const Ct &x, double magnitude = 1.0) const;
 
   /**
    * @brief The slot to coefficient leg: descend to StC's level, then StC.

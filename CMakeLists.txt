@@ -80,6 +80,7 @@ if(ENABLE_EXTENSION)
     src/extension/EvalSpecialFFT.cpp
     src/extension/Hoist.cu
     src/extension/LinearTransform.cpp
+    src/extension/LlamaBlock.cu
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
     src/extension/SoftMax.cu

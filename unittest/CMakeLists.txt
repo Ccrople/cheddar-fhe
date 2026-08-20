@@ -196,6 +196,14 @@ if (ENABLE_EXTENSION)
   add_executable(sylph_schedule_test SylphScheduleTest.cpp)
   target_link_libraries(sylph_schedule_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # One whole decoder block through six turns of that cycle. The plan and the
+  # calibration tests are host arithmetic; the third bootstraps ninety-six
+  # times. All three need LLAMA3_REAL_DIR except the first, and the matrix
+  # products are a host stand-in -- see the file header.
+  add_executable(llama_block_test LlamaBlockTest.cpp)
+  target_link_libraries(llama_block_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

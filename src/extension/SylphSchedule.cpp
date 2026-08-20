@@ -129,7 +129,8 @@ std::string SylphSchedule<word>::DescribePlan(
 }
 
 template <typename word>
-void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x) const {
+void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x,
+                                       double magnitude) const {
   const int level = boot_->param_.NPToLevel(x.GetNP());
   AssertTrue(level >= 1,
              "Canonicalise: nothing below level " + std::to_string(level) +
@@ -158,8 +159,18 @@ void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x) const {
   // rather than the nominal 2^35, so unlike LevelDown this leaves no drift.
   const double factor =
       target * boot_->param_.GetRescalePrimeProd(level) / x.GetScale();
+  // The caller's own half of the crossing constant rides on the same
+  // multiply. See the header: this is what lets an operator receive its
+  // argument on exactly the interval its polynomial owns while the bootstrap
+  // that precedes it still carries half of it.
+  const double number = restore * magnitude;
+  AssertTrue(number * factor >= 1.0,
+             "Canonicalise: the constant would encode as round(" +
+                 std::to_string(number * factor) +
+                 "), which rounds to zero and annihilates the ciphertext. The "
+                 "magnitude asked for is too small for this level's scale.");
   Constant<word> one;
-  boot_->encoder_.EncodeConstant(one, level, factor, restore);
+  boot_->encoder_.EncodeConstant(one, level, factor, number);
   Ct tmp;
   boot_->Mult(tmp, x, one);
   boot_->Rescale(res, tmp);
