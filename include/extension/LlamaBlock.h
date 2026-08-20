@@ -172,8 +172,24 @@ class LlamaBlock {
     // same `Add(Ct, Pt)`. And it is legitimate: [SYLPH] section 3.1.3's
     // calibration is exactly this -- offline statistics of the activations,
     // per layer, used as public constants.
+    // The masked entries are the other half of the story, and they are why
+    // the shift is per *entry* and not merely per row.
+    //
+    // The row maximum that makes ||y||_2^2 land in [1, keys] has to be taken
+    // over the causal entries only -- a row's own largest exponential is the
+    // one it will actually normalise by. But the exponential still runs on
+    // the masked entries; the mask multiplies them away afterwards, not
+    // before. Their argument then sits above the interval, by up to the gap
+    // between a row's overall maximum and its causal one, and a Chebyshev
+    // polynomial outside its interval grows like cosh(d * arccosh(v)).
+    //
+    // `softmax_mask_shift` is the calibrated size of that gap. Subtracting it
+    // from every masked entry puts them back inside, at the cost of widening
+    // the range that has to cover them. Both halves are plaintext additions
+    // in the coefficient domain, so the whole arrangement is free.
     double softmax_range = 21.0;
     std::vector<double> softmax_shift;  //!< one per row, head * T + query
+    double softmax_mask_shift = 0.0;    //!< extra, on masked entries only
     std::vector<double> softmax_norm_lo{1.0};
     std::vector<double> softmax_norm_hi{64.0};
     int softmax_iters = 1;
@@ -249,8 +265,10 @@ class LlamaBlock {
      * @param k the rotated keys, `num_kv_channels` wide
      * @param scale multiplies every entry, and carries 1/sqrt(head_dim), the
      * SoftMax range, and both operands' crossing constants
-     * @param shift added after scaling, one entry per row in the order
-     * `head * T + query`; see `Calibration::softmax_shift`
+     * @param shift added after scaling, one entry per score in the order
+     * `(head * T + query) * T + key`. Per entry rather than per row because
+     * the masked entries need their own correction; see
+     * `Calibration::softmax_shift` and `Calibration::softmax_mask_shift`.
      */
     virtual void Scores(std::vector<Ct> &res, const std::vector<Ct> &q,
                         const std::vector<Ct> &k, double scale,
@@ -351,6 +369,12 @@ class LlamaBlock {
   // The other half: StC every ciphertext back to the coefficient domain.
   void Lower(std::vector<Ct> &res, const std::vector<Ct> &x,
              const EvkMap<word> &evk_map) const;
+
+  // Say which turn is running and what level it is on. A hundred bootstraps
+  // is minutes of silence, and an assert inside one of them reports only that
+  // the prime counts differed.
+  void Announce(const char *what, const std::vector<Ct> &cts,
+                int expect_level = -1) const;
 
   // Per-channel weights, broadcast into the block's packing, with sqrt(alpha)
   // folded in the way RmsNormHandler asks for.

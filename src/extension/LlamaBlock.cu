@@ -1,6 +1,7 @@
 #include "extension/LlamaBlock.h"
 
 #include <cmath>
+#include <iostream>
 #include <sstream>
 
 #include "common/Assert.h"
@@ -155,6 +156,21 @@ std::string LlamaBlock<word>::DescribePlan() const {
   return os.str();
 }
 
+// A hundred bootstraps is minutes of silence, and an assert inside one of them
+// says only that the prime counts differed. Naming the turn costs a line of
+// output and turns "somewhere in the block" into "turn F, the gate multiply".
+template <typename word>
+void LlamaBlock<word>::Announce(const char *what, const std::vector<Ct> &cts,
+                                int expect_level) const {
+  const int level = cts.empty() ? -1 : boot_->param_.NPToLevel(cts[0].GetNP());
+  std::cout << "  [block] " << what << ": " << cts.size() << " ct at level "
+            << level;
+  if (expect_level >= 0 && level != expect_level) {
+    std::cout << "  (EXPECTED " << expect_level << ")";
+  }
+  std::cout << std::endl;
+}
+
 template <typename word>
 void LlamaBlock<word>::Lift(std::vector<Ct> &res, const std::vector<Ct> &x,
                             double magnitude, const EvkMap<word> &evk_map,
@@ -221,11 +237,15 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // constructor. So the normalised activation is the true one and every
   // crossing constant below is stated against unscaled tensors.
   std::vector<Ct> slots, normed, coeff;
+  Announce("A  input", x, 0);
   Lift(slots, x, 1.0, evk_map);
+  Announce("A  lifted", slots, sched_->GetSlotLevel() - 1);
   std::vector<std::vector<Complex>> attn_w;
   SpreadNormWeight(attn_w, w.attn_norm, cal_.attn_alpha / (r * r));
   attn_norm_->Apply(normed, slots, attn_w, evk_map);
+  Announce("A  RMSNorm", normed, sched_->GetStCLevel());
   Lower(coeff, normed, evk_map);
+  Announce("A  lowered", coeff, sched_->GetCoeffLevel());
 
   std::vector<Ct> q, k, v;
   leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels, w.wq, cal_.size_q,
@@ -241,6 +261,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // ciphertexts are lifted at magnitude 1 -- whatever they carry, they carry
   // it through unchanged and `Scores` divides both out.
   std::vector<Ct> q_slots, k_slots;
+  Announce("B  Q from the projection", q, 0);
   Lift(q_slots, q, 1.0, evk_map);
   Lift(k_slots, k, 1.0, evk_map);
   std::vector<Ct> q_rot(q_slots.size()), k_rot(k_slots.size());
@@ -250,6 +271,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   for (size_t i = 0; i < k_slots.size(); i++) {
     rope_->Apply(k_rot[i], k_slots[i], cfg_.first_position, evk_map);
   }
+  Announce("B  RoPE", q_rot, sched_->GetSlotLevel() - 2);
   std::vector<Ct> q_coeff, k_coeff;
   Lower(q_coeff, q_rot, evk_map);
   Lower(k_coeff, k_rot, evk_map);
@@ -269,15 +291,24 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   const double score_scale = cal_.size_scores /
                              (cal_.softmax_range * std::sqrt(cfg_.head_dim) *
                               cal_.size_q * cal_.size_k);
-  const int num_rows = (cfg_.num_channels / cfg_.head_dim) * cfg_.num_tokens;
+  const int T = cfg_.num_tokens;
+  const int num_rows = (cfg_.num_channels / cfg_.head_dim) * T;
   AssertTrue(static_cast<int>(cal_.softmax_shift.size()) == num_rows,
              "LlamaBlock: SoftMax needs one calibrated shift per row -- see "
              "Calibration::softmax_shift for why a single global one does not "
              "work on real scores");
-  std::vector<double> score_shift(num_rows);
-  for (int i = 0; i < num_rows; i++) {
-    score_shift[i] =
-        -cal_.size_scores * cal_.softmax_shift[i] / cal_.softmax_range;
+  std::vector<double> score_shift(static_cast<size_t>(num_rows) * T);
+  for (int rr = 0; rr < num_rows; rr++) {
+    const int query = rr % T;
+    for (int key = 0; key < T; key++) {
+      // Masked entries get pushed down by the calibrated gap so that the
+      // exponential still sees an in-interval argument; the mask zeroes them
+      // a level later, but the polynomial has already run by then.
+      const double extra = (key <= query) ? 0.0 : cal_.softmax_mask_shift;
+      score_shift[static_cast<size_t>(rr) * T + key] =
+          -cal_.size_scores * (cal_.softmax_shift[rr] + extra) /
+          cal_.softmax_range;
+    }
   }
   leg.Scores(scores, q_coeff, k_coeff, score_scale, score_shift);
 
@@ -293,11 +324,13 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
         sched_->ToSlot(landed, coeff, evk_map);
         sched_->Canonicalise(out, landed, magnitude);
       };
+  Announce("C  scores lifted", score_slots, sched_->GetSlotLevel() - 1);
   std::vector<Ct> probs(score_slots.size());
   for (size_t i = 0; i < score_slots.size(); i++) {
     softmax_->Apply(probs[i], score_slots[i], causal_mask[i], evk_map, nullptr,
                     &aux);
   }
+  Announce("C  SoftMax", probs, sched_->GetStCLevel());
   std::vector<Ct> prob_coeff;
   Lower(prob_coeff, probs, evk_map);
 
@@ -318,6 +351,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // follow PV directly. `residual` rather than a private constant, because
   // this output is added to the block input.
   std::vector<Ct> attn_slots, attn_coeff, attn_out;
+  Announce("D  attention values", attn, 0);
   Lift(attn_slots, attn, 1.0, evk_map);
   Lower(attn_coeff, attn_slots, evk_map);
   leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels, w.wo,
@@ -334,6 +368,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   std::vector<std::vector<Complex>> ffn_w;
   SpreadNormWeight(ffn_w, w.ffn_norm, cal_.ffn_alpha / (r * r));
   ffn_norm_->Apply(h_normed, h_slots, ffn_w, evk_map);
+  Announce("E  RMSNorm", h_normed, sched_->GetStCLevel());
   Lower(h_coeff, h_normed, evk_map);
 
   std::vector<Ct> gate, up;
@@ -351,6 +386,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // The gate is grown back to exactly the interval the polynomial was fitted
   // on. The bootstrap before it saw size_gate/range * g, at most boot_max.
   std::vector<Ct> gate_slots, up_slots;
+  Announce("F  gate", gate, 0);
   Lift(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
   Lift(up_slots, up, 1.0, evk_map);
   const auto &mult_key = evk_map.GetMultiplicationKey();
@@ -358,8 +394,17 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   for (size_t i = 0; i < gate_slots.size(); i++) {
     Ct activated;
     silu_->Apply(activated, gate_slots[i], evk_map);
-    boot_->HMult(gated[i], activated, up_slots[i], mult_key);
+    // `up` was lifted alongside the gate and has spent nothing since, while
+    // SiLU's polynomial has descended ceil(log2(degree+1)) levels. Cheddar's
+    // HMult requires the two operands at the same level and reports the
+    // mismatch as "Number of primes differ" from inside the tensor product,
+    // which names neither operand -- so bring `up` down explicitly.
+    const int level = boot_->param_.NPToLevel(activated.GetNP());
+    Ct levelled;
+    boot_->LevelDown(levelled, up_slots[i], level);
+    boot_->HMult(gated[i], activated, levelled, mult_key);
   }
+  Announce("F  SiLU * up", gated, -1);
   std::vector<Ct> gated_coeff, ffn_out;
   Lower(gated_coeff, gated, evk_map);
   leg.Project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,

@@ -127,7 +127,7 @@ struct ClearRun {
   std::vector<double> normed, q, k, v, scores, probs, attn, proj, hidden;
   std::vector<double> fnormed, gate, up, down, out;
   std::vector<double> row_max;  //!< the per-row shift, head * T + query
-  double score_max = 0.0, score_min = 0.0, span = 0.0;
+  double score_max = 0.0, score_min = 0.0, span = 0.0, mask_gap = 0.0;
   double norm_lo = 0.0, norm_hi = 0.0;
   double attn_alpha = 1.0, ffn_alpha = 1.0;
   double attn_window = 1.0, ffn_window = 1.0;
@@ -214,10 +214,13 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
   r.score_max = -1e300;
   r.score_min = 1e300;
   r.span = 0.0;
+  // Pass one: the scores, and the per-row *causal* maximum. Causal, because
+  // that is the entry the row will normalise by, and taking the maximum over
+  // every entry instead is what left ||y||^2 spanning 1.35e5x.
   for (int hd = 0; hd < heads; hd++) {
     const int kvh = hd / group;
     for (int t = 0; t < T; t++) {
-      double hi = -1e300, lo = 1e300;
+      double causal_hi = -1e300;
       for (int u = 0; u < T; u++) {
         double dot = 0.0;
         for (int d = 0; d < D; d++) {
@@ -226,18 +229,38 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
         }
         const double s = dot * inv_root;
         r.scores[(static_cast<size_t>(hd) * T + t) * T + u] = s;
-        // The row maximum is taken over *every* entry, not only the causal
-        // ones. The mask zeroes the others after the exponential, but the
-        // exponential still runs on them, and an argument above the interval
-        // is a Chebyshev blow-up that has to fit under the modulus before
-        // anything zeroes it.
-        hi = std::max(hi, s);
-        lo = std::min(lo, s);
+        if (u <= t) causal_hi = std::max(causal_hi, s);
+        r.score_max = std::max(r.score_max, s);
+        r.score_min = std::min(r.score_min, s);
       }
-      r.row_max[static_cast<size_t>(hd) * T + t] = hi;
-      r.span = std::max(r.span, hi - lo);
-      r.score_max = std::max(r.score_max, hi);
-      r.score_min = std::min(r.score_min, lo);
+      r.row_max[static_cast<size_t>(hd) * T + t] = causal_hi;
+    }
+  }
+  // Pass two: how far above its causal maximum a row's masked entries reach.
+  // The exponential runs on them -- the mask only zeroes them a level later --
+  // so they have to be pushed back into the interval, and the range then has
+  // to cover them where they land.
+  r.mask_gap = 0.0;
+  for (int hd = 0; hd < heads; hd++) {
+    for (int t = 0; t < T; t++) {
+      const double c = r.row_max[static_cast<size_t>(hd) * T + t];
+      for (int u = t + 1; u < T; u++) {
+        r.mask_gap = std::max(
+            r.mask_gap,
+            r.scores[(static_cast<size_t>(hd) * T + t) * T + u] - c);
+      }
+    }
+  }
+  r.span = 0.0;
+  for (int hd = 0; hd < heads; hd++) {
+    for (int t = 0; t < T; t++) {
+      const double c = r.row_max[static_cast<size_t>(hd) * T + t];
+      for (int u = 0; u < T; u++) {
+        const double shifted =
+            r.scores[(static_cast<size_t>(hd) * T + t) * T + u] - c -
+            (u > t ? r.mask_gap : 0.0);
+        r.span = std::max(r.span, -shifted);
+      }
     }
   }
 
@@ -250,7 +273,7 @@ void TraceClearBlock(const Block::Config &cfg, const Block::Weights &w,
   r.norm_hi = 0.0;
   for (int hd = 0; hd < heads; hd++) {
     for (int t = 0; t < T; t++) {
-      const double c = r.row_max[static_cast<size_t>(hd) * T + t];
+      const double c = r.row_max[static_cast<size_t>(hd) * T + t];  // causal
       double sq = 0.0, sum = 0.0;
       for (int u = 0; u <= t; u++) {
         const double half = std::exp(
@@ -347,7 +370,7 @@ class HostLinearLeg : public Block::LinearLeg {
                    ka[static_cast<size_t>(u) * cfg_.num_kv_channels + kvh * D + d];
           }
           s[(static_cast<size_t>(hd) * T + t) * T + u] =
-              dot * scale + shift[static_cast<size_t>(hd) * T + t];
+              dot * scale + shift[(static_cast<size_t>(hd) * T + t) * T + u];
         }
       }
     }
@@ -537,9 +560,13 @@ class LlamaBlockFixture : public Testbed32 {
     // widest single row, not the dispersion across rows, which is the other
     // half of what the per-row shift buys.
     cal.softmax_shift = r.row_max;
+    cal.softmax_mask_shift = r.mask_gap;
     cal.softmax_range = r.span;
     cal.softmax_iters = 1;
-    cal.softmax_exp_degree = 9;
+    // Degree 15 costs the same four levels as degree 9 -- EvalPoly spends
+    // ceil(log2(d+1)) -- and the range now has to cover the pushed-down
+    // masked entries as well, so there is no reason to take the smaller fit.
+    cal.softmax_exp_degree = 15;
     cal.softmax_inv_sqrt_degree = 31;
     cal.softmax_early_inv_sqrt_degree = 4;
     cal.softmax_norm_lo = {r.norm_lo};
@@ -618,11 +645,14 @@ TEST_P(LlamaBlockFixture, TheCalibrationIsReachable) {
             << "] globally; widest single row " << cal.softmax_range
             << " -> range M" << std::endl;
   std::cout << "SoftMax per-row shift: " << cal.softmax_shift.size()
-            << " constants, in ["
+            << " causal row maxima, in ["
             << *std::min_element(r.row_max.begin(), r.row_max.end()) << ", "
             << *std::max_element(r.row_max.begin(), r.row_max.end())
             << "] -- that spread is what one global shift would have to absorb"
             << std::endl;
+  std::cout << "SoftMax masked-entry gap: " << cal.softmax_mask_shift
+            << ", so the range carries it and every argument stays in "
+            << "[-1, 0] before the +1" << std::endl;
   std::cout << "SoftMax ||y||^2 over rows: [" << r.norm_lo << ", " << r.norm_hi
             << "], spread " << (r.norm_hi / r.norm_lo)
             << "x  (with one global shift this measured 5.39e9x, which no "
