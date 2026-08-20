@@ -177,6 +177,13 @@ if (ENABLE_EXTENSION)
   add_executable(half_boot_test HalfBootTest.cpp)
   target_link_libraries(half_boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # [SYLPH] 3.2's attention packing layout, and the GPU measurement of the
+  # coefficient-to-slot permutation it is built around. The host tests need no
+  # GPU; the measurement runs 17 HalfBoots, so filter to it deliberately.
+  add_executable(attention_packing_test AttentionPackingTest.cpp)
+  target_link_libraries(attention_packing_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

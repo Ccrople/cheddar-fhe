@@ -72,6 +72,7 @@ endif()
 if(ENABLE_EXTENSION)
   add_compile_definitions(ENABLE_EXTENSION)
   list(APPEND CKKS_GPU_SOURCES
+    src/extension/AttentionPacking.cpp
     src/extension/BootContext.cpp
     src/extension/BootParameter.cpp
     src/extension/EvalMod.cpp
