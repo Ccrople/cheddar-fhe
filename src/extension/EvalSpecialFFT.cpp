@@ -361,6 +361,82 @@ void EvalSpecialFFT<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
   res.SetNumSlots(num_slots_);
 }
 
+template <typename word>
+void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
+                                       int sub_degree, int stc_level,
+                                       int cts_level) {
+  const int degree = context->param_.degree_;
+  AssertTrue(full_slot_,
+             "PrepareSinC: the SinC conversions are defined on the full slot "
+             "count; the sparse-packing path is a different transform");
+  AssertTrue(IsPowOfTwo(sub_degree) && sub_degree >= 2 && sub_degree < degree,
+             "PrepareSinC: sub_degree must be a power of two in [2, degree); "
+             "SinC(degree) is the ordinary slot encoding and needs no "
+             "conversion");
+  AssertTrue(degree % sub_degree == 0, "PrepareSinC: sub_degree must divide "
+                                       "the ring degree");
+
+  const int num_stages = Log2Ceil(num_slots_);
+  const int d = degree / sub_degree;
+  const int p = Log2Ceil(d);
+  AssertTrue(p <= num_stages,
+             "PrepareSinC: sub_degree is smaller than the transform allows");
+
+  AssertTrue(p >= 1, "PrepareSinC: nothing to do");
+  sinc_sub_degree_ = sub_degree;
+  sinc_stc_.clear();
+  sinc_cts_.clear();
+
+  // Slots -> SinC: the SUFFIX of StC, ascending stride, no scalar. Mult(a, b)
+  // applies b first, so the loop puts the lowest of the p strides first --
+  // which is the order EvaluateStC uses for the same stages.
+  StripedMatrix forward = plain_fft_stages_[num_stages - p];
+  for (int j = num_stages - p + 1; j < num_stages; j++) {
+    forward = StripedMatrix::Mult(plain_fft_stages_[j], forward);
+  }
+  auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
+  sinc_stc_.emplace_back(context, forward, stc_level,
+                         context->param_.GetRescalePrimeProd(stc_level), fbs,
+                         fgs, 0, 0);
+
+  // SinC -> slots: the PREFIX of CtS, which is the same set of strides in the
+  // opposite order, times 1/d. `plain_ifft_stages_[num_stages-1-i]` holds
+  // stride 2^i, so index 0 is the highest stride -- the one the forward
+  // applied last, and therefore the one the inverse applies first.
+  StripedMatrix inverse = plain_ifft_stages_[0];
+  for (int j = 1; j < p; j++) {
+    inverse = StripedMatrix::Mult(plain_ifft_stages_[j], inverse);
+  }
+  // Each stage pair composes to 2I, so p of them compose to 2^p = d.
+  inverse = StripedMatrix::Mult(inverse, 1.0 / static_cast<double>(d));
+  auto [ibs, igs] = BSGSSplit(inverse.GetNumDiag());
+  sinc_cts_.emplace_back(context, inverse, cts_level,
+                         context->param_.GetRescalePrimeProd(cts_level), ibs,
+                         igs, 0, 0);
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::AddRequiredSinCRotations(EvkRequest &req) const {
+  for (const auto &lt : sinc_stc_) lt.AddRequiredRotations(req);
+  for (const auto &lt : sinc_cts_) lt.AddRequiredRotations(req);
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::EvaluateSlotToSinC(
+    ConstContextPtr<word> context, Ct &res, const Ct &input,
+    const EvkMap<word> &evk_map) const {
+  AssertTrue(!sinc_stc_.empty(), "EvaluateSlotToSinC: call PrepareSinC first");
+  sinc_stc_.front().Evaluate(context, res, input, evk_map);
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::EvaluateSinCToSlot(
+    ConstContextPtr<word> context, Ct &res, const Ct &input,
+    const EvkMap<word> &evk_map) const {
+  AssertTrue(!sinc_cts_.empty(), "EvaluateSinCToSlot: call PrepareSinC first");
+  sinc_cts_.front().Evaluate(context, res, input, evk_map);
+}
+
 template class EvalSpecialFFT<uint32_t>;
 template class EvalSpecialFFT<uint64_t>;
 

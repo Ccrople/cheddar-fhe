@@ -176,6 +176,29 @@ class BootContext : public Context<word>,
   void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
 
+  /**
+   * @brief The partial conversions of [SYLPH] section 3.2: slots <-> the
+   * Slots-in-Coefficients encoding the batch CC-MM operates in.
+   *
+   * `SlotToSinC` is the last `log2(degree / sub_degree)` butterfly stages of
+   * SlotToCoeff and nothing else; `SinCToSlot` is the first that many of
+   * CoeffToSlot, times `d^-1`. Each is a single `LinearTransform` and costs
+   * **one level**, against SlotToCoeff's three. See `EvalSpecialFFT.h` for the
+   * identity and why the *prefix* of StC is a different map.
+   *
+   * Unlike `CoeffToSlot`, `SinCToSlot` is compiled at a level the caller
+   * chooses, so it does not have to live inside a bootstrap.
+   *
+   * `PrepareEvalSpecialFFT(num_slots)` must have run first.
+   */
+  void PrepareSinC(int num_slots, int sub_degree, int stc_level,
+                   int cts_level);
+  void AddRequiredSinCRotations(EvkRequest &req, int num_slots) const;
+  void SlotToSinC(Ct &res, int num_slots, const Ct &input,
+                  const EvkMap<word> &evk_map) const;
+  void SinCToSlot(Ct &res, int num_slots, const Ct &input,
+                  const EvkMap<word> &evk_map) const;
+
   void Boot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
             bool min_ks = false) const;
 

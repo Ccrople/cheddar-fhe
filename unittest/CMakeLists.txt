@@ -126,6 +126,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(llama_projection_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # Slots <-> SinC, homomorphically: the last stages of SlotToCoeff and nothing
+  # else. One level against SlotToCoeff's three, and the piece the batch CC-MM
+  # needs before it can take an operand that arrived encrypted.
+  add_executable(sinc_transform_test SinCTransformTest.cpp)
+  target_link_libraries(sinc_transform_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(boot_test Bootstrapping.cpp)
   target_link_libraries(boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
