@@ -57,6 +57,16 @@
 // `UserInterface(context, secret_coeffs)` is for. That crossing has never been
 // exercised before; the test asserts the NPInfo matches before relying on it.
 //
+// AND THE SCALE TAKES CARE OF ITSELF, WHICH IS NOT OBVIOUS. A grafted ladder
+// does not hold one scale at every level -- sylphflow16_35 is 2^35 from level 3
+// up and 2^29.88 at level 1, where the product runs -- so an operand walking
+// down five levels looks like it should arrive five bits off the value that
+// ring defines. It does not: `Context::LevelDown` is a chain of multiply-by-one
+// and rescale whose constants are encoded at each level's own scale, so it
+// lands on the canonical value of wherever it stops. Correcting the transform's
+// output scale instead is not merely unnecessary, it breaks that chain, because
+// the constants assume a canonical input. Measured, at a cost of one run.
+//
 // K IS SUPPLIED IN ITS OWN LAYOUT, NOT TRANSPORTED. Q's operand wants the
 // channel on the column axis, which is where the projection can put it; K's
 // wants the KEY there, three of whose bits therefore land on the ciphertext
@@ -178,14 +188,8 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
   auto boot = std::dynamic_pointer_cast<cheddar::BootContext<word>>(big.context);
   ASSERT_NE(boot, nullptr);
   boot->PrepareEvalSpecialFFT(num_slots);
-  // The last phase's plaintexts are encoded so the operand lands on the
-  // product ring's own level-1 scale. On a grafted ladder that is not the
-  // scale the transform started at -- sylphflow16_35 is 2^35 from level 3 up
-  // and 2^29.88 at level 1 -- and `LevelDown` does not move a scale, so
-  // without this the operand reaches the product five bits off and the error
-  // does not surface until a bootstrap two turns later.
-  boot->PrepareSinC(num_slots, kSubDegree, kSinCLevel, kSinCLevel, kSinCPhases,
-                    big.param->GetScale(kProductLevel));
+  boot->PrepareSinC(num_slots, kSubDegree, kSinCLevel, kSinCLevel,
+                    kSinCPhases);
 
   // ---- the permutation, as the two narrow swaps ------------------------
   //

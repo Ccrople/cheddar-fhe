@@ -367,8 +367,7 @@ void EvalSpecialFFT<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
 template <typename word>
 void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
                                        int sub_degree, int stc_level,
-                                       int cts_level, int num_phases,
-                                       double stc_out_scale) {
+                                       int cts_level, int num_phases) {
   const int degree = context->param_.degree_;
   AssertTrue(full_slot_,
              "PrepareSinC: the SinC conversions are defined on the full slot "
@@ -467,33 +466,13 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 
     const int level = stc_level - phase;
     auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
-    // THE SCALE THE OPERAND HAS TO ARRIVE AT, AND WHY IT IS SETTLED HERE.
-    //
-    // A LinearTransform leaves the scale where it found it, because its
-    // plaintexts are encoded at exactly the rescale prime product it then
-    // divides by. That is the right default and it is wrong for this hop:
-    // a grafted ladder does not carry one scale at every level -- on
-    // sylphflow16_35 every level from 3 up is 2^35 and level 1, where the
-    // product runs, is 2^29.88 -- so a ciphertext that walks down to the
-    // product level with LevelDown arrives five bits off the value that ring
-    // defines. It is not detectably wrong at the product; the rescale simply
-    // lands somewhere non-canonical, and what aborts is `EvalPoly` inside a
-    // bootstrap two turns later.
-    //
-    // Encoding the LAST phase's diagonals at a different scale settles it for
-    // nothing: the output carries `ct_scale * pt_scale / rescale_prod`, so
-    // asking for a target is one multiplication on the host.
-    double pt_scale = context->param_.GetRescalePrimeProd(level);
-    if (last && stc_out_scale > 0.0) {
-      pt_scale = stc_out_scale * context->param_.GetRescalePrimeProd(level) /
-                 context->param_.GetScale(stc_level);
-    }
     std::cout << "SinC forward phase " << phase << ": " << counts[phase]
               << " stages, " << forward.GetNumDiag() << " diagonals, level "
               << level << ", BSGS " << fbs << "x" << fgs << ", pre_rotation "
               << pre_rotation << ", pt_rot " << a << std::endl;
-    sinc_stc_.emplace_back(context, forward, level, pt_scale, fbs, fgs,
-                           pre_rotation, a);
+    sinc_stc_.emplace_back(context, forward, level,
+                           context->param_.GetRescalePrimeProd(level), fbs,
+                           fgs, pre_rotation, a);
   }
 
   // SinC -> slots: the PREFIX of CtS, which is the same set of strides in the
