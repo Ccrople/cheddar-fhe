@@ -20,7 +20,9 @@ LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
   AssertTrue(cfg_.head_dim > 0 && channels_per_ct_ % cfg_.head_dim == 0,
              "LlamaBlock: the head dimension must divide the channels one "
              "ciphertext holds, or a head would straddle two of them");
-  for (int ch : {cfg_.num_channels, cfg_.num_kv_channels, cfg_.hidden}) {
+  const std::vector<int> widths = {cfg_.num_channels, cfg_.num_kv_channels,
+                                   cfg_.hidden};
+  for (int ch : widths) {
     AssertTrue(ch % channels_per_ct_ == 0,
                "LlamaBlock: every tensor width must be a whole number of "
                "ciphertexts");
