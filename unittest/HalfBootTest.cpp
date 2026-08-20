@@ -77,14 +77,10 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   // value changes. That is the same technique that broke RMSNorm by handing
   // EvalPoly a non-canonical scale -- here it is the opposite, matching the
   // scale the library asks for rather than inventing one.
-  Ciphertext<word> in = std::move(ct);
-  std::cout << "reinterpreting scale " << in.GetScale() << " as "
-            << boot->GetStCInputScale() << " (ratio "
-            << (boot->GetStCInputScale() / in.GetScale()) << ")" << std::endl;
-  in.SetScale(boot->GetStCInputScale());
-
+  // The scale reinterpretation tried here was falsified: it took the ratio
+  // spread from 15% to 239%. Left out rather than left in.
   Ciphertext<word> coeff_ct;
-  boot->SlotToCoeff(coeff_ct, num_slots, in, interface_->GetEvkMap());
+  boot->SlotToCoeff(coeff_ct, num_slots, ct, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const int coeff_level = param_->NPToLevel(coeff_ct.GetNP());
@@ -159,6 +155,78 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   std::cout << "after dividing by the ratio: max abs err " << worst << " ("
             << -std::log2(worst / absmax) << " bits)" << std::endl;
   EXPECT_GT(-std::log2(worst / absmax), 12.0);
+}
+
+// THE DECISIVE ONE, AND IT SHOULD HAVE COME FIRST.
+//
+// Four hypotheses about the round trip have now been falsified: an identity
+// coefficient-to-slot map, a single missing constant, the message ratio as the
+// source of the precision loss, and SlotToCoeff's input scale contract. Each was
+// a guess checked afterwards. Boot is a known-good reference measuring SNR 2.4e8
+// every run, and by construction
+//
+//     Boot(x) == SlotToCoeff(HalfBoot(x))
+//
+// because HalfBoot is Boot with the last phase removed. That equation separates
+// the two things the round trip conflates:
+//
+//   * If it holds, HalfBoot is right and the round-trip failure is entirely in
+//     calling SlotToCoeff standalone, outside the flow it was compiled for.
+//   * If it fails, HalfBoot differs from Boot somewhere, and the comparison is
+//     against a reference rather than against a hypothesis.
+TEST_P(Testbed32, HalfBootPlusSlotToCoeffEqualsBoot) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+
+  const int num_slots = param_->degree_ / 2;
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots);
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, msg, 0);
+
+  // Reference: Boot, exactly as the passing bootstrap test uses it.
+  Ciphertext<word> want;
+  boot->Boot(want, ct, interface_->GetEvkMap());
+
+  // The same thing assembled from HalfBoot plus the phase it omits.
+  Ciphertext<word> half, got;
+  boot->HalfBoot(half, ct, interface_->GetEvkMap());
+  std::cout << "HalfBoot: level "
+            << param_->NPToLevel(half.GetNP()) << ", scale " << half.GetScale()
+            << " (EvalMod's end scale, which is what StC is compiled to expect)"
+            << std::endl;
+  boot->SlotToCoeff(got, num_slots, half, interface_->GetEvkMap());
+  got.SetNumSlots(num_slots);
+  got.SetScale(want.GetScale());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  ASSERT_EQ(param_->NPToLevel(got.GetNP()), param_->NPToLevel(want.GetNP()))
+      << "the reassembled path did not land where Boot did";
+
+  std::vector<Complex> a, b;
+  DecryptAndDecode(a, want);
+  DecryptAndDecode(b, got);
+  double worst = 0.0, absmax = 0.0;
+  for (int i = 0; i < num_slots; i++) {
+    worst = std::max(worst, std::abs(a[i].real() - b[i].real()));
+    worst = std::max(worst, std::abs(a[i].imag() - b[i].imag()));
+    absmax = std::max(absmax, std::abs(a[i].real()));
+  }
+  std::cout << "Boot vs HalfBoot+StC: max abs diff " << worst << " ("
+            << -std::log2(worst / absmax) << " bits relative to |Boot| max "
+            << absmax << ")" << std::endl;
+  // Both paths run the same kernels in the same order, so this should be
+  // essentially exact -- not merely close.
+  EXPECT_GT(-std::log2(worst / absmax), 20.0)
+      << "HalfBoot is not Boot minus its last phase, so the difference is in "
+         "HalfBoot and not in how the round trip calls SlotToCoeff";
 }
 
 INSTANTIATE_TEST_SUITE_P(
