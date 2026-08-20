@@ -844,6 +844,102 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
 
 // ---------------------------------------------------------------------------
 
+// IS IT THE OPERATOR OR THE BOOTSTRAP?
+//
+// Calibrating for the message ratio moved the stage from 0.04 bits to 0.45 --
+// still garbage, so the approximation window was not the whole story. Two
+// things remain, and no bootstrap is needed to separate them: RMSNorm might be
+// failing at level 18 on a message whose magnitude is r = 2^-5 of what it was
+// calibrated on, or it might be failing on the 11.27-bit input a bootstrap
+// hands it.
+//
+// This encrypts the same values directly at the operator's level, so the input
+// is a fresh ciphertext at roughly 30 bits instead of a bootstrapped one at 11.
+// Everything else -- level, magnitude, calibration, weights, packing -- is what
+// the stage uses.
+//
+//   clean and correct  -> the operator is fine and 11.27 bits is not enough
+//   clean and wrong    -> the operator cannot work at this magnitude, and the
+//                         fix is to restore it, which Canonicalise can do for
+//                         free by multiplying by 1/r instead of by 1
+TEST_P(CycleTestbed, RmsNormAtTheOperatorLevelWithoutABootstrap) {
+  const std::string dir = DataDir();
+  if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
+
+  std::vector<double> x, w;
+  ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
+  ASSERT_TRUE(ReadF32(dir + "/attn_norm.f32", kChannels, w));
+
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  const int op_level = boot->GetBootParameter().GetEvalModEndLevel() - 1;
+  const int channels_per_ct = num_slots / kTokens;
+
+  double log_sum = 0.0;
+  for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
+    log_sum += std::log(MeanSquare(x, t));
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+  const double beta = std::sqrt(alpha);
+
+  // Two magnitudes, one calibration each, both mathematically exact. m = 1 is
+  // the order-one input RmsNormTest uses; m = r is what HalfBoot delivers.
+  for (double m : {1.0, std::pow(2.0, -boot->GetBootParameter()
+                                           .GetLogMessageRatio())}) {
+    const double a_used = 1.0 / (m * m);
+    const double eps_used = kEps * beta * beta * m * m;
+    RmsNormHandler<word> rms(context_, kTokens, kChannels, a_used, op_level,
+                             eps_used, 6.0, 9);
+    const int num_ct = rms.GetNumCiphertexts();
+    for (int d : rms.GetRotationDistances()) {
+      interface_->PrepareRotationKey(d, op_level);
+    }
+
+    const double root = std::sqrt(a_used);
+    std::vector<Ciphertext<word>> cts(num_ct);
+    std::vector<std::vector<Complex>> wts(num_ct);
+    for (int i = 0; i < num_ct; i++) {
+      std::vector<Complex> msg(num_slots);
+      wts[i].assign(num_slots, Complex(0.0, 0.0));
+      for (int s = 0; s < num_slots; s++) {
+        const int c = i * channels_per_ct + s / kTokens;
+        const int t = kFirstToken + (s % kTokens);
+        msg[s] = Complex(m * beta * x[static_cast<size_t>(t) * kChannels + c],
+                         0.0);
+        wts[i][s] = Complex(w[c] * root, 0.0);
+      }
+      EncodeAndEncrypt(cts[i], msg, op_level);
+    }
+
+    std::vector<Ciphertext<word>> res;
+    rms.Apply(res, cts, wts, interface_->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    double worst = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_ct; i++) {
+      std::vector<Complex> got;
+      DecryptAndDecode(got, res[i]);
+      for (int s = 0; s < num_slots; s++) {
+        const int c = i * channels_per_ct + s / kTokens;
+        const int t = s % kTokens;
+        const double inv =
+            1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
+        const double want =
+            x[static_cast<size_t>(kFirstToken + t) * kChannels + c] * inv * w[c];
+        worst = std::max(worst, std::abs(got[s].real() - want));
+        absmax = std::max(absmax, std::abs(want));
+      }
+    }
+    std::cout << "  magnitude " << m << " (alpha_L " << a_used
+              << "): max abs err " << worst << " against " << absmax << " ("
+              << -std::log2(worst / absmax) << " bits)" << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 // THE LOOP CLOSES, AND CLOSES AGAIN.
 //
 // A decoder block is four turns of figure 2's cycle and the model is 32 of
