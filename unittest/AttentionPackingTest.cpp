@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -240,7 +241,8 @@ TEST(AttentionPackingHost, TheRingSwitchChainLeavesOneTokenPerSmallRingElement) 
   // element -> the token it holds, -1 until seen
   std::vector<int> token_of(num_elements, -1);
   std::vector<int> entries(num_elements, 0);
-  std::vector<int> heads_seen(num_elements, 0);
+  std::vector<uint32_t> heads_seen(num_elements, 0);
+  std::vector<uint32_t> channels_seen(num_elements, 0);
 
   for (int coeff = 0; coeff < kDegree; coeff++) {
     const TensorIndex t = layout.CoeffPosition(0, coeff);
@@ -257,18 +259,38 @@ TEST(AttentionPackingHost, TheRingSwitchChainLeavesOneTokenPerSmallRingElement) 
         << "element " << element << " holds more than one token, so it is not "
            "a row and [BAE]'s identity does not apply to it";
     entries[element]++;
-    heads_seen[element] |= 1 << (t.head % 16);
+    heads_seen[element] |= 1u << t.head;
+    channels_seen[element] |= 1u << t.channel;
   }
 
+  // Each element is one token by 16 heads by 16 channels. The heads are not
+  // 0..15: the second gather's stride runs past the token field and takes the
+  // head field's own low bit with it, so an element holds one parity class of
+  // heads. That is still one row per element -- the head axis splits across
+  // elements exactly as the token axis does -- but asserting heads 0..15 was
+  // wrong, and this is what the run said instead of what the shape suggested.
   for (int e = 0; e < num_elements; e++) {
     ASSERT_EQ(entries[e], 256) << "element " << e << " is not full";
-    ASSERT_EQ(heads_seen[e], 0xffff) << "element " << e << " is missing heads";
+    ASSERT_EQ(__builtin_popcount(heads_seen[e]), 16)
+        << "element " << e << " does not hold 16 heads";
+    ASSERT_EQ(__builtin_popcount(channels_seen[e]), 16)
+        << "element " << e << " does not hold 16 channels";
+    int parity = -1;
+    for (int h = 0; h < kNumHeads; h++) {
+      if (!(heads_seen[e] & (1u << h))) continue;
+      if (parity == -1) parity = h % 2;
+      ASSERT_EQ(h % 2, parity)
+          << "element " << e << " mixes head parities, so the head axis is "
+             "not split cleanly by the gather";
+    }
   }
 
   std::vector<int> distinct(token_of);
   std::sort(distinct.begin(), distinct.end());
   distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
-  std::cout << num_elements << " degree-256 elements, each one token wide, "
+  std::cout << num_elements
+            << " degree-256 elements, each one token by 16 heads by 16 "
+               "channels, "
             << distinct.size() << " distinct tokens over them" << std::endl;
   EXPECT_EQ(static_cast<int>(distinct.size()), kNumTokens);
 }
