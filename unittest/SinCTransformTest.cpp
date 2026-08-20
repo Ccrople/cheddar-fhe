@@ -97,11 +97,25 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     const int lanes = sub_degree / 2;
     const int p = cheddar::Log2Ceil(d);
 
-    // One level per phase, and the inverse runs on the forward's output, so
-    // they are compiled that far apart. Starting where the block's StC starts.
+    // WHERE EACH DIRECTION IS COMPILED, AND WHY IT IS NOT THE SAME PLACE.
+    //
+    // The forward starts where the block's SlotToCoeff starts, because in the
+    // pipeline it *replaces* SlotToCoeff: a tensor bound for the product pays
+    // this instead of that, not on top of it.
+    //
+    // The inverse does not sit under the forward's output. In the pipeline it
+    // runs on the far side of a bootstrap -- the product returns at level 0 and
+    // nothing can follow it there -- so it is compiled high, at the same levels.
+    // That is also the only place it *works*: chained straight onto the
+    // forward's output the last phase lands at level 6, and a standalone
+    // LinearTransform below level 7 does not merely lose accuracy, it returns
+    // magnitudes near the modulus. `SlotPermuteTest` found the same floor from
+    // the other side. The round trip below therefore runs only when the two
+    // agree on a level, and the inverse is checked entrywise against the host
+    // encoder either way, which is the stronger statement in any case.
     const int stc_level = boot->GetBootParameter().GetStCStartLevel();
-    const int cts_level = stc_level - c.phases;
-    ASSERT_GE(cts_level - c.phases, 0);
+    const int cts_level = stc_level;
+    ASSERT_GE(cts_level - c.phases, 1);
 
     boot->PrepareSinC(num_slots, sub_degree, stc_level, cts_level, c.phases);
     ASSERT_EQ(boot->GetSinCNumPhases(num_slots), c.phases);
@@ -149,28 +163,58 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     }
     const double control_err = MaxDiff(got, unreversed);
 
-    // ---- inverse: SinC -> slots ----------------------------------------
-    Ciphertext<word> back;
-    boot->SinCToSlot(back, num_slots, sinc, interface_->GetEvkMap());
-    EXPECT_EQ(param_->NPToLevel(back.GetNP()), cts_level - c.phases);
-    EXPECT_NEAR(back.GetScale() / sinc.GetScale(), 1.0, 1e-6);
+    // ---- inverse: SinC -> slots, against the host encoder ---------------
+    //
+    // A round trip alone passes for any invertible map. This encodes `want`
+    // -- the permuted message, as `Encoder::EncodeSinC` writes it -- and
+    // requires SinCToSlot to hand back `message` in slots, entrywise. So the
+    // inverse is pinned to the same permutation the forward is, independently.
+    Plaintext<word> inv_pt;
+    context_->encoder_.EncodeSinC(inv_pt, cts_level,
+                                  param_->GetScale(cts_level), want,
+                                  sub_degree);
+    Ciphertext<word> inv_ct;
+    interface_->Encrypt(inv_ct, inv_pt);
 
-    std::vector<Complex> round;
-    DecryptAndDecode(round, back);
-    const double round_err = MaxDiff(round, message);
+    Ciphertext<word> back;
+    boot->SinCToSlot(back, num_slots, inv_ct, interface_->GetEvkMap());
+    EXPECT_EQ(param_->NPToLevel(back.GetNP()), cts_level - c.phases);
+    EXPECT_NEAR(back.GetScale() / inv_ct.GetScale(), 1.0, 1e-6);
+
+    std::vector<Complex> undone;
+    DecryptAndDecode(undone, back);
+    const double inverse_err = MaxDiff(undone, message);
+
+    // And the round trip itself, when the forward leaves its output at the
+    // level the inverse was compiled at. It does when there is one phase; with
+    // three the forward lands three levels lower, and the note above is why
+    // that is not a defect to be chased.
+    double round_err = -1.0;
+    if (param_->NPToLevel(sinc.GetNP()) == cts_level) {
+      Ciphertext<word> chained;
+      boot->SinCToSlot(chained, num_slots, sinc, interface_->GetEvkMap());
+      std::vector<Complex> round;
+      DecryptAndDecode(round, chained);
+      round_err = MaxDiff(round, message);
+    }
 
     std::cout << "  sub_degree " << sub_degree << " (d = " << d << ", " << lanes
               << " lanes, " << p << " stages in " << c.phases
-              << " phase(s)): forward " << forward_err
-              << ", round trip " << round_err << ", control (no bit reversal) "
-              << control_err << std::endl;
+              << " phase(s)): forward " << forward_err << ", inverse "
+              << inverse_err << ", round trip " << round_err
+              << ", control (no bit reversal) " << control_err << std::endl;
 
     EXPECT_LT(forward_err, 1e-4)
         << "the suffix of StC is not the SinC encoding at sub_degree "
         << sub_degree;
-    EXPECT_LT(round_err, 1e-4)
-        << "the prefix of CtS times 1/d is not its inverse at sub_degree "
+    EXPECT_LT(inverse_err, 1e-4)
+        << "the prefix of CtS times 1/d does not undo it at sub_degree "
         << sub_degree;
+    if (round_err >= 0.0) {
+      EXPECT_LT(round_err, 1e-4)
+          << "the two do not compose to the identity at sub_degree "
+          << sub_degree;
+    }
     if (p > 0) {
       EXPECT_GT(control_err, 1e-2)
           << "the block index is NOT bit-reversed, so this test would pass "

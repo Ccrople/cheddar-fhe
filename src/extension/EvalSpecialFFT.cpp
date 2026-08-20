@@ -1,6 +1,7 @@
 #include "extension/EvalSpecialFFT.h"
 
 #include <cmath>
+#include <iostream>
 #include <utility>
 #include <vector>
 
@@ -465,6 +466,10 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 
     const int level = stc_level - phase;
     auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
+    std::cout << "SinC forward phase " << phase << ": " << counts[phase]
+              << " stages, " << forward.GetNumDiag() << " diagonals, level "
+              << level << ", BSGS " << fbs << "x" << fgs << ", pre_rotation "
+              << pre_rotation << ", pt_rot " << a << std::endl;
     sinc_stc_.emplace_back(context, forward, level,
                            context->param_.GetRescalePrimeProd(level), fbs,
                            fgs, pre_rotation, a);
@@ -498,6 +503,10 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 
     const int level = cts_level - phase;
     auto [ibs, igs] = BSGSSplit(inverse.GetNumDiag());
+    std::cout << "SinC inverse phase " << phase << ": " << counts[phase]
+              << " stages, " << inverse.GetNumDiag() << " diagonals, level "
+              << level << ", BSGS " << ibs << "x" << igs << ", pre_rotation "
+              << pre_rotation << ", pt_rot " << a << std::endl;
     sinc_cts_.emplace_back(context, inverse, level,
                            context->param_.GetRescalePrimeProd(level), ibs,
                            igs, pre_rotation, a);
