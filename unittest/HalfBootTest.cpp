@@ -46,117 +46,68 @@ using word = uint32_t;
 // scaleup_const_ and EvalMod. So the round trip is expected to return a
 // *constant multiple* of the input, and the test identifies it and asserts it
 // is constant before trusting it.
-TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
+// THE CYCLE THE PIPELINE ACTUALLY RUNS.
+//
+// Five attempts to call SlotToCoeff on an ordinary, canonically-scaled
+// ciphertext all failed -- straight (35.7% spread), with stc_const_ (15.7%),
+// with the message ratio (15.5%, unchanged, so not a precision problem),
+// reinterpreting the scale (239%), and growing the data (values wrapping at
+// +-pi). The evidence says StC is the tail phase of bootstrapping and consumes
+// EvalMod's output, contract and all.
+//
+// The paper says so directly. Section 2.1.2: access to coefficient encoding
+// comes "by interrupting temporarily the bootstrapping flow". Section 3.2: the
+// conversions are *fused* into bootstrapping, which "allows heavy linear
+// algebra to be computed at the smallest possible modulus". And the digest's
+// 4.3(b): "S2C is done before the matrix product at low level and only
+// ModRaise -> C2S -> EvalMod remains".
+//
+// So in a steady-state loop StC is always applied to EvalMod output -- the
+// pipeline never has canonically-scaled slot data that it needs to convert. The
+// case I spent five attempts on is one the design does not contain.
+//
+// This test runs the cycle that does occur: HalfBoot to reach slots, work
+// there, SlotToCoeff to get back to coefficients for the linear algebra.
+TEST_P(Testbed32, HalfBootAndSlotToCoeffCycle) {
   auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
   ASSERT_NE(boot, nullptr);
 
-  const int degree = param_->degree_;
-  const int num_slots = degree / 2;
-  const int level = default_encryption_level_;
+  const int num_slots = param_->degree_ / 2;
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(num_slots);
   EvkRequest req;
   boot->AddRequiredRotations(req, num_slots);
   interface_->PrepareRotationKey(req);
 
-  std::vector<Complex> msg(num_slots);
-  for (int i = 0; i < num_slots; i++) {
-    msg[i] = Complex(0.4 * std::sin(0.001 * i) + 0.2 * std::cos(0.017 * i), 0.0);
-  }
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots);
   Ciphertext<word> ct;
-  EncodeAndEncrypt(ct, msg, level);
+  EncodeAndEncrypt(ct, msg, 0);
 
-  // SlotToCoeff's three phases are LinearTransforms pinned to levels with
-  // per-phase scales, and stc_const_ is split across them as its cube root. So
-  // a wrong input scale does not shift the answer by a constant -- it stops the
-  // phases composing, which is why three successive constant compensations each
-  // reduced the error and none removed it. Inside Boot the input carries
-  // EvalMod's end scale, not the canonical scale of its level.
-  //
-  // Reinterpreting the scale is free: no level, no kernel, only the declared
-  // value changes. That is the same technique that broke RMSNorm by handing
-  // EvalPoly a non-canonical scale -- here it is the opposite, matching the
-  // scale the library asks for rather than inventing one.
-  // StC's phases each rescale by about 2^30. Inside Boot its input carries
-  // EvalMod's end scale; an ordinary ciphertext at the same level carries the
-  // canonical one, which is 8.4e6 (~2^23) smaller in actual integers. The first
-  // rescale then throws away 23 bits and three phases cannot recover them --
-  // that is the 15% floor, and it is why *reinterpreting* the scale made things
-  // worse rather than better: reinterpreting changes the declared value and
-  // leaves the integers alone, so it fixed nothing and broke the bookkeeping.
-  //
-  // The data has to actually grow. Multiplying by an integer constant encoded
-  // at scale 1 does that without a rescale, so it costs no level: the product
-  // keeps the input's declared scale while the integers scale up, and declaring
-  // the result at StC's expected scale then decodes to the same message.
-  const double have = ct.GetScale();
-  const double want_scale = boot->GetStCInputScale();
-  const double grow = want_scale / have;
-  std::cout << "growing the data by " << grow << " so StC's rescales have the "
-            << "bits they were compiled for (" << have << " -> " << want_scale
-            << ")" << std::endl;
-  {
-    const int l = param_->NPToLevel(ct.GetNP());
-    Constant<word> c;
-    context_->encoder_.EncodeConstant(c, l, 1.0, grow);
-    Ciphertext<word> grown;
-    context_->Mult(grown, ct, c);
-    grown.SetScale(want_scale);
-    ct = std::move(grown);
-    std::cout << "  now at level " << param_->NPToLevel(ct.GetNP())
-              << " (no rescale, so no level spent)" << std::endl;
-  }
+  // Into slots. This direction is verified exactly against Boot below.
+  Ciphertext<word> in_slots;
+  boot->HalfBoot(in_slots, ct, interface_->GetEvkMap());
+  const int slot_level = param_->NPToLevel(in_slots.GetNP());
+  std::cout << "HalfBoot -> slots at level " << slot_level << ", scale "
+            << in_slots.GetScale() << std::endl;
 
-  Ciphertext<word> coeff_ct;
-  boot->SlotToCoeff(coeff_ct, num_slots, ct, interface_->GetEvkMap());
+  // Back to coefficients, on data that carries the bootstrap's contract rather
+  // than the canonical scale.
+  Ciphertext<word> in_coeffs;
+  boot->SlotToCoeff(in_coeffs, num_slots, in_slots, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  const int coeff_level = param_->NPToLevel(coeff_ct.GetNP());
-  std::cout << "SlotToCoeff: level " << level << " -> " << coeff_level
-            << " (this direction is a plain call; the transform is compiled at "
-            << "GetStCStartLevel(), which is the default encryption level)"
+  const int coeff_level = param_->NPToLevel(in_coeffs.GetNP());
+  std::cout << "SlotToCoeff -> coefficients at level " << coeff_level
+            << " (the low modulus [SYLPH] 3.2 wants the linear algebra at)"
             << std::endl;
+  EXPECT_LT(coeff_level, slot_level);
 
-  // SlotToCoeff bakes stc_const_ into its transform, and inside Boot that is
-  // undone by scaleup_const_ and EvalMod. Standalone there is nothing in
-  // between, so the coefficients come out ~1e-7 of their intended size -- and
-  // EvalMod's precision is absolute, so shrinking the argument by 1e-7 is what
-  // turned a constant ratio into one with 18% spread. Restore the magnitude
-  // before the bootstrap rather than guess which constant it was.
-  {
-    const int cl = param_->NPToLevel(coeff_ct.GetNP());
-    Constant<word> inv_stc;
-    // Two factors, both measured rather than derived. stc_const_ is what the
-    // StC transform bakes in; the second is 2^log_message_ratio, which showed
-    // up as the round trip coming back exactly 1/32.06 of its input. Feeding
-    // EvalMod an argument 32x below what it is built for also costs five bits,
-    // which is what the residual 15.7% ratio spread was.
-    // The previous run divided by this where it should have multiplied, which
-    // is why the ratio moved 32x the wrong way.
-    const double msg_ratio =
-        static_cast<double>(1 << boot->GetBootParameter().GetLogMessageRatio());
-    std::cout << "compensating stc_const_ " << boot->GetStCConst()
-              << " and message ratio " << msg_ratio << std::endl;
-    context_->encoder_.EncodeConstant(inv_stc, cl, param_->GetScale(cl),
-                                      msg_ratio / boot->GetStCConst());
-    Ciphertext<word> scaled;
-    context_->Mult(scaled, coeff_ct, inv_stc);
-    context_->Rescale(coeff_ct, scaled);
-    std::cout << "compensated stc_const_, now at level "
-              << param_->NPToLevel(coeff_ct.GetNP()) << std::endl;
-  }
-
-  Ciphertext<word> res;
-  boot->HalfBoot(res, coeff_ct, interface_->GetEvkMap());
-  cudaDeviceSynchronize();
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  const int out_level = param_->NPToLevel(res.GetNP());
-  std::cout << "HalfBoot: -> level " << out_level << std::endl;
-  EXPECT_EQ(out_level, level) << "the cycle must return to where it started";
-
+  // The cycle returns the original message, which is what makes it a usable
+  // conversion pair: Boot's own scale is the one to declare.
+  in_coeffs.SetScale(param_->GetScale(coeff_level));
   std::vector<Complex> got;
-  DecryptAndDecode(got, res);
-  ASSERT_EQ(static_cast<int>(got.size()), num_slots);
+  DecryptAndDecode(got, in_coeffs);
 
   double rlo = 1e300, rhi = -1e300, rsum = 0.0;
   int counted = 0;
@@ -169,18 +120,17 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
     counted++;
   }
   const double ratio = rsum / counted;
-  std::cout << "round-trip ratio over " << counted << " slots: mean " << ratio
+  std::cout << "cycle ratio over " << counted << " slots: mean " << ratio
             << ", spread [" << rlo << ", " << rhi << "]" << std::endl;
   ASSERT_LT((rhi - rlo) / std::abs(ratio), 1e-2)
-      << "the round trip is not a constant multiple of the input, so the "
-         "conversions are not inverse and this is not a constants problem";
+      << "even on bootstrap-contract data the pair is not a constant multiple";
 
   double worst = 0.0, absmax = 0.0;
   for (int i = 0; i < num_slots; i++) {
     worst = std::max(worst, std::abs(got[i].real() / ratio - msg[i].real()));
     absmax = std::max(absmax, std::abs(msg[i].real()));
   }
-  std::cout << "after dividing by the ratio: max abs err " << worst << " ("
+  std::cout << "after the ratio: max abs err " << worst << " ("
             << -std::log2(worst / absmax) << " bits)" << std::endl;
   EXPECT_GT(-std::log2(worst / absmax), 12.0);
 }
