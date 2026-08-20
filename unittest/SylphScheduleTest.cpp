@@ -663,8 +663,31 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
   ASSERT_LT(hi / lo, 30.0) << "the segment is outside [SYLPH]'s window";
   const double alpha = 1.0 / std::exp(log_sum / kTokens);
   const double beta = std::sqrt(alpha);
-  const double alpha_scaled = alpha / (beta * beta);
-  const double eps_scaled = kEps * beta * beta;
+  double alpha_scaled = alpha / (beta * beta);
+  double eps_scaled = kEps * beta * beta;
+
+  // CALIBRATE FOR WHAT THE BOOTSTRAP DELIVERS, NOT FOR WHAT WENT IN.
+  //
+  // HalfBoot returns the message at 2^-log_message_ratio of its input --
+  // measured 0.0309131, against the documented 2^-5 = 0.03125, so the constant
+  // is the right one to design against. RMSNorm is scale *invariant*, so that
+  // factor does not cancel: the output is unchanged, but the polynomial's
+  // argument alpha_L * mean(x^2) moves by r^2, which is 1024x and straight out
+  // of the approximation window. The first run of this test measured its
+  // output at 0.04 bits, which is the window being blown, not the circuit.
+  //
+  // The correction is exact and free. Feeding x' = r*x with alpha' = alpha/r^2
+  // and eps' = eps*r^2 leaves the argument bit-for-bit what it would have
+  // been, and the output identical:
+  //
+  //     x' / sqrt(mean(x'^2) + eps') = r*x / sqrt(r^2 (mean(x^2) + eps))
+  //
+  // which is the same scale invariance that justified beta in the first place.
+  const double r = std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
+  alpha_scaled /= r * r;
+  eps_scaled *= r * r;
+  std::cout << "HalfBoot's message ratio r = " << r
+            << ", so alpha_L becomes " << alpha_scaled << std::endl;
 
   // The operator's input level is where Canonicalise leaves HalfBoot's output,
   // one below the landing level. This is the joint the whole class exists for.
@@ -745,11 +768,16 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
     const double ratio = num / den;
     std::cout << "HalfBoot round trip: the message came back at " << ratio
               << "x of what went in (log2 " << std::log2(std::abs(ratio))
-              << ")" << std::endl;
-    EXPECT_LT(std::abs(ratio - 1.0), 0.05)
-        << "the bootstrap moved the magnitude, so RMSNorm's window no longer "
-           "matches its calibration and its output cannot be read as a "
-           "failure of the operator";
+              << "), designed against r = " << r << std::endl;
+    // The calibration above is built on the documented constant, so what has
+    // to hold is that the measured factor matches it -- not that it is one.
+    // The window is 6x wide and the argument moves as the square, so a few
+    // percent here is harmless and a factor of two is not.
+    EXPECT_LT(std::abs(ratio / r - 1.0), 0.1)
+        << "the bootstrap's message ratio is not the documented 2^-"
+        << boot->GetBootParameter().GetLogMessageRatio()
+        << ", so RMSNorm's window is calibrated against the wrong magnitude "
+           "and its output cannot be read as a failure of the operator";
   }
 
   // NOTE. ToSlot is a bootstrap, so what reaches RMSNorm is the *bootstrapped*
@@ -812,6 +840,204 @@ TEST_P(CycleTestbed, RmsNormRunsInTheGapAndReachesStC) {
             << param_->NPToLevel(coeff.GetNP()) << ", scale "
             << coeff.GetScale() << ", with " << sched.GetLinearBudget()
             << " levels left for the product" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+
+// THE LOOP CLOSES, AND CLOSES AGAIN.
+//
+// A decoder block is four turns of figure 2's cycle and the model is 32 of
+// those, so the question that matters is not whether one leg works but whether
+// the state coming out of a turn is a legal input to the next one. Every level
+// and every scale has to arrive back where it started, or the second turn is a
+// different computation from the first and nothing composes.
+//
+// This runs two full turns with a real operator in each -- coefficients at
+// level 0 in, ToSlot, Canonicalise, RMSNorm, ToCoeff, descend, and round again
+// -- and checks the state after each. RMSNorm is idempotent on its own output
+// up to the weights, which is what makes a two-turn check meaningful without a
+// product in between: turn two normalises what turn one produced, and the host
+// can say exactly what that is.
+//
+// The linear leg is deliberately absent, and its absence is the point of the
+// descent that stands in for it: [SYLPH] puts the product between ToCoeff and
+// ToSlot, and what this establishes is that the slot the product would occupy
+// is reachable and that the loop closes around it. Attaching the product needs
+// the degree-4096 ring, which needs the ring-switch parameter pair that
+// bootparam_35 does not have -- Doing.md 1.5y.
+TEST_P(CycleTestbed, TheLoopClosesTwice) {
+  const std::string dir = DataDir();
+  if (dir.empty()) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
+
+  std::vector<double> x, w;
+  ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
+  ASSERT_TRUE(ReadF32(dir + "/attn_norm.f32", kChannels, w));
+
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  const int degree = param_->degree_;
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+  SylphSchedule<word> sched(boot, num_slots);
+
+  double lo = 1e300, hi = 0.0, log_sum = 0.0;
+  for (int t = kFirstToken; t < kFirstToken + kTokens; t++) {
+    const double ms = MeanSquare(x, t);
+    lo = std::min(lo, ms);
+    hi = std::max(hi, ms);
+    log_sum += std::log(ms);
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+  const double beta = std::sqrt(alpha);
+  const double r = std::pow(2.0, -boot->GetBootParameter().GetLogMessageRatio());
+
+  const int op_level = sched.GetSlotLevel() - 1;
+  const int channels_per_ct = num_slots / kTokens;
+
+  // Turn one's operator is calibrated on the input; turn two's on turn one's
+  // output, whose mean square the host computes exactly. Two handlers, because
+  // alpha_L is a per-call property of the data and not of the circuit.
+  RmsNormHandler<word> rms1(context_, kTokens, kChannels, alpha / (r * r),
+                            op_level, kEps * beta * beta * r * r, 6.0, 9);
+  const int num_ct = rms1.GetNumCiphertexts();
+  for (int d : rms1.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, op_level);
+  }
+
+  // Host reference for turn one, and its mean square for turn two's alpha.
+  std::vector<double> y1(static_cast<size_t>(kTokens) * kChannels);
+  for (int t = 0; t < kTokens; t++) {
+    const double inv = 1.0 / std::sqrt(MeanSquare(x, kFirstToken + t) + kEps);
+    for (int c = 0; c < kChannels; c++) {
+      y1[static_cast<size_t>(t) * kChannels + c] =
+          x[static_cast<size_t>(kFirstToken + t) * kChannels + c] * inv * w[c];
+    }
+  }
+  double log_sum2 = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    double s = 0.0;
+    for (int c = 0; c < kChannels; c++) {
+      const double v = y1[static_cast<size_t>(t) * kChannels + c];
+      s += v * v;
+    }
+    log_sum2 += std::log(s / kChannels);
+  }
+  const double alpha2 = 1.0 / std::exp(log_sum2 / kTokens);
+  RmsNormHandler<word> rms2(context_, kTokens, kChannels, alpha2 / (r * r),
+                            op_level, kEps * r * r, 6.0, 9);
+
+  // Encrypt turn one's input in the coefficient domain at level 0, which is
+  // where the previous turn's product would have left it.
+  std::vector<Ciphertext<word>> state(num_ct);
+  for (int i = 0; i < num_ct; i++) {
+    std::vector<double> coeffs(degree, 0.0);
+    for (int s = 0; s < num_slots; s++) {
+      const int c = i * channels_per_ct + s / kTokens;
+      const int t = kFirstToken + (s % kTokens);
+      coeffs[AttentionPacking::CoeffOfSlot({s, false}, degree)] =
+          beta * x[static_cast<size_t>(t) * kChannels + c];
+    }
+    Plaintext<word> ptxt;
+    context_->encoder_.EncodeCoeff(ptxt, 0, DetermineScale(0), coeffs);
+    interface_->Encrypt(state[i], ptxt);
+  }
+
+  auto weights_for = [&](double a, std::vector<std::vector<Complex>> &wts) {
+    const double root = std::sqrt(a / (r * r));
+    wts.assign(num_ct, std::vector<Complex>(num_slots, Complex(0.0, 0.0)));
+    for (int i = 0; i < num_ct; i++) {
+      for (int s = 0; s < num_slots; s++) {
+        const int c = i * channels_per_ct + s / kTokens;
+        wts[i][s] = Complex(w[c] * root, 0.0);
+      }
+    }
+  };
+
+  // Turn two normalises turn one's output, so its "weights" are the ones that
+  // reproduce y2 = RMSNorm(y1) * w on the host below.
+  for (int turn = 1; turn <= 2; turn++) {
+    RmsNormHandler<word> &rms = (turn == 1) ? rms1 : rms2;
+    std::vector<std::vector<Complex>> wts;
+    weights_for(turn == 1 ? alpha : alpha2, wts);
+
+    std::vector<Ciphertext<word>> slots(num_ct);
+    for (int i = 0; i < num_ct; i++) {
+      Ciphertext<word> landed;
+      const double drift = sched.ToSlot(landed, state[i], interface_->GetEvkMap());
+      if (i == 0) {
+        std::cout << "turn " << turn << ": ToSlot landed at level "
+                  << param_->NPToLevel(landed.GetNP()) << ", scale "
+                  << landed.GetScale() << ", descent drift " << drift
+                  << std::endl;
+        EXPECT_EQ(param_->NPToLevel(landed.GetNP()), sched.GetSlotLevel());
+      }
+      sched.Canonicalise(slots[i], landed);
+    }
+
+    std::vector<Ciphertext<word>> normed;
+    rms.Apply(normed, slots, wts, interface_->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(param_->NPToLevel(normed[0].GetNP()), sched.GetStCLevel())
+        << "turn " << turn << " did not land on StC's level";
+
+    for (int i = 0; i < num_ct; i++) {
+      Ciphertext<word> coeff;
+      sched.ToCoeff(coeff, normed[i], interface_->GetEvkMap());
+      // Stand-in for the linear leg: descend to level 0, which is where the
+      // product would have left the ciphertext for the next ToSlot.
+      context_->LevelDown(state[i], coeff, 0);
+    }
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    std::cout << "turn " << turn << ": closed at level "
+              << param_->NPToLevel(state[0].GetNP()) << ", scale "
+              << state[0].GetScale() << std::endl;
+    EXPECT_EQ(param_->NPToLevel(state[0].GetNP()), 0)
+        << "turn " << turn << " did not return to the level it started at";
+  }
+
+  // Turn two's host reference.
+  std::vector<double> y2(static_cast<size_t>(kTokens) * kChannels);
+  double absmax = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    double s = 0.0;
+    for (int c = 0; c < kChannels; c++) {
+      const double v = y1[static_cast<size_t>(t) * kChannels + c];
+      s += v * v;
+    }
+    const double inv = 1.0 / std::sqrt(s / kChannels + kEps);
+    for (int c = 0; c < kChannels; c++) {
+      const double v = y1[static_cast<size_t>(t) * kChannels + c] * inv * w[c];
+      y2[static_cast<size_t>(t) * kChannels + c] = v;
+      absmax = std::max(absmax, std::abs(v));
+    }
+  }
+
+  // The state is coefficient-encoded at level 0, r^2 down after two turns.
+  double worst = 0.0;
+  for (int i = 0; i < num_ct; i++) {
+    Plaintext<word> ptxt;
+    interface_->Decrypt(ptxt, state[i]);
+    std::vector<double> coeffs;
+    context_->encoder_.DecodeCoeff(coeffs, ptxt);
+    for (int s = 0; s < num_slots; s++) {
+      const int c = i * channels_per_ct + s / kTokens;
+      const int t = s % kTokens;
+      const double got =
+          coeffs[AttentionPacking::CoeffOfSlot({s, false}, degree)] / (r * r);
+      worst = std::max(
+          worst, std::abs(got - y2[static_cast<size_t>(t) * kChannels + c]));
+    }
+  }
+  std::cout << "two full turns vs the host: max abs err " << worst
+            << " against |y2| <= " << absmax << " ("
+            << -std::log2(worst / absmax) << " bits)" << std::endl;
+  EXPECT_GT(-std::log2(worst / absmax), 6.0);
 }
 
 INSTANTIATE_TEST_SUITE_P(
