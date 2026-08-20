@@ -82,10 +82,12 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
 #include "extension/AttentionPacking.h"
+#include "extension/LlamaLinear.h"
 
 using word = uint32_t;
 using cheddar::AttentionPacking;
@@ -131,6 +133,25 @@ bool ReadF32(const std::string &path, size_t count, std::vector<double> &out) {
   out.assign(raw.begin(), raw.end());
   return true;
 }
+
+// `CoeffLinearLeg` implements only `Project`; `Scores` and `Values` are
+// ciphertext-ciphertext products that need `BatchCcmmHandler` and are left
+// pure virtual on purpose, so that nothing silently falls back to a stand-in.
+// This makes the class concrete for a test that exercises the projection only.
+class ProjectOnlyLeg : public cheddar::CoeffLinearLeg<word> {
+ public:
+  using cheddar::CoeffLinearLeg<word>::CoeffLinearLeg;
+
+  void Scores(std::vector<Ciphertext<word>> &, const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double,
+              const std::vector<double> &) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLeg: Scores is not part of this test");
+  }
+  void Values(std::vector<Ciphertext<word>> &, const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLeg: Values is not part of this test");
+  }
+};
 
 }  // namespace
 
@@ -328,6 +349,99 @@ TEST_P(Testbed32, ProjectionInTheBlockPackingWithoutARingSwitch) {
 
   EXPECT_LT(max_err / want_max, 1e-3)
       << "the encrypted projection disagrees with the host product";
+}
+
+// The same product through `CoeffLinearLeg` -- the class the block will call --
+// rather than through the handlers directly. What this adds over the test above
+// is the leg's own bookkeeping: the two bit reversals across *several* ModPack
+// groups (one group cannot distinguish them from the identity), the level and
+// scale contract it owes `LinearLeg`, and its decision to skip the descent when
+// the input already sits at the product level.
+TEST_P(Testbed32, TheLegProjectsThroughSeveralModPackGroups) {
+  constexpr int kLegOut = 512;  // two ModPack groups, so the reversals show
+  const int degree = 1 << log_degree_;
+  const int num_slots = degree / 2;
+  const int rank = degree / kSmallDegree;
+  const int num_parents = kInChannels / rank;
+  const double ct_scale = param_->GetScale(kLevel);
+  // A crossing constant, folded into the weights the way the block does it.
+  const double w_scale = 0.5;
+
+  std::mt19937_64 gen(0x1EA5);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.0175);
+  std::vector<double> x(static_cast<size_t>(kTokens) * kInChannels);
+  std::vector<double> w(static_cast<size_t>(kInChannels) * kLegOut);
+  for (auto &v : x) v = xd(gen);
+  for (auto &v : w) v = wd(gen);
+
+  std::vector<double> want(static_cast<size_t>(kTokens) * kLegOut, 0.0);
+  double want_max = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int o = 0; o < kLegOut; o++) {
+      double acc = 0.0;
+      for (int c = 0; c < kInChannels; c++) {
+        acc += x[static_cast<size_t>(t) * kInChannels + c] *
+               w[static_cast<size_t>(c) * kLegOut + o];
+      }
+      acc *= w_scale;
+      want[static_cast<size_t>(t) * kLegOut + o] = acc;
+      want_max = std::max(want_max, std::abs(acc));
+    }
+  }
+
+  interface_->PrepareModPackKeys(kSmallDegree, kLevel);
+  std::vector<const EvaluationKey<word> *> keys(rank);
+  for (int j = 0; j < rank; j++) keys[j] = &interface_->GetModPackKey(rank, j);
+
+  cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = kTokens;
+  lcfg.product_level = kLevel;
+  ProjectOnlyLeg leg(context_, lcfg, keys);
+  EXPECT_EQ(leg.GetRank(), rank);
+  EXPECT_EQ(leg.GetSmallDegree(), kSmallDegree);
+
+  std::vector<Ciphertext<word>> parents(num_parents);
+  for (int p = 0; p < num_parents; p++) {
+    std::vector<double> coeffs(degree, 0.0);
+    for (int c = 0; c < rank; c++) {
+      for (int t = 0; t < kTokens; t++) {
+        coeffs[CoeffOfTokenChannel(t, c, num_slots)] =
+            x[static_cast<size_t>(t) * kInChannels + p * rank + c];
+      }
+    }
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, kLevel, ct_scale, coeffs);
+    interface_->Encrypt(parents[p], pt);
+  }
+
+  std::vector<Ciphertext<word>> out;
+  leg.Project(out, parents, kInChannels, kLegOut, w, w_scale, "legQ");
+  ASSERT_EQ(static_cast<int>(out.size()), kLegOut / rank);
+
+  double max_err = 0.0;
+  for (int g = 0; g < kLegOut / rank; g++) {
+    EXPECT_EQ(param_->NPToLevel(out[g].GetNP()), kLevel - 1)
+        << "the leg owes LinearLeg a result one level below the product";
+    EXPECT_NEAR(out[g].GetScale() / param_->GetScale(kLevel - 1), 1.0, 1e-9)
+        << "and it owes it canonically scaled";
+    Plaintext<word> pt;
+    interface_->Decrypt(pt, out[g]);
+    std::vector<double> got;
+    context_->encoder_.DecodeCoeff(got, pt);
+    for (int c = 0; c < rank; c++) {
+      for (int t = 0; t < kTokens; t++) {
+        const double v = got[CoeffOfTokenChannel(t, c, num_slots)];
+        max_err = std::max(
+            max_err,
+            std::abs(v - want[static_cast<size_t>(t) * kLegOut + g * rank + c]));
+      }
+    }
+  }
+  std::cout << "  leg: " << (kLegOut / rank) << " ModPack groups, |Y| max "
+            << want_max << ", max abs err " << max_err << "  ("
+            << -std::log2(max_err / want_max) << " bits)" << std::endl;
+  EXPECT_LT(max_err / want_max, 1e-3);
 }
 
 INSTANTIATE_TEST_SUITE_P(
