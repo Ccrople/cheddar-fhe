@@ -1,5 +1,6 @@
 #include "extension/LlamaLinear.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -49,24 +50,28 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
   AssertTrue(cfg_.product_level >= 1,
              "CoeffLinearLeg: the product rescales, so it cannot run at level "
              "0");
+  AssertTrue(cfg_.parents_per_tile >= 0,
+             "CoeffLinearLeg: parents_per_tile cannot be negative");
 }
 
 template <typename word>
 void CoeffLinearLeg<word>::EncodeWeights(PlainMatrix<word> &res,
                                          const std::vector<double> &w,
                                          int in_channels, int out_channels,
-                                         int group, double w_scale) const {
+                                         int group, double w_scale,
+                                         int first_parent,
+                                         int num_parents) const {
   const int log_rank = Log2Ceil(rank_);
-  const int parents = in_channels / rank_;
-  std::vector<double> values(static_cast<size_t>(rank_) * in_channels);
+  const int cols = num_parents * rank_;
+  std::vector<double> values(static_cast<size_t>(rank_) * cols);
   for (int r = 0; r < rank_; r++) {
     const int out_channel =
         group * rank_ + static_cast<int>(BitReverseInt(r, log_rank));
-    for (int p = 0; p < parents; p++) {
+    for (int p = 0; p < num_parents; p++) {
       for (int i = 0; i < rank_; i++) {
-        const int in_channel =
-            p * rank_ + static_cast<int>(BitReverseInt(i, log_rank));
-        values[static_cast<size_t>(r) * in_channels + p * rank_ + i] =
+        const int in_channel = (first_parent + p) * rank_ +
+                               static_cast<int>(BitReverseInt(i, log_rank));
+        values[static_cast<size_t>(r) * cols + p * rank_ + i] =
             w[static_cast<size_t>(in_channel) * out_channels + out_channel] *
             w_scale;
       }
@@ -76,7 +81,7 @@ void CoeffLinearLeg<word>::EncodeWeights(PlainMatrix<word> &res,
   // below; see the class comment.
   pcmm_.EncodeMatrix(res, cfg_.product_level,
                      context_->param_.GetScale(cfg_.product_level), values,
-                     rank_, in_channels);
+                     rank_, cols);
 }
 
 template <typename word>
@@ -98,46 +103,72 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the weight matrix is not [in_channels][out_channels]");
 
-  // 1. Descend to the product level and split the channel axis onto the
-  //    ciphertext axis. ModDecomp is the whole of that step and costs nothing
-  //    but memory: `rank` module components per parent, each the size of the
-  //    parent's own a-part.
-  std::vector<MlweCiphertext<word>> columns;
-  columns.reserve(static_cast<size_t>(in_channels));
-  for (const Ct &parent : x) {
-    Ct lowered;
-    const Ct *source = &parent;
-    if (context_->param_.NPToLevel(parent.GetNP()) != level) {
-      context_->LevelDown(lowered, parent, level);
-      source = &lowered;
-    }
-    std::vector<MlweCiphertext<word>> decomposed;
-    mlwe_.ModDecomp(decomposed, *source, small_degree_);
-    for (auto &c : decomposed) columns.push_back(std::move(c));
-  }
-  AssertTrue(static_cast<int>(columns.size()) == in_channels,
-             "CoeffLinearLeg::Project: ModDecomp did not yield one module "
-             "component per input channel");
-
-  // 2. One ModPack group of output channels at a time. The decomposition is
-  //    shared by every group, which is why it is hoisted out of this loop --
-  //    it is the expensive part, and the product itself is two plaintext
-  //    matrix products with no key material at all.
+  const int parents = static_cast<int>(x.size());
   const int groups = out_channels / rank_;
-  res.resize(groups);
-  for (int g = 0; g < groups; g++) {
-    PlainMatrix<word> u;
-    EncodeWeights(u, w, in_channels, out_channels, g, w_scale);
+  const int tile = (cfg_.parents_per_tile > 0 && cfg_.parents_per_tile < parents)
+                       ? cfg_.parents_per_tile
+                       : parents;
 
-    std::vector<MlweCiphertext<word>> product;
-    pcmm_.Multiply(product, u, columns);
+  // The partial sums, one per output group, held at the product's level and
+  // scale. They are ordinary RLWE ciphertexts because they have already been
+  // ModPacked -- there is no MLWE addition to accumulate with instead.
+  std::vector<Ct> partial(groups);
+  bool started = false;
 
-    Ct repacked;
-    mlwe_.ModPack(context_, repacked, product, modpack_keys_);
-    // The product carries scale GetScale(level)^2; this is the rescale that
-    // brings it to GetScale(level - 1), and it is the level the product spends.
-    context_->Rescale(res[g], repacked);
+  for (int base = 0; base < parents; base += tile) {
+    const int span = std::min(tile, parents - base);
+
+    // 1. Descend to the product level and split the channel axis onto the
+    //    ciphertext axis. ModDecomp is the whole of that step and costs
+    //    nothing but memory: `rank` module components per parent, each the
+    //    size of the parent's own a-part. The tile bounds exactly that.
+    std::vector<MlweCiphertext<word>> columns;
+    columns.reserve(static_cast<size_t>(span) * rank_);
+    for (int p = base; p < base + span; p++) {
+      const Ct &parent = x[p];
+      Ct lowered;
+      const Ct *source = &parent;
+      if (context_->param_.NPToLevel(parent.GetNP()) != level) {
+        context_->LevelDown(lowered, parent, level);
+        source = &lowered;
+      }
+      std::vector<MlweCiphertext<word>> decomposed;
+      mlwe_.ModDecomp(decomposed, *source, small_degree_);
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+    }
+    AssertTrue(static_cast<int>(columns.size()) == span * rank_,
+               "CoeffLinearLeg::Project: ModDecomp did not yield one module "
+               "component per input channel");
+
+    // 2. One ModPack group of output channels at a time. The decomposition is
+    //    shared by every group, which is why it is hoisted out of this loop --
+    //    it is the expensive part, and the product itself is two plaintext
+    //    matrix products with no key material at all.
+    for (int g = 0; g < groups; g++) {
+      PlainMatrix<word> u;
+      EncodeWeights(u, w, in_channels, out_channels, g, w_scale, base, span);
+
+      std::vector<MlweCiphertext<word>> product;
+      pcmm_.Multiply(product, u, columns);
+
+      Ct repacked;
+      mlwe_.ModPack(context_, repacked, product, modpack_keys_);
+      if (!started) {
+        partial[g] = std::move(repacked);
+      } else {
+        Ct sum;
+        context_->Add(sum, partial[g], repacked);
+        partial[g] = std::move(sum);
+      }
+    }
+    started = true;
   }
+
+  // 3. One rescale, after the whole contraction. The product carries scale
+  //    GetScale(level)^2; this brings it to GetScale(level - 1), and it is the
+  //    single level the product spends however many tiles it took.
+  res.resize(groups);
+  for (int g = 0; g < groups; g++) context_->Rescale(res[g], partial[g]);
 }
 
 template class CoeffLinearLeg<uint32_t>;

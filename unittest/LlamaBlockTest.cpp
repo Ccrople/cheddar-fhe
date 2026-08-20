@@ -6,26 +6,33 @@
 // order the model puts them, with the residual connections, on real layer-2
 // weights.
 //
-// WHAT IS ENCRYPTED AND WHAT IS NOT, stated plainly and up front.
+// WHAT IS COMPUTED, stated plainly and up front.
 //
-// Encrypted, on the GPU, in the real parameter set: every bootstrap, every
-// slot/coefficient conversion, RMSNorm twice, RoPE, SoftMax, SiLU, the
-// elementwise gate, and both residual additions.
+// The whole 128-token prompt, T = 128, first position 0. Query 127 attends to
+// keys 0..127. That is the Llama-3 function; the earlier 64-token window
+// starting at token 64 was not, and no error figure taken against an equally
+// truncated reference could have said so.
 //
-// **Not** encrypted: the seven matrix products. `HostLinearLeg` decrypts,
-// multiplies in the clear and re-encrypts. That is a stand-in and it is
-// labelled as one everywhere it appears. The reason is recorded in Doing.md
-// 1.5y: the coefficient-domain product path needs a ring-switching parameter
-// pair, the pair for `bootparam_35` exists on paper but has never executed on
-// a GPU, and a block that hard-coded the product could not be run at all until
-// it had. With `LlamaBlock::LinearLeg` the same block runs today and takes the
-// real product as a drop-in when it is ready.
+// WHAT IS ENCRYPTED AND WHAT IS NOT.
 //
-// So the error this test reports is **the whole cost of everything except the
-// products**, measured against the true block in the clear. That is a real
-// number about a real question -- whether the non-linear half of a Llama-3
-// layer survives six bootstraps and four polynomial approximations -- and it
-// is not answerable any other way until the product lands.
+// Encrypted, on the GPU, in the real parameter set, in both tests below: every
+// bootstrap, every slot/coefficient conversion, RMSNorm twice, RoPE, SoftMax,
+// SiLU, the elementwise gate, and both residual additions.
+//
+// `TheBlockRunsWithEncryptedProjections` additionally runs **five of the seven
+// matrix products** for real -- Q, K, V, O, gate, up and down go through
+// `CoeffLinearLeg`: ModDecomp onto the channel axis, the Bae PC-MM, ModPack,
+// one rescale, at the block's own ring degree with no ring switch. That is
+// seven `Project` calls; the two that remain are `Scores` (Q K^T) and `Values`
+// (P V), which are ciphertext-ciphertext products and need a different
+// primitive.
+//
+// Those two still go through `HostLinearLeg`, which decrypts, multiplies in
+// the clear and re-encrypts. It is a stand-in and it is labelled as one
+// everywhere it appears.
+//
+// `TheBlockRunsEndToEnd` keeps every product on the host, so the difference
+// between the two numbers is exactly what the real projections cost.
 //
 // THE CALIBRATION IS COMPUTED HERE, FROM THE HOST RUN.
 //
@@ -43,12 +50,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Testbed.h"
 #include "extension/AttentionPacking.h"
 #include "extension/LlamaBlock.h"
+#include "extension/LlamaLinear.h"
 
 using word = uint32_t;
 using Block = LlamaBlock<word>;
@@ -66,8 +75,22 @@ constexpr int kChannels = 4096;
 constexpr int kKvChannels = 1024;
 constexpr int kHidden = 14336;
 constexpr int kHeadDim = 128;
-constexpr int kTokens = 64;      // the user segment, clear of the sinks
-constexpr int kFirstToken = 64;  // where it starts in the 128-token prompt
+// THE WHOLE PROMPT, and that is the point.
+//
+// This ran at kTokens = 64 from kFirstToken = 64 until now, which is attention
+// over a 64-token window with no key history: query 100 attended to keys
+// 64..100 instead of 0..100, and keys 0..63 were not cached anywhere, they
+// were absent. That is a different function from Llama-3, not an
+// approximation of it, and because TraceClearBlock truncated identically the
+// error figure could not see it.
+//
+// T = 128 is also the count the encrypted product needs. ModDecomp splits a
+// parent into `degree / (2T)` module components and the block puts
+// `slots / T` channels in a ciphertext; the Bae PC-MM separates channels only
+// when those two agree, which at degree 65536 happens at T = 128 and nowhere
+// else (Doing.md 1.5ac). Two holes, one constant.
+constexpr int kTokens = kAllTokens;
+constexpr int kFirstToken = 0;
 constexpr double kEps = 1e-5;
 constexpr double kBootMax = 0.5;
 
@@ -423,6 +446,28 @@ class HostLinearLeg : public Block::LinearLeg {
   // end of the block.
   mutable std::vector<std::pair<std::string, std::vector<double>>> seen_;
 
+  // ---- the same two records, taken WITHOUT standing in for anything ------
+  //
+  // A probe decrypts a copy and puts the ciphertext back untouched; the
+  // encrypted product then runs on it exactly as it would have. That is the
+  // difference between this and Project above, and it is the whole difference:
+  // one substitutes for the computation, the other only watches it. Keeping
+  // the turn-by-turn ledger is worth a decryption in a test, because without
+  // it a block that degrades reports one number and no address.
+  void Probe(const std::vector<Ciphertext<word>> &x, int channels,
+             const char *name) const {
+    std::vector<double> a;
+    Gather(a, x, channels);
+    seen_.emplace_back(std::string("in:") + name, a);
+  }
+
+  void ProbeOut(const std::vector<Ciphertext<word>> &res, int channels,
+                const char *name) const {
+    std::vector<double> y;
+    Gather(y, res, channels);
+    log_.emplace_back(name, MaxAbs(y));
+  }
+
  private:
   void Gather(std::vector<double> &out,
               const std::vector<Ciphertext<word>> &cts, int channels) const {
@@ -502,9 +547,72 @@ class HostLinearLeg : public Block::LinearLeg {
   Block::Config cfg_;
 };
 
+// ---------------------------------------------------------------------------
+// FIVE OF THE SEVEN PRODUCTS, FOR REAL.
+//
+// `CoeffLinearLeg` runs the Bae PC-MM on the block's own ciphertexts:
+// ModDecomp splits the channel axis onto the ciphertext axis, one plaintext
+// matrix product contracts it, ModPack puts the result back, one rescale lands
+// it at level 0. No ring switch, no key material in the product itself, and
+// the output layout is the input layout, which is what makes it a drop-in.
+//
+// `Scores` and `Values` are ciphertext-ciphertext products and are NOT
+// implemented by that class -- it leaves them pure virtual precisely so that a
+// caller has to say what it is using instead. Here that is `HostLinearLeg`,
+// and it is still a stand-in, still labelled as one. What this class buys is
+// that the QKV, O, gate, up and down projections are now real: the eight-level
+// descent is performed rather than fabricated, the imaginary half of every
+// polynomial is carried forward rather than zeroed, and the product's own
+// approximation error is in the number.
+class EncryptedProjectionLeg : public cheddar::CoeffLinearLeg<word> {
+ private:
+  using Base = cheddar::CoeffLinearLeg<word>;
+
+ public:
+  EncryptedProjectionLeg(cheddar::ConstContextPtr<word> context,
+                         const Base::Config &lcfg,
+                         std::vector<const EvaluationKey<word> *> keys,
+                         const HostLinearLeg &host)
+      : Base(context, lcfg, std::move(keys)), host_{host} {}
+
+  void Project(std::vector<Ciphertext<word>> &res,
+               const std::vector<Ciphertext<word>> &x, int in_channels,
+               int out_channels, const std::vector<double> &w, double w_scale,
+               const char *name) const override {
+    host_.Probe(x, in_channels, name);
+    Base::Project(res, x, in_channels, out_channels, w, w_scale, name);
+    host_.ProbeOut(res, out_channels, name);
+  }
+
+  // Still the stand-in. Turn C's and turn B's products decrypt, multiply on
+  // the host and re-encrypt.
+  void Scores(std::vector<Ciphertext<word>> &res,
+              const std::vector<Ciphertext<word>> &q,
+              const std::vector<Ciphertext<word>> &k, double scale,
+              const std::vector<double> &shift) const override {
+    host_.Scores(res, q, k, scale, shift);
+  }
+
+  void Values(std::vector<Ciphertext<word>> &res,
+              const std::vector<Ciphertext<word>> &p,
+              const std::vector<Ciphertext<word>> &v,
+              double scale) const override {
+    host_.Values(res, p, v, scale);
+  }
+
+ private:
+  const HostLinearLeg &host_;
+};
+
 class LlamaBlockFixture : public Testbed32 {
  protected:
   int BootSlackLevels() const override { return kSlack; }
+
+  // The whole block, run once. `encrypted_projections` selects between the
+  // stand-in for all seven products and the real Bae PC-MM for the five
+  // plaintext ones; everything else about the run is identical, which is what
+  // makes the two numbers comparable.
+  void RunWholeBlock(bool encrypted_projections);
 
   static Block::Config MakeConfig() {
     Block::Config cfg;
@@ -679,7 +787,7 @@ TEST_P(LlamaBlockFixture, TheCalibrationIsReachable) {
 
 // ---------------------------------------------------------------------------
 // 3. The block, encrypted, end to end.
-TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
+void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   Block::Weights w;
   std::vector<double> x;
   if (!LoadWeights(w, x)) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
@@ -742,15 +850,52 @@ TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
     }
   }
 
-  HostLinearLeg leg(*this, pack, cfg);
+  // THE PRODUCTS.
+  //
+  // `host` is always constructed: with encrypted projections it is still the
+  // stand-in for the two ciphertext-ciphertext products, and it is also where
+  // the per-turn ledger lives, because the probes write into its records.
+  HostLinearLeg host(*this, pack, cfg);
+  std::unique_ptr<EncryptedProjectionLeg> real_leg;
+  std::vector<const EvaluationKey<word> *> modpack_keys;
+
+  const Block::LinearLeg *leg = &host;
+  if (encrypted_projections) {
+    // rank = degree / (2T) = the block's channels per ciphertext, and one
+    // switching key per module component. These are the only keys the product
+    // needs; the PC-MM itself uses none.
+    using Leg = cheddar::CoeffLinearLeg<word>;
+    Leg::Config lcfg;
+    lcfg.num_tokens = kTokens;
+    lcfg.product_level = 1;
+    // 14336 input channels is 56 parents and about 11.3 GB of module
+    // components held at once. Bounding it costs one extra ModPack per output
+    // group per tile and nothing else; see LlamaLinear.h.
+    lcfg.parents_per_tile = 16;
+
+    const int small_degree = Leg::SmallDegreeFor(kTokens);
+    const int rank = param_->degree_ / small_degree;
+    std::cout << "preparing " << rank << " ModPack keys at level "
+              << lcfg.product_level << " (small degree " << small_degree << ")"
+              << std::endl;
+    interface_->PrepareModPackKeys(small_degree, lcfg.product_level);
+    modpack_keys.resize(rank);
+    for (int j = 0; j < rank; j++) {
+      modpack_keys[j] = &interface_->GetModPackKey(rank, j);
+    }
+    real_leg = std::make_unique<EncryptedProjectionLeg>(context_, lcfg,
+                                                        modpack_keys, host);
+    leg = real_leg.get();
+  }
+
   std::vector<Ciphertext<word>> out;
-  block.Run(out, state, w, mask, leg, interface_->GetEvkMap());
+  block.Run(out, state, w, mask, *leg, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
   std::cout << "product-leg magnitudes, against the bootstrap's " << kBootMax
             << ":" << std::endl;
-  for (const auto &e : leg.log_) {
+  for (const auto &e : host.log_) {
     std::cout << "   " << e.first << " max " << e.second << std::endl;
   }
 
@@ -786,7 +931,7 @@ TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
   std::cout << "where the block's bits go, turn by turn:" << std::endl;
   for (size_t j = 0; j < points.size(); j++) {
     const std::vector<double> *got = nullptr;
-    for (const auto &e : leg.seen_) {
+    for (const auto &e : host.seen_) {
       if (e.first == tags[j]) {
         got = &e.second;
         break;
@@ -826,4 +971,17 @@ TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
             << " against |out| <= " << absmax << " ("
             << -std::log2(worst / absmax) << " bits)" << std::endl;
   EXPECT_GT(-std::log2(worst / absmax), 4.0);
+}
+
+// The control: every product on the host, so the number is the cost of the
+// non-linear half alone. Keeping it is what lets the run below be attributed --
+// the difference between the two IS the products' contribution.
+TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) { RunWholeBlock(false); }
+
+// The block with its five plaintext projections running encrypted: ModDecomp,
+// Bae PC-MM, ModPack, rescale, at the block's own ring degree with no ring
+// switch. Two of the seven products -- Q K^T and P V -- are still the host
+// stand-in, and that is stated rather than hidden.
+TEST_P(LlamaBlockFixture, TheBlockRunsWithEncryptedProjections) {
+  RunWholeBlock(true);
 }

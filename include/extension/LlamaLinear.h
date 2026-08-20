@@ -72,6 +72,22 @@ namespace cheddar {
  * axis by Galois automorphisms -- costs 511 key switches per parent and has
  * never been built.
  *
+ * That is why the contraction is **tiled**. Llama's down projection contracts
+ * over 14336 channels, which is 56 parents and about 11.3 GB of module
+ * components held at once -- more than a 48 GiB card has free in the middle of
+ * a block that is already holding a dozen tensors. `Config::parents_per_tile`
+ * caps how many parents are decomposed at a time; each tile's partial products
+ * are ModPacked and **added as ordinary RLWE ciphertexts** before a single
+ * rescale at the end. Summing after ModPack rather than before it is not a
+ * preference: there is no MLWE addition in the library, and a partial sum that
+ * has already been repacked is an ordinary ciphertext at the product's level.
+ *
+ * The cost of a tile is one extra ModPack per output group, which is `rank`
+ * key switches at the lowest level -- so the tiling trades roughly 46 ms per
+ * group per extra tile against gigabytes. It does not change the result: the
+ * sum is exact, and the single rescale at the end is the same rescale the
+ * untiled path performs.
+ *
  * ## Scale, and the one answer
  *
  * The product does not rescale (following `Context::Mult`), so the caller's
@@ -101,6 +117,10 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   struct Config {
     int num_tokens = 128;   //!< T; must satisfy small_degree == 2 * T
     int product_level = 1;  //!< the product runs here and rescales to level - 1
+    //! Input ciphertexts decomposed at once. Each one costs `rank` module
+    //! components of the parent's own size -- about 201 MB at level 1 on
+    //! `bootparam_35` -- so 16 is roughly 3.2 GB. 0 means no tiling.
+    int parents_per_tile = 16;
   };
 
   /**
@@ -134,11 +154,13 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
 
  private:
   // Row r of the operand carries output channel `group * rank + BitRev(r)`,
-  // and column `p * rank + i` carries input channel `p * rank + BitRev(i)`.
-  // Both reversals are their own inverse.
+  // and column `p * rank + i` carries input channel
+  // `(first_parent + p) * rank + BitRev(i)`. Both reversals are their own
+  // inverse. Only the `num_parents` parents of the current tile are encoded,
+  // so the operand is `rank x (num_parents * rank)`.
   void EncodeWeights(PlainMatrix<word> &res, const std::vector<double> &w,
                      int in_channels, int out_channels, int group,
-                     double w_scale) const;
+                     double w_scale, int first_parent, int num_parents) const;
 
   ConstContextPtr<word> context_;
   Config cfg_;
