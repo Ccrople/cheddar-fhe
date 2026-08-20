@@ -44,6 +44,9 @@ class EvalSpecialFFT {
   int sinc_sub_degree_ = 0;
   std::vector<LinearTransform<word>> sinc_stc_;
   std::vector<LinearTransform<word>> sinc_cts_;
+  std::vector<LinearTransform<word>> sinc_prefix_;
+  int sinc_prefix_shift_ = 0;
+  int sinc_prefix_level_ = -1;
 
   std::pair<int, int> BSGSSplit(int num_diag) const;
   void PopulatePlainMatrices(ConstContextPtr<word> context);
@@ -143,11 +146,46 @@ class EvalSpecialFFT {
   /// The `sub_degree` PrepareSinC was called with, or 0.
   int GetSinCSubDegree() const { return sinc_sub_degree_; }
 
+  /**
+   * @brief The PREFIX of SlotToCoeff -- the part HalfBoot leaves undone.
+   *
+   * `SlotToCoeff` is `num_stages` butterfly stages and `SlotToSinC` is the
+   * last `p = log2(degree/sub_degree)` of them, so `StC = SlotToSinC . P` with
+   * `P` the first `num_stages - p`. A ciphertext holding `SlotToSinC(s)` is
+   * therefore `StC(P^-1(s))`, and `HalfBoot` -- which inverts the whole of StC
+   * -- hands back `P^-1(s)`, not `s`. This is `P`.
+   *
+   * It is not a relabelling that could be absorbed into the layout: the
+   * butterfly stages combine values with twiddle factors, so what comes back
+   * without it is a linear MIXTURE of the scores rather than a permutation of
+   * them.
+   *
+   * At the attention product's `sub_degree = 32` it is 4 stages and 31
+   * diagonals -- one level, which the schedule spends on `Canonicalise`'s
+   * multiply anyway, plus one HRot for the window (see the .cpp).
+   *
+   * @param level the level it is compiled at, i.e. where HalfBoot lands
+   * @param num_phases how many LinearTransforms to split the stages across,
+   *        one level each; 1 is right at `sub_degree = 32`
+   */
+  void PrepareSinCPrefix(ConstContextPtr<word> context, int sub_degree,
+                         int level, int num_phases = 1);
+
+  /// Levels the prefix spends, or 0 if it was never prepared.
+  int GetSinCPrefixNumPhases() const {
+    return static_cast<int>(sinc_prefix_.size());
+  }
+  /// The residual rotation the window leaves, undone inside EvaluateSinCPrefix.
+  int GetSinCPrefixShift() const { return sinc_prefix_shift_; }
+
   void AddRequiredSinCRotations(EvkRequest &req) const;
+  void AddRequiredSinCPrefixRotations(EvkRequest &req) const;
 
   void EvaluateSlotToSinC(ConstContextPtr<word> context, Ct &res,
                           const Ct &input, const EvkMap<word> &evk_map) const;
   void EvaluateSinCToSlot(ConstContextPtr<word> context, Ct &res,
+                          const Ct &input, const EvkMap<word> &evk_map) const;
+  void EvaluateSinCPrefix(ConstContextPtr<word> context, Ct &res,
                           const Ct &input, const EvkMap<word> &evk_map) const;
 };
 

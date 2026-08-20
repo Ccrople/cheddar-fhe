@@ -514,6 +514,122 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 }
 
 template <typename word>
+void EvalSpecialFFT<word>::PrepareSinCPrefix(ConstContextPtr<word> context,
+                                             int sub_degree, int level,
+                                             int num_phases) {
+  const int degree = context->param_.degree_;
+  AssertTrue(full_slot_,
+             "PrepareSinCPrefix: the SinC conversions are defined on the full "
+             "slot count");
+  AssertTrue(IsPowOfTwo(sub_degree) && sub_degree >= 2 && sub_degree < degree,
+             "PrepareSinCPrefix: sub_degree must be a power of two in "
+             "[2, degree)");
+  AssertTrue(degree % sub_degree == 0,
+             "PrepareSinCPrefix: sub_degree must divide the ring degree");
+
+  const int num_stages = Log2Ceil(num_slots_);
+  const int d = degree / sub_degree;
+  const int p = Log2Ceil(d);
+  const int q = num_stages - p;
+  AssertTrue(q >= 1,
+             "PrepareSinCPrefix: SlotToSinC is the whole of SlotToCoeff at "
+             "this sub_degree, so HalfBoot leaves nothing undone");
+  AssertTrue(num_phases >= 1 && num_phases <= q,
+             "PrepareSinCPrefix: the phase count must be between one and the "
+             "stage count");
+  AssertTrue(level - num_phases >= 0,
+             "PrepareSinCPrefix: the transform spends one level per phase and "
+             "there are not that many below the level it starts at");
+  sinc_prefix_.clear();
+  sinc_prefix_level_ = level;
+
+  auto split = [&](int total, int phases) {
+    std::vector<int> counts;
+    int left = total;
+    for (int i = 0; i < phases; i++) {
+      const int take = (i == 0) ? DivCeil(left, phases) : left / (phases - i);
+      counts.push_back(take);
+      left -= take;
+    }
+    return counts;
+  };
+  const std::vector<int> counts = split(q, num_phases);
+
+  // THE WINDOW, AND WHY THIS TRANSFORM CANNOT DO WITHOUT ONE EITHER.
+  //
+  // The prefix starts at stride 1, so `q` stages give offsets straddling zero
+  // over +-(2^q - 1) -- reduced mod the slot count they cover both ends of the
+  // ring, `DetermineStride` finds gcd 1 and a spread of `num_slots - 1`, and
+  // it demands `bs * gs >= num_slots`. Exactly the wall `PrepareSinC` hit, and
+  // the same fix: the chain rule is
+  //
+  //     p_0 + a_0 = 0,   p_{i+1} = a_i - a_{i+1}
+  //
+  // with `a_i = 2^(cumul_{i+1})` the stride the next group starts at. The one
+  // difference is the LAST phase. In a chain that continues, `a_last` must be
+  // zero so the next transform sees an unrotated input; here nothing follows,
+  // so `a_last` keeps the same rule and comes out `2^q` -- which is precisely
+  // the stride SlotToSinC's first stage would have used. The result is
+  // therefore `rot(P x, 2^q)`, and one HRot by `-2^q` finishes it.
+  //
+  // That HRot is the whole extra cost over a chained phase, and it is one key
+  // switch against a bootstrap.
+  int cursor = 0;
+  int prev_a = 0;
+  for (int phase = 0; phase < num_phases; phase++) {
+    StripedMatrix prefix = plain_fft_stages_[cursor];
+    for (int j = cursor + 1; j < cursor + counts[phase]; j++) {
+      prefix = StripedMatrix::Mult(plain_fft_stages_[j], prefix);
+    }
+    cursor += counts[phase];
+    const int a = 1 << cursor;
+    const int pre_rotation = (phase == 0) ? -a : (prev_a - a);
+    prev_a = a;
+
+    const int phase_level = level - phase;
+    auto [bs, gs] = BSGSSplit(prefix.GetNumDiag());
+    std::cout << "SinC prefix phase " << phase << ": " << counts[phase]
+              << " stages, " << prefix.GetNumDiag() << " diagonals, level "
+              << phase_level << ", BSGS " << bs << "x" << gs
+              << ", pre_rotation " << pre_rotation << ", pt_rot " << a
+              << std::endl;
+    sinc_prefix_.emplace_back(context, prefix, phase_level,
+                              context->param_.GetRescalePrimeProd(phase_level),
+                              bs, gs, pre_rotation, a);
+  }
+  sinc_prefix_shift_ = prev_a;
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::AddRequiredSinCPrefixRotations(
+    EvkRequest &req) const {
+  if (sinc_prefix_.empty()) return;
+  for (const auto &lt : sinc_prefix_) lt.AddRequiredRotations(req);
+  // The window is undone on the output, which is one level below the last
+  // phase.
+  const int back = num_slots_ - sinc_prefix_shift_;
+  req.AddRequest(back, sinc_prefix_level_ - static_cast<int>(sinc_prefix_.size()));
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::EvaluateSinCPrefix(ConstContextPtr<word> context,
+                                              Ct &res, const Ct &input,
+                                              const EvkMap<word> &evk_map)
+    const {
+  AssertTrue(!sinc_prefix_.empty(),
+             "EvaluateSinCPrefix: call PrepareSinCPrefix first");
+  Ct shifted;
+  sinc_prefix_.front().Evaluate(context, shifted, input, evk_map);
+  for (size_t i = 1; i < sinc_prefix_.size(); i++) {
+    Ct next;
+    sinc_prefix_[i].Evaluate(context, next, shifted, evk_map);
+    shifted = std::move(next);
+  }
+  const int back = num_slots_ - sinc_prefix_shift_;
+  context->HRot(res, shifted, evk_map.GetRotationKey(back), back);
+}
+
+template <typename word>
 void EvalSpecialFFT<word>::AddRequiredSinCRotations(EvkRequest &req) const {
   for (const auto &lt : sinc_stc_) lt.AddRequiredRotations(req);
   for (const auto &lt : sinc_cts_) lt.AddRequiredRotations(req);

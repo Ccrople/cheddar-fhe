@@ -222,3 +222,122 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// The other half of the trip: what HalfBoot leaves undone.
+// ---------------------------------------------------------------------------
+//
+// The test above converts slots -> SinC and back inside ONE ring at ONE level,
+// which is what a unit test of the identity needs and is not what the pipeline
+// does. The pipeline's return trip is forced: the batch CC-MM leaves its result
+// at level 0, and the only route out of level 0 is a bootstrap.
+//
+// `HalfBoot` inverts the WHOLE of SlotToCoeff. A SinC ciphertext is
+// `StC(P^-1(s))` with `P` the prefix StC applies before the SinC suffix, so
+// what lands in slots is `P^-1(s)` -- and `P` is butterfly stages, not a
+// permutation, so `P^-1(s)` is a twiddle-weighted MIXTURE of the values. No
+// relabelling of the layout can absorb that; `SinCPrefix` applies `P` and
+// finishes the trip.
+//
+// WHY THIS NEEDS NO HOST ENCODER AND NO GUESS ABOUT THE BIT REVERSAL. The
+// reversal cancels. HalfBootTest already shows StC and HalfBoot are inverse up
+// to a constant, and StC = SlotToSinC . P, so
+//
+//     SinCPrefix(HalfBoot(SlotToSinC(s)))  =  const . s
+//
+// end to end. The constant is real: StC bakes in stc_const_ and CtS bakes in
+// cts_const_, and outside a full Boot they do not cancel -- so the test fits
+// the best constant first and then asks whether what is left is the input,
+// exactly as HalfBootTest does.
+//
+// THE CONTROL is the same quantity without the prefix. It has the right
+// magnitude, which is why a norm-only test would pass against it.
+TEST_P(SinCTransformFixture, TheStCPrefixIsWhatHalfBootLeavesUndone) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int degree = param_->degree_;
+  const int num_slots = degree / 2;
+  // The attention product's own setting, so the prefix here is the 4 stages
+  // the score path will actually pay for.
+  constexpr int kSubDegree = 32;
+  constexpr int kPhases = 3;
+
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(num_slots);
+  const int stc_level = boot->GetBootParameter().GetStCStartLevel();
+  // Where HalfBoot lands, which is where the prefix has to be compiled -- and
+  // in a [SYLPH] schedule it is also where Canonicalise's multiply sits, so
+  // the level the prefix spends is one the cycle was spending anyway.
+  const int landing = boot->GetBootParameter().GetEvalModEndLevel();
+  std::cout << "StC starts at " << stc_level << ", HalfBoot lands at "
+            << landing << std::endl;
+
+  boot->PrepareSinC(num_slots, kSubDegree, stc_level, stc_level, kPhases);
+  boot->PrepareSinCPrefix(num_slots, kSubDegree, landing);
+  ASSERT_EQ(boot->GetSinCPrefixNumPhases(num_slots), 1)
+      << "4 stages is 31 diagonals, which is one transform";
+
+  EvkRequest req;
+  boot->AddRequiredRotations(req, num_slots);
+  boot->AddRequiredSinCRotations(req, num_slots);
+  boot->AddRequiredSinCPrefixRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> message(num_slots);
+  Random::SampleUniformComplex(message.data(), num_slots, -1.0, 1.0);
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, message, stc_level);
+
+  Ciphertext<word> sinc;
+  boot->SlotToSinC(sinc, num_slots, ct, interface_->GetEvkMap());
+  ASSERT_EQ(param_->NPToLevel(sinc.GetNP()), stc_level - kPhases);
+
+  // HalfBoot brings its input to level 0 itself, which is where the product
+  // would have left it.
+  Ciphertext<word> half;
+  boot->HalfBoot(half, sinc, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(param_->NPToLevel(half.GetNP()), landing)
+      << "the prefix was compiled where HalfBoot was expected to land, and it "
+         "landed somewhere else";
+
+  Ciphertext<word> back;
+  boot->SinCPrefix(back, num_slots, half, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  EXPECT_EQ(param_->NPToLevel(back.GetNP()), landing - 1)
+      << "the prefix is one LinearTransform and must cost exactly one level";
+
+  // Fit the best constant, then ask whether what is left is the input. The
+  // constant is the uncancelled stc_const_ / cts_const_ pair, not a bug.
+  auto residual = [&](const Ciphertext<word> &c, const char *name) {
+    std::vector<Complex> got;
+    DecryptAndDecode(got, c);
+    Complex sum(0.0, 0.0);
+    int counted = 0;
+    for (int i = 0; i < num_slots; i++) {
+      if (std::abs(message[i]) < 0.3) continue;
+      sum += got[i] / message[i];
+      counted++;
+    }
+    const Complex ratio = sum / static_cast<double>(counted);
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max(worst, std::abs(got[i] / ratio - message[i]));
+    }
+    std::cout << "  " << name << ": best constant " << ratio << " over "
+              << counted << " slots, residual " << worst << " ("
+              << -std::log2(worst) << " bits)" << std::endl;
+    return worst;
+  };
+
+  const double with_prefix = residual(back, "HalfBoot then the prefix");
+  const double without = residual(half, "HalfBoot alone (control)");
+
+  EXPECT_LT(with_prefix, 1e-2)
+      << "the prefix of SlotToCoeff is not what HalfBoot leaves undone";
+  EXPECT_GT(without, 1e-1)
+      << "HalfBoot alone already returns the slot vector, so this test is not "
+         "checking that the prefix does anything";
+}

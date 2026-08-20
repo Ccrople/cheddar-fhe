@@ -347,6 +347,32 @@ void BootContext<word>::SinCToSlot(Ct &res, int num_slots, const Ct &input,
 }
 
 template <typename word>
+void BootContext<word>::PrepareSinCPrefix(int num_slots, int sub_degree,
+                                          int level, int num_phases) {
+  AssertTrue(eval_fft_.count(num_slots) != 0,
+             "PrepareSinCPrefix: call PrepareEvalSpecialFFT first");
+  eval_fft_.at(num_slots).PrepareSinCPrefix(GetContext(), sub_degree, level,
+                                            num_phases);
+}
+
+template <typename word>
+int BootContext<word>::GetSinCPrefixNumPhases(int num_slots) const {
+  return eval_fft_.at(num_slots).GetSinCPrefixNumPhases();
+}
+
+template <typename word>
+void BootContext<word>::AddRequiredSinCPrefixRotations(EvkRequest &req,
+                                                       int num_slots) const {
+  eval_fft_.at(num_slots).AddRequiredSinCPrefixRotations(req);
+}
+
+template <typename word>
+void BootContext<word>::SinCPrefix(Ct &res, int num_slots, const Ct &input,
+                                   const EvkMap<word> &evk_map) const {
+  eval_fft_.at(num_slots).EvaluateSinCPrefix(GetContext(), res, input, evk_map);
+}
+
+template <typename word>
 void BootContext<word>::EvaluateMod(Ct &res, const Ct &input,
                                     const Evk &mult_key) const {
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");

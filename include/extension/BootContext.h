@@ -207,6 +207,30 @@ class BootContext : public Context<word>,
   void SinCToSlot(Ct &res, int num_slots, const Ct &input,
                   const EvkMap<word> &evk_map) const;
 
+  /**
+   * @brief The other half of the SinC round trip: what `HalfBoot` leaves
+   * undone.
+   *
+   * `SinCToSlot` above converts a SinC ciphertext to slots *in the same ring
+   * and at the caller's level*. It is not the way home from the matrix
+   * product, because the product leaves its result at level 0 and the only
+   * route out of level 0 is a bootstrap.
+   *
+   * `HalfBoot` inverts the WHOLE of SlotToCoeff, and a SinC-encoded ciphertext
+   * is `StC(P^-1(s))` with `P` StC's prefix -- so what lands in slots is
+   * `P^-1(s)`, a twiddle-weighted mixture of the values rather than a
+   * permutation of them. `SinCPrefix` applies `P` and finishes the trip.
+   *
+   * One level, which a [SYLPH] schedule is already spending on
+   * `Canonicalise`'s multiply at the same place, plus one HRot.
+   */
+  void PrepareSinCPrefix(int num_slots, int sub_degree, int level,
+                         int num_phases = 1);
+  int GetSinCPrefixNumPhases(int num_slots) const;
+  void AddRequiredSinCPrefixRotations(EvkRequest &req, int num_slots) const;
+  void SinCPrefix(Ct &res, int num_slots, const Ct &input,
+                  const EvkMap<word> &evk_map) const;
+
   void Boot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
             bool min_ks = false) const;
 
