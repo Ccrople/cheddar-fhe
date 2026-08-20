@@ -215,6 +215,64 @@ TEST(AttentionPackingHost, GeneralisesAwayFromTheSylphShape) {
   EXPECT_EQ(layout.ImaginaryFlagAxis(), Axis::kChannel);
 }
 
+// WHAT THE LAYOUT IS FOR, checked against the two operators that consume it.
+//
+// The route from the coefficient encoding down to the matrix product's ring is
+// RingSwitch then ModDecomp, and both end in the same operation: the X^k-adic
+// split e*_i(m)[s] = m[i + k*s]. RingSwitch.h calls its step 2 "a plain
+// stride-k gather on both components"; Mlwe.h states the same formula for
+// ModDecomp. So composing them is repeated stride splitting of the coefficient
+// index, which is pure arithmetic on the layout and needs no GPU.
+//
+// [SYLPH] table 4 runs PCMM at ring degree 256 with a "Row-split" layout, and
+// [BAE]'s identity needs "d ciphertexts whose messages m_i are the rows of a
+// matrix M". So the test of the layout is whether the two gathers leave one
+// row -- one token -- per degree-256 element. They do, and that is not an
+// accident: it is *because* the token field occupies the lowest coefficient
+// bits that a stride gather splits rows instead of shredding channels. Put the
+// token field anywhere else and this test fails.
+TEST(AttentionPackingHost, TheRingSwitchChainLeavesOneTokenPerSmallRingElement) {
+  const AttentionPacking layout = SylphShape();
+  constexpr int kRingSwitchStride = kDegree / 4096;  // 2^16 -> 2^12
+  constexpr int kModDecompStride = 4096 / 256;       // 2^12 -> 2^8
+  const int num_elements = kRingSwitchStride * kModDecompStride;
+
+  // element -> the token it holds, -1 until seen
+  std::vector<int> token_of(num_elements, -1);
+  std::vector<int> entries(num_elements, 0);
+  std::vector<int> heads_seen(num_elements, 0);
+
+  for (int coeff = 0; coeff < kDegree; coeff++) {
+    const TensorIndex t = layout.CoeffPosition(0, coeff);
+    const int i1 = coeff % kRingSwitchStride;
+    const int s1 = coeff / kRingSwitchStride;
+    const int i2 = s1 % kModDecompStride;
+    const int s2 = s1 / kModDecompStride;
+    ASSERT_GE(s2, 0);
+    ASSERT_LT(s2, 256) << "the chain does not land inside the degree-256 ring";
+
+    const int element = i1 * kModDecompStride + i2;
+    if (token_of[element] == -1) token_of[element] = t.token;
+    ASSERT_EQ(token_of[element], t.token)
+        << "element " << element << " holds more than one token, so it is not "
+           "a row and [BAE]'s identity does not apply to it";
+    entries[element]++;
+    heads_seen[element] |= 1 << (t.head % 16);
+  }
+
+  for (int e = 0; e < num_elements; e++) {
+    ASSERT_EQ(entries[e], 256) << "element " << e << " is not full";
+    ASSERT_EQ(heads_seen[e], 0xffff) << "element " << e << " is missing heads";
+  }
+
+  std::vector<int> distinct(token_of);
+  std::sort(distinct.begin(), distinct.end());
+  distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+  std::cout << num_elements << " degree-256 elements, each one token wide, "
+            << distinct.size() << " distinct tokens over them" << std::endl;
+  EXPECT_EQ(static_cast<int>(distinct.size()), kNumTokens);
+}
+
 // ---------------------------------------------------------------------------
 // The measurement.
 // ---------------------------------------------------------------------------
