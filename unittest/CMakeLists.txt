@@ -115,6 +115,13 @@ add_executable(pipeline_chain_test PipelineChainTest.cpp)
 target_link_libraries(pipeline_chain_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# [SYLPH] table 4's CC-MM row: 8 x 65536 -> RingSwitch -> 128 x 4096 ->
+# [KANG] Algorithm 4 -> SwitchBack, at Llama-3's per-head 128 x 128 shape.
+# Two rings alive at once, so it is its own binary like the two above.
+add_executable(switched_ccmm_test SwitchedCcmmTest.cpp)
+target_link_libraries(switched_ccmm_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 if (ENABLE_EXTENSION)
   # A Llama-3 projection, encrypted, in the block's own packing on
   # bootparam_35, with no ring switch. ModDecomp isolates the channel axis

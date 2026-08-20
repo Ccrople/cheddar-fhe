@@ -117,7 +117,25 @@ UserInterface<word>::UserInterface(ContextPtr<word> context)
   Warn(
       "UserInterface is for testing purposes only. "
       "Do not use in production.");
-  PrepareSecrets();
+  PrepareSecrets(nullptr);
+  PrepareBasicEvks();
+}
+
+template <typename word>
+UserInterface<word>::UserInterface(ContextPtr<word> context,
+                                   const std::vector<int> &secret_coeffs)
+    : context_{std::move(context)} {
+  const auto &param = context_->param_;
+  all_primes_ =
+      param.GetPrimeVector(param.LevelToNP(param.max_level_, param.alpha_));
+
+  AssertTrue(static_cast<int>(secret_coeffs.size()) == param.degree_,
+             "UserInterface: an adopted secret must have one coefficient per "
+             "ring position");
+  Warn(
+      "UserInterface is for testing purposes only. "
+      "Do not use in production.");
+  PrepareSecrets(&secret_coeffs);
   PrepareBasicEvks();
 }
 
@@ -240,7 +258,7 @@ const EvkMap<word> &UserInterface<word>::GetEvkMap() const {
 }
 
 template <typename word>
-void UserInterface<word>::PrepareSecrets() {
+void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
   int degree = context_->param_.degree_;
   int num_total_primes = all_primes_.size();
   int alpha = context_->param_.alpha_;
@@ -252,9 +270,28 @@ void UserInterface<word>::PrepareSecrets() {
   int hamming_weight = context_->param_.GetDenseHammingWeight();
   std::vector<int> indices(hamming_weight);
   std::vector<word> ternary_values(hamming_weight);
-  Random::SampleWithoutReplacement(indices.data(), hamming_weight, 0,
-                                   degree - 1);
-  Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0, 1);
+  if (given == nullptr) {
+    Random::SampleWithoutReplacement(indices.data(), hamming_weight, 0,
+                                     degree - 1);
+    Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0,
+                                    1);
+  } else {
+    // An adopted secret arrives as `degree` signed ternary coefficients, most
+    // of which may be zero; the sampled form is a list of nonzero positions
+    // and their signs. Converting rather than special-casing keeps the two
+    // paths sharing every line below this point.
+    indices.clear();
+    ternary_values.clear();
+    for (int i = 0; i < degree; i++) {
+      const int v = (*given)[i];
+      AssertTrue(v == -1 || v == 0 || v == 1,
+                 "UserInterface: an adopted secret must be ternary");
+      if (v == 0) continue;
+      indices.push_back(i);
+      ternary_values.push_back(static_cast<word>(v < 0 ? 1 : 0));
+    }
+    hamming_weight = static_cast<int>(indices.size());
+  }
 
   HostVector<word> main_s(num_total_primes * degree, 0);
   for (int i = 0; i < num_total_primes; i++) {
@@ -283,8 +320,8 @@ void UserInterface<word>::PrepareSecrets() {
   // Sampling for sparse secret
   // We also prepare it for the maximum size
   hamming_weight = context_->param_.GetSparseHammingWeight();
-  indices.resize(hamming_weight);
-  ternary_values.resize(hamming_weight);
+  indices.assign(hamming_weight, 0);
+  ternary_values.assign(hamming_weight, 0);
   Random::SampleWithoutReplacement(indices.data(), hamming_weight, 0,
                                    degree - 1);
   Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0, 1);

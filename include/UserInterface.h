@@ -39,6 +39,34 @@ class UserInterface {
   explicit UserInterface(ContextPtr<word> context);
 
   /**
+   * @brief The same, but adopting a secret that was sampled elsewhere.
+   *
+   * ## Why this exists
+   *
+   * [SYLPH]'s ladder is three Contexts deep -- the block's bootstrappable one,
+   * the switching one whose `alpha` is small enough that a ring-switching key
+   * fits the *small* ring's budget, and the small ring itself -- and a
+   * ciphertext walks down it unchanged. `RingSwitchHandler` states the
+   * arrangement outright: the two big rings hold the same primes at every
+   * level, so crossing between them moves no words. What it does not say, and
+   * what is just as binding, is that they must also hold the same **secret**:
+   * the switching key is a key switch off the block's secret, so the
+   * UserInterface that generates it has to be holding that secret and not one
+   * of its own.
+   *
+   * There is no key-generation protocol here to arrange that -- this class
+   * samples a fresh secret in its constructor and there is no other way in --
+   * so the second Context is given the first one's coefficients.
+   *
+   * @param context the Context to build keys in
+   * @param secret_coeffs signed ternary coefficients, exactly `degree` of
+   *        them, from another UserInterface's GetSecretCoeffs(). The two
+   *        Contexts must share a ring degree; they need not share anything
+   *        else.
+   */
+  UserInterface(ContextPtr<word> context, const std::vector<int> &secret_coeffs);
+
+  /**
    * @brief Encrypt a plaintext into a ciphertext.
    *
    * @param ctxt output ciphertext
@@ -201,7 +229,9 @@ class UserInterface {
   DvConstView<word> SparseSecretConstView(int front_ignore = 0) const;
 
   // Initialization sequences;
-  void PrepareSecrets();
+  // `given` is either null (sample a fresh secret) or `degree` signed ternary
+  // coefficients to adopt instead.
+  void PrepareSecrets(const std::vector<int> *given);
   void PrepareBasicEvks();
 
   void PrepareEvk(int key_idx, const NPInfo &np, const Dv &encryption_secret,

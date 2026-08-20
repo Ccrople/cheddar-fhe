@@ -1,5 +1,8 @@
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include "core/Context.h"
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
@@ -92,10 +95,15 @@ class EvalSpecialFFT {
    *
    * ## What it costs
    *
-   * The suffix product has exactly `d` diagonals at stride `sub_degree/2`, so
-   * it compiles to **one** `LinearTransform` and therefore **one level**,
-   * against the full StC's `num_stc_levels_` (three on every logN=16 preset).
-   * At degree 65536 and `sub_degree = 512` that is 128 diagonals, BSGS 16x8.
+   * The suffix product has exactly `d` diagonals at stride `sub_degree/2`. At
+   * `sub_degree = 512` that is 128 of them and one `LinearTransform` -- one
+   * level, against the full StC's `num_stc_levels_`. At `sub_degree = 32`,
+   * which is what Llama-3's per-head `128 x 128` product needs, it is 2048,
+   * and 2048 plaintexts at eleven limbs do not fit anywhere. So the stages are
+   * splittable across `num_phases` transforms exactly as StC's own are: three
+   * phases of 4 + 4 + 3 stages are 16 + 16 + 8 = 40 plaintexts and three
+   * levels, which is what StC would have cost anyway.
+   *
    * Nothing here is min-KS or pre-rotated: a standalone conversion has no
    * neighbouring phase to share a rotation with.
    *
@@ -109,11 +117,28 @@ class EvalSpecialFFT {
    *
    * @param sub_degree k, a power of two dividing the ring degree
    * @param stc_level the level the slots -> SinC transform is compiled at; it
-   *        returns one below
+   *        returns `num_phases` below
    * @param cts_level likewise for SinC -> slots
+   * @param num_phases how many `LinearTransform`s the `p` stages are split
+   *        into, one level each. **This is the whole cost question.** A
+   *        product of `q` stages has `2^q` diagonals and a diagonal is a full
+   *        plaintext at the transform's limb count, so one phase carrying all
+   *        `p` is `2^p` plaintexts -- 2048, i.e. gigabytes, at the
+   *        `sub_degree = 32` the attention product wants -- while three phases
+   *        of 4 + 4 + 3 are 40. It is the same trade StC itself makes
+   *        (`num_stc_levels_`, three on every logN=16 preset), and it is
+   *        level-neutral in the pipeline, because a tensor bound for the
+   *        product pays this *instead of* SlotToCoeff rather than on top of it.
    */
   void PrepareSinC(ConstContextPtr<word> context, int sub_degree,
-                   int stc_level, int cts_level);
+                   int stc_level, int cts_level, int num_phases = 1);
+
+  /// How many levels a conversion spends: one per phase.
+  int GetSinCNumPhases() const { return static_cast<int>(sinc_stc_.size()); }
+  /// The BSGS split of each forward phase, for reports.
+  std::pair<int, int> GetSinCPhaseBSGS(int phase) const {
+    return {sinc_stc_.at(phase).GetBS(), sinc_stc_.at(phase).GetGS()};
+  }
 
   /// The `sub_degree` PrepareSinC was called with, or 0.
   int GetSinCSubDegree() const { return sinc_sub_degree_; }

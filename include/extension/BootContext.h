@@ -182,9 +182,15 @@ class BootContext : public Context<word>,
    *
    * `SlotToSinC` is the last `log2(degree / sub_degree)` butterfly stages of
    * SlotToCoeff and nothing else; `SinCToSlot` is the first that many of
-   * CoeffToSlot, times `d^-1`. Each is a single `LinearTransform` and costs
-   * **one level**, against SlotToCoeff's three. See `EvalSpecialFFT.h` for the
-   * identity and why the *prefix* of StC is a different map.
+   * CoeffToSlot, times `d^-1`. See `EvalSpecialFFT.h` for the identity and why
+   * the *prefix* of StC is a different map.
+   *
+   * `num_phases` splits those stages across that many `LinearTransform`s, one
+   * level each, for the same reason StC is split: a phase of `q` stages holds
+   * `2^q` plaintexts. At `sub_degree = 512` one phase is 128 of them and one
+   * level; at the `sub_degree = 32` the attention product needs it would be
+   * 2048, so three phases -- the same three SlotToCoeff would have spent -- are
+   * what make it fit.
    *
    * Unlike `CoeffToSlot`, `SinCToSlot` is compiled at a level the caller
    * chooses, so it does not have to live inside a bootstrap.
@@ -192,7 +198,9 @@ class BootContext : public Context<word>,
    * `PrepareEvalSpecialFFT(num_slots)` must have run first.
    */
   void PrepareSinC(int num_slots, int sub_degree, int stc_level,
-                   int cts_level);
+                   int cts_level, int num_phases = 1);
+  /// Levels a conversion spends, one per phase.
+  int GetSinCNumPhases(int num_slots) const;
   void AddRequiredSinCRotations(EvkRequest &req, int num_slots) const;
   void SlotToSinC(Ct &res, int num_slots, const Ct &input,
                   const EvkMap<word> &evk_map) const;

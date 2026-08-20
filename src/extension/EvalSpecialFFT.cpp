@@ -1,6 +1,8 @@
 #include "extension/EvalSpecialFFT.h"
 
 #include <cmath>
+#include <utility>
+#include <vector>
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
@@ -364,7 +366,7 @@ void EvalSpecialFFT<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
 template <typename word>
 void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
                                        int sub_degree, int stc_level,
-                                       int cts_level) {
+                                       int cts_level, int num_phases) {
   const int degree = context->param_.degree_;
   AssertTrue(full_slot_,
              "PrepareSinC: the SinC conversions are defined on the full slot "
@@ -383,36 +385,80 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
              "PrepareSinC: sub_degree is smaller than the transform allows");
 
   AssertTrue(p >= 1, "PrepareSinC: nothing to do");
+  AssertTrue(num_phases >= 1 && num_phases <= p,
+             "PrepareSinC: the phase count must be between one and the stage "
+             "count");
+  AssertTrue(stc_level - num_phases >= 0 && cts_level - num_phases >= 0,
+             "PrepareSinC: the transform spends one level per phase and there "
+             "are not that many below the level it starts at");
   sinc_sub_degree_ = sub_degree;
   sinc_stc_.clear();
   sinc_cts_.clear();
 
+  // HOW THE p STAGES ARE SPLIT, AND WHY THAT IS THE WHOLE COST QUESTION.
+  //
+  // A product of `q` butterfly stages has 2^q diagonals, and a diagonal is a
+  // full plaintext at the transform's own limb count. So one phase carrying
+  // all p stages is 2^p plaintexts -- 2048 for the sub_degree = 32 the
+  // attention product wants, which is gigabytes -- while three phases of
+  // 4 + 4 + 3 are 16 + 16 + 8 = 40. That is the same trade `PreparePlaintexts`
+  // makes for StC itself (`num_stc_levels_`, three on every logN=16 preset),
+  // and it is level-neutral in the pipeline: a tensor bound for the product
+  // pays SlotToSinC *instead of* SlotToCoeff, not on top of it.
+  //
+  // The stages are split as evenly as p allows, largest group first, matching
+  // how StC's own phases are apportioned.
+  auto split = [&](int total, int phases) {
+    std::vector<int> counts;
+    int left = total;
+    for (int i = 0; i < phases; i++) {
+      const int take = (i == 0) ? DivCeil(left, phases) : left / (phases - i);
+      counts.push_back(take);
+      left -= take;
+    }
+    return counts;
+  };
+  const std::vector<int> counts = split(p, num_phases);
+
   // Slots -> SinC: the SUFFIX of StC, ascending stride, no scalar. Mult(a, b)
   // applies b first, so the loop puts the lowest of the p strides first --
   // which is the order EvaluateStC uses for the same stages.
-  StripedMatrix forward = plain_fft_stages_[num_stages - p];
-  for (int j = num_stages - p + 1; j < num_stages; j++) {
-    forward = StripedMatrix::Mult(plain_fft_stages_[j], forward);
+  int cursor = num_stages - p;
+  for (int phase = 0; phase < num_phases; phase++) {
+    StripedMatrix forward = plain_fft_stages_[cursor];
+    for (int j = cursor + 1; j < cursor + counts[phase]; j++) {
+      forward = StripedMatrix::Mult(plain_fft_stages_[j], forward);
+    }
+    cursor += counts[phase];
+    const int level = stc_level - phase;
+    auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
+    sinc_stc_.emplace_back(context, forward, level,
+                           context->param_.GetRescalePrimeProd(level), fbs,
+                           fgs, 0, 0);
   }
-  auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
-  sinc_stc_.emplace_back(context, forward, stc_level,
-                         context->param_.GetRescalePrimeProd(stc_level), fbs,
-                         fgs, 0, 0);
 
   // SinC -> slots: the PREFIX of CtS, which is the same set of strides in the
   // opposite order, times 1/d. `plain_ifft_stages_[num_stages-1-i]` holds
   // stride 2^i, so index 0 is the highest stride -- the one the forward
-  // applied last, and therefore the one the inverse applies first.
-  StripedMatrix inverse = plain_ifft_stages_[0];
-  for (int j = 1; j < p; j++) {
-    inverse = StripedMatrix::Mult(plain_ifft_stages_[j], inverse);
+  // applied last, and therefore the one the inverse applies first. The 1/d
+  // rides the first phase; each stage pair composes to 2I, so p of them
+  // compose to 2^p = d.
+  cursor = 0;
+  for (int phase = 0; phase < num_phases; phase++) {
+    StripedMatrix inverse = plain_ifft_stages_[cursor];
+    for (int j = cursor + 1; j < cursor + counts[phase]; j++) {
+      inverse = StripedMatrix::Mult(plain_ifft_stages_[j], inverse);
+    }
+    cursor += counts[phase];
+    if (phase == 0) {
+      inverse = StripedMatrix::Mult(inverse, 1.0 / static_cast<double>(d));
+    }
+    const int level = cts_level - phase;
+    auto [ibs, igs] = BSGSSplit(inverse.GetNumDiag());
+    sinc_cts_.emplace_back(context, inverse, level,
+                           context->param_.GetRescalePrimeProd(level), ibs,
+                           igs, 0, 0);
   }
-  // Each stage pair composes to 2I, so p of them compose to 2^p = d.
-  inverse = StripedMatrix::Mult(inverse, 1.0 / static_cast<double>(d));
-  auto [ibs, igs] = BSGSSplit(inverse.GetNumDiag());
-  sinc_cts_.emplace_back(context, inverse, cts_level,
-                         context->param_.GetRescalePrimeProd(cts_level), ibs,
-                         igs, 0, 0);
 }
 
 template <typename word>
@@ -427,6 +473,11 @@ void EvalSpecialFFT<word>::EvaluateSlotToSinC(
     const EvkMap<word> &evk_map) const {
   AssertTrue(!sinc_stc_.empty(), "EvaluateSlotToSinC: call PrepareSinC first");
   sinc_stc_.front().Evaluate(context, res, input, evk_map);
+  for (size_t i = 1; i < sinc_stc_.size(); i++) {
+    Ct next;
+    sinc_stc_[i].Evaluate(context, next, res, evk_map);
+    res = std::move(next);
+  }
 }
 
 template <typename word>
@@ -435,6 +486,11 @@ void EvalSpecialFFT<word>::EvaluateSinCToSlot(
     const EvkMap<word> &evk_map) const {
   AssertTrue(!sinc_cts_.empty(), "EvaluateSinCToSlot: call PrepareSinC first");
   sinc_cts_.front().Evaluate(context, res, input, evk_map);
+  for (size_t i = 1; i < sinc_cts_.size(); i++) {
+    Ct next;
+    sinc_cts_[i].Evaluate(context, next, res, evk_map);
+    res = std::move(next);
+  }
 }
 
 template class EvalSpecialFFT<uint32_t>;

@@ -39,11 +39,21 @@ using word = uint32_t;
 
 namespace {
 
-// The two configurations that matter. 512 is d = 128, which is what Llama's
-// per-head 128x128 attention product wants; 2048 is d = 32, which is what
-// [SYLPH] table 4 runs and the only d this repo has measured
-// (BatchCcmmTest.cpp, CmtTest.cpp).
-constexpr int kSubDegrees[] = {512, 2048};
+// The configurations that matter, and how many levels each is allowed to
+// spend. `sub_degree` is k in Ecd_SinC; the small ring's matrix is
+// small_degree/k wide and there are k/2 lanes.
+//
+//   32   the attention product's own setting: 4096/32 = 128, which is exactly
+//        Llama-3's per-head T x head_dim product, with 16 lanes for 16 heads.
+//        p = 11 stages, so ONE phase would be 2048 plaintexts; three phases of
+//        4 + 4 + 3 are 40, and three levels is what SlotToCoeff costs anyway.
+//   512  d = 128 on the *big* ring, one phase, the first case measured here.
+//   2048 d = 32, what [SYLPH] table 4 itself runs.
+struct Case {
+  int sub_degree;
+  int phases;
+};
+constexpr Case kCases[] = {{32, 3}, {512, 1}, {2048, 1}};
 
 int BitRev(int v, int bits) {
   int r = 0;
@@ -81,18 +91,20 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
 
   boot->PrepareEvalSpecialFFT(num_slots);
 
-  for (int sub_degree : kSubDegrees) {
+  for (const Case &c : kCases) {
+    const int sub_degree = c.sub_degree;
     const int d = degree / sub_degree;
     const int lanes = sub_degree / 2;
     const int p = cheddar::Log2Ceil(d);
 
-    // One level each, and the second runs on the first's output, so they are
-    // compiled one level apart. Starting where the block's StC starts.
+    // One level per phase, and the inverse runs on the forward's output, so
+    // they are compiled that far apart. Starting where the block's StC starts.
     const int stc_level = boot->GetBootParameter().GetStCStartLevel();
-    const int cts_level = stc_level - 1;
-    ASSERT_GE(cts_level, 1);
+    const int cts_level = stc_level - c.phases;
+    ASSERT_GE(cts_level - c.phases, 0);
 
-    boot->PrepareSinC(num_slots, sub_degree, stc_level, cts_level);
+    boot->PrepareSinC(num_slots, sub_degree, stc_level, cts_level, c.phases);
+    ASSERT_EQ(boot->GetSinCNumPhases(num_slots), c.phases);
     EvkRequest req;
     boot->AddRequiredSinCRotations(req, num_slots);
     interface_->PrepareRotationKey(req);
@@ -106,8 +118,9 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     // ---- forward: slots -> SinC ----------------------------------------
     Ciphertext<word> sinc;
     boot->SlotToSinC(sinc, num_slots, ct, interface_->GetEvkMap());
-    EXPECT_EQ(param_->NPToLevel(sinc.GetNP()), stc_level - 1)
-        << "the conversion is one LinearTransform and must cost one level";
+    EXPECT_EQ(param_->NPToLevel(sinc.GetNP()), stc_level - c.phases)
+        << "the conversion is one LinearTransform per phase and must cost "
+           "exactly that many levels";
     EXPECT_NEAR(sinc.GetScale() / ct.GetScale(), 1.0, 1e-6)
         << "and it must leave the scale where it found it";
 
@@ -139,7 +152,7 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     // ---- inverse: SinC -> slots ----------------------------------------
     Ciphertext<word> back;
     boot->SinCToSlot(back, num_slots, sinc, interface_->GetEvkMap());
-    EXPECT_EQ(param_->NPToLevel(back.GetNP()), cts_level - 1);
+    EXPECT_EQ(param_->NPToLevel(back.GetNP()), cts_level - c.phases);
     EXPECT_NEAR(back.GetScale() / sinc.GetScale(), 1.0, 1e-6);
 
     std::vector<Complex> round;
@@ -147,7 +160,8 @@ TEST_P(SinCTransformFixture, TheSuffixOfStCIsTheSinCEncoding) {
     const double round_err = MaxDiff(round, message);
 
     std::cout << "  sub_degree " << sub_degree << " (d = " << d << ", " << lanes
-              << " lanes, " << p << " stages): forward " << forward_err
+              << " lanes, " << p << " stages in " << c.phases
+              << " phase(s)): forward " << forward_err
               << ", round trip " << round_err << ", control (no bit reversal) "
               << control_err << std::endl;
 
