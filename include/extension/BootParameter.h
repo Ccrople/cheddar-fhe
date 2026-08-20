@@ -17,13 +17,32 @@ struct BootParameter {
    * @param num_stc_levels the number of levels for SlotToCoeff (StC)
    * @param log_message_ratio approximately log2(q0 / scale to target at the
    * lowest level). Do not modify if you do not know what you are doing.
+   * @param num_slack_levels levels left free between EvalMod and StC, for work
+   * done in the slot domain before the encoding conversion.
+   *
+   * Zero -- the default, and what Boot alone needs -- makes StC start exactly
+   * where EvalMod ends, which is where every shipped preset puts it and is why
+   * `GetStCStartLevel()` equals `default_encryption_level` there.
+   *
+   * [SYLPH] figure 2's Private Prefill path needs it non-zero: the non-linear
+   * operators run at high level, then StC, then the matrix product at the
+   * smallest modulus. With zero slack there is nowhere to put them -- HalfBoot
+   * is Boot minus StC, so it lands on precisely StC's compiled level, and even
+   * a one-level operator drops the ciphertext below it.
+   *
+   * The levels are not new ones. They come out of the range below StC's
+   * output, which the bootstrap cycle otherwise leaves idle: Boot's input has
+   * to be at level 0 regardless, so on `bootparam_35` levels 16 down to 0 are
+   * the linear phase's working range and only a couple of them are used.
+   * Slack D moves the whole conversion down by D and the linear phase with it.
    */
   BootParameter(int max_level, int num_cts_levels, int num_stc_levels,
-                int log_message_ratio = 5);
+                int log_message_ratio = 5, int num_slack_levels = 0);
 
   const int max_level_;
   const int num_cts_levels_;
   const int num_stc_levels_;
+  const int num_slack_levels_;
 
   const int log_message_ratio_;
 
@@ -38,6 +57,9 @@ struct BootParameter {
    * for loses five bits.
    */
   int GetLogMessageRatio() const { return log_message_ratio_; }
+
+  /** @brief Levels left free between EvalMod and StC. */
+  int GetNumSlackLevels() const { return num_slack_levels_; }
 
   // The following three parameters are inter-related, so changing
   // one of them requires changing the others.
@@ -75,11 +97,20 @@ struct BootParameter {
   int GetEvalModStartLevel() const;
 
   /**
-   * @brief Get the starting level for SlotToCoeff (StC)
+   * @brief Get the starting level for SlotToCoeff (StC), which is where
+   * EvalMod ends less `num_slack_levels_`.
    *
    * @return int the starting level for SlotToCoeff (StC)
    */
   int GetStCStartLevel() const;
+
+  /**
+   * @brief Get the level EvalMod ends on, which is where HalfBoot lands. Equal
+   * to GetStCStartLevel() only when there is no slack.
+   *
+   * @return int the level EvalMod ends on
+   */
+  int GetEvalModEndLevel() const;
 
   /**
    * @brief Get the starting level for bootstrapping. Should be the same as

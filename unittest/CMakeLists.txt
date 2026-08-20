@@ -184,6 +184,11 @@ if (ENABLE_EXTENSION)
   add_executable(attention_packing_test AttentionPackingTest.cpp)
   target_link_libraries(attention_packing_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The gap between EvalMod and StC that [SYLPH] figure 2's schedule needs.
+  add_executable(slack_schedule_test SlackScheduleTest.cpp)
+  target_link_libraries(slack_schedule_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json

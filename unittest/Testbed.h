@@ -209,8 +209,8 @@ class Testbed : public testing::TestWithParam<const char *> {
             "num_stc_levels should be an integer");
       int num_stc_levels = json_data["num_stc_levels"];
       context_ = BootContext<word>::Create(
-          *param_,
-          BootParameter(BootMaxLevel(), num_cts_levels, num_stc_levels));
+          *param_, BootParameter(BootMaxLevel(), num_cts_levels,
+                                 num_stc_levels, 5, BootSlackLevels()));
     } else {
       context_ = Context<word>::Create(*param_);
     }
@@ -226,6 +226,11 @@ class Testbed : public testing::TestWithParam<const char *> {
   // overrides this. Climbing less far also makes every limb operation in
   // between shorter, which is the point.
   virtual int BootMaxLevel() const { return param_->max_level_; }
+
+  // Levels left free between EvalMod and StC. Zero reproduces every shipped
+  // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
+  // the slot domain before the conversion -- overrides it.
+  virtual int BootSlackLevels() const { return 0; }
 
   void TearDown() override {
     interface_.reset();

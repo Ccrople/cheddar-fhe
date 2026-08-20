@@ -374,7 +374,17 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
     EvaluateMod(res, res, evk_map.GetMultiplicationKey());
   }
 
-  // 4. Finally, perform StC
+  // 4. Finally, perform StC.
+  //
+  // With slack configured, StC is compiled below where EvalMod ends -- that gap
+  // exists so the caller can put the non-linear operators in it ([SYLPH] figure
+  // 2). Boot itself puts nothing there, so it has to cross the gap, and
+  // LevelDown is a multiply by a level-down constant plus a rescale, which
+  // leaves the declared scale alone. That matters here: what StC receives
+  // inside Boot is still EvalMod's end scale, exactly as with no slack.
+  if (boot_param_.GetNumSlackLevels() > 0) {
+    this->LevelDown(res, res, boot_param_.GetStCStartLevel());
+  }
   SlotToCoeff(res, num_slots, res, evk_map, min_ks);
 
   if (boot_variant_.at(num_slots) == BootVariant::kImaginaryRemoving) {
