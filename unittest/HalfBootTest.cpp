@@ -82,13 +82,20 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   // EvalMod's precision is absolute, so shrinking the argument by 1e-7 is what
   // turned a constant ratio into one with 18% spread. Restore the magnitude
   // before the bootstrap rather than guess which constant it was.
-  std::cout << "GetStCConst " << boot->GetStCConst() << ", GetCtSConst "
-            << boot->GetCtSConst() << std::endl;
   {
     const int cl = param_->NPToLevel(coeff_ct.GetNP());
     Constant<word> inv_stc;
+    // Two factors, both measured rather than derived. stc_const_ is what the
+    // StC transform bakes in; the second is 2^log_message_ratio, which showed
+    // up as the round trip coming back exactly 1/32.06 of its input. Feeding
+    // EvalMod an argument 32x below what it is built for also costs five bits,
+    // which is what the residual 15.7% ratio spread was.
+    const double msg_ratio =
+        static_cast<double>(1 << boot->GetBootParameter().GetLogMessageRatio());
+    std::cout << "compensating stc_const_ " << boot->GetStCConst()
+              << " and message ratio " << msg_ratio << std::endl;
     context_->encoder_.EncodeConstant(inv_stc, cl, param_->GetScale(cl),
-                                      1.0 / boot->GetStCConst());
+                                      1.0 / (boot->GetStCConst() * msg_ratio));
     Ciphertext<word> scaled;
     context_->Mult(scaled, coeff_ct, inv_stc);
     context_->Rescale(coeff_ct, scaled);

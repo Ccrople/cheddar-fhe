@@ -27,6 +27,18 @@ struct BootParameter {
 
   const int log_message_ratio_;
 
+  /**
+   * @brief log2 of the ratio between the modulus and the message bootstrapping
+   * assumes.
+   *
+   * A caller crossing the encoding boundary outside Boot needs it: measured on
+   * a slot -> SlotToCoeff -> HalfBoot round trip, the output came back exactly
+   * 2^-log_message_ratio of the input, and it also cost that many bits of
+   * precision, because feeding EvalMod an argument 32x smaller than it is built
+   * for loses five bits.
+   */
+  int GetLogMessageRatio() const { return log_message_ratio_; }
+
   // The following three parameters are inter-related, so changing
   // one of them requires changing the others.
   // TODO (jongmin.kim): Allow changing these parameters

@@ -134,6 +134,9 @@ class BootContext : public Context<word>,
   // scaleup_const_ and EvalMod. A caller crossing the boundary outside
   // bootstrapping has to compensate it explicitly, which it cannot do without
   // being able to read the constant.
+  /** @brief The BootParameter this context was built with. */
+  const BootParameter &GetBootParameter() const { return boot_param_; }
+
   double GetCtSConst() const;
   double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
   void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
