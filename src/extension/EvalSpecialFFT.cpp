@@ -420,21 +420,54 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
   };
   const std::vector<int> counts = split(p, num_phases);
 
-  // Slots -> SinC: the SUFFIX of StC, ascending stride, no scalar. Mult(a, b)
-  // applies b first, so the loop puts the lowest of the p strides first --
-  // which is the order EvaluateStC uses for the same stages.
+  // THE SHIFT BETWEEN PHASES, AND WHY A SPLIT TRANSFORM CANNOT DO WITHOUT ONE.
+  //
+  // A group of `q` consecutive butterfly stages starting at stride 2^c has its
+  // offsets spread over multiples of 2^c in +-(2^(c+q) - 2^c) -- so they
+  // STRADDLE ZERO, and reduced mod the slot count the negative ones land near
+  // the top. `LinearTransform::DetermineStride` then sees a spread of nearly
+  // the whole ring and demands `bs * gs >= num_slots / 2^c`, which for the
+  // first phase of the sub_degree = 32 suffix is 2048 against 31 diagonals. It
+  // does not merely cost keys; it refuses to build.
+  //
+  // A transform whose stages are ALL of them does not have this problem -- the
+  // offsets wrap around and cover every residue at their common stride, which
+  // is why the single-phase form works and why nothing needed this until now.
+  //
+  // The fix is the one `PreparePlaintexts` already uses for StC's own phases,
+  // and it is free: `LinearTransform` computes
+  // `rot(M . rot(x, -(a + p)), a)` for `p = pre_rotation` and
+  // `a = additional_pt_rot`, so a chain of phases is exact iff
+  //
+  //     p_0 + a_0 = 0        the first phase takes an unrotated input
+  //     p_{i+1} = a_i - a_{i+1}   each phase undoes the last one's rotation
+  //     a_{last} = 0         and the last one leaves it unrotated
+  //
+  // Choosing `a_i = 2^(cumul_{i+1})` -- the stride the NEXT phase starts at --
+  // satisfies all three and puts every phase's reduced offsets in
+  // `[0, 2 (2^q - 1) 2^c]`, i.e. `bs * gs >= 2^(q+1) - 1`, which is exactly the
+  // diagonal count. It is the same rule StC uses; the only difference here is
+  // that the suffix starts at stride `2^(num_stages - p)` rather than at 1, and
+  // for `num_phases == 1` every shift is zero and this reduces to the plain
+  // transform the single-phase form was.
   int cursor = num_stages - p;
+  int prev_a = 0;
   for (int phase = 0; phase < num_phases; phase++) {
     StripedMatrix forward = plain_fft_stages_[cursor];
     for (int j = cursor + 1; j < cursor + counts[phase]; j++) {
       forward = StripedMatrix::Mult(plain_fft_stages_[j], forward);
     }
     cursor += counts[phase];
+    const bool last = (phase == num_phases - 1);
+    const int a = last ? 0 : (1 << cursor);
+    const int pre_rotation = (phase == 0) ? -a : (prev_a - a);
+    prev_a = a;
+
     const int level = stc_level - phase;
     auto [fbs, fgs] = BSGSSplit(forward.GetNumDiag());
     sinc_stc_.emplace_back(context, forward, level,
                            context->param_.GetRescalePrimeProd(level), fbs,
-                           fgs, 0, 0);
+                           fgs, pre_rotation, a);
   }
 
   // SinC -> slots: the PREFIX of CtS, which is the same set of strides in the
@@ -443,7 +476,12 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
   // applied last, and therefore the one the inverse applies first. The 1/d
   // rides the first phase; each stage pair composes to 2I, so p of them
   // compose to 2^p = d.
+  // The same chain, mirrored. `plain_ifft_stages_[j]` holds stride
+  // 2^(num_stages-1-j), so a phase ending at index `cursor` has its LOWEST
+  // stride at 2^(num_stages - cursor); that exponent is what `a` is built from,
+  // negated because CtS descends where StC ascends.
   cursor = 0;
+  prev_a = 0;
   for (int phase = 0; phase < num_phases; phase++) {
     StripedMatrix inverse = plain_ifft_stages_[cursor];
     for (int j = cursor + 1; j < cursor + counts[phase]; j++) {
@@ -453,11 +491,16 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
     if (phase == 0) {
       inverse = StripedMatrix::Mult(inverse, 1.0 / static_cast<double>(d));
     }
+    const bool last = (phase == num_phases - 1);
+    const int a = last ? 0 : -(1 << (num_stages - cursor));
+    const int pre_rotation = (phase == 0) ? -a : (prev_a - a);
+    prev_a = a;
+
     const int level = cts_level - phase;
     auto [ibs, igs] = BSGSSplit(inverse.GetNumDiag());
     sinc_cts_.emplace_back(context, inverse, level,
                            context->param_.GetRescalePrimeProd(level), ibs,
-                           igs, 0, 0);
+                           igs, pre_rotation, a);
   }
 }
 
