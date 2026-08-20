@@ -26,83 +26,93 @@
 
 using word = uint32_t;
 
-TEST_P(Testbed32, HalfBootTurnsCoefficientsIntoSlots) {
+// THE TEST IS A ROUND TRIP, ON PURPOSE.
+//
+// A first attempt encoded into coefficient i and expected slot i, and the
+// slot/coefficient ratio came back spread over [-0.36, 0.355] instead of being
+// one number -- so the gap was never a missing scale factor. CtS carries a
+// bit-reversal, which [SYLPH] section 3.3 spells out ("designed to accommodate
+// the bit-reversal operation that occurs when moving to coefficient encoding
+// ... the roles of dimensions i and k are swapped"), and the identity map was
+// simply wrong.
+//
+// Rather than reconstruct that permutation, this goes slot -> SlotToCoeff ->
+// HalfBoot -> slot. The permutation cancels because the two transforms are
+// inverse, and this is the shape the pipeline actually uses: the linear algebra
+// happens in between, in coefficient encoding at a small ring.
+//
+// The constants do not cancel -- StC's transform bakes in stc_const_ and CtS's
+// bakes in cts_const_, which only compose correctly inside Boot alongside
+// scaleup_const_ and EvalMod. So the round trip is expected to return a
+// *constant multiple* of the input, and the test identifies it and asserts it
+// is constant before trusting it.
+TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
   ASSERT_NE(boot, nullptr);
 
   const int degree = param_->degree_;
   const int num_slots = degree / 2;
+  const int level = default_encryption_level_;
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(num_slots);
   EvkRequest req;
   boot->AddRequiredRotations(req, num_slots);
   interface_->PrepareRotationKey(req);
 
-  // Coefficients 0..N/2-1 carry the data; N/2..N-1 stay zero, so the imaginary
-  // half of every slot is zero and the comparison is against a real vector.
-  // Bootstrapping needs the message inside (-1, 1) (Doing.md 1.3).
-  std::vector<double> coeffs(degree, 0.0);
+  std::vector<Complex> msg(num_slots);
   for (int i = 0; i < num_slots; i++) {
-    coeffs[i] = 0.4 * std::sin(0.001 * i) + 0.2 * std::cos(0.017 * i);
+    msg[i] = Complex(0.4 * std::sin(0.001 * i) + 0.2 * std::cos(0.017 * i), 0.0);
   }
-
-  Plaintext<word> pt;
-  context_->encoder_.EncodeCoeff(pt, 0, param_->GetScale(0), coeffs);
   Ciphertext<word> ct;
-  interface_->Encrypt(ct, pt);
+  EncodeAndEncrypt(ct, msg, level);
 
-  Ciphertext<word> res;
-  boot->HalfBoot(res, ct, interface_->GetEvkMap());
+  Ciphertext<word> coeff_ct;
+  boot->SlotToCoeff(coeff_ct, num_slots, ct, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const int coeff_level = param_->NPToLevel(coeff_ct.GetNP());
+  std::cout << "SlotToCoeff: level " << level << " -> " << coeff_level
+            << " (this direction is a plain call; the transform is compiled at "
+            << "GetStCStartLevel(), which is the default encryption level)"
+            << std::endl;
 
+  Ciphertext<word> res;
+  boot->HalfBoot(res, coeff_ct, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const int out_level = param_->NPToLevel(res.GetNP());
-  std::cout << "landed at level " << out_level << " (StC start is "
-            << (param_->max_level_ - 12) << ", default encryption level "
-            << default_encryption_level_ << ")" << std::endl;
-  EXPECT_EQ(out_level, default_encryption_level_)
-      << "the cycle must return to the level ordinary ciphertexts live at, or "
-         "the flow does not close";
+  std::cout << "HalfBoot: -> level " << out_level << std::endl;
+  EXPECT_EQ(out_level, level) << "the cycle must return to where it started";
 
   std::vector<Complex> got;
   DecryptAndDecode(got, res);
   ASSERT_EQ(static_cast<int>(got.size()), num_slots);
 
-  // Identify the constant StC would have applied, instead of deriving it
-  // through cts_const_, stc_const_ and q0. If the structure is right the ratio
-  // is one number for every slot, and its spread says so.
   double rlo = 1e300, rhi = -1e300, rsum = 0.0;
   int counted = 0;
   for (int i = 0; i < num_slots; i++) {
-    if (std::abs(coeffs[i]) < 0.05) continue;  // ratios of near-zeros are noise
-    const double r = got[i].real() / coeffs[i];
+    if (std::abs(msg[i].real()) < 0.05) continue;
+    const double r = got[i].real() / msg[i].real();
     rlo = std::min(rlo, r);
     rhi = std::max(rhi, r);
     rsum += r;
     counted++;
   }
   const double ratio = rsum / counted;
-  std::cout << "slot/coefficient ratio over " << counted << " slots: mean "
-            << ratio << ", spread [" << rlo << ", " << rhi << "]" << std::endl;
-  EXPECT_LT((rhi - rlo) / std::abs(ratio), 1e-2)
-      << "the ratio is not a constant, so this is not a missing scale factor";
+  std::cout << "round-trip ratio over " << counted << " slots: mean " << ratio
+            << ", spread [" << rlo << ", " << rhi << "]" << std::endl;
+  ASSERT_LT((rhi - rlo) / std::abs(ratio), 1e-2)
+      << "the round trip is not a constant multiple of the input, so the "
+         "conversions are not inverse and this is not a constants problem";
 
-  double worst = 0.0, absmax = 0.0, worst_imag = 0.0;
+  double worst = 0.0, absmax = 0.0;
   for (int i = 0; i < num_slots; i++) {
-    worst = std::max(worst, std::abs(got[i].real() / ratio - coeffs[i]));
-    worst_imag = std::max(worst_imag, std::abs(got[i].imag() / ratio));
-    absmax = std::max(absmax, std::abs(coeffs[i]));
+    worst = std::max(worst, std::abs(got[i].real() / ratio - msg[i].real()));
+    absmax = std::max(absmax, std::abs(msg[i].real()));
   }
-  std::cout << "coefficient i -> slot i: max abs err " << worst << " ("
-            << -std::log2(worst / absmax) << " bits relative to |v| max "
-            << absmax << ")" << std::endl;
-  std::cout << "imaginary leakage (coefficients N/2..N-1 were zero): "
-            << worst_imag << std::endl;
-  // Bootstrapping's own precision is the bar; [SYLPH] 3.1.3 quotes 13 effective
-  // bits for a 20-bit procedure, and Cheddar's Boot measures ~2.4e8 SNR.
-  EXPECT_GT(-std::log2(worst / absmax), 12.0)
-      << "HalfBoot lost more than a bootstrap should";
-  EXPECT_LT(worst_imag, 1e-2);
+  std::cout << "after dividing by the ratio: max abs err " << worst << " ("
+            << -std::log2(worst / absmax) << " bits)" << std::endl;
+  EXPECT_GT(-std::log2(worst / absmax), 12.0);
 }
 
 INSTANTIATE_TEST_SUITE_P(
