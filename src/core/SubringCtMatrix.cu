@@ -1,3 +1,5 @@
+#include <string>
+
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
@@ -253,6 +255,27 @@ __global__ void SubringPointwiseMatMul(word *dst, const word *lhs,
 
 }  // namespace kernel
 
+namespace {
+
+// gridDim.y is capped at 65535 on every CUDA architecture, and `entries`
+// (= rows * cols of the subring matrix) is launched in it by four of the
+// kernels below. Nothing in this library checks a launch error, so exceeding
+// it does not fail loudly -- the launch is rejected, the kernel never runs and
+// the output buffer keeps whatever it held. For [KANG] Algorithm 4 the matrix
+// is d x d with d = degree / sub_degree, so the real constraint is d^2 <= 65535,
+// i.e. d <= 255 and hence d <= 128 for the power-of-two d the algorithm uses.
+// Llama-3's per-head 128 x 128 attention product sits at d = 128, inside it
+// with a factor of four to spare; d = 256 would be silently wrong.
+void AssertGridYFits(size_t entries, const char *what) {
+  AssertTrue(entries <= 65535,
+             std::string(what) + ": rows * cols = " + std::to_string(entries) +
+                 " exceeds the gridDim.y limit of 65535, and a rejected launch "
+                 "here is silent -- the subring matrix is d x d with "
+                 "d = degree / sub_degree, so this needs d <= 255");
+}
+
+}  // namespace
+
 template <typename word>
 SubringCtMatrixHandler<word>::SubringCtMatrixHandler(
     const Parameter<word> &param, const NTTHandler<word> &ntt_handler)
@@ -286,6 +309,7 @@ void SubringCtMatrixHandler<word>::ToMatrices(SubringCoeffMatrix<word> &b_mat,
   const int cols = row_wise ? vec_dim : num_cts;
   const int num_total_primes = np.GetNumTotal();
   const size_t entries = static_cast<size_t>(rows) * cols;
+  AssertGridYFits(entries, "SubringCtMatrix");
 
   // montgomery_conversion = false keeps Montgomery residues, which is what the
   // convolution below needs; the default would hand back plain ones.
@@ -345,6 +369,7 @@ void SubringCtMatrixHandler<word>::MultiplyMatricesReference(
   const NPInfo np = lhs.np_;
   const int num_total_primes = np.GetNumTotal();
   const size_t entries = static_cast<size_t>(rows) * cols;
+  AssertGridYFits(entries, "SubringCtMatrix");
 
   res.rows_ = rows;
   res.cols_ = cols;
@@ -386,6 +411,7 @@ void SubringCtMatrixHandler<word>::ToCiphertexts(
              "ToCiphertexts: the Vec side must have the Vec dimension");
 
   const size_t entries = static_cast<size_t>(rows) * cols;
+  AssertGridYFits(entries, "SubringCtMatrix");
 
   std::vector<DeviceVector<word>> b_coeffs(num_cts), a_coeffs(num_cts);
   HostVector<word *> h_b(num_cts), h_a(num_cts);
@@ -519,6 +545,7 @@ void SubringCtMatrixHandler<word>::MultiplyMatrices(
   const NPInfo np = lhs.np_;
   const int num_total_primes = np.GetNumTotal();
   const size_t entries = static_cast<size_t>(rows) * cols;
+  AssertGridYFits(entries, "SubringCtMatrix");
 
   const SubringTwiddles tw = BuildTwiddles(np, sub_degree);
 
