@@ -58,20 +58,6 @@ class BootContext : public Context<word>,
   int GetBootEnabledNumSlots(int num_slots) const;
   double GetCtSConst() const;
   double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
-  /**
-   * @brief Lift the level-zero input to `target_level`.
-   *
-   * @param target_level level to climb to; -1 uses this context's
-   * `BootParameter::GetMaxLevel()`, which is what Boot passes. It was formerly
-   * always `param_.max_level_`, which is why a bootstrap could only ever land
-   * where the parameter set put it.
-   */
-  void ModUpToLevel(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
-                    int target_level = -1) const;
-  void CoeffToSlot(Ct &res, int num_slots, const Ct &input,
-                   const EvkMap<word> &evk_map, bool min_ks = false) const;
-  void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
-                   const EvkMap<word> &evk_map, bool min_ks = false) const;
   void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
 
   ContextPtr<word> GetContext();
@@ -145,6 +131,27 @@ class BootContext : public Context<word>,
    * @param evk_map client-provided EvkMap
    * @param min_ks whether to use minimum key-switching
    */
+  // The encoding conversions, public because the Llama pipeline needs them and
+  // not only Boot does. SlotToCoeff is compiled at GetStCStartLevel(), which is
+  // the default encryption level, so an ordinary ciphertext can feed it;
+  // CoeffToSlot is compiled at GetCtSStartLevel() = max_level, which only a
+  // ModUp'd ciphertext reaches. That asymmetry is why [SYLPH] section 3.2 fuses
+  // encoding conversions into bootstrapping, and why HalfBoot below exists.
+  /**
+   * @brief Lift the level-zero input to `target_level`.
+   *
+   * @param target_level level to climb to; -1 uses this context's
+   * `BootParameter::GetMaxLevel()`, which is what Boot passes. It was formerly
+   * always `param_.max_level_`, which is why a bootstrap could only ever land
+   * where the parameter set put it.
+   */
+  void ModUpToLevel(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
+                    int target_level = -1) const;
+  void CoeffToSlot(Ct &res, int num_slots, const Ct &input,
+                   const EvkMap<word> &evk_map, bool min_ks = false) const;
+  void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
+                   const EvkMap<word> &evk_map, bool min_ks = false) const;
+
   void Boot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
             bool min_ks = false) const;
 
