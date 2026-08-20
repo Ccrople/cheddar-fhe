@@ -342,6 +342,10 @@ class HostLinearLeg : public Block::LinearLeg {
                const char *name) const override {
     std::vector<double> a;
     Gather(a, x, in_channels);
+    // What the product read is the encrypted turn's *result*, so recording it
+    // here is the per-turn error ledger with no extra decryption: the block
+    // hands every operator's output to a product and nowhere else.
+    seen_.emplace_back(std::string("in:") + name, a);
     std::vector<double> y;
     Gemm(a, w, pack_.tokens, in_channels, out_channels, y);
     for (double &u : y) u *= w_scale;
@@ -356,6 +360,8 @@ class HostLinearLeg : public Block::LinearLeg {
     std::vector<double> qa, ka;
     Gather(qa, q, cfg_.num_channels);
     Gather(ka, k, cfg_.num_kv_channels);
+    seen_.emplace_back("in:q", qa);
+    seen_.emplace_back("in:k", ka);
     const int T = pack_.tokens, D = cfg_.head_dim;
     const int heads = cfg_.num_channels / D;
     const int group = heads / (cfg_.num_kv_channels / D);
@@ -385,6 +391,7 @@ class HostLinearLeg : public Block::LinearLeg {
     std::vector<double> pa, va;
     GatherScores(pa, p);
     Gather(va, v, cfg_.num_kv_channels);
+    seen_.emplace_back("in:probs", pa);
     const int T = pack_.tokens, D = cfg_.head_dim, H = cfg_.num_channels;
     const int heads = H / D;
     const int group = heads / (cfg_.num_kv_channels / D);
@@ -745,6 +752,58 @@ TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
             << ":" << std::endl;
   for (const auto &e : leg.log_) {
     std::cout << "   " << e.first << " max " << e.second << std::endl;
+  }
+
+  // WHERE THE BLOCK'S BITS GO, TURN BY TURN.
+  //
+  // Every operator's output is handed to a product and to nothing else, so
+  // what the stand-in read at each call *is* that turn's encrypted result.
+  // Comparing each against the clear run at the same point attributes the
+  // block's error to a turn instead of to the block.
+  //
+  // The constant each one carries is the calibration's, divided out here, so
+  // the bits reported are relative to the true tensor.
+  struct Point {
+    const char *tag;
+    const std::vector<double> *want;
+    double carried;
+  };
+  std::vector<double> gated(r.gate.size());
+  for (size_t i = 0; i < gated.size(); i++) {
+    gated[i] = r.gate[i] / (1.0 + std::exp(-r.gate[i])) * r.up[i];
+  }
+  const std::vector<Point> points = {
+      {"A  RMSNorm(attn) -> the QKV product", &r.normed, 1.0},
+      {"B  RoPE(Q) -> the score product", &r.q, cal.size_q},
+      {"B  RoPE(K) -> the score product", &r.k, cal.size_k},
+      {"C  SoftMax -> the value product", &r.probs, 1.0},
+      {"D  attention values -> the O product", &r.attn, cal.size_attn},
+      {"E  RMSNorm(ffn) -> the gate/up product", &r.fnormed, 1.0},
+      {"F  SiLU(G) * U -> the down product", &gated, cal.size_up},
+  };
+  const char *tags[] = {"in:Q", "in:q", "in:k", "in:probs",
+                        "in:O", "in:gate", "in:down"};
+  std::cout << "where the block's bits go, turn by turn:" << std::endl;
+  for (size_t j = 0; j < points.size(); j++) {
+    const std::vector<double> *got = nullptr;
+    for (const auto &e : leg.seen_) {
+      if (e.first == tags[j]) {
+        got = &e.second;
+        break;
+      }
+    }
+    if (got == nullptr || got->size() != points[j].want->size()) {
+      std::cout << "   " << points[j].tag << ": not recorded" << std::endl;
+      continue;
+    }
+    double e = 0.0, m = 0.0;
+    for (size_t i = 0; i < got->size(); i++) {
+      const double want = (*points[j].want)[i];
+      e = std::max(e, std::abs((*got)[i] / points[j].carried - want));
+      m = std::max(m, std::abs(want));
+    }
+    std::cout << "   " << points[j].tag << ": " << -std::log2(e / m)
+              << " bits (max |.| " << m << ")" << std::endl;
   }
 
   // The output carries `residual`, coefficient encoded at level 0.

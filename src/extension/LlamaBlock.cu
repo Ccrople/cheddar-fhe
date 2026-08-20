@@ -243,7 +243,9 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   std::vector<std::vector<Complex>> attn_w;
   SpreadNormWeight(attn_w, w.attn_norm, cal_.attn_alpha / (r * r));
   attn_norm_->Apply(normed, slots, attn_w, evk_map);
-  Announce("A  RMSNorm", normed, sched_->GetStCLevel());
+  // One above StC, not on it: Apply ends with Mult(res, res, weight_pt_) and
+  // no Rescale, so the ciphertext arrives owing one. ToCoeff settles it.
+  Announce("A  RMSNorm (owes a rescale)", normed, sched_->GetStCLevel() + 1);
   Lower(coeff, normed, evk_map);
   Announce("A  lowered", coeff, sched_->GetCoeffLevel());
 
@@ -368,7 +370,8 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   std::vector<std::vector<Complex>> ffn_w;
   SpreadNormWeight(ffn_w, w.ffn_norm, cal_.ffn_alpha / (r * r));
   ffn_norm_->Apply(h_normed, h_slots, ffn_w, evk_map);
-  Announce("E  RMSNorm", h_normed, sched_->GetStCLevel());
+  Announce("E  RMSNorm (owes a rescale)", h_normed,
+           sched_->GetStCLevel() + 1);
   Lower(h_coeff, h_normed, evk_map);
 
   std::vector<Ct> gate, up;
