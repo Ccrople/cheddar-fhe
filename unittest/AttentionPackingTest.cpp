@@ -225,13 +225,27 @@ TEST(AttentionPackingHost, GeneralisesAwayFromTheSylphShape) {
 // ModDecomp. So composing them is repeated stride splitting of the coefficient
 // index, which is pure arithmetic on the layout and needs no GPU.
 //
-// [SYLPH] table 4 runs PCMM at ring degree 256 with a "Row-split" layout, and
-// [BAE]'s identity needs "d ciphertexts whose messages m_i are the rows of a
-// matrix M". So the test of the layout is whether the two gathers leave one
-// row -- one token -- per degree-256 element. They do, and that is not an
-// accident: it is *because* the token field occupies the lowest coefficient
-// bits that a stride gather splits rows instead of shredding channels. Put the
-// token field anywhere else and this test fails.
+// The test is whether the two gathers leave one token per degree-256 element.
+// They do, and that is not an accident: a stride gather splits whichever axis
+// owns the low index bits, and the token field owns them. Put the token field
+// anywhere else and this test fails.
+//
+// WHAT THIS DOES NOT SHOW, because a first version of this comment claimed it
+// did. It does not show that the layout feeds a Llama *projection* for free.
+// PcmmHandler::Multiply computes res[i] = sum_j u[i][j] * cts[j] over whatever
+// list of ciphertexts the caller passes, so "the rows" is a choice at call
+// time, not a property this test establishes. PipelineChainTest pins down which
+// choice the descent actually makes: U acts on the ModDecomp digit alone,
+// coefficient bits 4-7, giving final[i + 16r + 256t] = sum_j U[r][j] * m[i +
+// 16j + 256t]. Under this layout those bits are the token field's high three
+// plus the head field's low one, so a PCMM there mixes tokens and head parity.
+// A projection has to mix *channels*, which live at bits 12-15 here.
+//
+// That is not a defect of the layout -- [SYLPH] table 4 gives PCMM its own
+// "Row-split" layout, separate from the attention layout of 3.2, and the
+// "most conversions removed" claim is about the attention block. It is a
+// defect of the earlier claim, which read one token per element as though it
+// were the projection's row format.
 TEST(AttentionPackingHost, TheRingSwitchChainLeavesOneTokenPerSmallRingElement) {
   const AttentionPacking layout = SylphShape();
   constexpr int kRingSwitchStride = kDegree / 4096;  // 2^16 -> 2^12
