@@ -1076,9 +1076,43 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
     ASSERT_EQ(param_->NPToLevel(normed[0].GetNP()), sched.GetStCLevel())
         << "turn " << turn << " did not land on StC's level";
 
+    // Read the turn's output on both sides of the descent. Nothing else in
+    // this file goes below level 8, and on bootparam_35 level 0 is [0, 2] --
+    // no main primes and two terminal -- so reaching it from level 8's [11, 0]
+    // drops eleven and adds two, which is a regraft nothing here has
+    // exercised. Measuring both sides says whether a zero output came out of
+    // the cycle or out of the descent standing in for the product.
+    const std::vector<double> &ref = (turn == 1) ? y1s : y2;
+    const double ref_scale = (turn == 1) ? 1.0 : s2;
     for (int i = 0; i < num_ct; i++) {
       Ciphertext<word> coeff;
       sched.ToCoeff(coeff, normed[i], interface_->GetEvkMap());
+      if (i == 0) {
+        auto read = [&](const Ciphertext<word> &c, const char *where) {
+          Plaintext<word> pt;
+          interface_->Decrypt(pt, c);
+          std::vector<double> cf;
+          context_->encoder_.DecodeCoeff(cf, pt);
+          double e = 0.0, m = 0.0;
+          for (int sl = 0; sl < num_slots; sl++) {
+            const int ch = sl / kTokens;
+            const int tk = sl % kTokens;
+            const double want =
+                ref_scale * ref[static_cast<size_t>(tk) * kChannels + ch];
+            const double got =
+                cf[AttentionPacking::CoeffOfSlot({sl, false}, degree)];
+            e = std::max(e, std::abs(got - want));
+            m = std::max(m, std::abs(want));
+          }
+          std::cout << "    turn " << turn << " " << where << ": "
+                    << -std::log2(e / m) << " bits (max " << m << ")"
+                    << std::endl;
+        };
+        read(coeff, "after ToCoeff, level 8");
+        Ciphertext<word> low;
+        context_->LevelDown(low, coeff, 0);
+        read(low, "after LevelDown to 0");
+      }
       // Stand-in for the linear leg: descend to level 0, which is where the
       // product would have left the ciphertext for the next ToSlot.
       context_->LevelDown(state[i], coeff, 0);
