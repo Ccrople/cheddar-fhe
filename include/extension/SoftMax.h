@@ -109,6 +109,32 @@ namespace cheddar {
  * That is a cost optimisation, not a level one -- theorem 1 keeps k+1 levels
  * for degree 2^k either way.
  *
+ * ## A row that spans several ciphertexts, which is a saving and not a cost
+ *
+ * The score product does not hand back one row per ciphertext. Its layout puts
+ * the key axis' high three bits on the **ciphertext** axis and the low four in
+ * slots -- score (query, key, head) lands in ciphertext `BitRev3(key & 7)` at
+ * slot `[key >> 3 | query | head]` -- so one row is `group_size` ciphertexts
+ * by `num_keys` strided slots, and its reduction is `group_size - 1`
+ * ciphertext adds before the `log2(num_keys)` rotate-and-adds.
+ *
+ * Everything on the main track is elementwise: the exponential, the causal
+ * mask, the multiply by the normalisation and the square simply run
+ * `group_size` times, which is exactly the work `group_size` separate rows
+ * would have cost. The **auxiliary track is per row**, and a group holds
+ * `group_size` times as many rows, so the norm, the affine map, the inverse
+ * square root and *its bootstrap* run once for the whole group. For
+ * Llama-3-8B's 32 heads that is 2 auxiliary tracks and 2 auxiliary bootstraps
+ * per block instead of 16.
+ *
+ * The normalisation broadcasts back for free -- every ciphertext of the group
+ * multiplies by the same `r`, because after the rotate-and-add every slot of a
+ * row already holds that row's whole norm. The causal mask does not: `key`
+ * depends on which ciphertext of the group it is, so there is one mask per
+ * group member.
+ *
+ * `group_size = 1` is the ordinary case and everything below reduces to it.
+ *
  * Section 3.4's slim polynomial evaluation is an auxiliary-track optimisation.
  * By its own theorem 1 it does not reduce levels (still k+1 for degree 2^k) --
  * it reduces multiplications to `O(2^((k-j)/2)) + j` and key-switchings. So it
@@ -127,6 +153,7 @@ class SoftMaxHandler {
   int num_keys_;
   int num_slots_;
   int num_rows_;
+  int group_size_;
   double range_;
   int input_level_;
   int num_iters_;
@@ -149,9 +176,9 @@ class SoftMaxHandler {
   // reaches the GPU. Caching it keyed on the mask's own values keeps Apply's
   // signature honest: a caller that changes the mask gets a new plaintext, and
   // comparing 32768 values costs about 0.03 ms against a 35 ms encode.
-  mutable std::vector<Complex> cached_mask_;
+  mutable std::vector<std::vector<Complex>> cached_mask_;
   mutable int cached_mask_level_ = -1;
-  mutable Pt mask_pt_;
+  mutable std::vector<Pt> mask_pt_;
 
   std::unique_ptr<EvalPoly<word>> MakeInvSqrt(double lo, double hi, int degree,
                                               int level);
@@ -186,6 +213,10 @@ class SoftMaxHandler {
    * `boot_aux`, which it supersedes on any set that reserves slack.
    * @param aux_boot_max the magnitude the hook is expected to be able to
    * carry, which sets the constant the handler divides by before calling it
+   * @param group_size how many ciphertexts one row spans. The row's keys are
+   * then `group_size * num_keys`, with `num_keys` of them strided inside each
+   * ciphertext as above and the group index supplying the rest. Defaults to 1,
+   * which is the whole of the old behaviour.
    */
   SoftMaxHandler(ConstContextPtr<word> context, int num_keys, double range,
                  int input_level, int num_iters,
@@ -193,7 +224,7 @@ class SoftMaxHandler {
                  const std::vector<double> &norm_hi, int exp_degree,
                  int inv_sqrt_degree, int early_inv_sqrt_degree = 4,
                  bool boot_aux = false, int aux_return_level = -1,
-                 double aux_boot_max = 0.5);
+                 double aux_boot_max = 0.5, int group_size = 1);
 
   /**
    * @brief The caller's bootstrap for the auxiliary track.
@@ -205,6 +236,12 @@ class SoftMaxHandler {
 
   /** @brief The level the hook will be called at, so a caller can check it. */
   int GetAuxCallLevel() const { return aux_in_level_; }
+
+  /** @brief Ciphertexts one row spans. */
+  int GetGroupSize() const { return group_size_; }
+
+  /** @brief Keys in one row, across the whole group. */
+  int GetNumKeys() const { return num_keys_ * group_size_; }
 
   // disable copying (or moving also)
   SoftMaxHandler(const SoftMaxHandler &) = delete;
@@ -247,6 +284,24 @@ class SoftMaxHandler {
              const AuxBoot *aux_boot = nullptr) const;
 
   /**
+   * @brief The same, over a row that spans `group_size` ciphertexts.
+   *
+   * The single-ciphertext overload is this one with a group of one. Every
+   * argument is per group member except the norm reduction and the auxiliary
+   * track, which are shared -- that sharing is the point.
+   *
+   * @param res output, `group_size` ciphertexts
+   * @param x_scaled input, `group_size` ciphertexts, all at the same level
+   * @param causal_mask one mask per group member, in that member's own slot
+   * layout
+   */
+  void Apply(std::vector<Ct> &res, const std::vector<Ct> &x_scaled,
+             const std::vector<std::vector<Complex>> &causal_mask,
+             const EvkMap<word> &evk_map,
+             const BootContext<word> *boot_context = nullptr,
+             const AuxBoot *aux_boot = nullptr) const;
+
+  /**
    * @brief Levels the main track spends, which is what a level budget counts.
    *
    * exp, the causal mask, then k times (multiply by the normalisation, square).
@@ -267,6 +322,9 @@ class SoftMaxHandler {
    * ~50 ms host encode inside what reads as an online measurement.
    */
   void Prepare(const std::vector<Complex> &causal_mask) const;
+
+  /** @brief The same, one mask per group member. */
+  void Prepare(const std::vector<std::vector<Complex>> &causal_mask) const;
 
   /** @brief Device bytes the cached mask holds, 0 before Prepare. */
   size_t GetPlaintextBytes() const;

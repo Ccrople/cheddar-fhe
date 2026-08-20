@@ -271,6 +271,140 @@ TEST_P(Testbed32, SoftMaxOnEncrypted) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. The same circuit over a row that spans a group of ciphertexts.
+//
+// WHY THE GROUP EXISTS, AND WHY IT IS A SAVING. The score product does not
+// hand back one row per ciphertext. Its layout splits the key axis -- the high
+// three bits on the CIPHERTEXT axis, the low four in slots -- so
+// score (query, key, head) sits in ciphertext BitRev3(key & 7) at slot
+// [key >> 3 | query | head], and a row is 8 ciphertexts by 16 strided slots.
+//
+// The main track does not care: exp, the mask, the multiply by the
+// normalisation and the square are elementwise and run eight times, which is
+// the work eight separate rows would have cost anyway. The AUXILIARY track is
+// per row, and a group holds eight times as many rows, so the norm, the affine
+// map, the inverse square root and its bootstrap run ONCE for the group. For
+// Llama-3's 32 heads that is two auxiliary tracks per block instead of
+// sixteen.
+//
+// The rows here are the same ones test 2 uses and the reference is the same,
+// so what this checks is the cross-ciphertext reduction and the broadcast of
+// the normalisation back across the group -- not the polynomials.
+// ---------------------------------------------------------------------------
+TEST_P(Testbed32, SoftMaxOverACiphertextGroup) {
+  constexpr int kGroup = 8;                      // ciphertexts per row
+  constexpr int kKeysPerCt = kKeys / kGroup;     // strided keys inside each
+  const int level = default_encryption_level_;
+  const int slots = param_->degree_ / 2;
+  const int rows = slots / kKeysPerCt;
+
+  std::vector<int> valid(rows);
+  for (int r = 0; r < rows; r++) valid[r] = kKeys - (r % (kKeys / 2));
+  std::vector<std::vector<double>> row_data;
+  for (int r = 0; r < rows; r++) row_data.push_back(MakeRow(r, valid[r]));
+
+  double lo, hi;
+  NormInterval(row_data, valid, kIters, &lo, &hi);
+
+  SoftMaxHandler<word> sm(context_, kKeysPerCt, kRange, level, kIters,
+                          std::vector<double>(kIters, lo),
+                          std::vector<double>(kIters, hi), kExpDegree,
+                          kInvSqrtDegree, /*early_inv_sqrt_degree=*/4,
+                          /*boot_aux=*/false, /*aux_return_level=*/-1,
+                          /*aux_boot_max=*/0.5, /*group_size=*/kGroup);
+  ASSERT_EQ(sm.GetGroupSize(), kGroup);
+  ASSERT_EQ(sm.GetNumKeys(), kKeys);
+  for (int d : sm.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, level);
+  }
+  std::cout << "group " << kGroup << " x " << kKeysPerCt << " strided keys, "
+            << rows << " rows, " << sm.GetRotationDistances().size()
+            << " rotations per reduction (plus " << kGroup - 1
+            << " ciphertext adds)" << std::endl;
+
+  // key i of row r lives in ciphertext i / kKeysPerCt at slot
+  // r + (i mod kKeysPerCt) * rows -- the group index on the outside, the
+  // strided axis inside, which is the score layout's own split.
+  std::vector<std::vector<Complex>> msg(kGroup,
+                                        std::vector<Complex>(slots, Complex(0)));
+  std::vector<std::vector<Complex>> mask(
+      kGroup, std::vector<Complex>(slots, Complex(0)));
+  for (int r = 0; r < rows; r++) {
+    const auto &row = row_data[r];
+    for (int i = 0; i < kKeys; i++) {
+      const int g = i / kKeysPerCt;
+      const int s = r + (i % kKeysPerCt) * rows;
+      msg[g][s] = Complex(2.0 * row[i] / kRange + 1.0, 0.0);
+      mask[g][s] = Complex(i < valid[r] ? 1.0 : 0.0, 0.0);
+    }
+  }
+
+  std::vector<Ciphertext<word>> ct(kGroup);
+  for (int g = 0; g < kGroup; g++) EncodeAndEncrypt(ct[g], msg[g], level);
+
+  std::vector<Ciphertext<word>> res;
+  sm.Apply(res, ct, mask, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(res.size()), kGroup);
+
+  const int out_level = param_->NPToLevel(res[0].GetNP());
+  std::cout << "output level " << out_level << " from " << level
+            << ", so depth " << (level - out_level)
+            << " -- the same depth as one ciphertext, for eight" << std::endl;
+  for (const auto &c : res) {
+    EXPECT_EQ(param_->NPToLevel(c.GetNP()), out_level);
+    EXPECT_NEAR(c.GetScale() / param_->GetScale(out_level), 1.0, 1e-9)
+        << "the output scale must stay canonical";
+  }
+
+  std::vector<std::vector<Complex>> got(kGroup);
+  for (int g = 0; g < kGroup; g++) DecryptAndDecode(got[g], res[g]);
+
+  const double ref = 1.0 / kKeys;
+  double err_fit = 0.0, err_true = 0.0, worst_sum = 0.0;
+  for (int r = 0; r < rows; r++) {
+    const auto &row = row_data[r];
+    std::vector<double> row_valid(row.begin(), row.begin() + valid[r]);
+    auto fit = sm.PlainSoftMax(row_valid);
+    auto want = TrueSoftMax(row, valid[r]);
+    double sum = 0.0;
+    for (int i = 0; i < kKeys; i++) {
+      const double g = got[i / kKeysPerCt][r + (i % kKeysPerCt) * rows].real();
+      sum += g;
+      if (i < valid[r]) {
+        err_fit = std::max(err_fit, std::abs(g - fit[i]));
+        err_true = std::max(err_true, std::abs(g - want[i]));
+      } else {
+        err_true = std::max(err_true, std::abs(g));
+      }
+    }
+    worst_sum = std::max(worst_sum, std::abs(sum - 1.0));
+  }
+  std::cout << "grouped circuit vs its own polynomials: " << err_fit << "  ("
+            << Bits(err_fit, 1.0) << " bits vs the largest value, "
+            << Bits(err_fit, ref) << " vs 1/d)" << std::endl;
+  std::cout << "grouped circuit vs true SoftMax:        " << err_true << "  ("
+            << Bits(err_true, 1.0) << " bits vs the largest value, "
+            << Bits(err_true, ref) << " vs 1/d)" << std::endl;
+  std::cout << "worst |sum(row) - 1|:                   " << worst_sum
+            << std::endl;
+  // A row that summed to one would still sum to one if the group reduction
+  // had covered only one ciphertext -- but it would be normalised by an eighth
+  // of its own norm, so every value would be off by the same large factor and
+  // err_true would be enormous. The two checks together pin the reduction.
+  EXPECT_LT(worst_sum, 1e-2)
+      << "the reduction did not cover the whole row";
+
+  if (param_->base_scale_ < kMinUsableScale) {
+    std::cout << "2^30: recorded as insufficient for the non-linearities"
+              << std::endl;
+    return;
+  }
+  EXPECT_GT(Bits(err_true, 1.0), kTargetBits);
+}
+
+// ---------------------------------------------------------------------------
 // 3. The auxiliary track bootstrapped, as [SYLPH] figure 2 does it.
 //
 // This is the whole point of that orange triangle: the norm square, the affine

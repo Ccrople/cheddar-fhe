@@ -12,17 +12,25 @@
 // WHAT IS ACTUALLY CHECKED. Entrywise, against a host reference, with a
 // control that reads the result where it would sit had the two axes NOT traded
 // places -- because the exchange preserves every value and only moves it, so a
-// no-op has exactly the right magnitude.
+// no-op has exactly the right magnitude. The control is three decades above
+// the tolerance, which is what makes this a test of the layout rather than of
+// the noise.
 //
-// TWO CASES, AND THE SECOND IS THE ONE THE MODEL NEEDS. Llama-3-8B has 8 KV
-// heads against 32 query heads, so a call group of 16 lanes needs its 4 KV
-// heads four times over. The source is then HALF the output -- two ciphertexts
-// becoming eight -- and the replication rides along in the low bits of the
-// exchanged field at no extra cost. The first case is the square one, at a
-// nonzero field offset, which pins the offset arithmetic on its own.
+// TWO CASES, ON TWO RINGS, AND THE SECOND IS THE ONE THE MODEL RUNS.
 //
-// ringswitch16_35 holds exactly one level, which is what the exchange spends,
-// so this runs on the cheapest ring in the ladder and needs no bootstrap.
+//  1. ringswitch16_35 at its only level, a square exchange at a nonzero field
+//     offset. It pins the offset arithmetic on its own and it is the cheapest
+//     ring in the ladder. Its accuracy is the floor of a big-ring key switch
+//     at the bottom of a grafted ladder -- about 1e-04, which is simply
+//     `noise / 2^29.877`, the scale that level holds. Rescaling does not
+//     improve it: the mask multiply and its rescale move the message and the
+//     noise by the same factor.
+//  2. sylphflow16_35 at level 11, the exact shape the score product's right
+//     operand needs -- 2 ciphertexts to 8, a three-bit field at offset 0,
+//     GQA's fourfold replication carried in the low two bits. This is where
+//     the attention path actually compiles it, and the scale there is 2^35.
+//
+// The exchange spends one level, whichever ring it is on.
 
 #undef ENABLE_EXTENSION
 
@@ -32,6 +40,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "RingFixture.h"
@@ -46,17 +55,30 @@ using Ring = ringfixture::Ring<word>;
 
 namespace {
 
-const char *Param() {
-  const char *e = std::getenv("CHEDDAR_SWITCH_PARAM");
-  return (e != nullptr && e[0] != 0) ? e : "ringswitch16_35.json";
+const char *Env(const char *name, const char *fallback) {
+  const char *e = std::getenv(name);
+  return (e != nullptr && e[0] != 0) ? e : fallback;
 }
 
-// One exchange, checked entrywise. log_src < log_cts is the replicating case.
-void RunCase(int log_cts, int field_offset, int log_src, double tolerance) {
-  Ring ring(Param());
+int EnvInt(const char *name, int fallback) {
+  const char *e = std::getenv(name);
+  return (e != nullptr && e[0] != 0) ? std::atoi(e) : fallback;
+}
+
+// A layout mistake lands at the control's magnitude, which is the size of the
+// data itself. This separates the two by three decades and prints what was
+// actually measured, so a precision regression is visible without pinning the
+// test to a particular ring's noise floor.
+constexpr double kTolerance = 1e-3;
+
+// `level < 0` means the ring's top level.
+void RunCase(const std::string &file, int level_in, int log_cts,
+             int field_offset, int log_src) {
+  Ring ring(file);
   const int num_slots = ring.Degree() / 2;
-  const int level = ring.param->max_level_;
+  const int level = (level_in < 0) ? ring.param->max_level_ : level_in;
   ASSERT_GE(level, 1);
+  ASSERT_LE(level, ring.param->max_level_);
   const double scale = ring.param->GetScale(level);
 
   const int num_cts = 1 << log_cts;
@@ -99,7 +121,8 @@ void RunCase(int log_cts, int field_offset, int log_src, double tolerance) {
     EXPECT_EQ(ring.param->NPToLevel(res[y].GetNP()), level - 1)
         << "the exchange spends exactly one level";
     EXPECT_NEAR(res[y].GetScale() / ring.param->GetScale(level - 1), 1.0, 1e-6)
-        << "the masks were not encoded at the level's own rescale prime";
+        << "the masks were not encoded at the level's own scale, so a "
+           "canonical input did not come back canonical";
     Plaintext<word> pt;
     ring.ui->Decrypt(pt, res[y]);
     ring.context->encoder_.Decode(got[y], pt);
@@ -115,18 +138,19 @@ void RunCase(int log_cts, int field_offset, int log_src, double tolerance) {
       // The control: what would be there if nothing had moved. It is a real
       // control only where the two axes actually disagree.
       if (x != y) {
-        control = std::max(control, std::abs(host[y >> replication][p].real() -
-                                             want));
+        control =
+            std::max(control, std::abs(host[y >> replication][p].real() - want));
       }
     }
   }
-  std::cout << "exchange w=" << log_cts << " offset=" << field_offset << " "
-            << num_src << " -> " << num_cts << " cts: max |diff| = " << worst
-            << ", control (nothing moved) " << control << ", "
-            << rot.size() << " rotations, " << exchange.GetNumMults()
-            << " plaintext mults" << std::endl;
+  std::cout << file << " level " << level << ": exchange w=" << log_cts
+            << " offset=" << field_offset << " " << num_src << " -> "
+            << num_cts << " cts: max |diff| = " << worst
+            << ", control (nothing moved) " << control << ", " << rot.size()
+            << " rotations, " << exchange.GetNumMults() << " plaintext mults"
+            << std::endl;
 
-  EXPECT_LT(worst, tolerance)
+  EXPECT_LT(worst, kTolerance)
       << "the exchange did not put the values where its contract says";
   EXPECT_GT(control, 1e-2)
       << "the source is flat enough that no exchange would pass this";
@@ -135,13 +159,18 @@ void RunCase(int log_cts, int field_offset, int log_src, double tolerance) {
 }  // namespace
 
 // The square case at a nonzero offset: the field is slot bits 5..7, so this
-// fails if the step arithmetic ignores the offset anywhere.
+// fails if the step arithmetic ignores the offset anywhere. On the smallest
+// ring in the ladder, at the only level it has.
 TEST(CtAxisExchange, TradesASlotFieldForTheCiphertextIndex) {
-  RunCase(/*log_cts=*/3, /*field_offset=*/5, /*log_src=*/3, 1e-4);
+  RunCase(Env("CHEDDAR_SWITCH_PARAM", "ringswitch16_35.json"), /*level=*/-1,
+          /*log_cts=*/3, /*field_offset=*/5, /*log_src=*/3);
 }
 
-// The shape the score product's right operand needs: 2 ciphertexts to 8, GQA's
-// fourfold replication carried in the low two bits of the exchanged field.
+// The shape the score product's right operand needs, on the ring and at the
+// level the attention path compiles it: 2 ciphertexts to 8, GQA's fourfold
+// replication in the low two bits of the exchanged field.
 TEST(CtAxisExchange, ReplicatesAShortSourceAcrossTheField) {
-  RunCase(/*log_cts=*/3, /*field_offset=*/0, /*log_src=*/1, 1e-4);
+  RunCase(Env("CHEDDAR_BLOCK_PARAM", "sylphflow16_35.json"),
+          EnvInt("CHEDDAR_EXCHANGE_LEVEL", 11), /*log_cts=*/3,
+          /*field_offset=*/0, /*log_src=*/1);
 }

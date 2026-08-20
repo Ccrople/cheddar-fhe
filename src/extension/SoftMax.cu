@@ -44,9 +44,11 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
                                      const std::vector<double> &norm_hi,
                                      int exp_degree, int inv_sqrt_degree,
                                      int early_inv_sqrt_degree, bool boot_aux,
-                                     int aux_return_level, double aux_boot_max)
+                                     int aux_return_level, double aux_boot_max,
+                                     int group_size)
     : context_{std::move(context)},
       num_keys_{num_keys},
+      group_size_{group_size},
       range_{range},
       input_level_{input_level},
       num_iters_{num_iters},
@@ -57,6 +59,8 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
       aux_in_level_{-1} {
   AssertTrue(num_keys_ > 1 && (num_keys_ & (num_keys_ - 1)) == 0,
              "SoftMax: num_keys must be a power of two");
+  AssertTrue(group_size_ >= 1 && (group_size_ & (group_size_ - 1)) == 0,
+             "SoftMax: group_size must be a power of two");
   AssertTrue(range_ > 0.0, "SoftMax: range must be positive");
   AssertTrue(num_iters_ >= 1, "SoftMax: at least one iteration");
   AssertTrue(static_cast<int>(norm_lo_.size()) == num_iters_ &&
@@ -184,13 +188,27 @@ std::vector<double> SoftMaxHandler<word>::PlainSoftMax(
 template <typename word>
 void SoftMaxHandler<word>::Prepare(
     const std::vector<Complex> &causal_mask) const {
+  Prepare(std::vector<std::vector<Complex>>{causal_mask});
+}
+
+template <typename word>
+void SoftMaxHandler<word>::Prepare(
+    const std::vector<std::vector<Complex>> &causal_mask) const {
+  AssertTrue(static_cast<int>(causal_mask.size()) == group_size_,
+             "SoftMax: one causal mask per ciphertext of the group");
   // The mask meets y right after the exponential, so that is the level it must
   // be encoded at -- known at construction, which is what lets this run in
   // setup rather than on the first Apply.
   const int level = exp_out_level_;
   if (level == cached_mask_level_ && causal_mask == cached_mask_) return;
-  context_->encoder_.Encode(mask_pt_, level, context_->param_.GetScale(level),
-                            causal_mask);
+  mask_pt_.clear();
+  mask_pt_.resize(group_size_);
+  for (int g = 0; g < group_size_; g++) {
+    AssertTrue(static_cast<int>(causal_mask[g].size()) == num_slots_,
+               "SoftMax: the mask must cover every slot");
+    context_->encoder_.Encode(mask_pt_[g], level,
+                              context_->param_.GetScale(level), causal_mask[g]);
+  }
   cached_mask_ = causal_mask;
   cached_mask_level_ = level;
 }
@@ -200,7 +218,7 @@ size_t SoftMaxHandler<word>::GetPlaintextBytes() const {
   if (cached_mask_level_ < 0) return 0;
   return static_cast<size_t>(
              context_->param_.LevelToNP(cached_mask_level_).GetNumTotal()) *
-         context_->param_.degree_ * sizeof(word);
+         context_->param_.degree_ * sizeof(word) * mask_pt_.size();
 }
 
 template <typename word>
@@ -209,8 +227,24 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
                                  const EvkMap<word> &evk_map,
                                  const BootContext<word> *boot_context,
                                  const AuxBoot *aux_boot) const {
-  AssertTrue(static_cast<int>(causal_mask.size()) == num_slots_,
-             "SoftMax: the mask must cover every slot");
+  AssertTrue(group_size_ == 1,
+             "SoftMax: this handler was built for rows spanning several "
+             "ciphertexts, so Apply needs the whole group");
+  std::vector<Ct> out, in(1);
+  context_->Copy(in[0], x_scaled);
+  Apply(out, in, std::vector<std::vector<Complex>>{causal_mask}, evk_map,
+        boot_context, aux_boot);
+  context_->Copy(res, out[0]);
+}
+
+template <typename word>
+void SoftMaxHandler<word>::Apply(
+    std::vector<Ct> &res, const std::vector<Ct> &x_scaled,
+    const std::vector<std::vector<Complex>> &causal_mask,
+    const EvkMap<word> &evk_map, const BootContext<word> *boot_context,
+    const AuxBoot *aux_boot) const {
+  AssertTrue(static_cast<int>(x_scaled.size()) == group_size_,
+             "SoftMax: one input ciphertext per member of the group");
   AssertTrue(aux_return_level_ < 0 || aux_boot != nullptr,
              "SoftMax: an auxiliary return level was configured, so Apply "
              "needs the hook that returns there");
@@ -219,27 +253,43 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
   const auto &mult_key = evk_map.GetMultiplicationKey();
 
   // 1. y = exp(x'). The argument arrives already on [-1, 1]; see the header
-  //    for why the mapping is the caller's and not this function's.
-  Ct y;
-  exp_poly_->Evaluate(context_, y, x_scaled, mult_key);
+  //    for why the mapping is the caller's and not this function's. This and
+  //    everything else on the main track is elementwise, so it is simply run
+  //    once per ciphertext of the group.
+  std::vector<Ct> y(group_size_);
+  for (int g = 0; g < group_size_; g++) {
+    exp_poly_->Evaluate(context_, y[g], x_scaled[g], mult_key);
+  }
 
   // 2. Causal mask. The exponential is strictly positive, so masked positions
   //    have to be zeroed explicitly or they would join the norm and the
-  //    output. Causality is public, hence a plaintext.
+  //    output. Causality is public, hence a plaintext -- one per member of the
+  //    group, because which keys a ciphertext carries is what distinguishes
+  //    them.
   {
-    AssertTrue(context_->param_.NPToLevel(y.GetNP()) == exp_out_level_,
+    AssertTrue(context_->param_.NPToLevel(y[0].GetNP()) == exp_out_level_,
                "SoftMax: the exponential did not land where Prepare assumed");
     Prepare(causal_mask);
     Ct masked;
-    context_->Mult(masked, y, mask_pt_);
-    context_->Rescale(y, masked);
+    for (int g = 0; g < group_size_; g++) {
+      context_->Mult(masked, y[g], mask_pt_[g]);
+      context_->Rescale(y[g], masked);
+    }
   }
 
-  Ct sq, rotated, r, scaled;
+  Ct sq, term, rotated, r, scaled;
   for (int j = 0; j < num_iters_; j++) {
     // 3. ||y||_2^2 over the row. Euclidean, not the sum -- that is what makes
-    //    the squaring below land on a vector that already sums to one.
-    context_->HMult(sq, y, y, mult_key);
+    //    the squaring below land on a vector that already sums to one. The row
+    //    spans the group, so the squares are added across it first and the
+    //    strided rotate-and-add then finishes the reduction inside what is now
+    //    a single ciphertext. Everything from here to step 6 runs ONCE for the
+    //    whole group; that is what the group is for.
+    context_->HMult(sq, y[0], y[0], mult_key);
+    for (int g = 1; g < group_size_; g++) {
+      context_->HMult(term, y[g], y[g], mult_key);
+      context_->Add(sq, sq, term);
+    }
     for (int d : rotation_distances_) {
       // HRotAdd is res = (a << dist) + b, so res must not alias its inputs.
       context_->HRotAdd(rotated, sq, sq, evk_map.GetRotationKey(d), d);
@@ -291,7 +341,7 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     //    pre-scaling is unnecessary here. The main track then never sees the
     //    auxiliary depth.
     if (boot_aux_ && aux_boot == nullptr) {
-      const int y_level = context_->param_.NPToLevel(y.GetNP());
+      const int y_level = context_->param_.NPToLevel(y[0].GetNP());
       Ct boosted;
       boot_context->Boot(boosted, r, evk_map);
       const int boosted_level = context_->param_.NPToLevel(boosted.GetNP());
@@ -302,7 +352,9 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     }
 
     // 7. y <- (y * r)^2. Now sum(y) = 1 for the last iteration, with no
-    //    further normalisation needed.
+    //    further normalisation needed. The normalisation broadcasts across the
+    //    group for free: after the reduction every slot of a row holds that
+    //    row's whole norm, so every ciphertext multiplies by the same r.
     //
     // Which of the two is higher depends on where the auxiliary track came
     // back. With `boot_aux` the normalisation is brought down to the main
@@ -311,17 +363,21 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     // has been sitting still since the causal mask. So meet at whichever is
     // lower rather than assuming.
     const int r_level = context_->param_.NPToLevel(r.GetNP());
-    const int main_level = context_->param_.NPToLevel(y.GetNP());
+    const int main_level = context_->param_.NPToLevel(y[0].GetNP());
     const int meet = std::min(r_level, main_level);
-    Ct levelled, levelled_r;
-    context_->LevelDown(levelled, y, meet);
+    Ct levelled_r;
     context_->LevelDown(levelled_r, r, meet);
     context_->Copy(r, levelled_r);
-    context_->HMult(y, levelled, r, mult_key);
-    context_->HMult(sq, y, y, mult_key);
-    context_->Copy(y, sq);
+    for (int g = 0; g < group_size_; g++) {
+      Ct levelled, prod;
+      context_->LevelDown(levelled, y[g], meet);
+      context_->HMult(prod, levelled, r, mult_key);
+      context_->HMult(y[g], prod, prod, mult_key);
+    }
   }
-  context_->Copy(res, y);
+  res.clear();
+  res.resize(group_size_);
+  for (int g = 0; g < group_size_; g++) context_->Copy(res[g], y[g]);
 }
 
 template class SoftMaxHandler<uint32_t>;
