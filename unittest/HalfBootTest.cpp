@@ -77,8 +77,36 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
   // value changes. That is the same technique that broke RMSNorm by handing
   // EvalPoly a non-canonical scale -- here it is the opposite, matching the
   // scale the library asks for rather than inventing one.
-  // The scale reinterpretation tried here was falsified: it took the ratio
-  // spread from 15% to 239%. Left out rather than left in.
+  // StC's phases each rescale by about 2^30. Inside Boot its input carries
+  // EvalMod's end scale; an ordinary ciphertext at the same level carries the
+  // canonical one, which is 8.4e6 (~2^23) smaller in actual integers. The first
+  // rescale then throws away 23 bits and three phases cannot recover them --
+  // that is the 15% floor, and it is why *reinterpreting* the scale made things
+  // worse rather than better: reinterpreting changes the declared value and
+  // leaves the integers alone, so it fixed nothing and broke the bookkeeping.
+  //
+  // The data has to actually grow. Multiplying by an integer constant encoded
+  // at scale 1 does that without a rescale, so it costs no level: the product
+  // keeps the input's declared scale while the integers scale up, and declaring
+  // the result at StC's expected scale then decodes to the same message.
+  const double have = ct.GetScale();
+  const double want_scale = boot->GetStCInputScale();
+  const double grow = want_scale / have;
+  std::cout << "growing the data by " << grow << " so StC's rescales have the "
+            << "bits they were compiled for (" << have << " -> " << want_scale
+            << ")" << std::endl;
+  {
+    const int l = param_->NPToLevel(ct.GetNP());
+    Constant<word> c;
+    context_->encoder_.EncodeConstant(c, l, 1.0, grow);
+    Ciphertext<word> grown;
+    context_->Mult(grown, ct, c);
+    grown.SetScale(want_scale);
+    ct = std::move(grown);
+    std::cout << "  now at level " << param_->NPToLevel(ct.GetNP())
+              << " (no rescale, so no level spent)" << std::endl;
+  }
+
   Ciphertext<word> coeff_ct;
   boot->SlotToCoeff(coeff_ct, num_slots, ct, interface_->GetEvkMap());
   cudaDeviceSynchronize();
