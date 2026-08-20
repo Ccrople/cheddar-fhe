@@ -33,7 +33,17 @@ CtAxisExchange<word>::CtAxisExchange(ConstContextPtr<word> context,
   // One mask per field value. They are the whole crossbar: every plaintext
   // multiplication below is by one of these, so there are 2^w of them however
   // many products they take part in.
-  const double scale = context->param_.GetRescalePrimeProd(level_);
+  // THE MASK SCALE IS THE LEVEL'S OWN SCALE, NOT ITS RESCALE PRIME PRODUCT.
+  // With a canonical input the result is then canonical too, because
+  // `scale(L)^2 / rescale_prod(L) = scale(L-1)` is the ladder's own
+  // recurrence. `LinearTransform` takes the rescale prime product instead and
+  // so preserves whatever scale it was handed; on a set whose scale is flat --
+  // sylphflow16_35 anywhere above level 3 -- the two agree exactly, and they
+  // part company only across a regraft, where the canonicalising one is what
+  // `LevelDown` and `EvalPoly` downstream assume. Measured: on
+  // ringswitch16_35, whose only rescale IS a regraft, the other choice lands
+  // 2^-5.12 low and costs 35x the precision.
+  const double scale = context->param_.GetScale(level_);
   mask_.resize(num_cts_);
   std::vector<Complex> m(num_slots_);
   for (int z = 0; z < num_cts_; z++) {

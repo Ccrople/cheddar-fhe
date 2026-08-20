@@ -77,10 +77,17 @@ namespace cheddar {
  *
  * ## One level, and the scale
  *
- * The mask multiply is the only level this spends. The masks are encoded at
- * the level's own rescale prime product, so the result comes back on the
- * canonical scale of `level - 1` -- the contract `LinearTransform` keeps, and
- * the one `Context::LevelDown` downstream assumes.
+ * The mask multiply is the only level this spends, and the masks are encoded
+ * at **the level's own scale** rather than at its rescale prime product. A
+ * canonical input then comes back canonical, because
+ * `scale(L)^2 / rescale_prod(L) = scale(L-1)` is the ladder's own recurrence.
+ * `LinearTransform` takes the rescale prime product and so preserves whatever
+ * scale it was handed; wherever the scale is flat -- sylphflow16_35 above
+ * level 3 -- the two choices agree exactly, and they part company only across
+ * a regraft. There the canonicalising one is what `Context::LevelDown` and
+ * `EvalPoly` downstream assume, and it is also worth 5 bits: measured on
+ * ringswitch16_35, whose one rescale is a regraft, the other choice lands
+ * 2^-5.12 low and 35x less accurate.
  *
  * @tparam word uint32_t or uint64_t
  */
