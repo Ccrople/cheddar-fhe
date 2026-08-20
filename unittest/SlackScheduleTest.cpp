@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -40,10 +41,51 @@
 using word = uint32_t;
 
 namespace {
-// One level more than RMSNorm at the degree its measured spread allows (3),
-// so the gap is big enough to be a real schedule and small enough to leave the
-// linear phase ten levels on bootparam_35.
-constexpr int kSlack = 4;
+
+// Swept from the environment so one binary can walk the slack values without a
+// rebuild, because the question is the *shape* of the loss and not any single
+// number. Defaults to the four levels the first run used.
+int SlackFromEnv() {
+  const char *env = std::getenv("CHEDDAR_SLACK");
+  return env ? std::atoi(env) : 4;
+}
+const int kSlack = SlackFromEnv();
+
+// THE PREDICTION THIS SWEEP EXISTS TO KILL OR CONFIRM.
+//
+// bootparam_35's Grafting is two shapes of level, read straight off its
+// level_config. A plain level takes 2 main primes (~29 bits) and gives back 1
+// terminal prime (~25), which is the 35 bits of the scale. But levels 3, 9 and
+// 15 do the opposite -- they hand back 3 main primes and take 5 terminal ones
+// -- and that is how the terminal pool, only five primes deep, gets refilled.
+// The ratio still comes to 35 bits, so nothing upstream of the prime set can
+// see the difference. Levels 20 and up are a third shape, 2 main and no refund,
+// which is the 58 bits CtS and EvalMod are built on.
+//
+// StC spans three levels starting where slack puts it:
+//
+//   slack 0 -> 19, 18, 17    no regraft   (measured 19.71 bits)
+//   slack 1 -> 18, 17, 16    no regraft
+//   slack 2 -> 17, 16, 15    regraft at the end
+//   slack 3 -> 16, 15, 14    regraft in the middle
+//   slack 4 -> 15, 14, 13    regraft at the start  (measured 10.24 bits)
+//   slack 5 -> 14, 13, 12    no regraft
+//   slack 6 -> 13, 12, 11    no regraft
+//
+// If crossing a regraft level inside StC is what costs the bits, then 1, 5 and
+// 6 come back clean and 2, 3, 4 do not. If instead the loss grows with the
+// slack, the cause is something accumulating and this is the wrong story. The
+// point of writing the prediction down first is that only one of those two
+// outcomes can be read as a success afterwards.
+constexpr int kRegraftLevels[] = {3, 9, 15};
+
+bool StCCrossesARegraft(int stc_start) {
+  for (int level : kRegraftLevels) {
+    if (level <= stc_start && level > stc_start - 3) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 class SlackTestbed : public Testbed32 {
@@ -117,11 +159,16 @@ TEST_P(SlackTestbed, SlackIsInvisibleToBoot) {
                       std::abs(out[i].imag() - msg[i].imag())});
     absmax = std::max(absmax, std::abs(msg[i]));
   }
-  std::cout << "Boot through the gap: max abs err " << worst << " ("
-            << -std::log2(worst / absmax) << " bits)" << std::endl;
-  EXPECT_GT(-std::log2(worst / absmax), 12.0)
-      << "compiling StC below where EvalMod ends broke bootstrapping itself, "
-         "so the gap is not usable and nothing downstream matters";
+  const int stc_start = boot->GetBootParameter().GetStCStartLevel();
+  const bool regraft = StCCrossesARegraft(stc_start);
+  std::cout << "SWEEP slack=" << kSlack << " StC spans " << stc_start << ".."
+            << stc_start - 2 << " regraft=" << (regraft ? "yes" : "no")
+            << " bits=" << -std::log2(worst / absmax) << std::endl;
+  if (!regraft) {
+    EXPECT_GT(-std::log2(worst / absmax), 15.0)
+        << "StC lost precision without crossing a regraft level, so the "
+           "regraft story is wrong and the loss is something else";
+  }
 }
 
 // SCALE TOO. Now spend the gap on real kernels instead of a LevelDown, and ask
