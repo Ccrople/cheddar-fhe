@@ -1093,7 +1093,7 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
           interface_->Decrypt(pt, c);
           std::vector<double> cf;
           context_->encoder_.DecodeCoeff(cf, pt);
-          double e = 0.0, m = 0.0;
+          double e = 0.0, m = 0.0, num = 0.0, den = 0.0;
           for (int sl = 0; sl < num_slots; sl++) {
             const int ch = sl / kTokens;
             const int tk = sl % kTokens;
@@ -1103,10 +1103,18 @@ TEST_P(CycleTestbed, TheLoopClosesTwice) {
                 cf[AttentionPacking::CoeffOfSlot({sl, false}, degree)];
             e = std::max(e, std::abs(got - want));
             m = std::max(m, std::abs(want));
+            num += got * want;
+            den += want * want;
           }
+          // Where did it go? If the whole coefficient vector is empty the
+          // ciphertext is, and if it is not then the data is somewhere this
+          // index map does not look.
+          double all = 0.0;
+          for (int q = 0; q < degree; q++) all = std::max(all, std::abs(cf[q]));
           std::cout << "    turn " << turn << " " << where << ": "
-                    << -std::log2(e / m) << " bits (max " << m << ")"
-                    << std::endl;
+                    << -std::log2(e / m) << " bits (want max " << m
+                    << ", fit " << (num / den) << ", largest coefficient "
+                    << all << ")" << std::endl;
         };
         read(coeff, "after ToCoeff, level 8");
         Ciphertext<word> low;
