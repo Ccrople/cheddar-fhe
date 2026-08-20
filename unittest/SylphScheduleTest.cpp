@@ -273,6 +273,88 @@ TEST_P(CycleTestbed, TheTransportPreservesTheMessage) {
 
 // ---------------------------------------------------------------------------
 
+// THE SCALE DROP, WITH NOTHING ELSE IN THE PICTURE.
+//
+// WhereCanonicalisationCosts localised 9.6 bits to Canonicalise, but every
+// number in it came out of a bootstrap, so "the rescale is at fault" and "the
+// bootstrap's noise interacts badly with the rescale" are still the same
+// measurement. This removes the bootstrap: a freshly encrypted ciphertext,
+// scaled up by a known amount and then rescaled back down to canonical, which
+// is exactly the shape of Canonicalise and nothing else.
+//
+// THE PREDICTION. A rescale's added error is a rounding term -- tau_b + tau_a*s
+// with tau in [-1/2, 1/2] -- so it is *absolute*, a few hundred integer units
+// for a ternary secret of weight 32768, call it 2^9. Every variant lands its
+// message on the same canonical 2^35, and each one's incoming noise is divided
+// by exactly the factor it was multiplied by, so **every row should read the
+// same**. If the residual instead falls off with the shrink, the error
+// introduced at this transition is not a rounding term and is far larger than
+// one -- and level 19 -> 18 is a Grafting regraft, two main primes dropped and
+// one terminal added, which is the part of it that is not an ordinary rescale.
+//
+// A flat table means Canonicalise is innocent and the interaction is with the
+// bootstrap's noise; a falling table means the operation itself is.
+TEST_P(CycleTestbed, TheScaleDropIsWhereTheBitsGo) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int num_slots = param_->degree_ / 2;
+  const int level = boot->GetBootParameter().GetEvalModEndLevel();
+
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots);
+
+  std::cout << "level " << level << " -> " << (level - 1) << ", canonical "
+            << param_->GetScale(level) << " -> " << param_->GetScale(level - 1)
+            << ", rescale product " << param_->GetRescalePrimeProd(level)
+            << std::endl;
+
+  for (int shrink : {0, 6, 12, 18, 23}) {
+    Ciphertext<word> ct;
+    EncodeAndEncrypt(ct, msg, level);
+
+    // Up by 2^shrink, no rescale: integers and declared scale move together,
+    // so the message is untouched and so is its precision.
+    if (shrink > 0) {
+      Constant<word> up;
+      context_->encoder_.EncodeConstant(up, level, std::pow(2.0, shrink), 1.0);
+      context_->Mult(ct, ct, up);
+    }
+
+    // Down to canonical, which is Canonicalise's own arithmetic.
+    const double factor = param_->GetScale(level - 1) *
+                          param_->GetRescalePrimeProd(level) / ct.GetScale();
+    Constant<word> down;
+    context_->encoder_.EncodeConstant(down, level, factor, 1.0);
+    Ciphertext<word> tmp;
+    context_->Mult(tmp, ct, down);
+    Ciphertext<word> out;
+    context_->Rescale(out, tmp);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    std::vector<Complex> got;
+    DecryptAndDecode(got, out);
+    double num = 0.0, den = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      num += got[i].real() * msg[i].real() + got[i].imag() * msg[i].imag();
+      den += msg[i].real() * msg[i].real() + msg[i].imag() * msg[i].imag();
+      absmax = std::max(absmax, std::abs(msg[i]));
+    }
+    const double fit = num / den;
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max({worst, std::abs(fit * msg[i].real() - got[i].real()),
+                        std::abs(fit * msg[i].imag() - got[i].imag())});
+    }
+    std::cout << "  up 2^" << shrink << " then back down: constant " << factor
+              << ", factor " << fit << ", residual "
+              << -std::log2(worst / (absmax * std::abs(fit))) << " bits"
+              << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 // WHERE CANONICALISATION'S TEN BITS GO.
 //
 // Measured, all at slack 8 on bootparam_35: Boot alone reaches 16.94 bits and
