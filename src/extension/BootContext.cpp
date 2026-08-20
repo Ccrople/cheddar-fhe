@@ -38,10 +38,17 @@ template <typename word>
 BootContext<word>::BootContext(const Parameter<word> &param,
                                const BootParameter &boot_param)
     : Base(param), boot_param_{boot_param} {
-  // Check if param and boot_param is consistent
+  // Check if param and boot_param is consistent.
+  //
+  // The invariant is on where EvalMod *ends*, not on where StC starts. Those
+  // are the same level exactly when there is no slack, which is every shipped
+  // preset, so this is the original check for all of them. With a slack gap
+  // StC is compiled below EvalMod's output on purpose ([SYLPH] figure 2 puts
+  // the non-linear operators in between), and pinning the check to StC would
+  // reject precisely the configuration the gap exists for.
   AssertTrue(
       param.max_level_ == boot_param.max_level_ &&
-          param.default_encryption_level_ == boot_param.GetStCStartLevel(),
+          param.default_encryption_level_ == boot_param.GetEvalModEndLevel(),
       "Parameter mismatch for BootContext");
 
   // At level 0, the scale is adjusted
