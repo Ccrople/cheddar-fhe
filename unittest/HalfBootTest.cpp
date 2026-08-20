@@ -76,6 +76,26 @@ TEST_P(Testbed32, HalfBootClosesTheRoundTrip) {
             << "GetStCStartLevel(), which is the default encryption level)"
             << std::endl;
 
+  // SlotToCoeff bakes stc_const_ into its transform, and inside Boot that is
+  // undone by scaleup_const_ and EvalMod. Standalone there is nothing in
+  // between, so the coefficients come out ~1e-7 of their intended size -- and
+  // EvalMod's precision is absolute, so shrinking the argument by 1e-7 is what
+  // turned a constant ratio into one with 18% spread. Restore the magnitude
+  // before the bootstrap rather than guess which constant it was.
+  std::cout << "GetStCConst " << boot->GetStCConst() << ", GetCtSConst "
+            << boot->GetCtSConst() << std::endl;
+  {
+    const int cl = param_->NPToLevel(coeff_ct.GetNP());
+    Constant<word> inv_stc;
+    context_->encoder_.EncodeConstant(inv_stc, cl, param_->GetScale(cl),
+                                      1.0 / boot->GetStCConst());
+    Ciphertext<word> scaled;
+    context_->Mult(scaled, coeff_ct, inv_stc);
+    context_->Rescale(coeff_ct, scaled);
+    std::cout << "compensated stc_const_, now at level "
+              << param_->NPToLevel(coeff_ct.GetNP()) << std::endl;
+  }
+
   Ciphertext<word> res;
   boot->HalfBoot(res, coeff_ct, interface_->GetEvkMap());
   cudaDeviceSynchronize();
