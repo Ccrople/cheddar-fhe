@@ -45,10 +45,18 @@ Parameter<word>::Parameter(
   word max_prime = 0;
   auto max_func = [](word a, word b) -> word { return Max<word>(a, b); };
 
-  std::accumulate(main_primes.cbegin(), main_primes.cend(), max_prime,
-                  max_func);
-  std::accumulate(aux_primes.cbegin(), aux_primes.cend(), max_prime, max_func);
-  std::accumulate(ter_primes.cbegin(), ter_primes.cend(), max_prime, max_func);
+  // std::accumulate returns the fold; it does not write through its seed. All
+  // three results used to be discarded, leaving max_prime at 0 and the assert
+  // below reading 0 < 2^31 -- so the word-size ceiling was enforced by nothing
+  // and a preset carrying an oversized prime would have been accepted here and
+  // failed somewhere far less obvious.
+  max_prime = std::accumulate(main_primes.cbegin(), main_primes.cend(),
+                              max_prime, max_func);
+  max_prime =
+      std::accumulate(aux_primes.cbegin(), aux_primes.cend(), max_prime,
+                      max_func);
+  max_prime = std::accumulate(ter_primes.cbegin(), ter_primes.cend(), max_prime,
+                              max_func);
   AssertTrue(max_prime < (((word)1) << (word_size_ * 8 - extra_bits_)),
              "Max prime is too large for the word size");
 
