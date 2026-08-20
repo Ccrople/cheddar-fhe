@@ -185,6 +185,35 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
       << "the block's ring and the switching ring disagree at the product "
          "level, so a ciphertext cannot cross";
 
+  // ...and they must agree on the SECRET, which is the half that has no
+  // structural check anywhere. One ciphertext encrypted on one and decrypted on
+  // the other says so in a millisecond; without it every failure downstream
+  // looks like a layout mistake.
+  {
+    std::vector<Complex> probe(num_slots);
+    for (int i = 0; i < num_slots; i++) {
+      probe[i] = Complex(0.5 - 1.0 * ((i * 7919) % 1000) / 1000.0, 0.0);
+    }
+    Plaintext<word> pt;
+    big.context->encoder_.Encode(pt, kProductLevel,
+                                 big.param->GetScale(kProductLevel), probe);
+    Ciphertext<word> ct;
+    big.ui->Encrypt(ct, pt);
+    Plaintext<word> back;
+    sw.ui->Decrypt(back, ct);
+    std::vector<Complex> got;
+    sw.context->encoder_.Decode(got, back);
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max(worst, std::abs(got[i] - probe[i]));
+    }
+    std::cout << "crossing block -> switching ring: max |diff| = " << worst
+              << std::endl;
+    ASSERT_LT(worst, 1e-3)
+        << "the two big Contexts do not share a secret, so nothing below this "
+           "means anything";
+  }
+
   auto boot = std::dynamic_pointer_cast<cheddar::BootContext<word>>(big.context);
   ASSERT_NE(boot, nullptr);
   boot->PrepareEvalSpecialFFT(num_slots);
@@ -270,12 +299,44 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
     boot->SlotToSinC(sinc, num_slots, b, big.ui->GetEvkMap());
     ASSERT_EQ(big.param->NPToLevel(sinc.GetNP()), kSinCLevel - kSinCPhases);
     big.context->LevelDown(q_operand[i], sinc, kProductLevel);
+    // LevelDown is five multiply-and-rescale steps and each one rounds, so
+    // the canonical value is met to about 3e-4 rather than exactly.
     EXPECT_NEAR(q_operand[i].GetScale() / big.param->GetScale(kProductLevel),
-                1.0, 1e-6)
+                1.0, 1e-3)
         << "the operand arrives at the product off the canonical scale";
   }
   ASSERT_EQ(big.param->LevelToNP(kProductLevel), q_operand[0].GetNP())
       << "the operand is not at the level the product expects";
+
+  // The transport, on its own, before the product runs on it. Splitting the
+  // two is worth a decryption: a layout mistake and a crossing mistake produce
+  // the same garbage at the end and have nothing in common as bugs.
+  {
+    double worst = 0.0, biggest = 0.0;
+    for (int i = 0; i < num_q_cts; i++) {
+      Plaintext<word> pt;
+      big.ui->Decrypt(pt, q_operand[i]);
+      std::vector<Complex> got;
+      big.context->encoder_.DecodeSinC(got, pt, kSubDegree);
+      for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
+      for (int head = 0; head < kLanes; head++) {
+        for (int query = 0; query < kTokens; query++) {
+          for (int c = 0; c < kHeadDim; c++) {
+            int ct, index;
+            layout.LocateSinC(BitRev(query, 7), BitRev(c, 7), head, ct, index);
+            if (ct != i) continue;
+            worst = std::max(worst,
+                             std::abs(got[index].real() -
+                                      at(q, head, query, c)));
+          }
+        }
+      }
+    }
+    std::cout << "Q operand after permute + SinC + LevelDown: max |diff| = "
+              << worst << ", |got| <= " << biggest << std::endl;
+    EXPECT_LT(worst, 1e-3)
+        << "the transport did not put Q where SwitchedCcmmLayout says it goes";
+  }
 
   // ---- K, encoded on the host in the layout the product wants -----------
   //
@@ -304,11 +365,9 @@ TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
 
   // Q must have landed on the same scale K was encoded at, or the product's
   // rescale does not return to the canonical level-0 value.
-  EXPECT_NEAR(q_operand[0].GetScale() / product_scale, 1.0, 1e-6);
+  EXPECT_NEAR(q_operand[0].GetScale() / product_scale, 1.0, 1e-3);
 
   // ---- the product ------------------------------------------------------
-  big.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
-                               kProductLevel);
   // The switching key has to live on the switching Context, whose alpha is 1;
   // the block's own alpha is 12 and a key published at that PQ would not fit
   // the small ring's budget at all. Same secret, different ring.
