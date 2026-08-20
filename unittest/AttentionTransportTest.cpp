@@ -107,11 +107,17 @@ constexpr int kLanes = 16;      // heads per CC-MM call
 constexpr int kSubDegree = 32;  // k: 4096/32 = 128 wide, 16 lanes
 
 // Where the transforms are compiled. The permutation takes two levels and the
-// SinC transform three, and the floor for any of them is 7.
-constexpr int kPermuteLevel = 11;
-constexpr int kSinCLevel = 9;
+// SinC transform three, and every standalone LinearTransform has a floor
+// somewhere -- SlotPermuteTest put it at 7 on bootparam_35. Both are settable
+// from the environment because finding that floor on a new ladder is a sweep,
+// not a derivation.
 constexpr int kSinCPhases = 3;
 constexpr int kProductLevel = 1;
+
+int EnvInt(const char *name, int fallback) {
+  const char *e = std::getenv(name);
+  return (e != nullptr && e[0] != 0) ? std::atoi(e) : fallback;
+}
 
 int BitRev(int v, int bits) {
   int r = 0;
@@ -157,6 +163,12 @@ struct BlockPacking {
 }  // namespace
 
 TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
+  const int kSinCLevel = EnvInt("CHEDDAR_SINC_LEVEL", 9);
+  const int kPermuteLevel = EnvInt("CHEDDAR_PERMUTE_LEVEL", kSinCLevel + 2);
+  std::cout << "permute at " << kPermuteLevel << "/" << kPermuteLevel - 1
+            << ", SinC at " << kSinCLevel << ".." << kSinCLevel - kSinCPhases + 1
+            << ", product at " << kProductLevel << std::endl;
+
   // ---- the three rings, and one secret between the two big ones ----------
   Ring big(Env("CHEDDAR_BLOCK_PARAM", "sylphflow16_35.json"), {}, 8);
   Ring sw(Env("CHEDDAR_SWITCH_PARAM", "ringswitch16_35.json"),
