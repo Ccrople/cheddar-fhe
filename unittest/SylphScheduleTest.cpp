@@ -327,22 +327,55 @@ TEST_P(CycleTestbed, WhereCanonicalisationCosts) {
     context_->Mult(res, x, c);
   };
 
+  // TWO NUMBERS, NOT ONE, and the distinction is the whole point.
+  //
+  // A wrong declared scale and a lost bit are both "the answer differs from
+  // Boot", and the first bisection could not tell them apart -- which is why
+  // its control came back at 11.82 against SlackScheduleTest's 15.86 for what
+  // should be the same computation. The difference is that SlackScheduleTest
+  // ends with `got.SetScale(want.GetScale())`, copying Boot's declared scale
+  // outright and so erasing any factor before it measures anything.
+  //
+  // So: fit the best single scalar first (least squares over every slot), then
+  // report the residual around it. The fitted factor is bookkeeping and costs
+  // nothing that a SetScale cannot repair; the residual is precision and is
+  // gone for good.
   auto report = [&](const char *name, const Ciphertext<word> &got) {
     std::vector<Complex> b;
     DecryptAndDecode(b, got);
-    double worst = 0.0, absmax = 0.0;
+    double num = 0.0, den = 0.0, absmax = 0.0;
     for (int i = 0; i < num_slots; i++) {
-      worst = std::max({worst, std::abs(a[i].real() - b[i].real()),
-                        std::abs(a[i].imag() - b[i].imag())});
+      num += b[i].real() * a[i].real() + b[i].imag() * a[i].imag();
+      den += a[i].real() * a[i].real() + a[i].imag() * a[i].imag();
       absmax = std::max(absmax, std::abs(a[i]));
     }
-    std::cout << "  " << name << ": " << -std::log2(worst / absmax)
-              << " bits vs Boot" << std::endl;
-    return -std::log2(worst / absmax);
+    const double fit = num / den;
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max({worst, std::abs(fit * a[i].real() - b[i].real()),
+                        std::abs(fit * a[i].imag() - b[i].imag())});
+    }
+    const double bits = -std::log2(worst / (absmax * std::abs(fit)));
+    std::cout << "  " << name << ": factor " << fit << " (1 - factor = "
+              << (1.0 - fit) << "), residual " << bits << " bits" << std::endl;
+    return bits;
   };
 
   Ciphertext<word> landed;
   sched.ToSlot(landed, ct, interface_->GetEvkMap());
+
+  // Before any variant: what did HalfBoot deliver, and what does Canonicalise
+  // do to it on its own? These are one operation apart, so if the round trip
+  // is lossy it shows here with nothing else in the picture. The comparison is
+  // against Boot's slot values, which differ from HalfBoot's by StC's
+  // compensation -- a constant, which is exactly what the fitted factor
+  // absorbs.
+  report("HalfBoot output", landed);
+  {
+    Ciphertext<word> canon_only;
+    sched.Canonicalise(canon_only, landed);
+    report("after Canonicalise alone", canon_only);
+  }
 
   // A -- control. Never leaves EvalMod's end scale.
   double bits_a = 0.0;
