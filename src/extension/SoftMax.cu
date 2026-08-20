@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 
 #include "common/Assert.h"
@@ -42,7 +43,8 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
                                      const std::vector<double> &norm_lo,
                                      const std::vector<double> &norm_hi,
                                      int exp_degree, int inv_sqrt_degree,
-                                     int early_inv_sqrt_degree, bool boot_aux)
+                                     int early_inv_sqrt_degree, bool boot_aux,
+                                     int aux_return_level, double aux_boot_max)
     : context_{std::move(context)},
       num_keys_{num_keys},
       range_{range},
@@ -50,7 +52,9 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
       num_iters_{num_iters},
       norm_lo_{norm_lo},
       norm_hi_{norm_hi},
-      boot_aux_{boot_aux} {
+      boot_aux_{boot_aux},
+      aux_return_level_{aux_return_level},
+      aux_in_level_{-1} {
   AssertTrue(num_keys_ > 1 && (num_keys_ & (num_keys_ - 1)) == 0,
              "SoftMax: num_keys must be a power of two");
   AssertTrue(range_ > 0.0, "SoftMax: range must be positive");
@@ -109,14 +113,25 @@ SoftMaxHandler<word>::SoftMaxHandler(ConstContextPtr<word> context,
   int level = exp_out - 1;  // the causal mask multiply
   for (int j = 0; j < num_iters_; j++) {
     const int norm_level = level - 1;   // square for ||y||^2
-    const int poly_in = norm_level - 1; // constant multiply for the affine map
+    const int affine_out = norm_level - 1;  // the affine map's constant multiply
+    // With a hook the polynomial is compiled where the hook returns, not where
+    // the affine map leaves off -- that is the whole point of the hook, and
+    // getting it wrong is not an approximation error but an EvalPoly assert.
+    const int poly_in =
+        (aux_return_level_ >= 0) ? aux_return_level_ : affine_out;
+    if (j == 0) aux_in_level_ = affine_out;
+    // ||y||^2 / a reaches 2 hi / (hi - lo). The hook cannot carry that, so the
+    // affine multiply divides by an extra constant and the hook multiplies it
+    // back -- both halves ride multiplies that are already there.
+    const double a = 0.5 * (norm_hi_[j] - norm_lo_[j]);
+    aux_shrink_.push_back((norm_hi_[j] / a) / aux_boot_max);
     const int degree =
         (j + 1 == num_iters_) ? inv_sqrt_degree : early_inv_sqrt_degree;
     inv_sqrt_.push_back(
         MakeInvSqrt(norm_lo_[j], norm_hi_[j], degree, poly_in));
     int used = 0;
     while ((1 << used) < degree + 1) used++;
-    if (boot_aux_) {
+    if (aux_return_level_ >= 0 || boot_aux_) {
       // The normalisation comes back at the bootstrap's landing level and is
       // brought down to the main track, so the auxiliary depth never lands
       // here: the main track pays only the multiply and the square. This is
@@ -192,10 +207,14 @@ template <typename word>
 void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
                                  const std::vector<Complex> &causal_mask,
                                  const EvkMap<word> &evk_map,
-                                 const BootContext<word> *boot_context) const {
+                                 const BootContext<word> *boot_context,
+                                 const AuxBoot *aux_boot) const {
   AssertTrue(static_cast<int>(causal_mask.size()) == num_slots_,
              "SoftMax: the mask must cover every slot");
-  AssertTrue(!boot_aux_ || boot_context != nullptr,
+  AssertTrue(aux_return_level_ < 0 || aux_boot != nullptr,
+             "SoftMax: an auxiliary return level was configured, so Apply "
+             "needs the hook that returns there");
+  AssertTrue(aux_return_level_ >= 0 || !boot_aux_ || boot_context != nullptr,
              "SoftMax: boot_aux was requested, so Apply needs a BootContext");
   const auto &mult_key = evk_map.GetMultiplicationKey();
 
@@ -232,12 +251,28 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     //    level this costs.
     const double a = 0.5 * (norm_hi_[j] - norm_lo_[j]);
     const double b = 0.5 * (norm_hi_[j] + norm_lo_[j]);
+    const double shrink = (aux_boot != nullptr) ? aux_shrink_[j] : 1.0;
     const int sq_level = context_->param_.NPToLevel(sq.GetNP());
     Constant<word> inv_a;
-    context_->encoder_.EncodeConstant(
-        inv_a, sq_level, context_->param_.GetScale(sq_level), 1.0 / a);
+    context_->encoder_.EncodeConstant(inv_a, sq_level,
+                                      context_->param_.GetScale(sq_level),
+                                      1.0 / (a * shrink));
     context_->Mult(scaled, sq, inv_a);
     context_->Rescale(sq, scaled);
+
+    // 4b. The auxiliary bootstrap, if the caller supplied one. It goes here
+    //     and not after the polynomial, because this is the only point in the
+    //     iteration that lands on the schedule's StC level -- the header says
+    //     why that is forced rather than chosen. The shift below is applied
+    //     after, at whatever level the hook returns.
+    if (aux_boot != nullptr) {
+      Ct fresh;
+      (*aux_boot)(fresh, sq, shrink);
+      AssertTrue(context_->param_.NPToLevel(fresh.GetNP()) == aux_return_level_,
+                 "SoftMax: the auxiliary hook did not return at the level the "
+                 "inverse square root was compiled for");
+      context_->Copy(sq, fresh);
+    }
 
     const int v_level = context_->param_.NPToLevel(sq.GetNP());
     Constant<word> shift;
@@ -255,7 +290,7 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
     //    [-1, 1] that CKKS bootstrapping needs -- [SYLPH] section 3.1.3's 1/B
     //    pre-scaling is unnecessary here. The main track then never sees the
     //    auxiliary depth.
-    if (boot_aux_) {
+    if (boot_aux_ && aux_boot == nullptr) {
       const int y_level = context_->param_.NPToLevel(y.GetNP());
       Ct boosted;
       boot_context->Boot(boosted, r, evk_map);
@@ -268,9 +303,20 @@ void SoftMaxHandler<word>::Apply(Ct &res, const Ct &x_scaled,
 
     // 7. y <- (y * r)^2. Now sum(y) = 1 for the last iteration, with no
     //    further normalisation needed.
+    //
+    // Which of the two is higher depends on where the auxiliary track came
+    // back. With `boot_aux` the normalisation is brought down to the main
+    // track above; with the hook it returns at the operator's own level and
+    // the polynomial leaves it *above* the main track, because the main track
+    // has been sitting still since the causal mask. So meet at whichever is
+    // lower rather than assuming.
     const int r_level = context_->param_.NPToLevel(r.GetNP());
-    Ct levelled;
-    context_->LevelDown(levelled, y, r_level);
+    const int main_level = context_->param_.NPToLevel(y.GetNP());
+    const int meet = std::min(r_level, main_level);
+    Ct levelled, levelled_r;
+    context_->LevelDown(levelled, y, meet);
+    context_->LevelDown(levelled_r, r, meet);
+    context_->Copy(r, levelled_r);
     context_->HMult(y, levelled, r, mult_key);
     context_->HMult(sq, y, y, mult_key);
     context_->Copy(y, sq);

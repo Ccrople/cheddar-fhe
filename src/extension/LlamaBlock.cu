@@ -50,11 +50,25 @@ LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
   rope_ = std::make_unique<RoPeHandler<word>>(boot_, cfg_.num_tokens,
                                               cfg_.head_dim, op_level,
                                               cfg_.rope_theta);
+  // The auxiliary track goes round this cycle, not through `Boot`. `Boot`
+  // lands at GetEndLevel(), which the slack pushes below the main track, so
+  // SoftMax's own boot_aux asserts on any set that reserves slack -- which is
+  // every set this schedule runs on. The hook below is StC, HalfBoot and
+  // Canonicalise, which is one whole turn of the cycle taken by a value that
+  // is not the main track.
   softmax_ = std::make_unique<SoftMaxHandler<word>>(
       boot_, cfg_.num_tokens, cal_.softmax_range, op_level, cal_.softmax_iters,
       cal_.softmax_norm_lo, cal_.softmax_norm_hi, cal_.softmax_exp_degree,
       cal_.softmax_inv_sqrt_degree, cal_.softmax_early_inv_sqrt_degree,
-      /*boot_aux=*/true);
+      /*boot_aux=*/false, /*aux_return_level=*/op_level,
+      /*aux_boot_max=*/cal_.boot_max);
+  AssertTrue(softmax_->GetAuxCallLevel() == sched_->GetStCLevel(),
+             "LlamaBlock: SoftMax's auxiliary value lands on level " +
+                 std::to_string(softmax_->GetAuxCallLevel()) +
+                 " but StC is compiled at " +
+                 std::to_string(sched_->GetStCLevel()) +
+                 ", so the cycle cannot pick it up. The exponential's degree "
+                 "and the number of iterations set that level.");
   silu_ = std::make_unique<SiLuHandler<word>>(boot_, cal_.silu_range, op_level,
                                               cal_.silu_degree);
 }
@@ -130,9 +144,13 @@ std::string LlamaBlock<word>::DescribePlan() const {
   const int ffn = NumCiphertexts(cfg_.hidden);
   const int scores = (cfg_.num_channels / cfg_.head_dim) * cfg_.num_tokens *
                      cfg_.num_tokens / num_slots_;
+  // Turn C bootstraps three things: the scores on the way in, V which was
+  // produced two turns ago, and SoftMax's own auxiliary track, which takes a
+  // whole turn of the cycle inside the operator.
   os << "bootstraps: A " << h << ", B " << (h + kv) << ", C "
-     << (scores + kv) << ", D " << h << ", E " << h << ", F " << (2 * ffn)
-     << " = " << (h + h + kv + scores + kv + h + h + 2 * ffn) << " per block"
+     << (2 * scores + kv) << " (" << scores << " aux), D " << h << ", E " << h
+     << ", F " << (2 * ffn) << " = "
+     << (h + h + kv + 2 * scores + kv + h + h + 2 * ffn) << " per block"
      << std::endl;
   return os.str();
 }
@@ -260,10 +278,17 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   Lift(score_slots, scores, 2.0 / cal_.size_scores, evk_map, /*shift=*/1.0);
   AssertTrue(causal_mask.size() == score_slots.size(),
              "LlamaBlock: one causal mask per score ciphertext is required");
+  typename SoftMaxHandler<word>::AuxBoot aux =
+      [this, &evk_map](Ct &out, const Ct &in, double magnitude) {
+        Ct coeff, landed;
+        sched_->ToCoeff(coeff, in, evk_map);
+        sched_->ToSlot(landed, coeff, evk_map);
+        sched_->Canonicalise(out, landed, magnitude);
+      };
   std::vector<Ct> probs(score_slots.size());
   for (size_t i = 0; i < score_slots.size(); i++) {
-    softmax_->Apply(probs[i], score_slots[i], causal_mask[i], evk_map,
-                    boot_.get());
+    softmax_->Apply(probs[i], score_slots[i], causal_mask[i], evk_map, nullptr,
+                    &aux);
   }
   std::vector<Ct> prob_coeff;
   Lower(prob_coeff, probs, evk_map);

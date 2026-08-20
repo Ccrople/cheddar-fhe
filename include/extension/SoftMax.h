@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -66,12 +67,40 @@ namespace cheddar {
  * track is **7**, one better than [SYLPH]'s 8 because k=1 needs one
  * normalisation rather than two.
  *
- * An ordinary `Boot()` suffices, which was not obvious. CKKS bootstrapping
- * needs its input inside [-1, 1] and [SYLPH] section 3.1.3 scales ciphertexts
- * by 1/B with B = 128 to guarantee it. Here no scaling is needed: the
- * normalisation is `1 / ||y||_2` with `||y||_2^2` calibrated to [1.54, 6.82],
- * so it lies in [0.38, 0.81] already. Pass a BootContext to Apply and the main
- * track stays at 7.
+ * An ordinary `Boot()` suffices **only when the parameter set has no slack**,
+ * and that turns out to be the binding constraint rather than the range. It is
+ * worth being precise about why, because the two placements look
+ * interchangeable and are not.
+ *
+ * `Boot` lands at `GetEndLevel()`, which a [SYLPH] schedule pushes down by
+ * exactly the slack it reserves for the slot leg: on `bootparam_35` with slack
+ * 8 it is level 8, against 16 with no slack. Bootstrapping `r` -- the output
+ * of the inverse square root, as `boot_aux` does -- needs the result to come
+ * back **at or above the main track**, and the main track is at 13 there. So
+ * `boot_aux` asserts on any set that reserves slack, which is every set this
+ * cycle runs on.
+ *
+ * Moving the bootstrap one step earlier settles it, and the step is forced.
+ * The auxiliary value that *can* be bootstrapped by the cycle rather than by
+ * `Boot` is the affine map's output, because that is the only point in the
+ * iteration that lands on `GetStCLevel()` -- exp (4) + mask (1) + the norm
+ * square (1) + the affine multiply (1) is 7 below the operator's level, which
+ * is the slack. `SylphSchedule::ToCoeff` needs its input there and nowhere
+ * else, so the placement is not a choice.
+ *
+ * That is what `AuxBoot` is: a hook the caller fills with its own
+ * StC-bootstrap-canonicalise, applied to the affine map's output. The
+ * normalisation then comes back fresh at the operator's own level, the
+ * polynomial is compiled there, and the main track pays only the multiply and
+ * the square -- the same 7 levels `boot_aux` was for.
+ *
+ * The hook is handed a `magnitude` because the two ends want opposite things
+ * again. `||y||_2^2 / a` reaches `2 hi / (hi - lo)`, which for the calibrated
+ * [1.54, 6.82] is 2.58 and is well outside what a bootstrap carries; the
+ * handler therefore divides by an extra constant on the way in -- free, it
+ * rides the affine multiply that is already there -- and tells the hook what
+ * to multiply back. `SylphSchedule::Canonicalise` takes exactly that argument
+ * and is also already being paid for.
  *
  * What remains unimplemented is section 3.4's *slim* evaluation. The
  * normalisation is one value per row, so it belongs in a sparsely-packed
@@ -106,6 +135,9 @@ class SoftMaxHandler {
   std::vector<double> norm_lo_, norm_hi_;
 
   bool boot_aux_;
+  int aux_return_level_;
+  int aux_in_level_;
+  std::vector<double> aux_shrink_;
   int exp_out_level_;
   std::unique_ptr<EvalPoly<word>> exp_poly_;
   std::vector<std::unique_ptr<EvalPoly<word>>> inv_sqrt_;
@@ -145,16 +177,34 @@ class SoftMaxHandler {
    * @param early_inv_sqrt_degree degree of every inverse square root but the
    * last, which only has to keep the magnitudes in range
    * @param boot_aux bootstrap the normalisation before it meets the main
-   * track, as [SYLPH] figure 2 does. This changes the level each polynomial is
-   * compiled at, so it is fixed here rather than per call, and Apply then
-   * requires a BootContext.
+   * track, as [SYLPH] figure 2 does, using an ordinary `Boot`. This changes
+   * the level each polynomial is compiled at, so it is fixed here rather than
+   * per call, and Apply then requires a BootContext. **Only usable on a
+   * parameter set with no slack** -- see the header.
+   * @param aux_return_level the level an `AuxBoot` hook returns the auxiliary
+   * value at, or -1 for no hook. Supplying it selects the hook over
+   * `boot_aux`, which it supersedes on any set that reserves slack.
+   * @param aux_boot_max the magnitude the hook is expected to be able to
+   * carry, which sets the constant the handler divides by before calling it
    */
   SoftMaxHandler(ConstContextPtr<word> context, int num_keys, double range,
                  int input_level, int num_iters,
                  const std::vector<double> &norm_lo,
                  const std::vector<double> &norm_hi, int exp_degree,
                  int inv_sqrt_degree, int early_inv_sqrt_degree = 4,
-                 bool boot_aux = false);
+                 bool boot_aux = false, int aux_return_level = -1,
+                 double aux_boot_max = 0.5);
+
+  /**
+   * @brief The caller's bootstrap for the auxiliary track.
+   *
+   * `res` must come back slot-encoded at `aux_return_level`, on that level's
+   * canonical scale, carrying `magnitude` times the message it was given.
+   */
+  using AuxBoot = std::function<void(Ct &res, const Ct &x, double magnitude)>;
+
+  /** @brief The level the hook will be called at, so a caller can check it. */
+  int GetAuxCallLevel() const { return aux_in_level_; }
 
   // disable copying (or moving also)
   SoftMaxHandler(const SoftMaxHandler &) = delete;
@@ -193,7 +243,8 @@ class SoftMaxHandler {
   void Apply(Ct &res, const Ct &x_scaled,
              const std::vector<Complex> &causal_mask,
              const EvkMap<word> &evk_map,
-             const BootContext<word> *boot_context = nullptr) const;
+             const BootContext<word> *boot_context = nullptr,
+             const AuxBoot *aux_boot = nullptr) const;
 
   /**
    * @brief Levels the main track spends, which is what a level budget counts.
