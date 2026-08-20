@@ -45,12 +45,20 @@ namespace cheddar {
  *    transpose -- has `2^(a+b)` offsets at stride 1, so 2048 for `[4 | 7]`,
  *    BSGS 64x32, about 95 rotations.
  *
- * Both are one level. What makes the second one affordable at all is
- * `pre_rotation`: the raw offsets straddle zero, so reduced mod the slot count
- * they span almost the whole ring and `LinearTransform::DetermineStride` would
- * demand `bs * gs >= num_slots`. Rotating the window so it starts just after
- * the largest circular gap in the offset set collapses that to the true
- * spread. This class finds that rotation itself rather than being told it.
+ * Both are one level. What makes the second one affordable is a window shift:
+ * the raw offsets straddle zero, so reduced mod the slot count they span
+ * almost the whole ring and `LinearTransform::DetermineStride` would demand
+ * `bs * gs >= num_slots`. Building the matrix for the permutation composed
+ * with a rotation, and undoing that rotation afterwards with one `HRot`,
+ * collapses it to the true spread. This class finds the rotation itself, and
+ * takes it only when it wins -- a shift can destroy a common stride, and the
+ * transpose above would rather keep its 127.
+ *
+ * It is deliberately **not** `LinearTransform::pre_rotation`. That parameter
+ * reduces the offsets and then rotates by the reduced amount, so it assumes
+ * the input already arrives rotated -- free inside `EvalSpecialFFT`, where the
+ * previous phase produced exactly that rotation, and garbage for a standalone
+ * transform. Measured, not assumed.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -79,8 +87,10 @@ class SlotPermute {
   int GetNumDiagonals() const { return num_diag_; }
   int GetBS() const { return bs_; }
   int GetGS() const { return gs_; }
-  /// The window rotation chosen so the offsets do not straddle zero.
-  int GetPreRotation() const { return pre_rotation_; }
+  /// The window rotation chosen so the offsets do not straddle zero, undone
+  /// afterwards with one HRot. Zero when the raw offsets are already tight --
+  /// which is the case whenever they share a large stride.
+  int GetShift() const { return shift_; }
   /// The common stride of the offsets after `pre_rotation`.
   int GetStride() const { return stride_; }
 
@@ -91,10 +101,11 @@ class SlotPermute {
 
  private:
   int num_slots_;
+  int level_;
   int num_diag_ = 0;
   int bs_ = 1;
   int gs_ = 1;
-  int pre_rotation_ = 0;
+  int shift_ = 0;
   int stride_ = 1;
   std::vector<LinearTransform<word>> lt_;
 };

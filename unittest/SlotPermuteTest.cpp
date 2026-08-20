@@ -23,7 +23,7 @@
 // WHAT THIS TEST PINS. The permutation entrywise -- a norm check passes for
 // any permutation at all -- plus the level and scale contract, plus the
 // diagonal/stride/BSGS numbers the header claims. It also prints the error
-// against the answer shifted by +-pre_rotation, so a convention mismatch in
+// against the answer shifted by +-shift, so a convention mismatch in
 // LinearTransform's window handling reports itself as a number rather than as
 // a mysterious failure.
 
@@ -100,8 +100,8 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
     cheddar::SlotPermute<word> perm(context_, c.perm, level);
     std::cout << "  " << c.name << ": " << perm.GetNumDiagonals()
               << " diagonals, stride " << perm.GetStride() << ", BSGS "
-              << perm.GetBS() << "x" << perm.GetGS() << ", pre_rotation "
-              << perm.GetPreRotation() << std::endl;
+              << perm.GetBS() << "x" << perm.GetGS() << ", shift "
+              << perm.GetShift() << std::endl;
 
     EvkRequest req;
     perm.AddRequiredRotations(req);
@@ -123,13 +123,13 @@ TEST_P(SlotPermuteFixture, PermutesTheSlotsExactly) {
     DecryptAndDecode(got, out);
 
     const double exact = MaxDiff(got, msg, c.perm, 0);
-    const double plus = MaxDiff(got, msg, c.perm, perm.GetPreRotation());
-    const double minus = MaxDiff(got, msg, c.perm, -perm.GetPreRotation());
-    std::cout << "     max |diff|: exact " << exact << ", shifted +pre "
-              << plus << ", shifted -pre " << minus << std::endl;
+    const double plus = MaxDiff(got, msg, c.perm, perm.GetShift());
+    const double minus = MaxDiff(got, msg, c.perm, -perm.GetShift());
+    std::cout << "     max |diff|: exact " << exact << ", shifted +s "
+              << plus << ", shifted -s " << minus << std::endl;
 
     EXPECT_LT(exact, 1e-4)
-        << c.name << " did not land where it was asked to (shifted +pre "
-        << plus << ", -pre " << minus << ")";
+        << c.name << " did not land where it was asked to (shifted +s "
+        << plus << ", -s " << minus << ")";
   }
 }
