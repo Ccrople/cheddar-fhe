@@ -129,9 +129,19 @@ class EvalSpecialFFT {
    *        (`num_stc_levels_`, three on every logN=16 preset), and it is
    *        level-neutral in the pipeline, because a tensor bound for the
    *        product pays this *instead of* SlotToCoeff rather than on top of it.
+   * @param stc_out_scale the scale the forward's output should carry, or 0 to
+   *        leave the input's alone. A grafted ladder does not hold one scale at
+   *        every level -- sylphflow16_35 is 2^35 from level 3 up and 2^29.88 at
+   *        level 1, where the product runs -- so an operand that reaches the
+   *        product by `LevelDown` arrives five bits off the value that ring
+   *        defines, silently, until `EvalPoly` aborts two turns later.
+   *        Encoding the last phase's diagonals at a different scale fixes it
+   *        for nothing. The input is assumed to arrive at
+   *        `GetScale(stc_level)`, which is what every other phase preserves.
    */
   void PrepareSinC(ConstContextPtr<word> context, int sub_degree,
-                   int stc_level, int cts_level, int num_phases = 1);
+                   int stc_level, int cts_level, int num_phases = 1,
+                   double stc_out_scale = 0.0);
 
   /// How many levels a conversion spends: one per phase.
   int GetSinCNumPhases() const { return static_cast<int>(sinc_stc_.size()); }

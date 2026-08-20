@@ -20,6 +20,10 @@
 
 #include "UserInterface.h"
 
+#ifdef ENABLE_EXTENSION
+#include "extension/BootContext.h"
+#endif
+
 namespace ringfixture {
 
 template <typename word>
@@ -33,7 +37,20 @@ struct Ring {
   cheddar::ContextPtr<word> context;
   std::unique_ptr<cheddar::UserInterface<word>> ui;
 
-  explicit Ring(const std::string &file) {
+  /**
+   * @param file the parameter JSON
+   * @param secret_coeffs an already-sampled secret to adopt, or empty to
+   *        sample one. [SYLPH]'s ladder is three Contexts deep and a
+   *        ciphertext walks down it unchanged, so the switching Context has to
+   *        hold the block's secret rather than one of its own -- its switching
+   *        key is a key switch off that secret. See
+   *        `UserInterface(context, secret_coeffs)`.
+   * @param boot_slack_levels levels the schedule reserves below the bootstrap;
+   *        only read when the JSON says `boot: true`
+   */
+  explicit Ring(const std::string &file,
+                const std::vector<int> &secret_coeffs = {},
+                int boot_slack_levels = 0) {
     std::ifstream f(std::string(PARAM_DIR) + "/" + file);
     if (!f) throw std::runtime_error("cannot open " + file);
     json j = json::parse(f);
@@ -67,8 +84,26 @@ struct Ring {
     if (j.contains("sparse_hamming_weight")) {
       param->SetSparseHammingWeight(int(j["sparse_hamming_weight"]));
     }
+#ifdef ENABLE_EXTENSION
+    const bool enable_boot = j.contains("boot") && bool(j["boot"]);
+    if (enable_boot) {
+      context = cheddar::BootContext<word>::Create(
+          *param, cheddar::BootParameter(param->max_level_,
+                                         int(j["num_cts_levels"]),
+                                         int(j["num_stc_levels"]), 5,
+                                         boot_slack_levels));
+    } else {
+      context = cheddar::Context<word>::Create(*param);
+    }
+#else
     context = cheddar::Context<word>::Create(*param);
-    ui = std::make_unique<cheddar::UserInterface<word>>(context);
+#endif
+    if (secret_coeffs.empty()) {
+      ui = std::make_unique<cheddar::UserInterface<word>>(context);
+    } else {
+      ui = std::make_unique<cheddar::UserInterface<word>>(context,
+                                                          secret_coeffs);
+    }
   }
 
   int Degree() const { return 1 << log_degree; }

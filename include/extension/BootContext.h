@@ -198,7 +198,8 @@ class BootContext : public Context<word>,
    * `PrepareEvalSpecialFFT(num_slots)` must have run first.
    */
   void PrepareSinC(int num_slots, int sub_degree, int stc_level,
-                   int cts_level, int num_phases = 1);
+                   int cts_level, int num_phases = 1,
+                   double stc_out_scale = 0.0);
   /// Levels a conversion spends, one per phase.
   int GetSinCNumPhases(int num_slots) const;
   void AddRequiredSinCRotations(EvkRequest &req, int num_slots) const;

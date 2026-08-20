@@ -314,11 +314,11 @@ void BootContext<word>::SlotToCoeff(Ct &res, int num_slots, const Ct &input,
 template <typename word>
 void BootContext<word>::PrepareSinC(int num_slots, int sub_degree,
                                     int stc_level, int cts_level,
-                                    int num_phases) {
+                                    int num_phases, double stc_out_scale) {
   AssertTrue(eval_fft_.count(num_slots) != 0,
              "PrepareSinC: call PrepareEvalSpecialFFT first");
   eval_fft_.at(num_slots).PrepareSinC(GetContext(), sub_degree, stc_level,
-                                      cts_level, num_phases);
+                                      cts_level, num_phases, stc_out_scale);
 }
 
 template <typename word>

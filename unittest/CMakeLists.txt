@@ -123,6 +123,16 @@ target_link_libraries(switched_ccmm_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
 if (ENABLE_EXTENSION)
+  # The block's packing all the way into a score product: SlotPermute, then
+  # SlotToSinC, then the switched CC-MM. Three Contexts and one secret between
+  # the two big ones, so it is its own binary and needs the extension for
+  # BootContext and SlotPermute.
+  add_executable(attention_transport_test AttentionTransportTest.cpp)
+  target_link_libraries(attention_transport_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+endif()
+
+if (ENABLE_EXTENSION)
   # A Llama-3 projection, encrypted, in the block's own packing on
   # bootparam_35, with no ring switch. ModDecomp isolates the channel axis
   # because the block's slot layout bit-reverses the channel into the low
