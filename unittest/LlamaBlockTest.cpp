@@ -66,6 +66,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1503,8 +1504,12 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
     // time rather than a sum of drained steps. With CHEDDAR_PROFILE_NOSYNC it
     // is the layer's actual latency; without, it is that plus the host/device
     // overlap the per-step syncs threw away.
-    std::cout << "  one decoder block, wall clock: " << std::fixed
-              << std::setprecision(1) << elapsed.count() * 1e3 << " ms"
+    // Formatted into a string rather than onto std::cout: `std::fixed` and
+    // `setprecision` are sticky stream state, and leaking them here rounds the
+    // accuracy ledger printed below to one decimal.
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(1) << elapsed.count() * 1e3;
+    std::cout << "  one decoder block, wall clock: " << line.str() << " ms"
               << (cheddar::Profile::Timing()
                       ? "  (per-step syncs ON -- an upper bound)"
                       : "  (per-step syncs off)")

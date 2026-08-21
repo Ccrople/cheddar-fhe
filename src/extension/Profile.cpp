@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 
 namespace cheddar {
 
@@ -49,24 +50,31 @@ void Profile::Report(const char *title) {
     width = std::max(width, e.label.size());
   }
 
-  // The steps nest -- turn A contains its projections -- so the column does
-  // not sum to the total and is not presented as if it did. Each row is
-  // against the whole, which is what "where does the time go" asks.
-  std::cout << "\n" << title << " (host wall time, device synchronised at "
-            << "every step boundary, so each row includes its own drain)\n";
-  std::cout << std::string(width + 34, '-') << "\n";
+  // Formatted into a buffer and written in one go, because `std::fixed` and
+  // `setprecision` are sticky stream state: setting them on std::cout here
+  // silently reformats whatever the caller prints next, and what the caller
+  // prints next is an accuracy ledger.
+  //
+  // The rows partition the layer -- `ProfileScope` marks leaf steps only, and
+  // anything nested inside one gets `NvtxScope`, which does not time -- so the
+  // sum is the layer and the percentage column is against it.
+  std::ostringstream out;
+  out << "\n"
+      << title << " (host wall time, device synchronised at every step "
+      << "boundary, so each row includes its own drain)\n";
+  out << std::string(width + 34, '-') << "\n";
   for (const auto &e : entries) {
-    std::cout << "  " << std::left << std::setw(static_cast<int>(width))
-              << e.label << std::right << std::fixed << std::setprecision(1)
-              << std::setw(10) << e.seconds * 1e3 << " ms" << std::setw(6)
-              << e.count << "x" << std::setw(8) << std::setprecision(2)
-              << (total > 0.0 ? 100.0 * e.seconds / total : 0.0) << "%\n";
+    out << "  " << std::left << std::setw(static_cast<int>(width)) << e.label
+        << std::right << std::fixed << std::setprecision(1) << std::setw(10)
+        << e.seconds * 1e3 << " ms" << std::setw(6) << e.count << "x"
+        << std::setw(8) << std::setprecision(2)
+        << (total > 0.0 ? 100.0 * e.seconds / total : 0.0) << "%\n";
   }
-  std::cout << std::string(width + 34, '-') << "\n";
-  std::cout << "  " << std::left << std::setw(static_cast<int>(width))
-            << "sum of the rows above" << std::right << std::fixed
-            << std::setprecision(1) << std::setw(10) << total * 1e3 << " ms\n"
-            << std::flush;
+  out << std::string(width + 34, '-') << "\n";
+  out << "  " << std::left << std::setw(static_cast<int>(width))
+      << "sum of the rows above" << std::right << std::fixed
+      << std::setprecision(1) << std::setw(10) << total * 1e3 << " ms\n";
+  std::cout << out.str() << std::flush;
 }
 
 }  // namespace cheddar
