@@ -185,7 +185,7 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
   cfg.sinc_level = kSinCLevel;
   cfg.prefix_level = boot->GetBootParameter().GetEvalModEndLevel();
   cfg.halfboot_scale = boot->GetStCInputScale();
-  cfg.verbose = true;
+  cfg.verbose = EnvInt("CHEDDAR_VERBOSE", 0) != 0;
   std::cout << "swap at " << cfg.swap_level << "/" << cfg.swap_level - 1
             << ", exchange at " << cfg.swap_level - 2 << ", SinC at "
             << kSinCLevel << ".." << kSinCLevel - kPhases + 1 << ", product at "
