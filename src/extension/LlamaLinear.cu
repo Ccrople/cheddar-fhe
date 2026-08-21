@@ -241,7 +241,7 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
   // tile inside the loop, which is what the layer used to do on every call.
   const Operands *cached = nullptr;
   if (cache_weights_) {
-    ProfileScope _p("pcmm: convert weights (first call only)");
+    NvtxScope _n("pcmm: convert weights (first call only)");
     cached = &GetOperands(name, w, in_channels, out_channels, w_scale, parents,
                           groups, tile);
   }
