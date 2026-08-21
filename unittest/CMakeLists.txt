@@ -137,6 +137,14 @@ if (ENABLE_EXTENSION)
   add_executable(attention_transport_test AttentionTransportTest.cpp)
   target_link_libraries(attention_transport_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # Both attention products as the block will call them: slots in, slots out,
+  # with the permutations, the exchange, SlotToSinC, the CC-MM, HalfBoot and
+  # the StC prefix all inside SinCAttention. Three Contexts and a full
+  # bootstrap, so it is its own binary and the heaviest test here.
+  add_executable(sinc_attention_test SinCAttentionTest.cpp)
+  target_link_libraries(sinc_attention_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 if (ENABLE_EXTENSION)

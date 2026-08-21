@@ -514,9 +514,33 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 }
 
 template <typename word>
+StripedMatrix EvalSpecialFFT<word>::SinCPrefixMatrix(int sub_degree,
+                                                     int &window) const {
+  AssertTrue(full_slot_,
+             "SinCPrefixMatrix: the SinC conversions are defined on the full "
+             "slot count");
+  const int degree = num_slots_ * 2;
+  AssertTrue(IsPowOfTwo(sub_degree) && sub_degree >= 2 && sub_degree < degree,
+             "SinCPrefixMatrix: sub_degree must be a power of two in "
+             "[2, degree)");
+  const int num_stages = Log2Ceil(num_slots_);
+  const int q = num_stages - Log2Ceil(degree / sub_degree);
+  AssertTrue(q >= 1,
+             "SinCPrefixMatrix: SlotToSinC is the whole of SlotToCoeff at this "
+             "sub_degree, so HalfBoot leaves nothing undone");
+  StripedMatrix prefix = plain_fft_stages_[0];
+  for (int j = 1; j < q; j++) {
+    prefix = StripedMatrix::Mult(plain_fft_stages_[j], prefix);
+  }
+  window = 1 << q;
+  return prefix;
+}
+
+template <typename word>
 void EvalSpecialFFT<word>::PrepareSinCPrefix(ConstContextPtr<word> context,
                                              int sub_degree, int level,
-                                             int num_phases) {
+                                             int num_phases, double constant,
+                                             double pt_scale) {
   const int degree = context->param_.degree_;
   AssertTrue(full_slot_,
              "PrepareSinCPrefix: the SinC conversions are defined on the full "
@@ -582,20 +606,29 @@ void EvalSpecialFFT<word>::PrepareSinCPrefix(ConstContextPtr<word> context,
       prefix = StripedMatrix::Mult(plain_fft_stages_[j], prefix);
     }
     cursor += counts[phase];
+    // Canonicalise rides the first phase: it is one constant multiply and one
+    // rescale at exactly this level, so folding it into the diagonals costs
+    // nothing and saves the level the schedule would have spent on it.
+    if (phase == 0 && constant != 1.0) {
+      prefix = StripedMatrix::Mult(prefix, constant);
+    }
     const int a = 1 << cursor;
     const int pre_rotation = (phase == 0) ? -a : (prev_a - a);
     prev_a = a;
 
     const int phase_level = level - phase;
+    const double scale =
+        (phase == 0 && pt_scale > 0.0)
+            ? pt_scale
+            : context->param_.GetRescalePrimeProd(phase_level);
     auto [bs, gs] = BSGSSplit(prefix.GetNumDiag());
     std::cout << "SinC prefix phase " << phase << ": " << counts[phase]
               << " stages, " << prefix.GetNumDiag() << " diagonals, level "
               << phase_level << ", BSGS " << bs << "x" << gs
               << ", pre_rotation " << pre_rotation << ", pt_rot " << a
               << std::endl;
-    sinc_prefix_.emplace_back(context, prefix, phase_level,
-                              context->param_.GetRescalePrimeProd(phase_level),
-                              bs, gs, pre_rotation, a);
+    sinc_prefix_.emplace_back(context, prefix, phase_level, scale, bs, gs,
+                              pre_rotation, a);
   }
   sinc_prefix_shift_ = prev_a;
 }

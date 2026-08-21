@@ -225,8 +225,13 @@ class BootContext : public Context<word>,
    * `Canonicalise`'s multiply at the same place, plus one HRot.
    */
   void PrepareSinCPrefix(int num_slots, int sub_degree, int level,
-                         int num_phases = 1);
+                         int num_phases = 1, double constant = 1.0,
+                         double pt_scale = -1.0);
   int GetSinCPrefixNumPhases(int num_slots) const;
+  /// The composed prefix matrix and its window, for a caller compiling its
+  /// own -- see `EvalSpecialFFT::SinCPrefixMatrix`.
+  StripedMatrix SinCPrefixMatrix(int num_slots, int sub_degree,
+                                 int &window) const;
   void AddRequiredSinCPrefixRotations(EvkRequest &req, int num_slots) const;
   void SinCPrefix(Ct &res, int num_slots, const Ct &input,
                   const EvkMap<word> &evk_map) const;

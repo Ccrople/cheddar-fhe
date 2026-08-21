@@ -167,9 +167,38 @@ class EvalSpecialFFT {
    * @param level the level it is compiled at, i.e. where HalfBoot lands
    * @param num_phases how many LinearTransforms to split the stages across,
    *        one level each; 1 is right at `sub_degree = 32`
+   * @param constant a scalar folded into the transform's own matrix, and
+   *        `pt_scale` the scale its plaintexts are encoded at. Together they
+   *        are `SylphSchedule::Canonicalise`: that operator is one multiply by
+   *        a constant and one rescale, at the level HalfBoot lands on, which
+   *        is exactly this level. Folding it in here is what makes the prefix
+   *        free -- the schedule was spending the level anyway -- and it is
+   *        also what restores the magnitude HalfBoot divided out, which is
+   *        worth about five bits. `pt_scale <= 0` means the default,
+   *        `GetRescalePrimeProd(level)`, which preserves the input scale and
+   *        folds nothing.
    */
   void PrepareSinCPrefix(ConstContextPtr<word> context, int sub_degree,
-                         int level, int num_phases = 1);
+                         int level, int num_phases = 1,
+                         double constant = 1.0, double pt_scale = -1.0);
+
+  /**
+   * @brief The composed prefix matrix and the window rotation it needs, for a
+   * caller that wants to compile more than one of them.
+   *
+   * `PrepareSinCPrefix` holds exactly one, which is enough when the constant
+   * folded into it is the same every time. The two attention products need
+   * different ones -- `Canonicalise`'s magnitude is `2 / size_scores` for the
+   * scores and 1 for the values -- so `SinCAttention` builds its own pair from
+   * this. The window is the `additional_pt_rot` the transform must be given,
+   * with `pre_rotation = -window`; the result then comes back rotated by
+   * `window` and one HRot by `-window` finishes it. See the .cpp for why a
+   * window is needed at all.
+   *
+   * @param sub_degree k
+   * @param window receives `2^(num_stages - p)`
+   */
+  StripedMatrix SinCPrefixMatrix(int sub_degree, int &window) const;
 
   /// Levels the prefix spends, or 0 if it was never prepared.
   int GetSinCPrefixNumPhases() const {

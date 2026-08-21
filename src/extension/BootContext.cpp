@@ -348,16 +348,24 @@ void BootContext<word>::SinCToSlot(Ct &res, int num_slots, const Ct &input,
 
 template <typename word>
 void BootContext<word>::PrepareSinCPrefix(int num_slots, int sub_degree,
-                                          int level, int num_phases) {
+                                          int level, int num_phases,
+                                          double constant, double pt_scale) {
   AssertTrue(eval_fft_.count(num_slots) != 0,
              "PrepareSinCPrefix: call PrepareEvalSpecialFFT first");
   eval_fft_.at(num_slots).PrepareSinCPrefix(GetContext(), sub_degree, level,
-                                            num_phases);
+                                            num_phases, constant, pt_scale);
 }
 
 template <typename word>
 int BootContext<word>::GetSinCPrefixNumPhases(int num_slots) const {
   return eval_fft_.at(num_slots).GetSinCPrefixNumPhases();
+}
+
+template <typename word>
+StripedMatrix BootContext<word>::SinCPrefixMatrix(int num_slots,
+                                                  int sub_degree,
+                                                  int &window) const {
+  return eval_fft_.at(num_slots).SinCPrefixMatrix(sub_degree, window);
 }
 
 template <typename word>
