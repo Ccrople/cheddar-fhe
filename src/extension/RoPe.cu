@@ -17,7 +17,8 @@ struct Tables {
 };
 
 Tables BuildTables(int num_slots, int num_tokens, int head_dim,
-                   int first_position, double theta) {
+                   int first_position, double theta,
+                   const std::vector<int> *channel) {
   const int half = head_dim / 2;
   Tables t;
   t.cos_t.assign(num_slots, Complex(0.0, 0.0));
@@ -25,7 +26,8 @@ Tables BuildTables(int num_slots, int num_tokens, int head_dim,
   t.upper.assign(num_slots, Complex(0.0, 0.0));
   for (int s = 0; s < num_slots; s++) {
     const int p = first_position + (s % num_tokens);
-    const int j = (s / num_tokens) % head_dim;
+    const int j =
+        (channel != nullptr) ? (*channel)[s] : (s / num_tokens) % head_dim;
     // The frequencies are duplicated across the upper half, so the angle uses
     // j mod half -- this is what makes cos = cat(freqs, freqs) in Hugging
     // Face's implementation.
@@ -75,13 +77,76 @@ RoPeHandler<word>::RoPeHandler(ConstContextPtr<word> context, int num_tokens,
 }
 
 template <typename word>
+RoPeHandler<word>::RoPeHandler(ConstContextPtr<word> context, int num_tokens,
+                               int head_dim, int input_level, double theta,
+                               std::vector<std::vector<int>> head_channel,
+                               int partner_step)
+    : context_{std::move(context)},
+      num_tokens_{num_tokens},
+      head_dim_{head_dim},
+      input_level_{input_level},
+      theta_{theta},
+      head_channel_{std::move(head_channel)} {
+  AssertTrue(num_tokens_ > 0, "RoPe: num_tokens must be positive");
+  AssertTrue(head_dim_ > 1 && head_dim_ % 2 == 0,
+             "RoPe: head_dim must be even");
+  AssertTrue(theta_ > 1.0, "RoPe: theta must exceed one");
+  num_slots_ = context_->param_.degree_ / 2;
+  AssertTrue(num_slots_ % num_tokens_ == 0,
+             "RoPe: num_tokens must divide the slot count");
+  AssertTrue(!head_channel_.empty(),
+             "RoPe: the layout constructor needs at least one channel map");
+  AssertTrue(partner_step > 0 && partner_step < num_slots_,
+             "RoPe: the partner step must be a positive rotation");
+
+  // THE STEP IS VERIFIED, NOT TRUSTED. A wrong one is not a crash: it pairs
+  // each channel with some other channel, and RoPE then comes back a
+  // plausible rotation of the wrong thing, which the residual carries all the
+  // way to the block's output.
+  const int half = head_dim_ / 2;
+  for (size_t v = 0; v < head_channel_.size(); v++) {
+    AssertTrue(static_cast<int>(head_channel_[v].size()) == num_slots_,
+               "RoPe: every channel map must cover every slot");
+    for (int s = 0; s < num_slots_; s++) {
+      const int j = head_channel_[v][s];
+      AssertTrue(j >= 0 && j < head_dim_,
+                 "RoPe: a channel map holds an index outside the head");
+      const int partner =
+          (j < half) ? (s + partner_step) % num_slots_
+                     : (s + num_slots_ - partner_step) % num_slots_;
+      const int want = (j < half) ? j + half : j - half;
+      AssertTrue(head_channel_[v][partner] == want,
+                 "RoPe: the partner step does not carry channel " +
+                     std::to_string(j) + " of slot " + std::to_string(s) +
+                     " to channel " + std::to_string(want) +
+                     ", so the layout and the step disagree");
+    }
+  }
+
+  up_ = partner_step;
+  down_ = num_slots_ - partner_step;
+  rotation_distances_ = (up_ == down_) ? std::vector<int>{up_}
+                                       : std::vector<int>{up_, down_};
+}
+
+template <typename word>
+const std::vector<int> *RoPeHandler<word>::ChannelMap(int variant) const {
+  if (head_channel_.empty()) return nullptr;
+  AssertTrue(variant >= 0 && variant < static_cast<int>(head_channel_.size()),
+             "RoPe: channel map " + std::to_string(variant) +
+                 " was asked for but only " +
+                 std::to_string(head_channel_.size()) + " were built");
+  return &head_channel_[variant];
+}
+
+template <typename word>
 void RoPeHandler<word>::PlainApply(std::vector<double> &res,
                                    const std::vector<double> &x,
-                                   int first_position) const {
+                                   int first_position, int variant) const {
   AssertTrue(static_cast<int>(x.size()) == num_slots_,
              "RoPe: input must cover every slot");
   auto t = BuildTables(num_slots_, num_tokens_, head_dim_, first_position,
-                       theta_);
+                       theta_, ChannelMap(variant));
   res.assign(num_slots_, 0.0);
   for (int s = 0; s < num_slots_; s++) {
     const int su = (s + up_) % num_slots_;
@@ -92,17 +157,22 @@ void RoPeHandler<word>::PlainApply(std::vector<double> &res,
 }
 
 template <typename word>
-void RoPeHandler<word>::Prepare(int first_position, int level) const {
+void RoPeHandler<word>::Prepare(int first_position, int level,
+                                int variant) const {
   if (level < 0) level = input_level_;
-  if (first_position == cached_position_ && level == cached_level_) return;
+  if (first_position == cached_position_ && level == cached_level_ &&
+      variant == cached_variant_) {
+    return;
+  }
   const double scale = context_->param_.GetScale(level);
-  auto t =
-      BuildTables(num_slots_, num_tokens_, head_dim_, first_position, theta_);
+  auto t = BuildTables(num_slots_, num_tokens_, head_dim_, first_position,
+                       theta_, ChannelMap(variant));
   context_->encoder_.Encode(cos_pt_, level, scale, t.cos_t);
   context_->encoder_.Encode(lower_pt_, level, scale, t.lower);
   context_->encoder_.Encode(upper_pt_, level, scale, t.upper);
   cached_position_ = first_position;
   cached_level_ = level;
+  cached_variant_ = variant;
 }
 
 template <typename word>
@@ -117,7 +187,7 @@ size_t RoPeHandler<word>::GetPlaintextBytes() const {
 
 template <typename word>
 void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
-                              const EvkMap<word> &evk_map) const {
+                              const EvkMap<word> &evk_map, int variant) const {
   const int level = context_->param_.NPToLevel(x.GetNP());
   const double scale = context_->param_.GetScale(level);
 
@@ -126,7 +196,13 @@ void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
   // same table at a different level is a different object with a different
   // prime count, and reusing one across levels fails inside the multiply with
   // "Number of primes differ".
-  Prepare(first_position, level);
+  // ONE CACHE SLOT, ON PURPOSE. With a channel map per ciphertext the tables
+  // are per ciphertext too, and holding all of them would be three plaintexts
+  // times the tensor ciphertext count -- 120 MB for Q at level 18 on
+  // sylphflow16_35, against 15 MB for one set. Memory is what binds this
+  // block, so the cache holds the last variant and the caller pays one host
+  // encode per ciphertext instead.
+  Prepare(first_position, level, variant);
   const Pt &cos_pt = cos_pt_, &lower_pt = lower_pt_, &upper_pt = upper_pt_;
 
   // Both rotations read the input, so they run at the input level and neither

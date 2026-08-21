@@ -11,6 +11,7 @@
 #include "extension/RmsNorm.h"
 #include "extension/RoPe.h"
 #include "extension/SiLu.h"
+#include "extension/SlotPermute.h"
 #include "extension/SoftMax.h"
 #include "extension/SylphSchedule.h"
 
@@ -47,14 +48,45 @@ namespace cheddar {
  *     turn  slot leg                     product leg
  *     ----  ---------------------------  --------------------------------
  *     A     RMSNorm(attn)                Q, K, V  = h @ W_{q,k,v}   PC-MM
- *     B     RoPE(Q), RoPE(K)             S        = Q K^T           CC-MM
- *     C     SoftMax(S); V transported    A        = P V             CC-MM
- *     D     (transport only)             O        = A @ W_o         PC-MM
+ *     B     RoPE(Q), RoPE(K); V carried  S        = Q K^T           CC-MM
+ *     C     SoftMax(S)                   A        = P V             CC-MM
+ *     D     untranspose A                O        = A @ W_o         PC-MM
  *     E     RMSNorm(ffn)                 G, U     = h @ W_{gate,up} PC-MM
  *     F     SiLU(G) * U                  Y        = . @ W_down      PC-MM
  *
  * The two residual additions are ordinary `Add`s in the coefficient domain at
  * level 0, between turn D and turn E and after turn F.
+ *
+ * ## The two ciphertext-ciphertext products do not use the cycle's transport
+ *
+ * `Project` is a coefficient-domain product: it is handed level-0 coefficient
+ * ciphertexts and returns level-0 coefficient ciphertexts, so the block wraps
+ * it in `Lift` on the way in and `Lower` on the way out. `Scores` and `Values`
+ * are **not**. They take slot-domain operands and hand back slot-domain
+ * results, because the SinC route the batch CC-MM needs -- the field swaps,
+ * the ciphertext-axis exchange, `SlotToSinC`, the ring switch, the product,
+ * `HalfBoot` and the StC prefix -- *is* a whole turn of the cycle, taken by a
+ * different road. Handing it a coefficient ciphertext would mean bootstrapping
+ * into slots only to descend again, which is one wasted bootstrap per score
+ * ciphertext per block.
+ *
+ * So turns B and C have no `Lower` at their end and turn C and D have no
+ * `Lift` at their start. The seam is exactly those two calls, and what the
+ * block keeps is the level bookkeeping around them: `GetOperandLevel()` is
+ * where Q, K and V must reach the leg, `GetProbLevel()` where P does, and
+ * `GetResultLevel()` where both products come back.
+ *
+ * ## Turn D untransposes, and that is not bookkeeping either
+ *
+ * The CC-MM's lane index is the four slot bits directly above the token, so
+ * the attention output comes back with the head there and the token above it
+ * -- the transpose of what a coefficient-domain product reads. One inverse
+ * `[4|7]` field swap puts it back, as two narrow swaps for the same reason the
+ * forward pair is split (`SlotPermute.h`: 256 + 128 diagonals against 2048).
+ * It costs two levels out of turn D's budget, which had nothing else in it.
+ *
+ * Everything else the layout needs is **free**, because a projection's output
+ * channel order is the column order of its weight -- see `ChannelOrder`.
  *
  * ## Magnitude is a schedule variable, and it is the one that bites
  *
@@ -69,13 +101,17 @@ namespace cheddar {
  *
  *  - **Shrinking** rides on the product's plaintext. Every projection already
  *    multiplies by a weight matrix, so `w_scale` folds in for nothing. The two
- *    ciphertext-ciphertext products take an explicit `scale` for the same
- *    reason -- the 1/sqrt(head_dim) is already there.
- *  - **Growing** rides on `Canonicalise`. It is a multiply by a constant and a
- *    rescale, and the constant is arbitrary, so `magnitude` restores whatever
- *    the crossing divided out at no extra level. This is what lets SiLU and
- *    SoftMax receive their arguments on exactly the interval their polynomials
- *    were fitted on while the bootstrap before them still sees half of it.
+ *    ciphertext-ciphertext products have no plaintext to fold into, so theirs
+ *    rides on the *shift* instead: `Scores` adds the calibrated row maximum
+ *    before the bootstrap, which is what bounds the crossing by `range/2`
+ *    rather than by whatever the raw scores happen to reach.
+ *  - **Growing** rides on `Canonicalise`, or -- on the ciphertext-ciphertext
+ *    leg, which has no `Canonicalise` -- on the transform that stands in its
+ *    place. It is a multiply by a constant, and the constant is arbitrary, so
+ *    `magnitude` restores whatever the crossing divided out at no extra level.
+ *    This is what lets SiLU and SoftMax receive their arguments on exactly the
+ *    interval their polynomials were fitted on while the bootstrap before them
+ *    still sees half of it.
  *
  * The second point is not a convenience. `SiLuHandler::Apply` takes `x / range`
  * and `SoftMaxHandler::Apply` takes `2(x - c)/M + 1`, both on [-1, 1]; a
@@ -95,12 +131,13 @@ namespace cheddar {
  * ## What is not here
  *
  * The products. `LinearLeg` is a pure interface, and the block never sees a
- * weight matrix, a head, a transpose or a ring switch. That is deliberate:
- * the coefficient-domain product path (RingSwitch -> ModDecomp -> PC-MM /
- * CC-MM -> ModPack -> RingSwitch) is the one part of the block that does not
- * yet run on `bootparam_35`, and a block that hard-coded it could not be run
- * at all until it did. With the interface, the same block runs today against
- * any implementation and against the real one when it exists.
+ * ring, a ring switch, a tile or a key beyond its own. What it does see is the
+ * *layout* the leg works in, because RoPE, SoftMax and the causal mask all
+ * read it -- and it sees that through three narrow queries (`ChannelOrder`,
+ * `GetScoreGroupSize`, `LocateScore`) rather than through the product itself.
+ * With the interface, the same block runs against a host stand-in and against
+ * the real path, and the difference between the two numbers is what the real
+ * path costs.
  *
  * Attention sinks, on the other hand, ARE here, and they have to be: a query
  * that does not attend to the sink keys is computing a different function.
@@ -259,7 +296,16 @@ class LlamaBlock {
     double size_q = 1.0;
     double size_k = 1.0;
     double size_v = 1.0;
-    double size_scores = 1.0;  //!< applied to (s - shift) / range
+    //! **Not a free knob on a slot-domain leg, and DescribePlan reports what
+    //! it actually is.** The score product has no plaintext operand, so
+    //! nothing can scale its output before the bootstrap that follows it. What
+    //! the bootstrap carries is fixed by the operands and by the shift:
+    //! `size_q * size_k * sqrt(head_dim) * softmax_range / 2`, because the
+    //! shift centres the row on its own calibrated maximum and the SoftMax
+    //! interval is what is left. Calibrating the scores means moving `size_q`
+    //! and `size_k`; this field is kept for a coefficient-domain leg, which
+    //! does have a plaintext to fold it into.
+    double size_scores = 1.0;
     double size_probs = 1.0;
     double size_attn = 1.0;
     double size_gate = 1.0;
@@ -269,16 +315,71 @@ class LlamaBlock {
   /**
    * @brief The product leg: everything that mixes channels or tokens.
    *
-   * All arguments and results are **coefficient-encoded** ciphertexts in the
+   * `Project` takes and returns **coefficient-encoded** ciphertexts in the
    * block's packing -- slot `s` of ciphertext `i` holds token `s % T` of
    * channel `i * (slots/T) + s / T`, placed by
    * `AttentionPacking::CoeffOfSlot`. The implementation owns the level it
    * works at, the ring it works in, and the descent to it; it must return at
    * level 0, which is where `SylphSchedule::ToSlot` expects its input.
+   *
+   * `Scores` and `Values` take and return **slot-encoded** ciphertexts, at
+   * the levels `LlamaBlock::GetOperandLevel`, `GetProbLevel` and
+   * `GetResultLevel` name. See the class comment for why the two products do
+   * not share `Project`'s domain.
    */
   class LinearLeg {
    public:
     virtual ~LinearLeg() = default;
+
+    /** @brief Which tensor a channel order is being asked for. */
+    enum class Tensor {
+      kQuery,   //!< W_q's columns
+      kKey,     //!< W_k's columns
+      kValue,   //!< W_v's columns
+      kAttnOut  //!< the attention output, so W_o's ROWS
+    };
+
+    /**
+     * @brief The output-channel order this leg wants, or empty for the block's
+     * own `[head][channel]` order.
+     *
+     * A projection's output channel order is the column order of its weight
+     * matrix, so **any** permutation of the channels is free: the block
+     * reorders the plaintext once, offline, and the ciphertext comes out of
+     * the product already packed the way the next stage reads it. That is what
+     * pays for the CC-MM's layout, which otherwise needs a slot permutation --
+     * a `LinearTransform`, a level and hundreds of plaintexts -- on Q, K and V
+     * alike.
+     *
+     * `kAttnOut` is the same statement read backwards: the attention output
+     * arrives in a layout the block did not choose, and permuting W_o's *rows*
+     * is how the O projection reads it.
+     *
+     * @param res receives a permutation of `[head * head_dim + channel]`,
+     * giving the leg's own channel index, or is left empty
+     */
+    virtual void ChannelOrder(std::vector<int> &res, Tensor which) const {
+      res.clear();
+    }
+
+    /** @brief Ciphertexts one score row spans; 1 when a row fits in one. */
+    virtual int GetScoreGroupSize() const { return 1; }
+
+    /**
+     * @brief Where score entry `(head, query, key)` lives, in slots.
+     *
+     * The block needs this for the causal mask, which it builds rather than
+     * being handed: `key <= query` is arithmetic, and a caller that had to
+     * know the leg's score layout to state it would be doing the leg's job.
+     */
+    virtual void LocateScore(int head, int query, int key, int &ct,
+                             int &slot) const = 0;
+
+    /**
+     * @brief Whether `Values` returns with the head above the token, so that
+     * the block has to untranspose before the O projection.
+     */
+    virtual bool NeedsOutputSwap() const { return false; }
 
     /**
      * @brief res = w_scale * (x @ w), a plaintext projection.
@@ -298,37 +399,50 @@ class LlamaBlock {
                          const char *name) const = 0;
 
     /**
-     * @brief res = scale * (Q K^T) + shift, per head, with GQA repetition.
+     * @brief res = magnitude * (Q K^T + shift), per head, with GQA repetition.
      *
-     * The shift is an additive constant on every entry. In the coefficient
-     * domain that is a plaintext whose coefficients are all equal, so it costs
-     * no level -- which is why SoftMax's affine map is split here rather than
-     * done in the slot domain where it would cost one.
+     * ## The order is not the obvious one, and it is what makes the bootstrap
+     * ## carry the SoftMax interval rather than the raw scores
      *
-     * @param res output, `num_heads * T` rows of `T` keys
-     * @param q the rotated queries, `num_channels` wide
-     * @param k the rotated keys, `num_kv_channels` wide
-     * @param scale multiplies every entry, and carries 1/sqrt(head_dim), the
-     * SoftMax range, and both operands' crossing constants
-     * @param shift added after scaling, one entry per score in the order
+     * `shift` is added to the **raw** product and the whole sum is scaled
+     * afterwards. That is deliberate. On a SinC leg the addition happens at
+     * level 0, in SinC form, immediately before the bootstrap, and the scaling
+     * happens after it, in the transform that replaces `Canonicalise`. So what
+     * crosses is `raw - c`, which the calibration bounds by `range/2`, and not
+     * `raw`, which nothing bounds -- a row's scores sit wherever its own
+     * maximum puts them. A plaintext addition costs no level in either place;
+     * the difference is entirely in what the bootstrap has to carry.
+     *
+     * @param res output, `num_heads * T` rows of `T` keys, slot-encoded in the
+     * leg's own score layout at `LlamaBlock::GetResultLevel()`
+     * @param q the rotated queries, `num_channels` wide, slot-encoded at
+     * `LlamaBlock::GetOperandLevel()`
+     * @param k the rotated keys, `num_kv_channels` wide, at the same level
+     * @param magnitude multiplies the shifted product; it carries
+     * 1/sqrt(head_dim), 2/range and both operands' crossing constants
+     * @param shift added to the raw product, one entry per score in the order
      * `(head * T + query) * T + key`. Per entry rather than per row because
      * the masked entries need their own correction; see
      * `Calibration::softmax_shift` and `Calibration::softmax_mask_shift`.
      */
     virtual void Scores(std::vector<Ct> &res, const std::vector<Ct> &q,
-                        const std::vector<Ct> &k, double scale,
+                        const std::vector<Ct> &k, double magnitude,
                         const std::vector<double> &shift) const = 0;
 
     /**
-     * @brief res = scale * (P V), per head, with GQA repetition.
+     * @brief res = magnitude * (P V), per head, with GQA repetition.
      *
-     * @param res output, `num_channels` wide
-     * @param p the SoftMax probabilities
-     * @param v the values, `num_kv_channels` wide
-     * @param scale multiplies every entry
+     * @param res output, `num_channels` wide, slot-encoded at
+     * `LlamaBlock::GetResultLevel()` and, if `NeedsOutputSwap()`, transposed
+     * @param p the SoftMax probabilities, slot-encoded at or above
+     * `LlamaBlock::GetProbLevel()`, in the leg's own score layout
+     * @param v the values, `num_kv_channels` wide, slot-encoded at
+     * `LlamaBlock::GetOperandLevel()`
+     * @param magnitude multiplies every entry
      */
     virtual void Values(std::vector<Ct> &res, const std::vector<Ct> &p,
-                        const std::vector<Ct> &v, double scale) const = 0;
+                        const std::vector<Ct> &v,
+                        double magnitude) const = 0;
   };
 
   /** @brief The layer's plaintext weights, row-major and already transposed. */
@@ -344,8 +458,15 @@ class LlamaBlock {
     std::vector<double> wdown;      //!< [hidden][H]
   };
 
+  /**
+   * @param leg the product implementation. It is a constructor argument and
+   * not a `Run` argument because the block's own operators depend on its
+   * layout: RoPE's tables are per ciphertext once the channels are permuted,
+   * SoftMax's group size is the leg's score grouping, and the causal mask is
+   * built in the leg's score layout. The reference must outlive the block.
+   */
   LlamaBlock(std::shared_ptr<const BootContext<word>> boot, const Config &cfg,
-             const Calibration &cal);
+             const Calibration &cal, const LinearLeg &leg);
 
   // disable copying (or moving also)
   LlamaBlock(const LlamaBlock &) = delete;
@@ -376,17 +497,12 @@ class LlamaBlock {
    * @param x input, the residual stream, coefficient encoded at level 0 and
    * carrying `Calibration::residual`
    * @param w the layer's weights
-   * @param causal_mask 1 where key <= query and 0 elsewhere, in the score
-   * packing, one vector per score ciphertext
    * @param sinks the public K and V of the first `Config::num_sink_tokens`
    * tokens, and what the filler produces for them; empty when there are none
-   * @param leg the product implementation
    * @param evk_map every key the block needs
    */
   void Run(std::vector<Ct> &res, const std::vector<Ct> &x, const Weights &w,
-           const std::vector<std::vector<Complex>> &causal_mask,
-           const PublicSinks &sinks, const LinearLeg &leg,
-           const EvkMap<word> &evk_map) const;
+           const PublicSinks &sinks, const EvkMap<word> &evk_map) const;
 
   /**
    * @brief The same block in the clear, for a reference the encrypted run can
@@ -407,6 +523,21 @@ class LlamaBlock {
   const Calibration &GetCalibration() const { return cal_; }
   const SylphSchedule<word> &GetSchedule() const { return *sched_; }
 
+  /** @brief Level every slot-domain operator runs at. */
+  int GetOperatorLevel() const { return sched_->GetSlotLevel() - 1; }
+  /** @brief Level Q, K and V reach `Scores` and `Values` at: after RoPE. */
+  int GetOperandLevel() const { return GetOperatorLevel() - 1; }
+  /** @brief Level P reaches `Values` at: where SoftMax leaves it. */
+  int GetProbLevel() const { return sched_->GetStCLevel(); }
+  /** @brief Level both products must return at, which is the operator one. */
+  int GetResultLevel() const { return GetOperatorLevel(); }
+
+  /** @brief Score ciphertexts the whole layer holds. */
+  int NumScoreCiphertexts() const;
+
+  /** @brief The causal mask, in the leg's score layout, one per ciphertext. */
+  void BuildCausalMask(std::vector<std::vector<Complex>> &res) const;
+
  private:
   // One turn's slot leg: bootstrap every ciphertext, canonicalise it onto the
   // operator's scale and magnitude, and hand back the result. `magnitude` is
@@ -417,6 +548,40 @@ class LlamaBlock {
   // The other half: StC every ciphertext back to the coefficient domain.
   void Lower(std::vector<Ct> &res, const std::vector<Ct> &x,
              const EvkMap<word> &evk_map) const;
+
+  // A tensor's weight with its columns (or, for W_o, its rows) put in the
+  // order the leg asked for. Returns `w` itself when the leg wants none, so
+  // the untouched matrices are never copied.
+  const std::vector<double> &Reorder(std::vector<double> &buf,
+                                     const std::vector<double> &w, int rows,
+                                     int cols,
+                                     typename LinearLeg::Tensor which,
+                                     bool permute_rows) const;
+
+  // RoPE's channel map for each ciphertext of a tensor, derived from the
+  // leg's channel order, and the slot distance to the partner channel. Only
+  // the DISTINCT maps come back, with `variant` saying which one each
+  // ciphertext uses -- a map is three host-encoded plaintexts and a tensor
+  // repeats its layout once per head group.
+  void BuildRoPeLayout(std::vector<std::vector<int>> &maps,
+                       std::vector<int> &variant, int &step,
+                       typename LinearLeg::Tensor which, int channels) const;
+
+  // RoPE over a whole tensor, variant-major so the handler's one plaintext
+  // cache is rebuilt once per distinct layout rather than once per ciphertext.
+  void ApplyRoPe(std::vector<Ct> &res, const std::vector<Ct> &x,
+                 const RoPeHandler<word> &rope,
+                 const std::vector<int> &variant,
+                 const EvkMap<word> &evk_map) const;
+
+  // Levels turn D's untranspose spends: two, or none when the leg hands the
+  // attention output back in the block's own packing.
+  int OutSwapDepth() const;
+
+  // The untranspose of turn D: the inverse of the [4|7] field swap the CC-MM
+  // leaves behind, as two narrow swaps.
+  void Untranspose(std::vector<Ct> &res, const std::vector<Ct> &x,
+                   const EvkMap<word> &evk_map) const;
 
   // Say which turn is running and what level it is on. A hundred bootstraps
   // is minutes of silence, and an assert inside one of them reports only that
@@ -434,21 +599,27 @@ class LlamaBlock {
   // addition: no level, no key, and it lands before RoPE, which is where the
   // cached K of a sink token belongs.
   void InjectSinks(std::vector<Ct> &cts, const std::vector<double> &want,
-                   const std::vector<double> &got, int channels,
-                   double scale) const;
+                   const std::vector<double> &got, int channels, double scale,
+                   const std::vector<int> &order) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   Config cfg_;
   Calibration cal_;
+  const LinearLeg *leg_;
   int num_slots_;
   int channels_per_ct_;
+  // The leg's channel orders, taken once, and their inverses, which is what
+  // the sink injection and RoPE's tables actually read.
+  std::vector<int> q_order_, k_order_, v_order_, o_order_;
+  std::vector<int> q_variant_, k_variant_;
 
   std::unique_ptr<SylphSchedule<word>> sched_;
   std::unique_ptr<RmsNormHandler<word>> attn_norm_;
   std::unique_ptr<RmsNormHandler<word>> ffn_norm_;
-  std::unique_ptr<RoPeHandler<word>> rope_;
+  std::unique_ptr<RoPeHandler<word>> q_rope_, k_rope_;
   std::unique_ptr<SoftMaxHandler<word>> softmax_;
   std::unique_ptr<SiLuHandler<word>> silu_;
+  std::unique_ptr<SlotPermute<word>> untranspose_a_, untranspose_b_;
 };
 
 }  // namespace cheddar

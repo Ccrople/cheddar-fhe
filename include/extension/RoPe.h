@@ -74,6 +74,9 @@ class RoPeHandler {
   int num_slots_;
   int up_, down_;  // rotation distances for the two halves
   std::vector<int> rotation_distances_;
+  // Which channel of its head each slot carries, one map per ciphertext
+  // shape. Empty for the default packing, where it is `(s / T) % D`.
+  std::vector<std::vector<int>> head_channel_;
 
   // The three plaintexts depend only on (first_position, level), so they are
   // built once and reused. Encoder::Encode runs SpecialIFFT over every slot and
@@ -85,7 +88,13 @@ class RoPeHandler {
   // rather than a constructor argument.
   mutable int cached_position_ = INT_MIN;
   mutable int cached_level_ = -1;
+  mutable int cached_variant_ = -1;
   mutable Pt cos_pt_, lower_pt_, upper_pt_;
+
+  // The channel map of one variant, or the default packing's when there is
+  // none. Returned by value only where it is built; Apply reads it by
+  // reference.
+  const std::vector<int> *ChannelMap(int variant) const;
 
  public:
   /**
@@ -98,6 +107,34 @@ class RoPeHandler {
    */
   RoPeHandler(ConstContextPtr<word> context, int num_tokens, int head_dim,
               int input_level, double theta = 500000.0);
+
+  /**
+   * @brief The same handler on a packing that is not the default one.
+   *
+   * ## Why a second layout exists at all
+   *
+   * The ciphertext-ciphertext products want the head in the four slot bits
+   * immediately above the token, because that field is the batch CC-MM's lane
+   * index. Nothing else can be there, and the head cannot get there for free
+   * after the projection -- but it can get there for **nothing at all** by
+   * permuting the projection weight's columns, which is what
+   * `LlamaBlock::LinearLeg::ChannelOrder` does. What that costs is here: the
+   * channel a slot carries is no longer `(s / T) % D`, and three of the
+   * channel's bits move onto the ciphertext axis, so each ciphertext of the
+   * tensor sees a **different** set of frequencies and needs its own tables.
+   *
+   * The partner is still one rotation away and, in the layout the SinC leg
+   * uses, it is the *same* rotation both ways -- the half-of-head bit lands on
+   * the top slot bit, so `+step` and `-step` coincide at `num_slots / 2`.
+   *
+   * @param head_channel one map per ciphertext shape: `head_channel[v][s]` is
+   * the channel of its head that slot `s` of variant `v` carries, in [0, D).
+   * @param partner_step slot distance from a lower-half channel to its upper-
+   * half partner. Verified against every map rather than trusted.
+   */
+  RoPeHandler(ConstContextPtr<word> context, int num_tokens, int head_dim,
+              int input_level, double theta,
+              std::vector<std::vector<int>> head_channel, int partner_step);
 
   // disable copying (or moving also)
   RoPeHandler(const RoPeHandler &) = delete;
@@ -115,7 +152,7 @@ class RoPeHandler {
    * @param first_position position of the token in slot 0
    */
   void PlainApply(std::vector<double> &res, const std::vector<double> &x,
-                  int first_position) const;
+                  int first_position, int variant = 0) const;
 
   /**
    * @brief Build the three plaintexts up front, so their cost sits in setup.
@@ -130,7 +167,12 @@ class RoPeHandler {
    * @param first_position the position Apply will be called with
    * @param level level of the input; -1 uses the constructor's input_level
    */
-  void Prepare(int first_position, int level = -1) const;
+  void Prepare(int first_position, int level = -1, int variant = 0) const;
+
+  /** @brief How many channel maps this handler was built with; 1 by default. */
+  int GetNumVariants() const {
+    return head_channel_.empty() ? 1 : static_cast<int>(head_channel_.size());
+  }
 
   /** @brief Device bytes the cached plaintexts hold, 0 before Prepare. */
   size_t GetPlaintextBytes() const;
@@ -145,7 +187,7 @@ class RoPeHandler {
    * @param evk_map supplies the two rotation keys
    */
   void Apply(Ct &res, const Ct &x, int first_position,
-             const EvkMap<word> &evk_map) const;
+             const EvkMap<word> &evk_map, int variant = 0) const;
 };
 
 }  // namespace cheddar

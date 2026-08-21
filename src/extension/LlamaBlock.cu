@@ -1,5 +1,6 @@
 #include "extension/LlamaBlock.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -12,8 +13,9 @@ namespace cheddar {
 
 template <typename word>
 LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
-                             const Config &cfg, const Calibration &cal)
-    : boot_{std::move(boot)}, cfg_{cfg}, cal_{cal} {
+                             const Config &cfg, const Calibration &cal,
+                             const LinearLeg &leg)
+    : boot_{std::move(boot)}, cfg_{cfg}, cal_{cal}, leg_{&leg} {
   AssertTrue(boot_ != nullptr, "LlamaBlock: no BootContext");
   num_slots_ = boot_->param_.degree_ / 2;
   AssertTrue(cfg_.num_tokens > 0 && num_slots_ % cfg_.num_tokens == 0,
@@ -49,21 +51,81 @@ LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
   ffn_norm_ = std::make_unique<RmsNormHandler<word>>(
       boot_, cfg_.num_tokens, cfg_.num_channels, cal_.ffn_alpha / r2, op_level,
       cfg_.eps * r2, cal_.rms_window, cal_.rms_degree);
-  rope_ = std::make_unique<RoPeHandler<word>>(boot_, cfg_.num_tokens,
-                                              cfg_.head_dim, op_level,
-                                              cfg_.rope_theta);
+  // THE LEG'S LAYOUT, TAKEN ONCE. Everything below depends on it: RoPE's
+  // tables are per ciphertext when the channels are permuted, SoftMax's group
+  // size is the leg's score grouping, and the causal mask is built in the
+  // leg's score layout. That is why the leg is a constructor argument.
+  leg_->ChannelOrder(q_order_, LinearLeg::Tensor::kQuery);
+  leg_->ChannelOrder(k_order_, LinearLeg::Tensor::kKey);
+  leg_->ChannelOrder(v_order_, LinearLeg::Tensor::kValue);
+  leg_->ChannelOrder(o_order_, LinearLeg::Tensor::kAttnOut);
+  for (const auto *o : {&q_order_, &o_order_}) {
+    AssertTrue(o->empty() || static_cast<int>(o->size()) == cfg_.num_channels,
+               "LlamaBlock: a channel order must cover every channel");
+  }
+  for (const auto *o : {&k_order_, &v_order_}) {
+    AssertTrue(o->empty() ||
+                   static_cast<int>(o->size()) == cfg_.num_kv_channels,
+               "LlamaBlock: a KV channel order must cover every KV channel");
+  }
+
+  // RoPE runs one level below the operators, on Q and K only, and each of them
+  // gets its own handler because their channel orders differ. Only the
+  // *distinct* maps are built: a tensor's ciphertexts repeat their layout once
+  // per head group, and a duplicate map would be a duplicate set of plaintexts
+  // encoded on the host for nothing.
+  {
+    std::vector<std::vector<int>> maps;
+    int step = 0;
+    BuildRoPeLayout(maps, q_variant_, step, LinearLeg::Tensor::kQuery,
+                    cfg_.num_channels);
+    q_rope_ = maps.empty()
+                  ? std::make_unique<RoPeHandler<word>>(
+                        boot_, cfg_.num_tokens, cfg_.head_dim, op_level - 1,
+                        cfg_.rope_theta)
+                  : std::make_unique<RoPeHandler<word>>(
+                        boot_, cfg_.num_tokens, cfg_.head_dim, op_level - 1,
+                        cfg_.rope_theta, std::move(maps), step);
+    BuildRoPeLayout(maps, k_variant_, step, LinearLeg::Tensor::kKey,
+                    cfg_.num_kv_channels);
+    k_rope_ = maps.empty()
+                  ? std::make_unique<RoPeHandler<word>>(
+                        boot_, cfg_.num_tokens, cfg_.head_dim, op_level - 1,
+                        cfg_.rope_theta)
+                  : std::make_unique<RoPeHandler<word>>(
+                        boot_, cfg_.num_tokens, cfg_.head_dim, op_level - 1,
+                        cfg_.rope_theta, std::move(maps), step);
+  }
+
+  // The untranspose of turn D. Split into two narrow swaps for the reason
+  // SlotPermute.h gives: 256 + 128 diagonals against 2048, one more level and
+  // an eighth of the plaintext memory, and the memory is what binds.
+  if (leg_->NeedsOutputSwap()) {
+    untranspose_a_ = std::make_unique<SlotPermute<word>>(
+        boot_, SwapAdjacentFields(num_slots_, 4, 3), op_level);
+    untranspose_b_ = std::make_unique<SlotPermute<word>>(
+        boot_, SwapAdjacentFields(num_slots_, 4, 4, 3), op_level - 1);
+  }
   // The auxiliary track goes round this cycle, not through `Boot`. `Boot`
   // lands at GetEndLevel(), which the slack pushes below the main track, so
   // SoftMax's own boot_aux asserts on any set that reserves slack -- which is
-  // every set this schedule runs on. The hook below is StC, HalfBoot and
-  // Canonicalise, which is one whole turn of the cycle taken by a value that
-  // is not the main track.
+  // every set this schedule runs on. The hook Run installs is StC, HalfBoot
+  // and Canonicalise, which is one whole turn of the cycle taken by a value
+  // that is not the main track.
+  //
+  // A score row spans `group_size` ciphertexts on a slot-domain leg, because
+  // the CC-MM puts three bits of the key on the ciphertext axis. `num_keys` is
+  // therefore per ciphertext and the group carries the rest.
+  const int group_size = leg_->GetScoreGroupSize();
+  AssertTrue(group_size >= 1 && cfg_.num_tokens % group_size == 0,
+             "LlamaBlock: the score group size must divide the token count");
   softmax_ = std::make_unique<SoftMaxHandler<word>>(
-      boot_, cfg_.num_tokens, cal_.softmax_range, op_level, cal_.softmax_iters,
-      cal_.softmax_norm_lo, cal_.softmax_norm_hi, cal_.softmax_exp_degree,
-      cal_.softmax_inv_sqrt_degree, cal_.softmax_early_inv_sqrt_degree,
+      boot_, cfg_.num_tokens / group_size, cal_.softmax_range, op_level,
+      cal_.softmax_iters, cal_.softmax_norm_lo, cal_.softmax_norm_hi,
+      cal_.softmax_exp_degree, cal_.softmax_inv_sqrt_degree,
+      cal_.softmax_early_inv_sqrt_degree,
       /*boot_aux=*/false, /*aux_return_level=*/op_level,
-      /*aux_boot_max=*/cal_.boot_max);
+      /*aux_boot_max=*/cal_.boot_max, group_size);
   AssertTrue(softmax_->GetAuxCallLevel() == sched_->GetStCLevel(),
              "LlamaBlock: SoftMax's auxiliary value lands on level " +
                  std::to_string(softmax_->GetAuxCallLevel()) +
@@ -81,12 +143,182 @@ int LlamaBlock<word>::NumCiphertexts(int channels) const {
 }
 
 template <typename word>
+int LlamaBlock<word>::OutSwapDepth() const {
+  return leg_->NeedsOutputSwap() ? 2 : 0;
+}
+
+template <typename word>
+int LlamaBlock<word>::NumScoreCiphertexts() const {
+  const int heads = cfg_.num_channels / cfg_.head_dim;
+  return heads * cfg_.num_tokens * cfg_.num_tokens / num_slots_;
+}
+
+template <typename word>
+const std::vector<double> &LlamaBlock<word>::Reorder(
+    std::vector<double> &buf, const std::vector<double> &w, int rows, int cols,
+    typename LinearLeg::Tensor which, bool permute_rows) const {
+  const std::vector<int> *order = nullptr;
+  switch (which) {
+    case LinearLeg::Tensor::kQuery: order = &q_order_; break;
+    case LinearLeg::Tensor::kKey: order = &k_order_; break;
+    case LinearLeg::Tensor::kValue: order = &v_order_; break;
+    case LinearLeg::Tensor::kAttnOut: order = &o_order_; break;
+  }
+  // The common case, and the one worth not copying: 14336 x 4096 doubles is
+  // 470 MB and the FFN's three matrices are never reordered.
+  if (order->empty()) return w;
+  AssertTrue(w.size() == static_cast<size_t>(rows) * cols,
+             "LlamaBlock::Reorder: the weight is not rows x cols");
+  buf.assign(w.size(), 0.0);
+  if (permute_rows) {
+    AssertTrue(static_cast<int>(order->size()) == rows,
+               "LlamaBlock::Reorder: the row order must cover every row");
+    for (int i = 0; i < rows; i++) {
+      std::copy(w.begin() + static_cast<size_t>(i) * cols,
+                w.begin() + static_cast<size_t>(i + 1) * cols,
+                buf.begin() + static_cast<size_t>((*order)[i]) * cols);
+    }
+  } else {
+    AssertTrue(static_cast<int>(order->size()) == cols,
+               "LlamaBlock::Reorder: the column order must cover every column");
+    for (int i = 0; i < rows; i++) {
+      const double *src = &w[static_cast<size_t>(i) * cols];
+      double *dst = &buf[static_cast<size_t>(i) * cols];
+      for (int j = 0; j < cols; j++) dst[(*order)[j]] = src[j];
+    }
+  }
+  return buf;
+}
+
+template <typename word>
+void LlamaBlock<word>::BuildRoPeLayout(std::vector<std::vector<int>> &maps,
+                                       std::vector<int> &variant, int &step,
+                                       typename LinearLeg::Tensor which,
+                                       int channels) const {
+  const std::vector<int> &order =
+      (which == LinearLeg::Tensor::kQuery) ? q_order_ : k_order_;
+  maps.clear();
+  variant.assign(NumCiphertexts(channels), 0);
+  step = 0;
+  if (order.empty()) return;  // the default packing; RoPeHandler knows it
+
+  // position -> (head * head_dim + channel), the inverse of the leg's order
+  std::vector<int> inv(channels, -1);
+  for (int i = 0; i < channels; i++) {
+    AssertTrue(order[i] >= 0 && order[i] < channels && inv[order[i]] == -1,
+               "LlamaBlock: a channel order is not a permutation");
+    inv[order[i]] = i;
+  }
+
+  const int num_ct = NumCiphertexts(channels);
+  const int T = cfg_.num_tokens;
+  const int D = cfg_.head_dim;
+  const int half = D / 2;
+
+  // The partner distance, read off slot 0 of ciphertext 0 and then verified
+  // over every slot of every map by RoPeHandler's own constructor.
+  const int m0 = inv[0];
+  const int c0 = m0 % D;
+  const int m1 = (c0 < half) ? m0 + half : m0 - half;
+  const int p1 = order[m1];
+  AssertTrue(p1 / channels_per_ct_ == 0,
+             "LlamaBlock: the channel order puts a RoPE pair in two different "
+             "ciphertexts, so the partner cannot be rotated in");
+  const int s1 = (p1 % channels_per_ct_) * T;
+  step = (c0 < half) ? s1 : (num_slots_ - s1);
+
+  // ONE MAP PER DISTINCT LAYOUT, NOT ONE PER CIPHERTEXT. A tensor's layout
+  // repeats once per head group, so Q's sixteen ciphertexts hold eight
+  // distinct maps -- and a map is three encoded plaintexts on the host, which
+  // is the expensive part of RoPE.
+  std::vector<std::vector<int>> all(num_ct, std::vector<int>(num_slots_, 0));
+  for (int ct = 0; ct < num_ct; ct++) {
+    for (int s = 0; s < num_slots_; s++) {
+      all[ct][s] = inv[ct * channels_per_ct_ + s / T] % D;
+    }
+  }
+  for (int ct = 0; ct < num_ct; ct++) {
+    int found = -1;
+    for (size_t j = 0; j < maps.size(); j++) {
+      if (maps[j] == all[ct]) { found = static_cast<int>(j); break; }
+    }
+    if (found < 0) {
+      found = static_cast<int>(maps.size());
+      maps.push_back(all[ct]);
+    }
+    variant[ct] = found;
+  }
+}
+
+template <typename word>
+void LlamaBlock<word>::ApplyRoPe(std::vector<Ct> &res,
+                                 const std::vector<Ct> &x,
+                                 const RoPeHandler<word> &rope,
+                                 const std::vector<int> &variant,
+                                 const EvkMap<word> &evk_map) const {
+  AssertTrue(variant.size() == x.size(),
+             "LlamaBlock::ApplyRoPe: one variant per ciphertext");
+  res.resize(x.size());
+  // VARIANT-MAJOR, AND THAT IS THE WHOLE REASON THIS HELPER EXISTS. RoPeHandler
+  // keeps one set of encoded tables, because holding all of them would be
+  // three plaintexts per distinct layout at the operator's level. Encoding a
+  // set is a SpecialIFFT plus a prime-by-prime reduction over every slot on
+  // the host -- RoPE's measured 171 ms, against SiLU's 7.8 ms for a much
+  // heavier circuit -- so the loop is ordered to pay it once per layout.
+  const int variants = rope.GetNumVariants();
+  for (int v = 0; v < variants; v++) {
+    for (size_t i = 0; i < x.size(); i++) {
+      if (variant[i] != v) continue;
+      rope.Apply(res[i], x[i], cfg_.first_position, evk_map, v);
+    }
+  }
+}
+
+template <typename word>
+void LlamaBlock<word>::BuildCausalMask(
+    std::vector<std::vector<Complex>> &res) const {
+  const int T = cfg_.num_tokens;
+  const int heads = cfg_.num_channels / cfg_.head_dim;
+  res.assign(NumScoreCiphertexts(),
+             std::vector<Complex>(num_slots_, Complex(0.0, 0.0)));
+  for (int h = 0; h < heads; h++) {
+    for (int query = 0; query < T; query++) {
+      for (int key = 0; key <= query; key++) {
+        int ct = 0, slot = 0;
+        leg_->LocateScore(h, query, key, ct, slot);
+        AssertTrue(ct >= 0 && ct < static_cast<int>(res.size()) && slot >= 0 &&
+                       slot < num_slots_,
+                   "LlamaBlock: the leg's score layout is out of range");
+        res[ct][slot] = Complex(1.0, 0.0);
+      }
+    }
+  }
+}
+
+template <typename word>
+void LlamaBlock<word>::Untranspose(std::vector<Ct> &res,
+                                   const std::vector<Ct> &x,
+                                   const EvkMap<word> &evk_map) const {
+  res.resize(x.size());
+  for (size_t i = 0; i < x.size(); i++) {
+    Ct a;
+    untranspose_a_->Evaluate(boot_, a, x[i], evk_map);
+    untranspose_b_->Evaluate(boot_, res[i], a, evk_map);
+  }
+}
+
+template <typename word>
 void LlamaBlock<word>::AddRequiredRotations(EvkRequest &req) const {
   const int op_level = sched_->GetSlotLevel() - 1;
   boot_->AddRequiredRotations(req, num_slots_);
   for (int d : attn_norm_->GetRotationDistances()) req.AddRequest(d, op_level);
-  for (int d : rope_->GetRotationDistances()) req.AddRequest(d, op_level);
+  for (int d : q_rope_->GetRotationDistances()) req.AddRequest(d, op_level - 1);
+  for (int d : k_rope_->GetRotationDistances()) req.AddRequest(d, op_level - 1);
   for (int d : softmax_->GetRotationDistances()) req.AddRequest(d, op_level);
+  if (untranspose_a_ != nullptr) {
+    untranspose_a_->AddRequiredRotations(req);
+    untranspose_b_->AddRequiredRotations(req);
+  }
 }
 
 // The six turns, as the schedule sees them. `Stage::linear_depth` is what the
@@ -96,7 +328,7 @@ void LlamaBlock<word>::AddRequiredRotations(EvkRequest &req) const {
 namespace {
 template <typename word>
 std::vector<typename SylphSchedule<word>::Stage> TurnsOf(
-    const typename LlamaBlock<word>::Calibration &cal) {
+    const typename LlamaBlock<word>::Calibration &cal, int out_swap) {
   const int rms = 1 + Log2Ceil(cal.rms_degree + 1) + 2 + 1;
   // RmsNormHandler::Apply consumes one level for the square, ceil(log2(d+1))
   // for the polynomial and two more to apply the result and the weight -- and
@@ -108,11 +340,18 @@ std::vector<typename SylphSchedule<word>::Stage> TurnsOf(
                       2 * cal.softmax_iters;
   const int silu = Log2Ceil(cal.silu_degree + 1) + 1;  // the fit, then * up
   using Stage = typename SylphSchedule<word>::Stage;
+  // Turns B and C spend NOTHING on the linear leg of this schedule. Their
+  // products take the SinC road instead -- swaps, exchange, SlotToSinC, the
+  // ring switch, the product, HalfBoot and the prefix -- and the leg checks
+  // that road's own arithmetic, which is a different set of constraints
+  // (`SinCAttention`'s constructor states them). What this schedule still owns
+  // for those turns is the slot leg above the handover: RoPE in B, SoftMax in
+  // C, both of which must land on the level the leg takes its operands at.
   return {
       Stage{"A  RMSNorm(attn) -> Q,K,V", rms, 2},
-      Stage{"B  RoPE(Q), RoPE(K) -> S = QK^T", 1, 2},
-      Stage{"C  SoftMax(S), carry V -> A = PV", softmax, 2},
-      Stage{"D  carry A -> O = A W_o", 0, 2},
+      Stage{"B  RoPE(Q), RoPE(K), carry V -> S = QK^T", 1, 0},
+      Stage{"C  SoftMax(S) -> A = PV", softmax, 0},
+      Stage{"D  untranspose A -> O = A W_o", out_swap, 2},
       Stage{"E  RMSNorm(ffn) -> G,U", rms, 2},
       Stage{"F  SiLU(G) * U -> Y = . W_down", silu, 2},
   };
@@ -121,8 +360,21 @@ std::vector<typename SylphSchedule<word>::Stage> TurnsOf(
 
 template <typename word>
 bool LlamaBlock<word>::Fits(std::string *why) const {
-  for (const auto &stage : TurnsOf<word>(cal_)) {
+  for (const auto &stage : TurnsOf<word>(cal_, OutSwapDepth())) {
     if (!sched_->Fits(stage, why)) return false;
+  }
+  // SoftMax has to end exactly where the leg picks P up. One level above and
+  // the LevelDown inside the leg absorbs it silently; one below and there is
+  // nothing to absorb, and the failure is a prime-count mismatch four frames
+  // deep in a transform.
+  if (softmax_->GetAuxCallLevel() < GetProbLevel()) {
+    if (why != nullptr) {
+      *why = "C: SoftMax leaves P at level " +
+             std::to_string(softmax_->GetAuxCallLevel()) +
+             " but the product leg takes it at " +
+             std::to_string(GetProbLevel());
+    }
+    return false;
   }
   return true;
 }
@@ -130,7 +382,7 @@ bool LlamaBlock<word>::Fits(std::string *why) const {
 template <typename word>
 std::string LlamaBlock<word>::DescribePlan() const {
   std::ostringstream os;
-  os << sched_->DescribePlan(TurnsOf<word>(cal_));
+  os << sched_->DescribePlan(TurnsOf<word>(cal_, OutSwapDepth()));
   os << "packing: " << cfg_.num_tokens << " tokens x " << channels_per_ct_
      << " channels per ciphertext" << std::endl;
   os << "  hidden state " << NumCiphertexts(cfg_.num_channels) << " ct, kv "
@@ -146,14 +398,29 @@ std::string LlamaBlock<word>::DescribePlan() const {
   const int ffn = NumCiphertexts(cfg_.hidden);
   const int scores = (cfg_.num_channels / cfg_.head_dim) * cfg_.num_tokens *
                      cfg_.num_tokens / num_slots_;
-  // Turn C bootstraps three things: the scores on the way in, V which was
-  // produced two turns ago, and SoftMax's own auxiliary track, which takes a
-  // whole turn of the cycle inside the operator.
-  os << "bootstraps: A " << h << ", B " << (h + kv) << ", C "
-     << (2 * scores + kv) << " (" << scores << " aux), D " << h << ", E " << h
-     << ", F " << (2 * ffn) << " = "
-     << (h + h + kv + 2 * scores + kv + h + h + 2 * ffn) << " per block"
-     << std::endl;
+  // WHERE THE BOOTSTRAPS ARE NOW. Turn B lifts Q, K and V and the leg
+  // bootstraps every score ciphertext on the way out of the product; turn C
+  // runs SoftMax's auxiliary track once per row group and the leg bootstraps
+  // the attention output; turn D lifts nothing at all, because the attention
+  // output came back in slots.
+  const int groups = scores / std::max(1, leg_->GetScoreGroupSize());
+  const int total = h + (h + kv + kv + scores) + (groups + scores) + h + 2 * ffn;
+  os << "bootstraps: A " << h << ", B " << (h + kv + kv) << " + " << scores
+     << " in the leg, C " << groups << " aux + " << scores
+     << " in the leg, D 0, E " << h << ", F " << (2 * ffn) << " = " << total
+     << " per block" << std::endl;
+
+  // WHAT THE SCORE BOOTSTRAP ACTUALLY CARRIES, which is not a free knob --
+  // see Calibration::size_scores. The shift centres each row on its own
+  // calibrated maximum before the crossing, so what has to fit is half the
+  // SoftMax interval and not the raw scores.
+  const double crossing = cal_.size_q * cal_.size_k *
+                          std::sqrt(static_cast<double>(cfg_.head_dim)) *
+                          cal_.softmax_range / 2.0;
+  os << "score crossing: size_q * size_k * sqrt(head_dim) * range / 2 = "
+     << crossing << " against boot_max " << cal_.boot_max;
+  if (crossing > cal_.boot_max) os << "  (TOO LARGE -- lower size_q/size_k)";
+  os << std::endl;
   return os.str();
 }
 
@@ -222,7 +489,8 @@ template <typename word>
 void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
                                    const std::vector<double> &want,
                                    const std::vector<double> &got, int channels,
-                                   double scale) const {
+                                   double scale,
+                                   const std::vector<int> &order) const {
   const int sinks = cfg_.num_sink_tokens;
   if (sinks <= 0) return;
   const size_t expect = static_cast<size_t>(sinks) * channels;
@@ -231,6 +499,18 @@ void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
              "[num_sink_tokens][channels]");
   AssertTrue(static_cast<int>(cts.size()) == NumCiphertexts(channels),
              "LlamaBlock::InjectSinks: wrong ciphertext count");
+
+  // The projection's columns were reordered, so slot position `p` holds the
+  // model's channel `inv[p]` and not `p`. The sink rows are stated in the
+  // model's order, which is the only order they mean anything in.
+  std::vector<int> inv;
+  if (!order.empty()) {
+    AssertTrue(static_cast<int>(order.size()) == channels,
+               "LlamaBlock::InjectSinks: the channel order must cover every "
+               "channel of the tensor");
+    inv.assign(channels, -1);
+    for (int c = 0; c < channels; c++) inv[order[c]] = c;
+  }
 
   const int degree = boot_->param_.degree_;
   const int level = 0;
@@ -242,7 +522,8 @@ void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
     bool any = false;
     for (int t = 0; t < sinks; t++) {
       for (int c = 0; c < channels_per_ct_; c++) {
-        const int channel = static_cast<int>(i) * channels_per_ct_ + c;
+        const int position = static_cast<int>(i) * channels_per_ct_ + c;
+        const int channel = inv.empty() ? position : inv[position];
         const size_t idx = static_cast<size_t>(t) * channels + channel;
         const double d = scale * (want[idx] - got[idx]);
         if (d == 0.0) continue;
@@ -262,16 +543,16 @@ void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
 
 template <typename word>
 void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
-                           const Weights &w,
-                           const std::vector<std::vector<Complex>> &causal_mask,
-                           const PublicSinks &sinks, const LinearLeg &leg,
+                           const Weights &w, const PublicSinks &sinks,
                            const EvkMap<word> &evk_map) const {
   std::string why;
   AssertTrue(Fits(&why), "LlamaBlock: the plan does not close -- " + why);
   AssertTrue(static_cast<int>(x.size()) == NumCiphertexts(cfg_.num_channels),
              "LlamaBlock: wrong number of input ciphertexts");
 
+  const LinearLeg &leg = *leg_;
   const double r = cal_.residual;
+  std::vector<double> wbuf;
 
   // ---- turn A: RMSNorm(attn), then the QKV projection -------------------
   //
@@ -292,12 +573,24 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   Lower(coeff, normed, evk_map);
   Announce("A  lowered", coeff, sched_->GetCoeffLevel());
 
+  // THE CHANNEL ORDER RIDES ON THE WEIGHT AND COSTS NOTHING. A projection's
+  // output channel order is the column order of its matrix, so the layout the
+  // ciphertext-ciphertext product needs -- head in the four slot bits above
+  // the token, three channel bits on the ciphertext axis -- is bought here, in
+  // a host-side permutation of a plaintext, rather than with a slot transform
+  // and a level on each of Q, K and V.
   std::vector<Ct> q, k, v;
-  leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels, w.wq, cal_.size_q,
-              "Q");
-  leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels, w.wk,
+  leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels,
+              Reorder(wbuf, w.wq, cfg_.num_channels, cfg_.num_channels,
+                      LinearLeg::Tensor::kQuery, false),
+              cal_.size_q, "Q");
+  leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+              Reorder(wbuf, w.wk, cfg_.num_channels, cfg_.num_kv_channels,
+                      LinearLeg::Tensor::kKey, false),
               cal_.size_k, "K");
-  leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels, w.wv,
+  leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+              Reorder(wbuf, w.wv, cfg_.num_channels, cfg_.num_kv_channels,
+                      LinearLeg::Tensor::kValue, false),
               cal_.size_v, "V");
 
   // The sink tokens' K and V, put back. Their hidden state never reached the
@@ -307,46 +600,66 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // it should have been. Adding the difference is a plaintext addition and
   // costs nothing. It happens before RoPE, which then rotates the sink keys by
   // their own positions exactly as it would have.
-  InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k);
-  InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v);
+  InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k,
+              k_order_);
+  InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v,
+              v_order_);
 
   // ---- turn B: RoPE on Q and K, then the score product ------------------
   //
   // RoPE is linear, so it commutes with the crossing constant and the
   // ciphertexts are lifted at magnitude 1 -- whatever they carry, they carry
   // it through unchanged and `Scores` divides both out.
-  std::vector<Ct> q_slots, k_slots;
+  std::vector<Ct> q_slots, k_slots, v_slots;
   Announce("B  Q from the projection", q, 0);
   Lift(q_slots, q, 1.0, evk_map);
   Lift(k_slots, k, 1.0, evk_map);
+  Lift(v_slots, v, 1.0, evk_map);
+  q.clear();
+  k.clear();
+  v.clear();
   std::vector<Ct> q_rot(q_slots.size()), k_rot(k_slots.size());
-  for (size_t i = 0; i < q_slots.size(); i++) {
-    rope_->Apply(q_rot[i], q_slots[i], cfg_.first_position, evk_map);
+  ApplyRoPe(q_rot, q_slots, *q_rope_, q_variant_, evk_map);
+  ApplyRoPe(k_rot, k_slots, *k_rope_, k_variant_, evk_map);
+  q_slots.clear();
+  k_slots.clear();
+  Announce("B  RoPE", q_rot, GetOperandLevel());
+  // V takes no part in turn B's slot leg, but it has to arrive at the product
+  // alongside Q and K, so it spends RoPE's level doing nothing. A LevelDown is
+  // free; what is not free is the bootstrap above, and that one is unavoidable
+  // -- the projection left V at level 0 and the product does not start there.
+  for (size_t i = 0; i < v_slots.size(); i++) {
+    Ct dropped;
+    boot_->LevelDown(dropped, v_slots[i], GetOperandLevel());
+    v_slots[i] = std::move(dropped);
   }
-  for (size_t i = 0; i < k_slots.size(); i++) {
-    rope_->Apply(k_rot[i], k_slots[i], cfg_.first_position, evk_map);
-  }
-  Announce("B  RoPE", q_rot, sched_->GetSlotLevel() - 2);
-  std::vector<Ct> q_coeff, k_coeff;
-  Lower(q_coeff, q_rot, evk_map);
-  Lower(k_coeff, k_rot, evk_map);
 
-  // What SoftMax wants is 2 (s - c) / M + 1 on [-1, 1], and what the
-  // bootstrap can carry is at most boot_max. The affine map is therefore split
-  // three ways, and none of the three costs a level: the product carries
-  // (s - c) * size_scores / M, which is small enough to cross; Canonicalise
-  // multiplies by 2 / size_scores on its way through; and the +1 is a constant
-  // addition in the slot domain.
+  // WHAT SOFTMAX WANTS IS 2 (s - c) / M + 1 ON [-1, 1], AND THE WHOLE AFFINE
+  // MAP IS FREE -- but only in this order.
   //
-  // The subtraction of c happens inside the product because there it is a
-  // plaintext whose coefficients are all equal -- free -- while in the slot
-  // domain it would have to wait until after the crossing, where the magnitude
-  // it would add is exactly what the crossing has no room for.
+  // The shift goes in first, on the raw product, before the bootstrap; the
+  // scaling goes in afterwards, in the transform that replaces Canonicalise.
+  // Both are free -- an addition is a plaintext and the scaling rides a
+  // multiply that was already being paid for -- so the order is not about
+  // cost. It is about what the bootstrap in between has to carry.
+  //
+  // Shift first, and the crossing carries s - c, which the calibration bounds
+  // by range/2 because c IS the row's calibrated maximum. Scale first and the
+  // crossing carries s, which nothing bounds: a row's scores sit wherever its
+  // own maximum puts them, and on the real layer-2 scores that is twelve nats
+  // of spread between rows.
+  //
+  // The +1 rides in the same shift, for nothing, because the shift is already
+  // per entry -- see Calibration::softmax_mask_shift for why it has to be.
   std::vector<Ct> scores;
-  const double score_scale = cal_.size_scores /
-                             (cal_.softmax_range * std::sqrt(cfg_.head_dim) *
-                              cal_.size_q * cal_.size_k);
   const int T = cfg_.num_tokens;
+  const double root = std::sqrt(static_cast<double>(cfg_.head_dim));
+  // The product carries both operands' crossing constants and a factor
+  // sqrt(head_dim) from the contraction; `magnitude` divides all three out and
+  // applies SoftMax's own 2/range. It is applied AFTER the shift, which is
+  // what makes the crossing carry range/2 instead of the raw scores.
+  const double raw = cal_.size_q * cal_.size_k * root;
+  const double score_magnitude = 2.0 / (cal_.softmax_range * raw);
   const int num_rows = (cfg_.num_channels / cfg_.head_dim) * T;
   AssertTrue(static_cast<int>(cal_.softmax_shift.size()) == num_rows,
              "LlamaBlock: SoftMax needs one calibrated shift per row -- see "
@@ -360,18 +673,29 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
       // exponential still sees an in-interval argument; the mask zeroes them
       // a level later, but the polynomial has already run by then.
       const double extra = (key <= query) ? 0.0 : cal_.softmax_mask_shift;
+      // magnitude * (raw_product + shift) = 2 (u - c - extra) / range + 1, so
+      // the shift is the whole affine map's constant carried back through the
+      // magnitude -- the +1 included, which is why SoftMax's argument needs no
+      // further addition once the product has come back.
       score_shift[static_cast<size_t>(rr) * T + key] =
-          -cal_.size_scores * (cal_.softmax_shift[rr] + extra) /
-          cal_.softmax_range;
+          (cal_.softmax_range / 2.0 - cal_.softmax_shift[rr] - extra) * raw;
     }
   }
-  leg.Scores(scores, q_coeff, k_coeff, score_scale, score_shift);
+  leg.Scores(scores, q_rot, k_rot, score_magnitude, score_shift);
+  q_rot.clear();
+  k_rot.clear();
+  AssertTrue(static_cast<int>(scores.size()) == NumScoreCiphertexts(),
+             "LlamaBlock: the leg returned " + std::to_string(scores.size()) +
+                 " score ciphertexts against the " +
+                 std::to_string(NumScoreCiphertexts()) + " the packing holds");
 
-  // ---- turn C: SoftMax, and V carried across ----------------------------
-  std::vector<Ct> score_slots;
-  Lift(score_slots, scores, 2.0 / cal_.size_scores, evk_map, /*shift=*/1.0);
-  AssertTrue(causal_mask.size() == score_slots.size(),
-             "LlamaBlock: one causal mask per score ciphertext is required");
+  // ---- turn C: SoftMax over a row that may span several ciphertexts ------
+  //
+  // The scores arrive from the leg already in slots, on the operator's level
+  // and its canonical scale, with the affine map already applied -- there is
+  // no Lift here, and that is the seam. The transform that stands in for
+  // `Canonicalise` inside the leg did the same job on the way out of the
+  // product's bootstrap.
   typename SoftMaxHandler<word>::AuxBoot aux =
       [this, &evk_map](Ct &out, const Ct &in, double magnitude) {
         Ct coeff, landed;
@@ -379,37 +703,59 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
         sched_->ToSlot(landed, coeff, evk_map);
         sched_->Canonicalise(out, landed, magnitude);
       };
-  Announce("C  scores lifted", score_slots, sched_->GetSlotLevel() - 1);
-  std::vector<Ct> probs(score_slots.size());
-  for (size_t i = 0; i < score_slots.size(); i++) {
-    softmax_->Apply(probs[i], score_slots[i], causal_mask[i], evk_map, nullptr,
-                    &aux);
+  Announce("C  scores from the product", scores, GetResultLevel());
+  std::vector<std::vector<Complex>> causal_mask;
+  BuildCausalMask(causal_mask);
+  const int group = leg.GetScoreGroupSize();
+  std::vector<Ct> probs(scores.size());
+  for (size_t base = 0; base < scores.size(); base += group) {
+    std::vector<Ct> in, out;
+    std::vector<std::vector<Complex>> mask;
+    in.reserve(group);
+    mask.reserve(group);
+    // Moved in, not copied: a row group is `group` ciphertexts at the
+    // operator's level and SoftMax holds several more of each while it runs,
+    // so the peak is one group rather than the layer.
+    for (int j = 0; j < group; j++) {
+      in.push_back(std::move(scores[base + j]));
+      mask.push_back(causal_mask[base + j]);
+    }
+    softmax_->Apply(out, in, mask, evk_map, nullptr, &aux);
+    for (int j = 0; j < group; j++) probs[base + j] = std::move(out[j]);
   }
-  Announce("C  SoftMax", probs, sched_->GetStCLevel());
-  std::vector<Ct> prob_coeff;
-  Lower(prob_coeff, probs, evk_map);
-
-  // V was produced two turns ago and left at level 0, which is below the
-  // product's input level, so it is bootstrapped here with nothing in its slot
-  // leg. That transport is what the two-level product ring costs; it is not
-  // recoverable by reordering.
-  std::vector<Ct> v_slots, v_coeff;
-  Lift(v_slots, v, 1.0, evk_map);
-  Lower(v_coeff, v_slots, evk_map);
+  scores.clear();
+  causal_mask.clear();
+  Announce("C  SoftMax", probs, GetProbLevel());
 
   std::vector<Ct> attn;
-  leg.Values(attn, prob_coeff, v_coeff, cal_.size_attn / cal_.size_v);
+  leg.Values(attn, probs, v_slots, cal_.size_attn / cal_.size_v);
+  probs.clear();
+  v_slots.clear();
 
   // ---- turn D: carry the attention output into the O projection ---------
   //
   // O is a second product and the product ring holds one level, so it cannot
   // follow PV directly. `residual` rather than a private constant, because
   // this output is added to the block input.
-  std::vector<Ct> attn_slots, attn_coeff, attn_out;
-  Announce("D  attention values", attn, 0);
-  Lift(attn_slots, attn, 1.0, evk_map);
-  Lower(attn_coeff, attn_slots, evk_map);
-  leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels, w.wo,
+  //
+  // There is no Lift here either. What there is instead is the untranspose:
+  // the CC-MM's lane index is the four slot bits above the token, so the
+  // attention output comes back with the head there and the token above it,
+  // and the O projection reads token-fastest. Two narrow field swaps put it
+  // back, and W_o's ROWS carry the rest of the layout for nothing.
+  std::vector<Ct> attn_coeff, attn_out;
+  Announce("D  attention values", attn, GetResultLevel());
+  if (untranspose_a_ != nullptr) {
+    std::vector<Ct> flat;
+    Untranspose(flat, attn, evk_map);
+    attn = std::move(flat);
+    Announce("D  untransposed", attn, GetResultLevel() - 2);
+  }
+  Lower(attn_coeff, attn, evk_map);
+  attn.clear();
+  leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
+              Reorder(wbuf, w.wo, cfg_.num_channels, cfg_.num_channels,
+                      LinearLeg::Tensor::kAttnOut, true),
               r / cal_.size_attn, "O");
 
   std::vector<Ct> h(x.size());

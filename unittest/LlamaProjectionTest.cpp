@@ -151,6 +151,10 @@ class ProjectOnlyLeg : public cheddar::CoeffLinearLeg<word> {
               const std::vector<Ciphertext<word>> &, double) const override {
     cheddar::AssertTrue(false, "ProjectOnlyLeg: Values is not part of this test");
   }
+  void LocateScore(int, int, int, int &, int &) const override {
+    cheddar::AssertTrue(false,
+                        "ProjectOnlyLeg: there is no score layout in this test");
+  }
 };
 
 }  // namespace

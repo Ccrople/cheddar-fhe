@@ -226,6 +226,18 @@ class SinCAttention {
               const std::vector<std::vector<Complex>> &shift = {}) const;
 
   /**
+   * @brief The same, over operands that are a slice of a larger tensor.
+   *
+   * A ciphertext is movable and not copyable, so a caller holding all 32
+   * heads cannot hand over one lane group by slicing the vector. It hands
+   * over pointers instead; nothing is copied and nothing is moved out of the
+   * caller's tensor, which still owns every ciphertext when the call returns.
+   */
+  void Scores(std::vector<Ct> &res, const std::vector<const Ct *> &q,
+              const std::vector<const Ct *> &k, const Keys &keys,
+              const std::vector<std::vector<Complex>> &shift = {}) const;
+
+  /**
    * @brief `res = P V`, slots in and slots out.
    *
    * @param res output, `num_cts` slot-encoded ciphertexts at `GetOutputLevel()`
@@ -236,11 +248,15 @@ class SinCAttention {
   void Values(std::vector<Ct> &res, const std::vector<Ct> &p,
               const std::vector<Ct> &v, const Keys &keys) const;
 
+  /** @brief The same, over operands that are a slice of a larger tensor. */
+  void Values(std::vector<Ct> &res, const std::vector<const Ct *> &p,
+              const std::vector<const Ct *> &v, const Keys &keys) const;
+
  private:
   // One operand's descent from slots to a SinC ciphertext at the product
   // level. `permute` picks which second swap, or none.
   enum class Leg { kQuery, kKey, kValue, kProb };
-  void Descend(std::vector<Ct> &res, const std::vector<Ct> &x, Leg leg,
+  void Descend(std::vector<Ct> &res, const std::vector<const Ct *> &x, Leg leg,
                const EvkMap<word> &evk) const;
   // The product, then the shift, then HalfBoot and the prefix.
   void Ascend(std::vector<Ct> &res, std::vector<Ct> &product,

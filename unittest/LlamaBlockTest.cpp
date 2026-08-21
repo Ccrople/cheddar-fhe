@@ -423,6 +423,29 @@ class HostLinearLeg : public Block::LinearLeg {
                 const Block::Config &cfg)
       : bed_{bed}, pack_{pack}, cfg_{cfg} {}
 
+  // WHERE THE STAND-IN HAS TO PUT THINGS. `Project` is unchanged -- level 0,
+  // coefficient domain -- but `Scores` and `Values` are slot-domain now, and
+  // the level they return at is the block's, not one this class can pick. The
+  // block reports it; this takes it after construction, which is the only
+  // ordering that works when the block also needs the leg to build itself.
+  void SetLevels(int operand, int prob, int result) {
+    operand_level_ = operand;
+    prob_level_ = prob;
+    result_level_ = result;
+  }
+
+  // The score layout of the block's own packing: row `head * T + query`, keys
+  // strided by the rows one ciphertext holds. This is what SoftMax reads with
+  // a group of one, which is what makes the stand-in a control rather than a
+  // second implementation of the real leg's layout.
+  void LocateScore(int head, int query, int key, int &ct,
+                   int &slot) const override {
+    const int rows = pack_.rows_per_ct();
+    const int row = head * pack_.tokens + query;
+    ct = row / rows;
+    slot = (row % rows) + key * rows;
+  }
+
   void Project(std::vector<Ciphertext<word>> &res,
                const std::vector<Ciphertext<word>> &x, int in_channels,
                int out_channels, const std::vector<double> &w, double w_scale,
@@ -442,11 +465,11 @@ class HostLinearLeg : public Block::LinearLeg {
 
   void Scores(std::vector<Ciphertext<word>> &res,
               const std::vector<Ciphertext<word>> &q,
-              const std::vector<Ciphertext<word>> &k, double scale,
+              const std::vector<Ciphertext<word>> &k, double magnitude,
               const std::vector<double> &shift) const override {
     std::vector<double> qa, ka;
-    Gather(qa, q, cfg_.num_channels);
-    Gather(ka, k, cfg_.num_kv_channels);
+    GatherSlots(qa, q, cfg_.num_channels);
+    GatherSlots(ka, k, cfg_.num_kv_channels);
     seen_.emplace_back("in:q", qa);
     seen_.emplace_back("in:k", ka);
     const int T = pack_.tokens, D = cfg_.head_dim;
@@ -462,8 +485,14 @@ class HostLinearLeg : public Block::LinearLeg {
             dot += qa[static_cast<size_t>(t) * cfg_.num_channels + hd * D + d] *
                    ka[static_cast<size_t>(u) * cfg_.num_kv_channels + kvh * D + d];
           }
+          // SHIFT FIRST, THEN SCALE. On the real leg the shift goes in at
+          // level 0 before the bootstrap and the scale comes out of the
+          // transform after it, so what crosses is the centred score. The
+          // stand-in has to compute the same function in the same order or the
+          // two runs are not comparable.
           s[(static_cast<size_t>(hd) * T + t) * T + u] =
-              dot * scale + shift[(static_cast<size_t>(hd) * T + t) * T + u];
+              (dot + shift[(static_cast<size_t>(hd) * T + t) * T + u]) *
+              magnitude;
         }
       }
     }
@@ -474,10 +503,10 @@ class HostLinearLeg : public Block::LinearLeg {
   void Values(std::vector<Ciphertext<word>> &res,
               const std::vector<Ciphertext<word>> &p,
               const std::vector<Ciphertext<word>> &v,
-              double scale) const override {
+              double magnitude) const override {
     std::vector<double> pa, va;
     GatherScores(pa, p);
-    Gather(va, v, cfg_.num_kv_channels);
+    GatherSlots(va, v, cfg_.num_kv_channels);
     seen_.emplace_back("in:probs", pa);
     const int T = pack_.tokens, D = cfg_.head_dim, H = cfg_.num_channels;
     const int heads = H / D;
@@ -496,9 +525,9 @@ class HostLinearLeg : public Block::LinearLeg {
         }
       }
     }
-    for (double &u : y) u *= scale;
+    for (double &u : y) u *= magnitude;
     log_.emplace_back("attn", MaxAbs(y));
-    Scatter(res, y, H);
+    ScatterSlots(res, y, H);
   }
 
   // What every product produced, so a magnitude that leaves the bootstrap's
@@ -533,6 +562,55 @@ class HostLinearLeg : public Block::LinearLeg {
   }
 
  private:
+  // The same packing as `Gather`, read as slots rather than as coefficients.
+  // Both index the ciphertext identically -- channel `s / T`, token `s % T`;
+  // what differs is which encoder reads it, and that is the whole content of
+  // the seam this block was rewired around.
+  void GatherSlots(std::vector<double> &out,
+                   const std::vector<Ciphertext<word>> &cts,
+                   int channels) const {
+    out.assign(static_cast<size_t>(pack_.tokens) * channels, 0.0);
+    const int cpc = pack_.channels_per_ct();
+    for (size_t i = 0; i < cts.size(); i++) {
+      Plaintext<word> ptxt;
+      bed_.interface_->Decrypt(ptxt, cts[i]);
+      std::vector<Complex> msg;
+      bed_.context_->encoder_.Decode(msg, ptxt);
+      for (int s = 0; s < pack_.slots; s++) {
+        const int t = s % pack_.tokens;
+        const int c = static_cast<int>(i) * cpc + s / pack_.tokens;
+        out[static_cast<size_t>(t) * channels + c] = msg[s].real();
+      }
+    }
+  }
+
+  void ScatterSlots(std::vector<Ciphertext<word>> &res,
+                    const std::vector<double> &v, int channels) const {
+    AssertLevel();
+    const int cpc = pack_.channels_per_ct();
+    const int num_ct = channels / cpc;
+    res.resize(num_ct);
+    for (int i = 0; i < num_ct; i++) {
+      std::vector<Complex> msg(pack_.slots, Complex(0.0, 0.0));
+      for (int s = 0; s < pack_.slots; s++) {
+        const int t = s % pack_.tokens;
+        const int c = i * cpc + s / pack_.tokens;
+        msg[s] = Complex(v[static_cast<size_t>(t) * channels + c], 0.0);
+      }
+      Plaintext<word> ptxt;
+      bed_.context_->encoder_.Encode(
+          ptxt, result_level_,
+          bed_.context_->param_.GetScale(result_level_), msg);
+      bed_.interface_->Encrypt(res[i], ptxt);
+    }
+  }
+
+  void AssertLevel() const {
+    ASSERT_GE(result_level_, 0)
+        << "HostLinearLeg::SetLevels was never called, so the stand-in does "
+           "not know where the block expects its results";
+  }
+
   void Gather(std::vector<double> &out,
               const std::vector<Ciphertext<word>> &cts, int channels) const {
     out.assign(static_cast<size_t>(pack_.tokens) * channels, 0.0);
@@ -576,11 +654,11 @@ class HostLinearLeg : public Block::LinearLeg {
     for (size_t i = 0; i < cts.size(); i++) {
       Plaintext<word> ptxt;
       bed_.interface_->Decrypt(ptxt, cts[i]);
-      std::vector<double> coeffs;
-      bed_.context_->encoder_.DecodeCoeff(coeffs, ptxt);
+      std::vector<Complex> msg;
+      bed_.context_->encoder_.Decode(msg, ptxt);
       for (int r = 0; r < rows; r++) {
         for (int j = 0; j < T; j++) {
-          out[(i * rows + r) * T + j] = coeffs[pack_.coeff(r + j * rows)];
+          out[(i * rows + r) * T + j] = msg[r + j * rows].real();
         }
       }
     }
@@ -588,20 +666,22 @@ class HostLinearLeg : public Block::LinearLeg {
 
   void ScatterScores(std::vector<Ciphertext<word>> &res,
                      const std::vector<double> &v) const {
+    AssertLevel();
     const int T = pack_.tokens, rows = pack_.rows_per_ct();
     const int num_ct = static_cast<int>(v.size()) / (rows * T);
     res.resize(num_ct);
     for (int i = 0; i < num_ct; i++) {
-      std::vector<double> coeffs(pack_.degree, 0.0);
+      std::vector<Complex> msg(pack_.slots, Complex(0.0, 0.0));
       for (int r = 0; r < rows; r++) {
         for (int j = 0; j < T; j++) {
-          coeffs[pack_.coeff(r + j * rows)] =
-              v[(static_cast<size_t>(i) * rows + r) * T + j];
+          msg[r + j * rows] = Complex(
+              v[(static_cast<size_t>(i) * rows + r) * T + j], 0.0);
         }
       }
       Plaintext<word> ptxt;
-      bed_.context_->encoder_.EncodeCoeff(
-          ptxt, 0, bed_.context_->param_.GetScale(0), coeffs);
+      bed_.context_->encoder_.Encode(
+          ptxt, result_level_,
+          bed_.context_->param_.GetScale(result_level_), msg);
       bed_.interface_->Encrypt(res[i], ptxt);
     }
   }
@@ -609,6 +689,9 @@ class HostLinearLeg : public Block::LinearLeg {
   const Testbed32 &bed_;
   Packing pack_;
   Block::Config cfg_;
+  int operand_level_ = -1;
+  int prob_level_ = -1;
+  int result_level_ = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -652,16 +735,22 @@ class EncryptedProjectionLeg : public cheddar::CoeffLinearLeg<word> {
   // the host and re-encrypt.
   void Scores(std::vector<Ciphertext<word>> &res,
               const std::vector<Ciphertext<word>> &q,
-              const std::vector<Ciphertext<word>> &k, double scale,
+              const std::vector<Ciphertext<word>> &k, double magnitude,
               const std::vector<double> &shift) const override {
-    host_.Scores(res, q, k, scale, shift);
+    host_.Scores(res, q, k, magnitude, shift);
   }
 
   void Values(std::vector<Ciphertext<word>> &res,
               const std::vector<Ciphertext<word>> &p,
               const std::vector<Ciphertext<word>> &v,
-              double scale) const override {
-    host_.Values(res, p, v, scale);
+              double magnitude) const override {
+    host_.Values(res, p, v, magnitude);
+  }
+
+  // The stand-in's score layout, so the block builds the causal mask in it.
+  void LocateScore(int head, int query, int key, int &ct,
+                   int &slot) const override {
+    host_.LocateScore(head, query, key, ct, slot);
   }
 
  private:
@@ -865,7 +954,12 @@ TEST_P(LlamaBlockFixture, ThePlanClosesForTheBlock) {
   boot->PrepareEvalMod();
 
   Block::Calibration cal;
-  Block block(boot, MakeConfig(), cal);
+  Packing pack;
+  pack.tokens = kTokens;
+  pack.slots = param_->degree_ / 2;
+  pack.degree = param_->degree_;
+  HostLinearLeg host(*this, pack, MakeConfig());
+  Block block(boot, MakeConfig(), cal, host);
   std::cout << block.DescribePlan() << std::endl;
 
   std::string why;
@@ -969,58 +1063,22 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
 
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(num_slots);
-  Block block(boot, cfg, cal);
-  std::string why;
-  ASSERT_TRUE(block.Fits(&why)) << why;
-  std::cout << block.DescribePlan() << std::endl;
-
-  EvkRequest req;
-  block.AddRequiredRotations(req);
-  interface_->PrepareRotationKey(req);
 
   Packing pack;
   pack.tokens = kTokens;
   pack.slots = num_slots;
   pack.degree = param_->degree_;
 
-  // The input, coefficient encoded at level 0 -- where the previous block's
-  // down projection would have left it.
-  const int num_ct = kChannels / pack.channels_per_ct();
-  std::vector<Ciphertext<word>> state(num_ct);
-  for (int i = 0; i < num_ct; i++) {
-    std::vector<double> coeffs(pack.degree, 0.0);
-    for (int s = 0; s < num_slots; s++) {
-      const int t = s % kTokens;
-      const int c = i * pack.channels_per_ct() + s / kTokens;
-      coeffs[pack.coeff(s)] =
-          cal.residual * x_fill[static_cast<size_t>(t) * kChannels + c];
-    }
-    Plaintext<word> ptxt;
-    context_->encoder_.EncodeCoeff(ptxt, 0, param_->GetScale(0), coeffs);
-    interface_->Encrypt(state[i], ptxt);
-  }
-
-  // The causal mask, in the score packing. Causality is public, so it is a
-  // plaintext.
-  const int heads = kChannels / kHeadDim;
-  const int rows = pack.rows_per_ct();
-  const int num_score_ct = heads * kTokens / rows;
-  std::vector<std::vector<Complex>> mask(
-      num_score_ct, std::vector<Complex>(num_slots, Complex(0.0, 0.0)));
-  for (int i = 0; i < num_score_ct; i++) {
-    for (int rr = 0; rr < rows; rr++) {
-      const int query = (i * rows + rr) % kTokens;
-      for (int j = 0; j < kTokens; j++) {
-        mask[i][rr + j * rows] = Complex(j <= query ? 1.0 : 0.0, 0.0);
-      }
-    }
-  }
-
-  // THE PRODUCTS.
+  // THE PRODUCTS, BUILT BEFORE THE BLOCK.
   //
   // `host` is always constructed: with encrypted projections it is still the
   // stand-in for the two ciphertext-ciphertext products, and it is also where
   // the per-turn ledger lives, because the probes write into its records.
+  //
+  // The leg comes first because the block's own operators depend on its
+  // layout -- RoPE's tables, SoftMax's group size and the causal mask all read
+  // it -- so `LlamaBlock` takes it as a constructor argument. The levels go
+  // the other way, and go in afterwards.
   HostLinearLeg host(*this, pack, cfg);
   std::unique_ptr<EncryptedProjectionLeg> real_leg;
   std::vector<const EvaluationKey<word> *> modpack_keys;
@@ -1061,8 +1119,39 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
               << rank << " ModPack keys" << std::endl;
   }
 
+  Block block(boot, cfg, cal, *leg);
+  host.SetLevels(block.GetOperandLevel(), block.GetProbLevel(),
+                 block.GetResultLevel());
+  std::string why;
+  ASSERT_TRUE(block.Fits(&why)) << why;
+  std::cout << block.DescribePlan() << std::endl;
+  std::cout << "the seam: operands at " << block.GetOperandLevel()
+            << ", P at " << block.GetProbLevel() << ", results at "
+            << block.GetResultLevel() << std::endl;
+
+  EvkRequest req;
+  block.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+
+  // The input, coefficient encoded at level 0 -- where the previous block's
+  // down projection would have left it.
+  const int num_ct = kChannels / pack.channels_per_ct();
+  std::vector<Ciphertext<word>> state(num_ct);
+  for (int i = 0; i < num_ct; i++) {
+    std::vector<double> coeffs(pack.degree, 0.0);
+    for (int s = 0; s < num_slots; s++) {
+      const int t = s % kTokens;
+      const int c = i * pack.channels_per_ct() + s / kTokens;
+      coeffs[pack.coeff(s)] =
+          cal.residual * x_fill[static_cast<size_t>(t) * kChannels + c];
+    }
+    Plaintext<word> ptxt;
+    context_->encoder_.EncodeCoeff(ptxt, 0, param_->GetScale(0), coeffs);
+    interface_->Encrypt(state[i], ptxt);
+  }
+
   std::vector<Ciphertext<word>> out;
-  block.Run(out, state, w, mask, sinks, *leg, interface_->GetEvkMap());
+  block.Run(out, state, w, sinks, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 

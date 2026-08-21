@@ -139,7 +139,7 @@ void SinCAttention<word>::AddRequiredRotations(EvkRequest &req) const {
 
 template <typename word>
 void SinCAttention<word>::Descend(std::vector<Ct> &res,
-                                  const std::vector<Ct> &x, Leg leg,
+                                  const std::vector<const Ct *> &x, Leg leg,
                                   const EvkMap<word> &evk) const {
   const auto &layout = ccmm_.GetLayout();
   const int n = layout.num_cts;
@@ -152,14 +152,14 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
     AssertTrue(static_cast<int>(x.size()) == n,
                "SinCAttention: P is one ciphertext per product ciphertext");
     for (int i = 0; i < n; i++) {
-      boot_->LevelDown(stage[i], x[i], sinc_level);
+      boot_->LevelDown(stage[i], *x[i], sinc_level);
     }
   } else if (leg == Leg::kQuery) {
     AssertTrue(static_cast<int>(x.size()) == n,
                "SinCAttention: Q is one ciphertext per product ciphertext");
     for (int i = 0; i < n; i++) {
       Ct a, b;
-      swap_a_->Evaluate(boot_, a, x[i], evk);
+      swap_a_->Evaluate(boot_, a, *x[i], evk);
       swap_qv_b_->Evaluate(boot_, b, a, evk);
       // Q skips the exchange, so it arrives a level above K and V. Dropping it
       // is free in time and turn B has the level.
@@ -173,7 +173,7 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
     std::vector<Ct> swapped(x.size());
     for (size_t i = 0; i < x.size(); i++) {
       Ct a;
-      swap_a_->Evaluate(boot_, a, x[i], evk);
+      swap_a_->Evaluate(boot_, a, *x[i], evk);
       if (leg == Leg::kKey) {
         swap_k_b_->Evaluate(boot_, swapped[i], a, evk);
       } else {
@@ -263,10 +263,36 @@ void SinCAttention<word>::Ascend(
   }
 }
 
+namespace {
+template <typename Ct>
+std::vector<const Ct *> Pointers(const std::vector<Ct> &v) {
+  std::vector<const Ct *> res;
+  res.reserve(v.size());
+  for (const auto &c : v) res.push_back(&c);
+  return res;
+}
+}  // namespace
+
 template <typename word>
 void SinCAttention<word>::Scores(
     std::vector<Ct> &res, const std::vector<Ct> &q, const std::vector<Ct> &k,
     const Keys &keys, const std::vector<std::vector<Complex>> &shift) const {
+  Scores(res, Pointers(q), Pointers(k), keys, shift);
+}
+
+template <typename word>
+void SinCAttention<word>::Values(std::vector<Ct> &res,
+                                 const std::vector<Ct> &p,
+                                 const std::vector<Ct> &v,
+                                 const Keys &keys) const {
+  Values(res, Pointers(p), Pointers(v), keys);
+}
+
+template <typename word>
+void SinCAttention<word>::Scores(
+    std::vector<Ct> &res, const std::vector<const Ct *> &q,
+    const std::vector<const Ct *> &k, const Keys &keys,
+    const std::vector<std::vector<Complex>> &shift) const {
   AssertTrue(keys.big != nullptr && keys.small != nullptr &&
                  keys.ring_switch != nullptr &&
                  keys.inverse_ring_switch != nullptr,
@@ -283,8 +309,9 @@ void SinCAttention<word>::Scores(
 }
 
 template <typename word>
-void SinCAttention<word>::Values(std::vector<Ct> &res, const std::vector<Ct> &p,
-                                 const std::vector<Ct> &v,
+void SinCAttention<word>::Values(std::vector<Ct> &res,
+                                 const std::vector<const Ct *> &p,
+                                 const std::vector<const Ct *> &v,
                                  const Keys &keys) const {
   AssertTrue(keys.big != nullptr && keys.small != nullptr &&
                  keys.ring_switch != nullptr &&
