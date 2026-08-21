@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <string>
 #include <numeric>
 
 #include "core/Parameter.h"
@@ -318,8 +319,13 @@ int Parameter<word>::NPToLevel(const NPInfo& np) const {
         np.num_aux_ <= short_base_np_.num_aux_) {
       return -1;
     }
-    // Otherwise, fails
-    Fail("NPInfo not found");
+    // Otherwise, fails. Naming the NPInfo matters: this is reached from
+    // LevelDown, HalfBoot and every handler that asks what level it is
+    // holding, and "not found" on its own says nothing about which of them.
+    Fail("NPInfo not found: " + std::to_string(np.num_main_) + " main + " +
+         std::to_string(np.num_ter_) + " terminal (" +
+         std::to_string(np.num_aux_) + " auxiliary), against " +
+         std::to_string(level_config_.size()) + " levels");
   }
   return found.first - level_config_.cbegin();
 }

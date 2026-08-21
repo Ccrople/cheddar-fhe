@@ -185,6 +185,7 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
   cfg.sinc_level = kSinCLevel;
   cfg.prefix_level = boot->GetBootParameter().GetEvalModEndLevel();
   cfg.halfboot_scale = boot->GetStCInputScale();
+  cfg.verbose = true;
   std::cout << "swap at " << cfg.swap_level << "/" << cfg.swap_level - 1
             << ", exchange at " << cfg.swap_level - 2 << ", SinC at "
             << kSinCLevel << ".." << kSinCLevel - kPhases + 1 << ", product at "
@@ -207,11 +208,13 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
             << " MiB, " << free_after / (1 << 20) << " MiB free after"
             << std::endl;
 
+  std::cout << "step: ring switch keys" << std::endl;
   sw.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
                               kProductLevel);
   sw.ui->PrepareInverseRingSwitchKey(small.Degree(),
                                      small.ui->GetSecretCoeffs(),
                                      kProductLevel);
+  std::cout << "step: small-ring keys" << std::endl;
   for (int idx : attn.SmallRotationIndices()) {
     small.ui->PrepareRotationKey(idx, kProductLevel);
   }
@@ -273,12 +276,14 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
     }
   }
 
+  std::cout << "step: encrypt the operands" << std::endl;
   std::vector<Ciphertext<word>> q_ct, k_ct, v_ct;
   encrypt(q_msg, kSwapLevel, q_ct);
   encrypt(k_msg, kSwapLevel, k_ct);
   encrypt(v_msg, kSwapLevel, v_ct);
 
   // ---- Q K^T, slots to slots -------------------------------------------
+  std::cout << "step: Scores" << std::endl;
   std::vector<Ciphertext<word>> scores;
   attn.Scores(scores, q_ct, k_ct, keys);
   cudaDeviceSynchronize();
@@ -371,6 +376,7 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
   std::vector<Ciphertext<word>> p_ct;
   encrypt(p_msg, kSinCLevel, p_ct);
 
+  std::cout << "step: Values" << std::endl;
   std::vector<Ciphertext<word>> out;
   attn.Values(out, p_ct, v_ct, keys);
   cudaDeviceSynchronize();

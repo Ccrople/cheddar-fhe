@@ -1,5 +1,6 @@
 #include "extension/SinCAttention.h"
 
+#include <iostream>
 #include <string>
 #include <utility>
 
@@ -176,6 +177,11 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
     }
   }
 
+  if (cfg_.verbose) {
+    std::cout << "  SinCAttention: leg " << static_cast<int>(leg)
+              << " at level " << boot_->param_.NPToLevel(stage[0].GetNP())
+              << " before SlotToSinC" << std::endl;
+  }
   res.clear();
   res.resize(n);
   for (int i = 0; i < n; i++) {
@@ -216,6 +222,12 @@ void SinCAttention<word>::Ascend(
     }
   }
 
+  if (cfg_.verbose) {
+    std::cout << "  SinCAttention: the product left " << n
+              << " ciphertexts at " << product[0].GetNP().num_main_ << " main + "
+              << product[0].GetNP().num_ter_ << " terminal, scale "
+              << product[0].GetScale() << std::endl;
+  }
   res.clear();
   res.resize(n);
   for (int i = 0; i < n; i++) {
@@ -225,6 +237,13 @@ void SinCAttention<word>::Ascend(
     Ct half, shifted;
     boot_->HalfBoot(half, product[i], evk);
     product[i] = Ct{};  // 8 big ciphertexts at the bootstrap's level is real
+    if (cfg_.verbose && i == 0) {
+      std::cout << "  SinCAttention: HalfBoot landed at "
+                << boot_->param_.NPToLevel(half.GetNP()) << ", scale "
+                << half.GetScale() << " (the prefix was compiled at "
+                << cfg_.prefix_level << " for scale " << cfg_.halfboot_scale
+                << ")" << std::endl;
+    }
     prefix.Evaluate(boot_, shifted, half, evk);
     const int back = num_slots_ - prefix_window_;
     boot_->HRot(res[i], shifted, evk.GetRotationKey(back), back);

@@ -144,6 +144,11 @@ class SinCAttention {
     //! what comes back. Hence the whole constant, not half of it.
     double score_magnitude = 1.0;
     double value_magnitude = 1.0;
+
+    //! Print each stage's level and scale. Three transforms, a ring descent
+    //! and a bootstrap compose here and they all fail the same way, so the
+    //! ledger is worth having.
+    bool verbose = false;
   };
 
   /** @brief The keys one call needs, on both rings. */
