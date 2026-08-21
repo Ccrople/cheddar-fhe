@@ -100,11 +100,21 @@ LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
   // The untranspose of turn D. Split into two narrow swaps for the reason
   // SlotPermute.h gives: 256 + 128 diagonals against 2048, one more level and
   // an eighth of the plaintext memory, and the memory is what binds.
+  //
+  // AND COMPILED AT THE BOTTOM OF TURN D, NOT THE TOP. A diagonal is a full
+  // plaintext at the transform's own level, so 384 of them cost a third less
+  // at level 13 than at level 18 -- and turn D has nothing else in its slot
+  // leg, so descending to meet StC first is free. That is the schedule's own
+  // idiom (`SylphSchedule.h`: a stage shallower than the slack descends to
+  // meet StC, measured at 19.7101 bits against 19.7099 over four levels).
   if (leg_->NeedsOutputSwap()) {
+    const int landing = sched_->GetStCLevel();
+    AssertTrue(landing + 2 <= op_level,
+               "LlamaBlock: turn D has no room for the untranspose above StC");
     untranspose_a_ = std::make_unique<SlotPermute<word>>(
-        boot_, SwapAdjacentFields(num_slots_, 4, 3), op_level);
+        boot_, SwapAdjacentFields(num_slots_, 4, 3), landing + 2);
     untranspose_b_ = std::make_unique<SlotPermute<word>>(
-        boot_, SwapAdjacentFields(num_slots_, 4, 4, 3), op_level - 1);
+        boot_, SwapAdjacentFields(num_slots_, 4, 4, 3), landing + 1);
   }
   // The auxiliary track goes round this cycle, not through `Boot`. `Boot`
   // lands at GetEndLevel(), which the slack pushes below the main track, so
@@ -144,7 +154,12 @@ int LlamaBlock<word>::NumCiphertexts(int channels) const {
 
 template <typename word>
 int LlamaBlock<word>::OutSwapDepth() const {
-  return leg_->NeedsOutputSwap() ? 2 : 0;
+  // The two swaps cost two levels, but they are placed at the bottom of the
+  // turn, so the turn's slot leg spends everything down to StC. That is what
+  // the budget has to be checked against, and it is the whole budget -- which
+  // is correct, because turn D has nothing else to spend it on.
+  return leg_->NeedsOutputSwap() ? (GetResultLevel() - sched_->GetStCLevel())
+                                 : 0;
 }
 
 template <typename word>
@@ -300,9 +315,11 @@ void LlamaBlock<word>::Untranspose(std::vector<Ct> &res,
                                    const std::vector<Ct> &x,
                                    const EvkMap<word> &evk_map) const {
   res.resize(x.size());
+  const int entry = sched_->GetStCLevel() + 2;
   for (size_t i = 0; i < x.size(); i++) {
-    Ct a;
-    untranspose_a_->Evaluate(boot_, a, x[i], evk_map);
+    Ct dropped, a;
+    boot_->LevelDown(dropped, x[i], entry);
+    untranspose_a_->Evaluate(boot_, a, dropped, evk_map);
     untranspose_b_->Evaluate(boot_, res[i], a, evk_map);
   }
 }
@@ -749,7 +766,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
     std::vector<Ct> flat;
     Untranspose(flat, attn, evk_map);
     attn = std::move(flat);
-    Announce("D  untransposed", attn, GetResultLevel() - 2);
+    Announce("D  untransposed", attn, sched_->GetStCLevel());
   }
   Lower(attn_coeff, attn, evk_map);
   attn.clear();
