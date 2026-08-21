@@ -844,8 +844,9 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
     // head_dim == num_tokens here, and not by coincidence: SinCAttention
     // asserts that the product's width is both, because d is one number. So
     // the score layout and the output layout are the same function and one
-    // probe reads both.
-    ProbeLanes(res, kHeadDim, "attn_out");
+    // probe reads both -- but the two are compared against references in
+    // different orders, hence `model_order`.
+    ProbeLanes(res, kHeadDim, "attn_out", /*model_order=*/true);
   }
 
  private:
@@ -875,8 +876,22 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
 
   // A lane tensor -- scores, probabilities or the attention output -- read
   // back in [head][query][index] order through the leg's own score layout.
+  // `model_order` picks which of two orders the record is written in, and the
+  // two are the same length so nothing catches a wrong choice but the numbers.
+  //
+  //   head-major  [head][token][j]              -- what `probs` and `scores`
+  //                                                are compared against
+  //   model order [token][head * head_dim + j]  -- what `r.attn` is, because
+  //                                                the O projection consumes
+  //                                                it that way
+  //
+  // Reading the attention output head-major against a model-order reference
+  // compares each value with some other value and reports ~0 bits, which is
+  // exactly what the ledger said the first time the layer ran fully encrypted
+  // -- while the same crossing read 6.55 bits on the host stand-in, off the
+  // same reference and at the same magnitude.
   void ProbeLanes(const std::vector<Ciphertext<word>> &cts, int width,
-                  const char *name) const {
+                  const char *name, bool model_order = false) const {
     std::vector<std::vector<Complex>> msg(cts.size());
     for (size_t i = 0; i < cts.size(); i++) {
       Plaintext<word> ptxt;
@@ -891,8 +906,11 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
         for (int j = 0; j < width; j++) {
           int ct = 0, slot = 0;
           LocateScore(h, t, j, ct, slot);
-          out[(static_cast<size_t>(h) * kTokens + t) * width + j] =
-              msg[ct][slot].real();
+          const size_t at =
+              model_order
+                  ? (static_cast<size_t>(t) * heads + h) * width + j
+                  : (static_cast<size_t>(h) * kTokens + t) * width + j;
+          out[at] = msg[ct][slot].real();
         }
       }
     }
