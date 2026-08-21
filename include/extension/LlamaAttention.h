@@ -145,9 +145,9 @@ class SinCLinearLeg : public CoeffLinearLeg<word> {
   void Retune(double score, double value) const;
 
   Config cfg_;
-  // Mutable because  is the only place a magnitude is installed and it
-  // runs from the const  / . What it rebuilds is two
-  // transforms of 31 diagonals; no key and no ciphertext is touched.
+  // Mutable because Retune is the only place a magnitude is installed and it
+  // runs from the const Scores and Values. What it rebuilds is two transforms
+  // of 31 diagonals; no key and no ciphertext is touched.
   mutable SinCAttention<word> attn_;
   typename SinCAttention<word>::Keys keys_;
   int num_slots_;
