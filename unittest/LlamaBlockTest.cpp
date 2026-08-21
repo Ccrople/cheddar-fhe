@@ -1334,8 +1334,23 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
       acfg.sub_degree = kSubDegree;
       acfg.sinc_phases = kSinCPhases;
       acfg.product_level = kProductLevel;
-      acfg.swap_level = operand_level;
+      // SINC AT `prob_level`, AND THE SWAPS THREE ABOVE IT -- NOT AT THE
+      // OPERAND LEVEL.
+      //
+      // `sinc_level` is forced: P comes out of SoftMax at the StC level and
+      // the whole saving on that leg is that it needs nothing further, so
+      // SlotToSinC has to be compiled exactly where P lands. K and V then
+      // spend two swaps and the exchange getting there, which fixes the swaps
+      // three levels up and no higher. Q and K arrive from RoPE at
+      // `operand_level`, well above that; `SinCAttention::Descend` drops them
+      // on the way in, which is cheaper than compiling three linear
+      // transforms at 17 limbs to reach the same place.
+      //
+      // The gap is real slack: the attention product needs its operands only
+      // at prob_level + 3, not at operand_level, so turn B has three levels
+      // spare that nothing currently spends.
       acfg.sinc_level = prob_level;
+      acfg.swap_level = acfg.sinc_level + 3;
       acfg.prefix_level = boot->GetBootParameter().GetEvalModEndLevel();
       acfg.halfboot_scale = boot->GetStCInputScale();
       acfg.verbose = std::getenv("CHEDDAR_VERBOSE") != nullptr;
@@ -1347,9 +1362,10 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
           boot, sw_ring->context, small_ring->context, scfg, acfg, empty, lcfg,
           modpack_keys, *this, pack, host);
       leg = sinc_leg.get();
-      std::cout << "the SinC leg: swaps at " << operand_level << "/"
-                << operand_level - 1 << ", exchange at " << operand_level - 2
-                << ", SinC at " << prob_level << ".."
+      std::cout << "the SinC leg: operands in at " << operand_level
+                << ", swaps at " << acfg.swap_level << "/"
+                << acfg.swap_level - 1 << ", exchange at "
+                << acfg.swap_level - 2 << ", SinC at " << prob_level << ".."
                 << prob_level - kSinCPhases + 1 << ", product at "
                 << kProductLevel << ", HalfBoot lands at " << acfg.prefix_level
                 << ", chain constant " << scfg.chain_constant << std::endl;

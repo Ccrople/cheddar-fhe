@@ -145,6 +145,21 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
   const int n = layout.num_cts;
   const int sinc_level = GetSinCLevel();
 
+  // The swaps are compiled at `swap_level`, so whatever the caller hands over
+  // has to arrive there. It generally does not: the block's Q, K and V leave
+  // RoPE at the block's operand level, and the leg is deliberately compiled
+  // lower -- the same three transforms cost fewer limbs down there, and the
+  // levels in between would be dropped before SlotToSinC anyway. So this is a
+  // real LevelDown, not a formality.
+  auto at_swap_level = [&](Ct &dst, const Ct &src) {
+    const int level = boot_->param_.NPToLevel(src.GetNP());
+    AssertTrue(level >= cfg_.swap_level,
+               "SinCAttention: an operand arrived at level " +
+                   std::to_string(level) + ", below the swap level " +
+                   std::to_string(cfg_.swap_level));
+    boot_->LevelDown(dst, src, cfg_.swap_level);
+  };
+
   std::vector<Ct> stage(n);
   if (leg == Leg::kProb) {
     // SoftMax leaves P exactly where the product wants it. This is the whole
@@ -158,12 +173,12 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
     AssertTrue(static_cast<int>(x.size()) == n,
                "SinCAttention: Q is one ciphertext per product ciphertext");
     for (int i = 0; i < n; i++) {
-      Ct a, b;
-      swap_a_->Evaluate(boot_, a, *x[i], evk);
-      swap_qv_b_->Evaluate(boot_, b, a, evk);
-      // Q skips the exchange, so it arrives a level above K and V. Dropping it
-      // is free in time and turn B has the level.
-      boot_->LevelDown(stage[i], b, sinc_level);
+      Ct in, a;
+      at_swap_level(in, *x[i]);
+      swap_a_->Evaluate(boot_, a, in, evk);
+      // Q skips the exchange, so it arrives a level above K and V. The drop
+      // that reconciles them is taken below, with everyone else's.
+      swap_qv_b_->Evaluate(boot_, stage[i], a, evk);
     }
   } else {
     AssertTrue(static_cast<int>(x.size()) == exchange_->GetNumSrcCts(),
@@ -172,8 +187,9 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
                    " ciphertexts before the exchange");
     std::vector<Ct> swapped(x.size());
     for (size_t i = 0; i < x.size(); i++) {
-      Ct a;
-      swap_a_->Evaluate(boot_, a, *x[i], evk);
+      Ct in, a;
+      at_swap_level(in, *x[i]);
+      swap_a_->Evaluate(boot_, a, in, evk);
       if (leg == Leg::kKey) {
         swap_k_b_->Evaluate(boot_, swapped[i], a, evk);
       } else {
@@ -198,8 +214,17 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
   res.clear();
   res.resize(n);
   for (int i = 0; i < n; i++) {
-    Ct sinc;
-    boot_->SlotToSinC(sinc, num_slots_, stage[i], evk);
+    // SlotToSinC is compiled at `sinc_level`, and the three legs reach this
+    // point at three different levels: P exactly there, Q at swap_level - 2,
+    // K and V at swap_level - 3 because the exchange took one more. THIS is
+    // where they are made to agree. Without it the K and V legs went into
+    // SlotToSinC at whatever the exchange happened to leave, which worked only
+    // when the caller had chosen sinc_level == swap_level - 3 exactly -- true
+    // of SinCAttentionTest, false of the block, where it asserted inside a
+    // hoist with no indication of which leg or which level was wrong.
+    Ct dropped, sinc;
+    boot_->LevelDown(dropped, stage[i], sinc_level);
+    boot_->SlotToSinC(sinc, num_slots_, dropped, evk);
     boot_->LevelDown(res[i], sinc, cfg_.product_level);
   }
 }
