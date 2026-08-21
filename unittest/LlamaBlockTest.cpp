@@ -60,9 +60,11 @@
 #include <cuda_profiler_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1488,12 +1490,25 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
     cudaProfilerStart();
   }
 
+  const auto t0 = std::chrono::steady_clock::now();
   block.Run(out, state, w, sinks, interface_->GetEvkMap());
   cudaDeviceSynchronize();
+  const std::chrono::duration<double> elapsed =
+      std::chrono::steady_clock::now() - t0;
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   if (cheddar::Profile::Enabled()) {
     cudaProfilerStop();
     cheddar::Profile::Report("one decoder block, online evaluation");
+    // One sync, at the end, so this is the only number here that is a wall
+    // time rather than a sum of drained steps. With CHEDDAR_PROFILE_NOSYNC it
+    // is the layer's actual latency; without, it is that plus the host/device
+    // overlap the per-step syncs threw away.
+    std::cout << "  one decoder block, wall clock: " << std::fixed
+              << std::setprecision(1) << elapsed.count() * 1e3 << " ms"
+              << (cheddar::Profile::Timing()
+                      ? "  (per-step syncs ON -- an upper bound)"
+                      : "  (per-step syncs off)")
+              << std::endl;
   }
 
   std::cout << "product-leg magnitudes, against the bootstrap's " << kBootMax

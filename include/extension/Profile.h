@@ -53,14 +53,35 @@ namespace cheddar {
  *
  * ## Enabling
  *
- * `CHEDDAR_PROFILE` in the environment turns the host timers on. NVTX ranges
- * are always pushed -- with no profiler attached that is a predicted branch
- * and a function call, against steps that are milliseconds long.
+ * `CHEDDAR_PROFILE` turns the apparatus on and `CHEDDAR_PROFILE_NOSYNC` drops
+ * the timers from it; see `Timing()` for why the second run is not optional.
+ * NVTX ranges are always pushed -- with no profiler attached that is a
+ * predicted branch and a function call, against steps that are milliseconds
+ * long.
  */
 class Profile {
  public:
+  // `CHEDDAR_PROFILE` turns the whole apparatus on: the warm-up pass, the
+  // capture range and the host timers.
   static bool Enabled() {
     static const bool on = std::getenv("CHEDDAR_PROFILE") != nullptr;
+    return on;
+  }
+
+  // `CHEDDAR_PROFILE_NOSYNC` keeps the apparatus and drops the per-step
+  // timers, and it is not a refinement -- it is the only way to get a true
+  // wall time. Synchronising at every step boundary costs nothing in device
+  // work but destroys host/device overlap: normally the host runs ahead
+  // queueing launches while the GPU works, and the layer has real host work
+  // between launches (weight encoding, the causal mask, the score shift). A
+  // synchronised total is therefore an upper bound on the layer's wall time,
+  // and the gap between the two runs is exactly the overlap that was lost.
+  //
+  // An nsys run wants this set too: kernel durations do not care, but a
+  // timeline full of artificial drains is a worse thing to read.
+  static bool Timing() {
+    static const bool on =
+        Enabled() && std::getenv("CHEDDAR_PROFILE_NOSYNC") == nullptr;
     return on;
   }
 
@@ -80,14 +101,14 @@ class ProfileScope {
 #ifdef CHEDDAR_HAS_NVTX
     nvtxRangePushA(label);
 #endif
-    if (Profile::Enabled()) {
+    if (Profile::Timing()) {
       cudaDeviceSynchronize();
       start_ = std::chrono::steady_clock::now();
     }
   }
 
   ~ProfileScope() {
-    if (Profile::Enabled()) {
+    if (Profile::Timing()) {
       cudaDeviceSynchronize();
       const std::chrono::duration<double> d =
           std::chrono::steady_clock::now() - start_;
