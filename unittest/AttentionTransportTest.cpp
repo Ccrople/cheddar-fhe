@@ -204,7 +204,361 @@ struct KeyPacking {
   }
 };
 
+
+// V'S PACKING. V takes no RoPE, so nothing constrains its channel assignment
+// but the exchange, and the choice is
+//
+//     ciphertext    = kv mod 2
+//     channel_in_ct = (c >> 3) * 16 + (kv / 2) * 8 + (c & 7)
+//
+// giving `slot = [c>>3 (11..14) | kv1 (10) | c&7 (7..9) | key (0..6)]`. This
+// call group's four KV heads then fill exactly two ciphertexts, and the low
+// three bits of the channel sit where the [4|7] swap will drop them into the
+// exchange's field.
+struct ValuePacking {
+  int tokens = kTokens;
+
+  void Locate(int kv, int c, int key, int &ct, int &slot) const {
+    ct = kv & 1;
+    const int channel_in_ct =
+        (c >> 3) * kLanes + ((kv >> 1) & 1) * 8 + (c & 7);
+    slot = channel_in_ct * tokens + key;
+  }
+};
+
 }  // namespace
+
+// The second attention product, P V, from the two places its operands really
+// come from:
+//
+//   P: straight out of SoftMax, in slots, WITH NO PERMUTATION AT ALL
+//        --SlotToSinC(32)-->                              3 levels
+//   V: the block's packing
+//        --SlotPermute [4|7], Q's own swap-->             2 levels
+//        --CtAxisExchange, 2 cts to 8 with GQA-->         1 level
+//        --SlotToSinC(32)-->                              3 levels
+//   = the attention output, one 128x128 product per head
+//
+// WHY P COSTS NOTHING, WHICH IS WHAT THE NAMING BOUGHT. The score product
+// leaves S at `Locate(BitRev7(query), BitRev7(key), head)`, and HalfBoot plus
+// the StC prefix return exactly that to slots: `[key>>3 | query | head]` with
+// the ciphertext axis carrying `BitRev3(key & 7)`. SoftMax is elementwise on
+// the main track and reduces along the key axis, so it leaves the layout where
+// it found it. For the second product P is the LEFT operand with
+// `row = BitRev7(query)` and the contraction index `BitRev7(key)` -- and
+// `Locate` of that is the same slot and the same ciphertext. Naming K's column
+// axis `BitRev7(key)` back in the score product is what arranged this; with any
+// other naming P would need a transform between the two products, on the one
+// leg of the cycle that has no levels to spare.
+//
+// WHY V IS K'S CHAIN WITH THE AXES EXCHANGED. V's column index is the channel
+// again, so nothing forces a cross-ciphertext move the way K's key axis did.
+// What forces one anyway is GQA: 8 KV heads against 32 query heads means this
+// call group's 16 lanes need 4 KV heads four times over, so 2 dense
+// ciphertexts have to become 8. `CtAxisExchange` already does exactly that --
+// the replication rides in the low bits of the exchanged field -- and it costs
+// one level and 14 key switches.
+//
+// THE ALTERNATIVE, WHICH IS NOT MEASURED HERE. The replication could instead
+// come from the projection, by duplicating V's weight columns fourfold: no
+// level, no key switch, but four times V's plaintext count and four times its
+// ModPack. Which is cheaper is a measurement nobody has taken, and it cannot
+// be taken until the projection is wired into the block. This test uses the
+// exchange because the exchange exists, is measured, and leaves the weight
+// memory alone -- and because a level is a thing the schedule can be asked
+// for, while gigabytes of resident plaintext is not.
+//
+// AND THE OUTPUT COMES BACK WHERE Q WENT IN. The result sits at
+// `Locate(BitRev7(query), BitRev7(c), head)`, which is `[c>>3 | query | head]`
+// with the ciphertext axis carrying `BitRev3(c & 7)` -- the exact layout the Q
+// operand had after its own [4|7] swap. So the O projection reads it after the
+// inverse of that swap, and the attention block closes on itself.
+TEST(AttentionTransport, CarriesTheScoresAndValuesIntoAnAttentionOutput) {
+  const int kSinCLevel = EnvInt("CHEDDAR_SINC_LEVEL", 10);
+  // V's leg is two swaps then the exchange, and it has to arrive where P
+  // arrives.
+  const int kValueLevel = kSinCLevel + 3;
+  std::cout << "V at " << kValueLevel << "/" << kValueLevel - 1 << "/"
+            << kValueLevel - 2 << ", P enters at " << kSinCLevel
+            << ", SinC at " << kSinCLevel << ".."
+            << kSinCLevel - kSinCPhases + 1 << ", product at " << kProductLevel
+            << std::endl;
+
+  Ring big(Env("CHEDDAR_BLOCK_PARAM", "sylphflow16_35.json"), {}, 8);
+  Ring sw(Env("CHEDDAR_SWITCH_PARAM", "ringswitch16_35.json"),
+          big.ui->GetSecretCoeffs());
+  Ring small(Env("CHEDDAR_SMALL_PARAM", "ringdegree12_35.json"));
+
+  const int degree = big.Degree();
+  const int num_slots = degree / 2;
+  SwitchedCcmmLayout layout(degree, small.Degree(), kSubDegree);
+  ASSERT_EQ(layout.dim, kTokens);
+  ASSERT_EQ(layout.lanes, kLanes);
+  ASSERT_EQ(layout.num_cts, 8);
+
+  auto boot = std::dynamic_pointer_cast<cheddar::BootContext<word>>(big.context);
+  ASSERT_NE(boot, nullptr);
+  boot->PrepareEvalSpecialFFT(num_slots);
+  boot->PrepareSinC(num_slots, kSubDegree, kSinCLevel, kSinCLevel, kSinCPhases);
+
+  // V's permutation is Q's, at V's own levels: [4|4]@3 then [4|3].
+  const std::vector<int> step_a = SwapAdjacentFields(num_slots, 4, 4, 3);
+  const std::vector<int> step_b = SwapAdjacentFields(num_slots, 3, 4);
+  {
+    std::vector<int> composed(num_slots);
+    for (int t = 0; t < num_slots; t++) composed[t] = step_b[step_a[t]];
+    const std::vector<int> direct = SwapAdjacentFields(num_slots, 7, 4);
+    int mismatch = 0;
+    for (int t = 0; t < num_slots; t++) {
+      if (direct[t] != composed[t]) mismatch++;
+    }
+    ASSERT_EQ(mismatch, 0) << "the two narrow swaps are not the wide one";
+  }
+  SlotPermute<word> swap_a(big.context, step_a, kValueLevel);
+  SlotPermute<word> swap_b(big.context, step_b, kValueLevel - 1);
+  CtAxisExchange<word> exchange(big.context, /*log_num_cts=*/3,
+                                /*field_offset=*/0, kValueLevel - 2,
+                                /*log_num_src_cts=*/1);
+
+  EvkRequest req;
+  swap_a.AddRequiredRotations(req);
+  swap_b.AddRequiredRotations(req);
+  exchange.AddRequiredRotations(req);
+  boot->AddRequiredSinCRotations(req, num_slots);
+  size_t free_before = 0, total = 0;
+  cudaMemGetInfo(&free_before, &total);
+  big.ui->PrepareRotationKey(req);
+  size_t free_after = 0;
+  cudaMemGetInfo(&free_after, &total);
+  std::cout << "rotation keys: " << (free_before - free_after) / (1 << 20)
+            << " MiB, " << free_after / (1 << 20) << " MiB free after"
+            << std::endl;
+
+  // ---- the tensors ------------------------------------------------------
+  //
+  // P is causal and row-stochastic, which is what SoftMax returns, with at
+  // least half the row valid so no single entry dominates -- the batch CC-MM
+  // accumulates d terms inside the polynomial product and the level-1 ring has
+  // no headroom for a spike.
+  std::mt19937_64 gen(0x5A1AD);
+  std::uniform_real_distribution<double> weight(-1.0, 1.0);
+  std::uniform_real_distribution<double> vdist(-0.08, 0.08);
+  std::vector<double> p(static_cast<size_t>(kLanes) * kTokens * kTokens, 0.0);
+  double p_max = 0.0;
+  for (int head = 0; head < kLanes; head++) {
+    for (int query = 0; query < kTokens; query++) {
+      const int valid = kTokens / 2 + (query % (kTokens / 2)) + 1;
+      double sum = 0.0;
+      const size_t base =
+          (static_cast<size_t>(head) * kTokens + query) * kTokens;
+      for (int key = 0; key < valid; key++) {
+        const double w = std::exp(weight(gen));
+        p[base + key] = w;
+        sum += w;
+      }
+      for (int key = 0; key < valid; key++) {
+        p[base + key] /= sum;
+        p_max = std::max(p_max, p[base + key]);
+      }
+    }
+  }
+  std::vector<double> v(static_cast<size_t>(kKvHeads) * kTokens * kHeadDim);
+  for (auto &z : v) z = vdist(gen);
+  auto at = [](const std::vector<double> &t, int a, int b, int c, int stride) {
+    return t[(static_cast<size_t>(a) * kTokens + b) * stride + c];
+  };
+  std::cout << "P is causal and row-stochastic, max entry " << p_max
+            << "; |V| <= 0.08" << std::endl;
+
+  // ---- P: encrypted where SoftMax leaves it, then SlotToSinC only -------
+  std::vector<Ciphertext<word>> p_operand(layout.num_cts);
+  {
+    std::vector<std::vector<Complex>> slots(
+        layout.num_cts, std::vector<Complex>(num_slots, Complex(0)));
+    for (int head = 0; head < kLanes; head++) {
+      for (int query = 0; query < kTokens; query++) {
+        for (int key = 0; key < kTokens; key++) {
+          // SoftMax's own layout: ciphertext BitRev3(key & 7),
+          // slot [key>>3 | query | head].
+          const int ct = BitRev(key & 7, 3);
+          const int slot = ((key >> 3) << 11) | (query << 4) | head;
+          slots[ct][slot] = Complex(at(p, head, query, key, kTokens), 0.0);
+        }
+      }
+    }
+    for (int i = 0; i < layout.num_cts; i++) {
+      Plaintext<word> pt;
+      big.context->encoder_.Encode(pt, kSinCLevel,
+                                   big.param->GetScale(kSinCLevel), slots[i]);
+      Ciphertext<word> ct, sinc;
+      big.ui->Encrypt(ct, pt);
+      boot->SlotToSinC(sinc, num_slots, ct, big.ui->GetEvkMap());
+      big.context->LevelDown(p_operand[i], sinc, kProductLevel);
+    }
+  }
+
+  // ---- V: the swap, the exchange, then SlotToSinC -----------------------
+  ValuePacking vpack;
+  const int num_v_src = kKvHeads * kHeadDim / (num_slots / kTokens);
+  ASSERT_EQ(num_v_src, 2);
+  std::vector<Ciphertext<word>> v_swapped(num_v_src);
+  {
+    std::vector<std::vector<Complex>> slots(
+        num_v_src, std::vector<Complex>(num_slots, Complex(0)));
+    for (int kv = 0; kv < kKvHeads; kv++) {
+      for (int key = 0; key < kTokens; key++) {
+        for (int c = 0; c < kHeadDim; c++) {
+          int ct, slot;
+          vpack.Locate(kv, c, key, ct, slot);
+          ASSERT_LT(ct, num_v_src);
+          slots[ct][slot] = Complex(at(v, kv, key, c, kHeadDim), 0.0);
+        }
+      }
+    }
+    for (int i = 0; i < num_v_src; i++) {
+      Plaintext<word> pt;
+      big.context->encoder_.Encode(pt, kValueLevel,
+                                   big.param->GetScale(kValueLevel), slots[i]);
+      Ciphertext<word> ct, a;
+      big.ui->Encrypt(ct, pt);
+      swap_a.Evaluate(big.context, a, ct, big.ui->GetEvkMap());
+      swap_b.Evaluate(big.context, v_swapped[i], a, big.ui->GetEvkMap());
+    }
+  }
+
+  std::vector<Ciphertext<word>> exchanged;
+  exchange.Evaluate(exchanged, v_swapped, big.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(big.param->NPToLevel(exchanged[0].GetNP()), kSinCLevel);
+
+  std::vector<Ciphertext<word>> v_operand(layout.num_cts);
+  for (int y = 0; y < layout.num_cts; y++) {
+    Ciphertext<word> sinc;
+    boot->SlotToSinC(sinc, num_slots, exchanged[y], big.ui->GetEvkMap());
+    big.context->LevelDown(v_operand[BitRev(y, 3)], sinc, kProductLevel);
+  }
+  exchanged.clear();
+
+  // ---- both operands, before the product runs on them -------------------
+  auto check_operand = [&](const std::vector<Ciphertext<word>> &op,
+                           bool is_p, const char *name) {
+    double worst = 0.0, biggest = 0.0, control = 0.0;
+    for (int i = 0; i < layout.num_cts; i++) {
+      Plaintext<word> pt;
+      big.ui->Decrypt(pt, op[i]);
+      std::vector<Complex> got;
+      big.context->encoder_.DecodeSinC(got, pt, kSubDegree);
+      for (const auto &z : got) biggest = std::max(biggest, std::abs(z));
+      for (int head = 0; head < kLanes; head++) {
+        for (int a = 0; a < kTokens; a++) {
+          for (int b = 0; b < (is_p ? kTokens : kHeadDim); b++) {
+            int ct, index;
+            layout.LocateSinC(BitRev(a, 7), BitRev(b, 7), head, ct, index);
+            if (ct != i) continue;
+            const double want =
+                is_p ? at(p, head, a, b, kTokens)
+                     : at(v, head / kGqaGroup, a, b, kHeadDim);
+            worst = std::max(worst, std::abs(got[index].real() - want));
+            if (!is_p) {
+              control = std::max(
+                  control, std::abs(got[index].real() -
+                                    at(v, head % kKvHeads, a, b, kHeadDim)));
+            }
+          }
+        }
+      }
+    }
+    std::cout << name << ": max |diff| = " << worst << ", |got| <= " << biggest
+              << std::endl;
+    if (!is_p) {
+      std::cout << "  control (lanes not replicated by KV head): " << control
+                << std::endl;
+      EXPECT_GT(control, 1e-2)
+          << "every lane holds the same values, so this is not checking GQA";
+    }
+    EXPECT_LT(worst, 1e-3) << name << " did not land where the layout says";
+  };
+  check_operand(p_operand, true,
+                "P operand, straight from SoftMax's layout + SinC");
+  check_operand(v_operand, false, "V operand after swap + exchange + SinC");
+
+  // ---- the product ------------------------------------------------------
+  sw.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                              kProductLevel);
+  sw.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                     small.ui->GetSecretCoeffs(),
+                                     kProductLevel);
+  SwitchedCcmmHandler<word> product(sw.context, small.context, kSubDegree);
+  for (int idx : product.SmallRotationIndices()) {
+    small.ui->PrepareRotationKey(idx, kProductLevel);
+  }
+
+  std::vector<Ciphertext<word>> out;
+  product.Multiply(out, p_operand, v_operand,
+                   sw.ui->GetRingSwitchKey(layout.rank),
+                   sw.ui->GetInverseRingSwitchKey(layout.rank),
+                   small.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(out.size()), layout.num_cts);
+
+  std::vector<std::vector<Complex>> got(layout.num_cts);
+  for (int i = 0; i < layout.num_cts; i++) {
+    EXPECT_EQ(sw.param->NPToLevel(out[i].GetNP()), kProductLevel - 1);
+    Plaintext<word> pt;
+    sw.ui->Decrypt(pt, out[i]);
+    sw.context->encoder_.DecodeSinC(got[i], pt, kSubDegree);
+  }
+
+  double worst = 0.0, sum = 0.0, biggest = 0.0, transposed = 0.0;
+  double in_q_layout = 0.0;
+  for (int head = 0; head < kLanes; head++) {
+    for (int query = 0; query < kTokens; query++) {
+      for (int c = 0; c < kHeadDim; c++) {
+        double want = 0.0;
+        for (int key = 0; key < kTokens; key++) {
+          want += at(p, head, query, key, kTokens) *
+                  at(v, head / kGqaGroup, key, c, kHeadDim);
+        }
+        biggest = std::max(biggest, std::abs(want));
+        int ct, index;
+        layout.LocateSinC(BitRev(query, 7), BitRev(c, 7), head, ct, index);
+        const double d = std::abs(got[ct][index].real() - want);
+        worst = std::max(worst, d);
+        sum += d;
+        // Control: the same entry read transposed, which a norm-only test
+        // could not tell apart.
+        int ct2, index2;
+        layout.LocateSinC(BitRev(c, 7), BitRev(query, 7), head, ct2, index2);
+        transposed =
+            std::max(transposed, std::abs(got[ct2][index2].real() - want));
+        // And the claim that closes the block: in SLOT terms this entry is
+        // `[c>>3 | query | head]` in ciphertext BitRev3(c & 7), which is
+        // exactly where the Q operand sat after its own [4|7] swap.
+        int ct3, slot3;
+        layout.Locate(BitRev(query, 7), BitRev(c, 7), head, ct3, slot3);
+        if (ct3 != BitRev(c & 7, 3) ||
+            slot3 != (((c >> 3) << 11) | (query << 4) | head)) {
+          in_q_layout = 1.0;
+        }
+      }
+    }
+  }
+  const double mean = sum / (static_cast<double>(kLanes) * kTokens * kHeadDim);
+
+  std::cout << "P V through the transport: max |diff| = " << worst << ", mean "
+            << mean << ", |want| <= " << biggest << std::endl;
+  std::cout << "  control (transposed): " << transposed << std::endl;
+
+  EXPECT_LT(worst, 5e-3)
+      << "the attention output did not land where the layout says it should";
+  EXPECT_GT(transposed, 1e-3)
+      << "the result is symmetric enough that a transpose would pass";
+  EXPECT_EQ(in_q_layout, 0.0)
+      << "the output is NOT in the Q operand's own slot layout, so the O "
+         "projection cannot read it back with the inverse [4|7] swap";
+}
 
 TEST(AttentionTransport, CarriesTheBlockPackingIntoAScoreProduct) {
   const int kSinCLevel = EnvInt("CHEDDAR_SINC_LEVEL", 9);
