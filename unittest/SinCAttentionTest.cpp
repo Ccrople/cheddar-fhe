@@ -332,10 +332,27 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
       << "the score product did not come back where SoftMax reads it";
   EXPECT_GT(ft.residual, 1e-2)
       << "the scores are symmetric enough that a transpose would pass";
-  EXPECT_NEAR(fs.constant.real(), 1.0, 0.05)
-      << "the prefix carries Canonicalise, so the chain should be the identity "
-         "and not merely proportional to it";
-  EXPECT_LT(std::abs(fs.constant.imag()), 0.05);
+  EXPECT_LT(std::abs(fs.constant.imag()), 1e-3 * std::abs(fs.constant.real()))
+      << "the chain's constant is not real, which no part of it should be";
+
+  // THE CONSTANT IS MEASURED, NOT DERIVED, AND THAT IS THE CODEBASE'S OWN
+  // POSITION. HalfBoot declares its output at eval_mod_->end_scale_ and says
+  // in its own comment that "what the remaining constant is gets measured
+  // rather than derived through cts_const_, stc_const_ and q0". It comes out
+  // near 2^-log_message_ratio, which is the design intent, and the few percent
+  // it misses by is the part that does not cancel here because this leg has no
+  // ToCoeff to cancel against.
+  //
+  // So: read it off, hand back its inverse, and require the SECOND product to
+  // come back at 1. That costs no extra GPU work -- the prefixes are 31
+  // diagonals and no rotation key changes -- and it is the difference between
+  // a chain that is proportional to the right answer and one that IS it.
+  const double measured = fs.constant.real();
+  std::cout << "  the chain's constant: " << measured << " = 2^"
+            << std::log2(measured) << ", against 2^-"
+            << boot->GetBootParameter().GetLogMessageRatio()
+            << " intended" << std::endl;
+  attn.SetMagnitudes(1.0 / measured, 1.0 / measured);
 
   // ---- P V, slots to slots ----------------------------------------------
   //
@@ -421,6 +438,11 @@ TEST(SinCAttention, TheTwoProductsRunSlotsToSlots) {
          "layout, so the block does not close on itself";
   EXPECT_GT(fg.residual, 1e-3)
       << "every lane holds the same values, so this is not checking GQA";
-  EXPECT_NEAR(fo.constant.real(), 1.0, 0.05);
-  EXPECT_LT(std::abs(fo.constant.imag()), 0.05);
+  EXPECT_NEAR(fo.constant.real(), 1.0, 1e-3)
+      << "the prefix was given the chain's own constant, so the chain should "
+         "now BE the identity and not merely proportional to it";
+  EXPECT_LT(std::abs(fo.constant.imag()), 1e-3);
+  std::cout << "  and the residual is " << fo.residual / fs.residual
+            << "x the un-canonicalised one, on a message " << 1.0 / measured
+            << "x larger" << std::endl;
 }

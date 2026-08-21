@@ -81,11 +81,17 @@ SinCAttention<word>::SinCAttention(
   exchange_ = std::make_unique<CtAxisExchange<word>>(
       boot_, log_cts, /*field_offset=*/0, cfg_.swap_level - 2, log_src);
 
+  BuildPrefixes();
+}
+
+template <typename word>
+void SinCAttention<word>::BuildPrefixes() {
   // THE PREFIX PAIR. Canonicalise is one constant multiply and one rescale at
   // the level HalfBoot lands on, and the prefix is one LinearTransform at the
   // same level, so the first folds into the second for nothing -- and folding
   // it is what restores the magnitude HalfBoot divided out. The two products
   // want different magnitudes, hence two.
+  prefix_.clear();
   const StripedMatrix raw =
       boot_->SinCPrefixMatrix(num_slots_, cfg_.sub_degree, prefix_window_);
   auto [bs, gs] = SplitBSGS(raw.GetNumDiag());
@@ -99,9 +105,8 @@ SinCAttention<word>::SinCAttention(
     // HalfBoot scale to work from, fall back to LinearTransform's own
     // convention, which preserves whatever it is handed.
     const double scale =
-        (cfg_.halfboot_scale > 0.0)
-            ? target * prod / cfg_.halfboot_scale
-            : prod;
+        (cfg_.halfboot_scale > 0.0) ? target * prod / cfg_.halfboot_scale
+                                    : prod;
     const StripedMatrix m =
         (magnitudes[i] == 1.0)
             ? raw
@@ -110,6 +115,14 @@ SinCAttention<word>::SinCAttention(
                          /*pre_rotation=*/-prefix_window_,
                          /*additional_pt_rot=*/prefix_window_);
   }
+}
+
+template <typename word>
+void SinCAttention<word>::SetMagnitudes(double score_magnitude,
+                                        double value_magnitude) {
+  cfg_.score_magnitude = score_magnitude;
+  cfg_.value_magnitude = value_magnitude;
+  BuildPrefixes();
 }
 
 template <typename word>
