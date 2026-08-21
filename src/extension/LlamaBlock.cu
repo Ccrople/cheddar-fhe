@@ -172,18 +172,25 @@ int LlamaBlock<word>::NumScoreCiphertexts() const {
 
 template <typename word>
 const std::vector<double> &LlamaBlock<word>::Reorder(
-    std::vector<double> &buf, const std::vector<double> &w, int rows, int cols,
+    const std::vector<double> &w, int rows, int cols,
     typename LinearLeg::Tensor which, bool permute_rows) const {
   const std::vector<int> *order = nullptr;
+  int slot = 0;
   switch (which) {
-    case LinearLeg::Tensor::kQuery: order = &q_order_; break;
-    case LinearLeg::Tensor::kKey: order = &k_order_; break;
-    case LinearLeg::Tensor::kValue: order = &v_order_; break;
-    case LinearLeg::Tensor::kAttnOut: order = &o_order_; break;
+    case LinearLeg::Tensor::kQuery: order = &q_order_; slot = 0; break;
+    case LinearLeg::Tensor::kKey: order = &k_order_; slot = 1; break;
+    case LinearLeg::Tensor::kValue: order = &v_order_; slot = 2; break;
+    case LinearLeg::Tensor::kAttnOut: order = &o_order_; slot = 3; break;
   }
   // The common case, and the one worth not copying: 14336 x 4096 doubles is
   // 470 MB and the FFN's three matrices are never reordered.
   if (order->empty()) return w;
+
+  Reordered &held = reordered_[slot];
+  if (held.source == w.data() && held.size == w.size()) return held.data;
+  std::vector<double> &buf = held.data;
+  held.source = w.data();
+  held.size = w.size();
   AssertTrue(w.size() == static_cast<size_t>(rows) * cols,
              "LlamaBlock::Reorder: the weight is not rows x cols");
   buf.assign(w.size(), 0.0);
@@ -579,7 +586,6 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
 
   const LinearLeg &leg = *leg_;
   const double r = cal_.residual;
-  std::vector<double> wbuf;
 
   // ---- turn A: RMSNorm(attn), then the QKV projection -------------------
   //
@@ -619,21 +625,21 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   {
     ProfileScope _p("A  project Q");
     leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels,
-                Reorder(wbuf, w.wq, cfg_.num_channels, cfg_.num_channels,
+                Reorder(w.wq, cfg_.num_channels, cfg_.num_channels,
                         LinearLeg::Tensor::kQuery, false),
                 cal_.size_q, "Q");
   }
   {
     ProfileScope _p("A  project K");
     leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-                Reorder(wbuf, w.wk, cfg_.num_channels, cfg_.num_kv_channels,
+                Reorder(w.wk, cfg_.num_channels, cfg_.num_kv_channels,
                         LinearLeg::Tensor::kKey, false),
                 cal_.size_k, "K");
   }
   {
     ProfileScope _p("A  project V");
     leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-                Reorder(wbuf, w.wv, cfg_.num_channels, cfg_.num_kv_channels,
+                Reorder(w.wv, cfg_.num_channels, cfg_.num_kv_channels,
                         LinearLeg::Tensor::kValue, false),
                 cal_.size_v, "V");
   }
@@ -837,7 +843,7 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   {
     ProfileScope _p("D  project O");
     leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
-                Reorder(wbuf, w.wo, cfg_.num_channels, cfg_.num_channels,
+                Reorder(w.wo, cfg_.num_channels, cfg_.num_channels,
                         LinearLeg::Tensor::kAttnOut, true),
                 r / cal_.size_attn, "O");
   }

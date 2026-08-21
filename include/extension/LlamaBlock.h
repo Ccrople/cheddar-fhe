@@ -552,8 +552,14 @@ class LlamaBlock {
   // A tensor's weight with its columns (or, for W_o, its rows) put in the
   // order the leg asked for. Returns `w` itself when the leg wants none, so
   // the untouched matrices are never copied.
-  const std::vector<double> &Reorder(std::vector<double> &buf,
-                                     const std::vector<double> &w, int rows,
+  //
+  // The permuted copy is kept per tensor rather than rebuilt per call. It is a
+  // pure function of the weight and the order, both of which are fixed for the
+  // life of the block, and W_q is 4096 x 4096 doubles -- 134 MB allocated,
+  // scattered and freed on every call, for a result that could not have
+  // changed. The source pointer and size are checked so a different tensor
+  // cannot be answered with a held permutation.
+  const std::vector<double> &Reorder(const std::vector<double> &w, int rows,
                                      int cols,
                                      typename LinearLeg::Tensor which,
                                      bool permute_rows) const;
@@ -611,6 +617,14 @@ class LlamaBlock {
   // The leg's channel orders, taken once, and their inverses, which is what
   // the sink injection and RoPE's tables actually read.
   std::vector<int> q_order_, k_order_, v_order_, o_order_;
+  // Reorder's held permutations, one per tensor, with the source they were
+  // built from.
+  struct Reordered {
+    const double *source = nullptr;
+    size_t size = 0;
+    std::vector<double> data;
+  };
+  mutable Reordered reordered_[4];
   std::vector<int> q_variant_, k_variant_;
 
   std::unique_ptr<SylphSchedule<word>> sched_;

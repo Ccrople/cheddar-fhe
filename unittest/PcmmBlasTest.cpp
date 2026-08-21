@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "core/Mlwe.h"
 #include "core/Pcmm.h"
 #ifdef USE_CUBLAS
 #include "core/PcmmBlas.h"
@@ -158,6 +159,91 @@ TEST_P(Testbed32, PcmmBlasIsFasterThanTheHandKernel) {
     std::cout << "  " << p.n << "  " << gemm * p.out / kRows << " ms  ([SYLPH] "
               << p.sylph << ")" << std::endl;
   }
+}
+#endif
+
+#ifdef USE_CUBLAS
+// The MLWE overload, which is the one that matters.
+//
+// `CoeffLinearLeg` reaches the product through `ModDecomp`, so every PC-MM the
+// Llama block performs is on `MlweCiphertext`, not `Ciphertext` -- the RLWE
+// overload the two tests above cover was never on the layer's path. Same
+// standard: `PcmmHandler::Multiply(MLWE)` is the reference and the only
+// acceptable result is equality.
+TEST_P(Testbed32, PcmmBlasMlweMatchesTheHandKernel) {
+  constexpr int kSmallDegree = 256;
+  constexpr int kParents = 4;
+  constexpr double kWeightScale = 1073741824.0;
+
+  const int degree = param_->degree_;
+  const int level = default_encryption_level_;
+  const double ct_scale = DetermineScale(level);
+  const int rank = degree / kSmallDegree;
+  const int cols = kParents * rank;
+  const int rows = rank;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+  PcmmHandler<word> pcmm(*param_);
+  PcmmBlasHandler<word> blas(*param_);
+
+  std::vector<MlweCiphertext<word>> columns;
+  {
+    std::vector<double> coeffs(degree, 0.0);
+    Plaintext<word> pt;
+    Ciphertext<word> ct;
+    for (int p = 0; p < kParents; p++) {
+      for (int i = 0; i < degree; i++) {
+        coeffs[i] = 0.011 * static_cast<double>((p * 37 + i * 13) % 197) - 1.1;
+      }
+      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+      interface_->Encrypt(ct, pt);
+      std::vector<MlweCiphertext<word>> decomposed;
+      mlwe.ModDecomp(decomposed, ct, kSmallDegree);
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+    }
+  }
+  ASSERT_EQ(static_cast<int>(columns.size()), cols);
+
+  std::vector<double> values(static_cast<size_t>(rows) * cols);
+  for (size_t i = 0; i < values.size(); i++) {
+    values[i] = 0.002 * static_cast<double>((i * 7919) % 401) - 0.4;
+  }
+
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, kWeightScale, values, rows, cols);
+  typename PcmmBlasHandler<word>::SplitMatrix us;
+  blas.SplitMatrixFrom(us, level, kWeightScale, values, rows, cols);
+
+  std::vector<MlweCiphertext<word>> want, got;
+  pcmm.Multiply(want, u, columns);
+  blas.Multiply(got, us, columns);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(want.size(), got.size());
+
+  size_t mismatches = 0, words = 0;
+  for (int i = 0; i < rows; i++) {
+    ASSERT_EQ(want[i].a_.size(), got[i].a_.size());
+    ASSERT_EQ(want[i].b_.size(), got[i].b_.size());
+    HostVector<word> ha(want[i].a_.size()), ga(got[i].a_.size());
+    HostVector<word> hb(want[i].b_.size()), gb(got[i].b_.size());
+    CopyDeviceToHost(ha, want[i].a_);
+    CopyDeviceToHost(ga, got[i].a_);
+    CopyDeviceToHost(hb, want[i].b_);
+    CopyDeviceToHost(gb, got[i].b_);
+    for (size_t k = 0; k < ha.size(); k++) {
+      if (ha[k] != ga[k]) mismatches++;
+    }
+    for (size_t k = 0; k < hb.size(); k++) {
+      if (hb[k] != gb[k]) mismatches++;
+    }
+    words += ha.size() + hb.size();
+  }
+  std::cout << "rank " << rank << ", " << cols << " columns, " << us.pieces
+            << " int8 pieces; compared " << words << " words" << std::endl;
+  EXPECT_EQ(mismatches, 0u)
+      << "the GEMM path disagrees with PcmmAccum on the MLWE format";
+  EXPECT_NEAR(got[0].scale_ / want[0].scale_, 1.0, 1e-12);
 }
 #endif
 

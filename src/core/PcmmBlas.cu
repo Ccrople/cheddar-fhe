@@ -1,5 +1,6 @@
 #ifdef USE_CUBLAS
 
+#include <algorithm>
 #include <cmath>
 
 #include "common/Assert.h"
@@ -139,19 +140,127 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
   CopyHostToDevice(res.data, host);
 }
 
+namespace {
+// The gather and the recombination are both flat; 256 is what every other
+// elementwise kernel in the library uses.
+constexpr int kBlock = 256;
+}  // namespace
+
+template <typename word>
+void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
+                                              const word *const *src_ptrs,
+                                              const SplitMatrix &u,
+                                              const NPInfo &np,
+                                              int vec_len) const {
+  const int rows = u.rows, cols = u.cols, pieces = u.pieces;
+  const int num_primes = np.GetNumTotal();
+  const int num_groups = pieces * pieces;
+  AssertTrue(vec_len % kBlock == 0,
+             "PcmmBlas: the component length must be a multiple of the block "
+             "dim");
+
+  // The scratch buffers are indexed by int, because DeviceVector is, and the
+  // a-part of a wide tile passes 2^31 words long before it runs out of card:
+  // 56 parents at rank 256 is 14336 columns of 65536 words per limb, which is
+  // 3.8e9 int8 pieces. So the product is chunked along the vector axis --
+  // valid without further thought, since the product is a scalar combination
+  // and never mixes positions within a limb. Bounding the peak is a reason to
+  // chunk even where the index would have fitted: at 134M words the two
+  // scratch buffers are 134 MB and 537 MB, against a ModDecomp that is already
+  // holding gigabytes.
+  constexpr size_t kScratchWords = 1u << 27;
+  size_t chunk =
+      std::min(kScratchWords / (static_cast<size_t>(pieces) * cols),
+               kScratchWords / (static_cast<size_t>(num_groups) * rows));
+  chunk = std::min(chunk, static_cast<size_t>(vec_len));
+  chunk -= chunk % kBlock;
+  AssertTrue(chunk >= static_cast<size_t>(kBlock),
+             "PcmmBlas: the operand is too wide for the scratch budget");
+
+  const size_t src_n = static_cast<size_t>(cols) * chunk;
+  const size_t dst_n = static_cast<size_t>(rows) * chunk;
+  DeviceVector<int8_t> src_split(static_cast<int>(pieces * src_n));
+  DeviceVector<int32_t> groups(static_cast<int>(num_groups * dst_n));
+
+  const auto primes = param_.GetPrimeVector(np);
+  const int one = 1, zero = 0;
+
+  for (int j = 0; j < num_primes; j++) {
+    // 2^(7*(k+l)) mod p, laid out to match the (l * pieces + k) buffer order.
+    HostVector<word> h_shift(num_groups);
+    {
+      const uint64_t p = primes[j];
+      std::vector<uint64_t> pow(2 * pieces - 1);
+      uint64_t acc = 1;
+      for (int s = 0; s < 2 * pieces - 1; s++) {
+        pow[s] = acc;
+        for (int b2 = 0; b2 < kPieceBits; b2++) acc = (acc * 2) % p;
+      }
+      for (int l = 0; l < pieces; l++) {
+        for (int k = 0; k < pieces; k++) {
+          h_shift[l * pieces + k] = static_cast<word>(pow[k + l]);
+        }
+      }
+    }
+    DeviceVector<word> d_shift(num_groups);
+    CopyHostToDevice(d_shift, h_shift);
+
+    for (size_t off = 0; off < static_cast<size_t>(vec_len); off += chunk) {
+      const int span =
+          static_cast<int>(std::min(chunk, static_cast<size_t>(vec_len) - off));
+      const int limb_offset =
+          static_cast<int>(j * static_cast<size_t>(vec_len) + off);
+      const size_t src_span = static_cast<size_t>(cols) * span;
+      const size_t dst_span = static_cast<size_t>(rows) * span;
+
+      kernel::SplitGather<word>
+          <<<static_cast<int>((src_span + kBlock - 1) / kBlock), kBlock>>>(
+              src_split.data(), src_ptrs, cols, span, limb_offset, pieces,
+              kPieceBits);
+
+      for (int l = 0; l < pieces; l++) {
+        const int8_t *b = src_split.data() + static_cast<size_t>(l) * src_span;
+        for (int k = 0; k < pieces; k++) {
+          const int8_t *a = u.data.data() +
+                            (static_cast<size_t>(k) * num_primes + j) *
+                                static_cast<size_t>(rows) * cols;
+          int32_t *c =
+              groups.data() + static_cast<size_t>(l * pieces + k) * dst_span;
+          // One buffer per (k, l) and beta = 0. Accumulating several GEMMs into
+          // one buffer with beta = 1 was the first thing to suspect when 0.46%
+          // of the words came out wrong: cuBLAS's integer path does not
+          // guarantee read-modify-write on C the way the floating-point one
+          // does. Each product now lands in its own slab and the recombination
+          // kernel does all of the summing.
+          const cublasStatus_t st = cublasGemmEx(
+              handle_, CUBLAS_OP_N, CUBLAS_OP_N, span, rows, cols, &one, b,
+              CUDA_R_8I, span, a, CUDA_R_8I, cols, &zero, c, CUDA_R_32I, span,
+              CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+          AssertTrue(st == CUBLAS_STATUS_SUCCESS, "PcmmBlas: GemmEx failed");
+        }
+      }
+
+      kernel::CombineGroups<word>
+          <<<static_cast<int>((dst_span + kBlock - 1) / kBlock), kBlock>>>(
+              dst_ptrs, groups.data(), num_groups, rows, span, limb_offset,
+              primes[j], d_shift.data());
+    }
+  }
+}
+
 template <typename word>
 void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
                                      const SplitMatrix &u,
                                      const std::vector<Ct> &cts) const {
-  const int rows = u.rows, cols = u.cols, pieces = u.pieces;
+  const int rows = u.rows, cols = u.cols;
   AssertTrue(static_cast<int>(cts.size()) == cols,
              "PcmmBlas::Multiply: cts size must equal u.cols");
   AssertTrue(!cts.empty(), "PcmmBlas::Multiply: no inputs");
 
   const NPInfo np = cts[0].GetNP();
   const int degree = param_.degree_;
-  const int num_primes = np.GetNumTotal();
   AssertTrue(np.num_aux_ == 0, "PcmmBlas::Multiply: aux primes unsupported");
+  AssertTrue(np == u.np, "PcmmBlas::Multiply: NP mismatch between u and cts");
   for (const auto &c : cts) {
     AssertTrue(c.GetNP() == np, "PcmmBlas::Multiply: mixed NP");
     AssertFalse(c.HasRx(), "PcmmBlas::Multiply: input has rx");
@@ -186,75 +295,72 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
   CopyHostToDevice(d_src_bx, h_src_bx);
   CopyHostToDevice(d_src_ax, h_src_ax);
 
-  const size_t src_n = static_cast<size_t>(cols) * degree;
-  const size_t dst_n = static_cast<size_t>(rows) * degree;
-  const int num_groups = pieces * pieces;
-  DeviceVector<int8_t> src_split(static_cast<int>(pieces * src_n));
-  DeviceVector<int32_t> groups(static_cast<int>(num_groups * dst_n));
+  MultiplyComponent(d_dst_bx.data(), d_src_bx.data(), u, np, degree);
+  MultiplyComponent(d_dst_ax.data(), d_src_ax.data(), u, np, degree);
+}
 
-  const auto primes = param_.GetPrimeVector(np);
-  const int one = 1, zero = 0;
-  constexpr int kBlock = 256;
+template <typename word>
+void PcmmBlasHandler<word>::Multiply(
+    std::vector<MlweCiphertext<word>> &res, const SplitMatrix &u,
+    const std::vector<MlweCiphertext<word>> &cts) const {
+  const int rows = u.rows, cols = u.cols;
+  AssertTrue(rows > 0 && cols > 0, "PcmmBlas::Multiply(MLWE): bad shape");
+  AssertTrue(static_cast<int>(cts.size()) == cols,
+             "PcmmBlas::Multiply(MLWE): cts size must equal u.cols");
 
-  for (int comp = 0; comp < 2; comp++) {
-    const word *const *src_ptrs =
-        comp == 0 ? d_src_bx.data() : d_src_ax.data();
-    for (int j = 0; j < num_primes; j++) {
-      const int limb_offset = j * degree;
-      kernel::SplitGather<word>
-          <<<static_cast<int>((src_n + kBlock - 1) / kBlock), kBlock>>>(
-              src_split.data(), src_ptrs, cols, degree, limb_offset, pieces,
-              kPieceBits);
-
-      for (int l = 0; l < pieces; l++) {
-        const int8_t *b = src_split.data() + static_cast<size_t>(l) * src_n;
-        for (int k = 0; k < pieces; k++) {
-          const int8_t *a = u.data.data() +
-                            (static_cast<size_t>(k) * num_primes + j) *
-                                static_cast<size_t>(rows) * cols;
-          int32_t *c =
-              groups.data() + static_cast<size_t>(l * pieces + k) * dst_n;
-          // One buffer per (k, l) and beta = 0. Accumulating several GEMMs into
-          // one buffer with beta = 1 was the first thing to suspect when 0.46%
-          // of the words came out wrong: cuBLAS's integer path does not
-          // guarantee read-modify-write on C the way the floating-point one
-          // does. Each product now lands in its own slab and the recombination
-          // kernel does all of the summing.
-          const cublasStatus_t st = cublasGemmEx(
-              handle_, CUBLAS_OP_N, CUBLAS_OP_N, degree, rows, cols, &one, b,
-              CUDA_R_8I, degree, a, CUDA_R_8I, cols, &zero, c, CUDA_R_32I,
-              degree, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
-          AssertTrue(st == CUBLAS_STATUS_SUCCESS, "PcmmBlas: GemmEx failed");
-        }
-      }
-
-      // 2^(7t) mod p for each shift group.
-      // 2^(7*(k+l)) mod p, laid out to match the (l * pieces + k) buffer order.
-      HostVector<word> h_shift(num_groups);
-      {
-        const uint64_t p = primes[j];
-        std::vector<uint64_t> pow(2 * pieces - 1);
-        uint64_t acc = 1;
-        for (int s = 0; s < 2 * pieces - 1; s++) {
-          pow[s] = acc;
-          for (int b2 = 0; b2 < kPieceBits; b2++) acc = (acc * 2) % p;
-        }
-        for (int l = 0; l < pieces; l++) {
-          for (int k = 0; k < pieces; k++) {
-            h_shift[l * pieces + k] = static_cast<word>(pow[k + l]);
-          }
-        }
-      }
-      DeviceVector<word> d_shift(num_groups);
-      CopyHostToDevice(d_shift, h_shift);
-
-      kernel::CombineGroups<word>
-          <<<static_cast<int>((dst_n + kBlock - 1) / kBlock), kBlock>>>(
-              (comp == 0 ? d_dst_bx.data() : d_dst_ax.data()), groups.data(),
-              num_groups, rows, degree, limb_offset, primes[j],
-              d_shift.data());
-    }
+  const NPInfo np = cts.at(0).np_;
+  AssertTrue(np.num_aux_ == 0,
+             "PcmmBlas::Multiply(MLWE): aux primes unsupported");
+  AssertTrue(np == u.np,
+             "PcmmBlas::Multiply(MLWE): NP mismatch between u and cts");
+  const int rank = cts.at(0).rank_;
+  const int small_degree = cts.at(0).degree_;
+  const double ct_scale = cts.at(0).scale_;
+  for (const auto &ct : cts) {
+    AssertTrue(ct.np_ == np,
+               "PcmmBlas::Multiply(MLWE): ciphertexts differ in NP");
+    AssertTrue(ct.rank_ == rank && ct.degree_ == small_degree,
+               "PcmmBlas::Multiply(MLWE): ciphertexts differ in rank or "
+               "degree");
   }
+
+  const int num_primes = np.GetNumTotal();
+  // All k blocks of a limb are contiguous, so the a-part is one long row and
+  // the product needs no notion of rank -- the same substitution
+  // PcmmHandler::Multiply(MLWE) makes when it hands PcmmAccum the a-stride in
+  // place of the degree.
+  const int a_stride = rank * small_degree;
+
+  res.clear();
+  res.resize(rows);
+  for (auto &r : res) {
+    r.rank_ = rank;
+    r.degree_ = small_degree;
+    r.np_ = np;
+    r.scale_ = u.scale * ct_scale;
+    r.a_.resize(num_primes * a_stride);
+    r.b_.resize(num_primes * small_degree);
+  }
+
+  HostVector<word *> h_dst_a(rows), h_dst_b(rows);
+  HostVector<word *> h_src_a(cols), h_src_b(cols);
+  for (int i = 0; i < rows; i++) {
+    h_dst_a[i] = res[i].a_.data();
+    h_dst_b[i] = res[i].b_.data();
+  }
+  for (int j = 0; j < cols; j++) {
+    h_src_a[j] = const_cast<word *>(cts[j].a_.data());
+    h_src_b[j] = const_cast<word *>(cts[j].b_.data());
+  }
+  DeviceVector<word *> d_dst_a(rows), d_dst_b(rows);
+  DeviceVector<word *> d_src_a(cols), d_src_b(cols);
+  CopyHostToDevice(d_dst_a, h_dst_a);
+  CopyHostToDevice(d_dst_b, h_dst_b);
+  CopyHostToDevice(d_src_a, h_src_a);
+  CopyHostToDevice(d_src_b, h_src_b);
+
+  MultiplyComponent(d_dst_b.data(), d_src_b.data(), u, np, small_degree);
+  MultiplyComponent(d_dst_a.data(), d_src_a.data(), u, np, a_stride);
 }
 
 template class PcmmBlasHandler<uint32_t>;

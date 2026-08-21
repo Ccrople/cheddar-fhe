@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/Container.h"
@@ -8,6 +11,9 @@
 #include "core/EvkMap.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
+#ifdef USE_CUBLAS
+#include "core/PcmmBlas.h"
+#endif
 #include "extension/LlamaBlock.h"
 
 namespace cheddar {
@@ -153,14 +159,63 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
                const char *name) const override;
 
  private:
+  /**
+   * @brief The plaintext operands of one projection, converted once.
+   *
+   * A projection's weight matrix enters the product as `tiles * groups`
+   * separate operands, and building them was **31% of the layer** -- 61.5 s of
+   * host time per block against 0.43 s of GPU behind it (Doing.md 1.5an).
+   * Every input to that work is a constant: the weights, the scale, the level,
+   * the tiling. It was being redone 832 times per block and would have been
+   * redone again for each of the 32 layers and every prompt.
+   *
+   * [SYLPH] section 5.3 calls this model conversion and does it once, offline,
+   * keeping the result on the GPU (its section 5.1). That is what this holds.
+   * The whole set is `sum(in * out)` entries over the seven projections, which
+   * is 218M -- about 2.6 GB at three limbs, either as `PlainMatrix` words or
+   * as int8 pieces.
+   */
+  struct Operands {
+    int tiles = 0;
+    int groups = 0;
+    int tile = 0;
+    int in_channels = 0;
+    int out_channels = 0;
+    double w_scale = 0.0;
+    //! Of the weight matrix, so a second tensor arriving under the same name
+    //! is caught rather than silently answered with the first one's operands.
+    uint64_t fingerprint = 0;
+    size_t bytes = 0;
+    //! Indexed `tile_index * groups + group`.
+    std::vector<PlainMatrix<word>> u;
+#ifdef USE_CUBLAS
+    std::vector<typename PcmmBlasHandler<word>::SplitMatrix> split;
+#endif
+  };
+
   // Row r of the operand carries output channel `group * rank + BitRev(r)`,
   // and column `p * rank + i` carries input channel
   // `(first_parent + p) * rank + BitRev(i)`. Both reversals are their own
   // inverse. Only the `num_parents` parents of the current tile are encoded,
   // so the operand is `rank x (num_parents * rank)`.
-  void EncodeWeights(PlainMatrix<word> &res, const std::vector<double> &w,
+  void GatherWeights(std::vector<double> &values, const std::vector<double> &w,
                      int in_channels, int out_channels, int group,
                      double w_scale, int first_parent, int num_parents) const;
+
+  //! Append one tile's `groups` operands to `res`, in group order.
+  void BuildOperands(Operands &res, const std::vector<double> &w,
+                     int in_channels, int out_channels, double w_scale,
+                     int first_parent, int num_parents, int groups) const;
+
+  //! The cached operands of `name`, built on first use. Asserts that the
+  //! weight matrix is the one they were built from.
+  const Operands &GetOperands(const char *name, const std::vector<double> &w,
+                              int in_channels, int out_channels, double w_scale,
+                              int parents, int groups, int tile) const;
+
+  //! Size, scale and a strided sample of the entries. Cheap enough to run on
+  //! every call and specific enough that a different tensor cannot pass.
+  static uint64_t Fingerprint(const std::vector<double> &w, double w_scale);
 
   ConstContextPtr<word> context_;
   Config cfg_;
@@ -169,6 +224,17 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   std::vector<const EvaluationKey<word> *> modpack_keys_;
   MlweHandler<word> mlwe_;
   PcmmHandler<word> pcmm_;
+  //! `CHEDDAR_WEIGHT_CACHE=0` restores the recompute-every-call behaviour,
+  //! which is what a card without room for the converted model needs and what
+  //! the before/after measurement is against.
+  bool cache_weights_;
+  //! `CHEDDAR_PCMM_BLAS=0` puts the product back on `PcmmAccum`. Always false
+  //! in a build without USE_CUBLAS.
+  bool use_blas_;
+  mutable std::map<std::string, Operands> operands_;
+#ifdef USE_CUBLAS
+  std::unique_ptr<PcmmBlasHandler<word>> blas_;
+#endif
 };
 
 }  // namespace cheddar

@@ -117,6 +117,43 @@ class PcmmBlasHandler {
    */
   void Multiply(std::vector<Ct> &res, const SplitMatrix &u,
                 const std::vector<Ct> &cts) const;
+
+  /**
+   * @brief The same product on MLWE ciphertexts, which is the format the Llama
+   * projections actually run in.
+   *
+   * `CoeffLinearLeg` reaches the product by `ModDecomp`, so its operands are
+   * `MlweCiphertext`, not `Ciphertext`, and the RLWE overload above was never
+   * on the layer's path. `PcmmHandler` carries the same pair of overloads for
+   * the same reason, and the second one is the one the block calls.
+   *
+   * No new machinery is involved: an MLWE ciphertext is a rank-k `a_` plus a
+   * single `b_`, both laid out with all limb data contiguous, so each is one
+   * more plaintext product of the same shape -- the b-part over vectors of
+   * `degree` words per limb and the a-part over `rank * degree`. That is
+   * exactly the substitution `PcmmHandler::Multiply(MLWE)` makes when it
+   * passes `a_stride` to `PcmmAccum` in place of the degree.
+   *
+   * @param res output, resized to u.rows
+   * @param u split plaintext matrix, u.cols must equal cts.size()
+   * @param cts input MLWE ciphertexts, sharing one NP, rank and degree
+   */
+  void Multiply(std::vector<MlweCiphertext<word>> &res, const SplitMatrix &u,
+                const std::vector<MlweCiphertext<word>> &cts) const;
+
+ private:
+  /**
+   * @brief One plaintext product against one ciphertext component.
+   *
+   * `vec_len` is the number of words a single RNS limb of the component holds:
+   * the ring degree for an RLWE component, the small degree for an MLWE b-part
+   * and `rank * small_degree` for an MLWE a-part. Everything else about the
+   * product -- the gather, the `pieces^2` GEMMs and the recombination -- is
+   * identical, which is why both public overloads are two calls to this.
+   */
+  void MultiplyComponent(word *const *dst_ptrs, const word *const *src_ptrs,
+                         const SplitMatrix &u, const NPInfo &np,
+                         int vec_len) const;
 };
 
 }  // namespace cheddar
