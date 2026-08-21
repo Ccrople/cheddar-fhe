@@ -65,8 +65,10 @@
 #include <string>
 #include <vector>
 
+#include "RingFixture.h"
 #include "Testbed.h"
 #include "extension/AttentionPacking.h"
+#include "extension/LlamaAttention.h"
 #include "extension/LlamaBlock.h"
 #include "extension/LlamaLinear.h"
 
@@ -114,6 +116,21 @@ constexpr int kHeadDim = 128;
 // else (Doing.md 1.5ac). Two holes, one constant.
 constexpr int kTokens = kAllTokens;
 constexpr int kFirstToken = 0;
+
+// THE SINC LEG'S SHAPE. `sub_degree = 32` at ring degree 4096 gives d = 128 --
+// which has to be both T and head_dim at once, and is -- and 16 lanes, so one
+// batch CC-MM does 16 of the layer's 32 heads and every product is two calls.
+constexpr int kSubDegree = 32;
+constexpr int kSinCPhases = 3;
+constexpr int kProductLevel = 1;
+
+// The constant HalfBoot and the StC prefix leave when the magnitude is 1.
+// Measured on sylphflow16_35 with slack 8 by SinCAttentionTest, which prints
+// it; see SinCLinearLeg::Config::chain_constant for why it cannot be derived.
+double ChainConstant() {
+  const char *env = std::getenv("CHEDDAR_CHAIN_CONSTANT");
+  return env ? std::atof(env) : 0.0298533;
+}
 
 // THE SINKS, AND WHY THEY ARE NOT MERELY SKIPPED.
 //
@@ -561,6 +578,15 @@ class HostLinearLeg : public Block::LinearLeg {
     log_.emplace_back(name, MaxAbs(y));
   }
 
+  // The same two records, written by a probe that did its own decoding
+  // because the tensor is not in this class's packing.
+  void Record(const std::string &tag, const std::vector<double> &v) const {
+    seen_.emplace_back(tag, v);
+  }
+  void RecordMax(const std::string &tag, const std::vector<double> &v) const {
+    log_.emplace_back(tag, MaxAbs(v));
+  }
+
  private:
   // The same packing as `Gather`, read as slots rather than as coefficients.
   // Both index the ciphertext identically -- channel `s / T`, token `s % T`;
@@ -757,15 +783,141 @@ class EncryptedProjectionLeg : public cheddar::CoeffLinearLeg<word> {
   const HostLinearLeg &host_;
 };
 
+// ---------------------------------------------------------------------------
+// THE REAL LEG, WITH THE SAME LEDGER.
+//
+// `SinCLinearLeg` is the whole product path. What this adds is the per-turn
+// record: every operator's output is handed to a product and to nothing else,
+// so reading it at the product's door attributes the block's error to a turn.
+//
+// Reading it means undoing the leg's own layout, and that is the point of
+// keeping the probe here rather than inside the leg: the probe has to know the
+// permutation to invert it, and asking the leg for the permutation it applied
+// is exactly the check that the permutation is what the block thinks it is.
+class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
+ private:
+  using Base = cheddar::SinCLinearLeg<word>;
+  using Tensor = Block::LinearLeg::Tensor;
+
+ public:
+  ProbedSinCLeg(std::shared_ptr<const cheddar::BootContext<word>> boot,
+                cheddar::ConstContextPtr<word> sw,
+                cheddar::ConstContextPtr<word> small, const Base::Config &cfg,
+                const cheddar::SinCAttention<word>::Config &acfg,
+                const cheddar::SinCAttention<word>::Keys &keys,
+                const cheddar::CoeffLinearLeg<word>::Config &lcfg,
+                std::vector<const EvaluationKey<word> *> modpack_keys,
+                const Testbed32 &bed, const Packing &pack,
+                const HostLinearLeg &host)
+      : Base(std::move(boot), std::move(sw), std::move(small), cfg, acfg, keys,
+             lcfg, std::move(modpack_keys)),
+        bed_{bed},
+        pack_{pack},
+        host_{host},
+        cfg_{cfg} {}
+
+  void Project(std::vector<Ciphertext<word>> &res,
+               const std::vector<Ciphertext<word>> &x, int in_channels,
+               int out_channels, const std::vector<double> &w, double w_scale,
+               const char *name) const override {
+    host_.Probe(x, in_channels, name);
+    Base::Project(res, x, in_channels, out_channels, w, w_scale, name);
+    host_.ProbeOut(res, out_channels, name);
+  }
+
+  void Scores(std::vector<Ciphertext<word>> &res,
+              const std::vector<Ciphertext<word>> &q,
+              const std::vector<Ciphertext<word>> &k, double magnitude,
+              const std::vector<double> &shift) const override {
+    ProbeChannels(q, kChannels, Tensor::kQuery, "q");
+    ProbeChannels(k, kKvChannels, Tensor::kKey, "k");
+    Base::Scores(res, q, k, magnitude, shift);
+    ProbeLanes(res, kTokens, "scores");
+  }
+
+  void Values(std::vector<Ciphertext<word>> &res,
+              const std::vector<Ciphertext<word>> &p,
+              const std::vector<Ciphertext<word>> &v,
+              double magnitude) const override {
+    ProbeLanes(p, kTokens, "probs");
+    Base::Values(res, p, v, magnitude);
+    // head_dim == num_tokens here, and not by coincidence: SinCAttention
+    // asserts that the product's width is both, because d is one number. So
+    // the score layout and the output layout are the same function and one
+    // probe reads both.
+    ProbeLanes(res, kHeadDim, "attn_out");
+  }
+
+ private:
+  // A channel tensor in the leg's own packing, read back in the model's
+  // [token][head * head_dim + channel] order.
+  void ProbeChannels(const std::vector<Ciphertext<word>> &cts, int channels,
+                     Tensor which, const char *name) const {
+    std::vector<int> order;
+    ChannelOrder(order, which);
+    std::vector<int> inv(channels, 0);
+    for (int c = 0; c < channels; c++) inv[order[c]] = c;
+    std::vector<double> out(static_cast<size_t>(kTokens) * channels, 0.0);
+    const int cpc = pack_.channels_per_ct();
+    for (size_t i = 0; i < cts.size(); i++) {
+      Plaintext<word> ptxt;
+      bed_.interface_->Decrypt(ptxt, cts[i]);
+      std::vector<Complex> msg;
+      bed_.context_->encoder_.Decode(msg, ptxt);
+      for (int s = 0; s < pack_.slots; s++) {
+        const int t = s % kTokens;
+        const int p = static_cast<int>(i) * cpc + s / kTokens;
+        out[static_cast<size_t>(t) * channels + inv[p]] = msg[s].real();
+      }
+    }
+    host_.Record(std::string("in:") + name, out);
+  }
+
+  // A lane tensor -- scores, probabilities or the attention output -- read
+  // back in [head][query][index] order through the leg's own score layout.
+  void ProbeLanes(const std::vector<Ciphertext<word>> &cts, int width,
+                  const char *name) const {
+    std::vector<std::vector<Complex>> msg(cts.size());
+    for (size_t i = 0; i < cts.size(); i++) {
+      Plaintext<word> ptxt;
+      bed_.interface_->Decrypt(ptxt, cts[i]);
+      bed_.context_->encoder_.Decode(msg[i], ptxt);
+    }
+    const int heads = cfg_.num_heads;
+    std::vector<double> out(
+        static_cast<size_t>(heads) * kTokens * width, 0.0);
+    for (int h = 0; h < heads; h++) {
+      for (int t = 0; t < kTokens; t++) {
+        for (int j = 0; j < width; j++) {
+          int ct = 0, slot = 0;
+          LocateScore(h, t, j, ct, slot);
+          out[(static_cast<size_t>(h) * kTokens + t) * width + j] =
+              msg[ct][slot].real();
+        }
+      }
+    }
+    host_.Record(std::string("in:") + name, out);
+    host_.RecordMax(name, out);
+  }
+
+  const Testbed32 &bed_;
+  Packing pack_;
+  const HostLinearLeg &host_;
+  Base::Config cfg_;
+};
+
 class LlamaBlockFixture : public Testbed32 {
  protected:
   int BootSlackLevels() const override { return kSlack; }
 
-  // The whole block, run once. `encrypted_projections` selects between the
-  // stand-in for all seven products and the real Bae PC-MM for the five
-  // plaintext ones; everything else about the run is identical, which is what
-  // makes the two numbers comparable.
-  void RunWholeBlock(bool encrypted_projections);
+  // WHICH PRODUCTS ARE REAL. Everything else about the run is identical,
+  // which is what makes the three numbers comparable.
+  enum class Mode {
+    kHost,         //!< every product on the host: the non-linear half alone
+    kProjections,  //!< the seven plaintext products real, the two CC ones not
+    kFull          //!< nothing on the host
+  };
+  void RunWholeBlock(Mode mode);
 
   static Block::Config MakeConfig() {
     Block::Config cfg;
@@ -924,8 +1076,35 @@ class LlamaBlockFixture : public Testbed32 {
 
     cal.size_q = kBootMax / MaxAbs(r.q);
     cal.size_k = kBootMax / MaxAbs(r.k);
+
+    // THE SCORE CROSSING IS A SECOND CONSTRAINT ON THE SAME TWO CONSTANTS,
+    // AND IT IS NOT IMPLIED BY THE FIRST.
+    //
+    // On a slot-domain leg the score product has no plaintext operand, so
+    // nothing scales its output before the bootstrap that follows it. What
+    // that bootstrap carries is fixed by the operands and by the shift:
+    // `size_q * size_k * sqrt(head_dim) * range / 2`, the shift having centred
+    // each row on its own calibrated maximum. Sizing Q and K only against
+    // their own maxima says nothing about that number, and it is a product of
+    // two small constants against a sqrt(128) * 21 / 2 that is not small.
+    //
+    // Both are shrunk by the same factor when it binds, because there is no
+    // reason to prefer one: the product is what has to fit and only the
+    // product appears in it.
+    const double crossing = cal.size_q * cal.size_k *
+                            std::sqrt(static_cast<double>(kHeadDim)) *
+                            r.span / 2.0;
+    if (crossing > kBootMax) {
+      const double shrink = std::sqrt(kBootMax / crossing);
+      std::cout << "  the score crossing would be " << crossing << " against "
+                << kBootMax << ", so size_q and size_k are both scaled by "
+                << shrink << std::endl;
+      cal.size_q *= shrink;
+      cal.size_k *= shrink;
+    }
+
     cal.size_v = kBootMax / MaxAbs(r.v);
-    cal.size_scores = kBootMax;  // (s - c) / M already lies in [-1, 0]
+    cal.size_scores = kBootMax;  // unused by a slot-domain leg; see the header
     cal.size_attn = kBootMax / MaxAbs(r.attn);
     cal.size_gate = kBootMax;  // the ciphertext carries size_gate * g / range
     cal.size_up = kBootMax / MaxAbs(r.up);
@@ -934,7 +1113,8 @@ class LlamaBlockFixture : public Testbed32 {
 };
 
 INSTANTIATE_TEST_SUITE_P(Cheddar, LlamaBlockFixture,
-                         testing::Values("bootparam_35.json"),
+                         testing::Values("bootparam_35.json",
+                                         "sylphflow16_35.json"),
                          [](const testing::TestParamInfo<const char *> &info) {
                            std::string name = info.param;
                            name = name.substr(0, name.find('.'));
@@ -1045,7 +1225,8 @@ TEST_P(LlamaBlockFixture, TheCalibrationIsReachable) {
 
 // ---------------------------------------------------------------------------
 // 3. The block, encrypted, end to end.
-void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
+void LlamaBlockFixture::RunWholeBlock(Mode mode) {
+  const bool encrypted_projections = (mode != Mode::kHost);
   Block::Weights w;
   std::vector<double> x;
   if (!LoadWeights(w, x)) GTEST_SKIP() << "LLAMA3_REAL_DIR is not set";
@@ -1081,6 +1262,8 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   // the other way, and go in afterwards.
   HostLinearLeg host(*this, pack, cfg);
   std::unique_ptr<EncryptedProjectionLeg> real_leg;
+  std::unique_ptr<ProbedSinCLeg> sinc_leg;
+  std::unique_ptr<ringfixture::Ring<word>> sw_ring, small_ring;
   std::vector<const EvaluationKey<word> *> modpack_keys;
 
   const Block::LinearLeg *leg = &host;
@@ -1111,12 +1294,66 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
     for (int j = 0; j < rank; j++) {
       modpack_keys[j] = &interface_->GetModPackKey(rank, j);
     }
-    real_leg = std::make_unique<EncryptedProjectionLeg>(context_, lcfg,
-                                                        modpack_keys, host);
-    leg = real_leg.get();
     cudaMemGetInfo(&dev_free, &dev_total);
     std::cout << "device " << (dev_free >> 20) << " MiB free after the "
               << rank << " ModPack keys" << std::endl;
+
+    if (mode == Mode::kProjections) {
+      real_leg = std::make_unique<EncryptedProjectionLeg>(context_, lcfg,
+                                                          modpack_keys, host);
+      leg = real_leg.get();
+    } else {
+      // ---- THE OTHER TWO RINGS ------------------------------------------
+      //
+      // The switching ring shares the block ring's primes and its SECRET --
+      // the ciphertext walks down the ladder unchanged, so a Context of its
+      // own would be a different key. What it does not share is `alpha`, and
+      // that is the whole reason it exists: the ring-switching key is
+      // published at PQ, and PQ has to fit the small ring's budget.
+      const int operand_level =
+          boot->GetBootParameter().GetEvalModEndLevel() - 2;
+      const int prob_level = boot->GetBootParameter().GetStCStartLevel();
+      std::cout << "preparing SlotToSinC at level " << prob_level << ", "
+                << kSinCPhases << " phases" << std::endl;
+      boot->PrepareSinC(num_slots, kSubDegree, prob_level, prob_level,
+                        kSinCPhases);
+      sw_ring = std::make_unique<ringfixture::Ring<word>>(
+          "ringswitch16_35.json", interface_->GetSecretCoeffs());
+      small_ring =
+          std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+
+      cheddar::SinCLinearLeg<word>::Config scfg;
+      scfg.num_heads = kChannels / kHeadDim;
+      scfg.num_kv_heads = kKvChannels / kHeadDim;
+      scfg.chain_constant = ChainConstant();
+      cheddar::SinCAttention<word>::Config acfg;
+      acfg.num_tokens = kTokens;
+      acfg.head_dim = kHeadDim;
+      acfg.lanes = kSubDegree / 2;
+      acfg.gqa_group = scfg.num_heads / scfg.num_kv_heads;
+      acfg.sub_degree = kSubDegree;
+      acfg.sinc_phases = kSinCPhases;
+      acfg.product_level = kProductLevel;
+      acfg.swap_level = operand_level;
+      acfg.sinc_level = prob_level;
+      acfg.prefix_level = boot->GetBootParameter().GetEvalModEndLevel();
+      acfg.halfboot_scale = boot->GetStCInputScale();
+      acfg.verbose = std::getenv("CHEDDAR_VERBOSE") != nullptr;
+
+      // The keys go in after the leg exists, because what has to be generated
+      // is what the leg asks for. See SinCLinearLeg::SetKeys.
+      cheddar::SinCAttention<word>::Keys empty;
+      sinc_leg = std::make_unique<ProbedSinCLeg>(
+          boot, sw_ring->context, small_ring->context, scfg, acfg, empty, lcfg,
+          modpack_keys, *this, pack, host);
+      leg = sinc_leg.get();
+      std::cout << "the SinC leg: swaps at " << operand_level << "/"
+                << operand_level - 1 << ", exchange at " << operand_level - 2
+                << ", SinC at " << prob_level << ".."
+                << prob_level - kSinCPhases + 1 << ", product at "
+                << kProductLevel << ", HalfBoot lands at " << acfg.prefix_level
+                << ", chain constant " << scfg.chain_constant << std::endl;
+    }
   }
 
   Block block(boot, cfg, cal, *leg);
@@ -1131,7 +1368,47 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
 
   EvkRequest req;
   block.AddRequiredRotations(req);
-  interface_->PrepareRotationKey(req);
+  if (sinc_leg != nullptr) sinc_leg->AddRequiredRotations(req);
+  {
+    size_t before = 0, total = 0, after = 0;
+    cudaMemGetInfo(&before, &total);
+    interface_->PrepareRotationKey(req);
+    cudaMemGetInfo(&after, &total);
+    std::cout << "big-ring rotation keys: " << ((before - after) >> 20)
+              << " MiB, " << (after >> 20) << " MiB free after" << std::endl;
+  }
+
+  if (sinc_leg != nullptr) {
+    // The block's own accessors are the contract; the levels above were
+    // derived from the BootParameter to break the ordering cycle, and this is
+    // where the two are required to agree.
+    const auto &acfg_layout = sinc_leg->GetAttention().GetLayout();
+    ASSERT_EQ(sinc_leg->GetAttention().GetSinCLevel(), block.GetProbLevel());
+    ASSERT_EQ(sinc_leg->GetAttention().GetOutputLevel(),
+              block.GetResultLevel());
+    const int rank = acfg_layout.rank;
+    size_t before = 0, total = 0, after = 0;
+    cudaMemGetInfo(&before, &total);
+    sw_ring->ui->PrepareRingSwitchKey(small_ring->Degree(),
+                                      small_ring->ui->GetSecretCoeffs(),
+                                      kProductLevel);
+    sw_ring->ui->PrepareInverseRingSwitchKey(small_ring->Degree(),
+                                             small_ring->ui->GetSecretCoeffs(),
+                                             kProductLevel);
+    for (int idx : sinc_leg->SmallRotationIndices()) {
+      small_ring->ui->PrepareRotationKey(idx, kProductLevel);
+    }
+    cudaMemGetInfo(&after, &total);
+    std::cout << "ring-switch and small-ring keys: " << ((before - after) >> 20)
+              << " MiB, " << (after >> 20) << " MiB free after" << std::endl;
+
+    cheddar::SinCAttention<word>::Keys keys;
+    keys.big = &interface_->GetEvkMap();
+    keys.small = &small_ring->ui->GetEvkMap();
+    keys.ring_switch = &sw_ring->ui->GetRingSwitchKey(rank);
+    keys.inverse_ring_switch = &sw_ring->ui->GetInverseRingSwitchKey(rank);
+    sinc_leg->SetKeys(keys);
+  }
 
   // The input, coefficient encoded at level 0 -- where the previous block's
   // down projection would have left it.
@@ -1190,6 +1467,11 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
   };
   const char *tags[] = {"in:Q", "in:q", "in:k", "in:probs",
                         "in:O", "in:gate", "in:down"};
+  // The SinC leg reads the attention output in its own layout, before the
+  // block untransposes it, so its probe writes a different tag. The O
+  // projection then sees the untransposed one under "in:O" as usual.
+  const char *alt[] = {nullptr, nullptr, nullptr, nullptr,
+                       "in:attn_out", nullptr, nullptr};
   std::cout << "where the block's bits go, turn by turn:" << std::endl;
   for (size_t j = 0; j < points.size(); j++) {
     const std::vector<double> *got = nullptr;
@@ -1197,6 +1479,14 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
       if (e.first == tags[j]) {
         got = &e.second;
         break;
+      }
+    }
+    if (got == nullptr && alt[j] != nullptr) {
+      for (const auto &e : host.seen_) {
+        if (e.first == alt[j]) {
+          got = &e.second;
+          break;
+        }
       }
     }
     if (got == nullptr || got->size() != points[j].want->size()) {
@@ -1246,12 +1536,42 @@ void LlamaBlockFixture::RunWholeBlock(bool encrypted_projections) {
 // The control: every product on the host, so the number is the cost of the
 // non-linear half alone. Keeping it is what lets the run below be attributed --
 // the difference between the two IS the products' contribution.
-TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) { RunWholeBlock(false); }
+//
+// ONE THING THIS CONTROL NO LONGER MODELS. The stand-in returns its results
+// already in slots at the operator's level, so the score product and the value
+// product each skip a bootstrap that the real leg performs inside itself. That
+// is not a flaw in the stand-in; it is what a stand-in for a product that owns
+// its own bootstrap can be. It means the gap between this run and the full one
+// contains two bootstraps per score ciphertext that this run never paid.
+TEST_P(LlamaBlockFixture, TheBlockRunsEndToEnd) {
+  RunWholeBlock(Mode::kHost);
+}
 
 // The block with its five plaintext projections running encrypted: ModDecomp,
 // Bae PC-MM, ModPack, rescale, at the block's own ring degree with no ring
 // switch. Two of the seven products -- Q K^T and P V -- are still the host
 // stand-in, and that is stated rather than hidden.
 TEST_P(LlamaBlockFixture, TheBlockRunsWithEncryptedProjections) {
-  RunWholeBlock(true);
+  RunWholeBlock(Mode::kProjections);
+}
+
+// ---------------------------------------------------------------------------
+// THE LAYER, WITH NOTHING ON THE HOST.
+//
+// All nine products encrypted: seven through the Bae PC-MM at the block's own
+// ring degree, and Q K^T and P V through `SinCAttention` -- field swaps,
+// ciphertext-axis exchange, SlotToSinC, the ring switch to degree 4096,
+// [KANG] Algorithm 4, HalfBoot and the StC prefix.
+//
+// It needs three Contexts and therefore its own parameter set: the block ring
+// `sylphflow16_35`, the switching ring `ringswitch16_35` sharing its primes
+// and its SECRET, and the product ring `ringdegree12_35`. The other two tests
+// run on `bootparam_35` and this one skips there, so a filtered run gets what
+// it asked for and nothing else.
+TEST_P(LlamaBlockFixture, TheLayerRunsFullyEncrypted) {
+  if (std::string(GetParam()).find("sylphflow") == std::string::npos) {
+    GTEST_SKIP() << "the fully encrypted layer needs sylphflow16_35, whose "
+                    "ladder the SinC band was solved for";
+  }
+  RunWholeBlock(Mode::kFull);
 }

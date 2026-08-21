@@ -115,6 +115,19 @@ class SinCLinearLeg : public CoeffLinearLeg<word> {
     return attn_.SmallRotationIndices();
   }
 
+  /**
+   * @brief Install the key sets after construction.
+   *
+   * They cannot all be constructor arguments. The small ring needs rotation
+   * keys at the indices this leg names, and naming them needs the leg; the
+   * switching ring needs a key whose rank the leg reports. So the leg is built
+   * first, the keys are generated against what it asks for, and they come back
+   * here before the first product.
+   */
+  void SetKeys(const typename SinCAttention<word>::Keys &keys) {
+    keys_ = keys;
+  }
+
   /** @brief Install a measured chain constant after construction. */
   void SetChainConstant(double c);
   double GetChainConstant() const { return cfg_.chain_constant; }
