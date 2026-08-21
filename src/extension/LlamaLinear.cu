@@ -1,5 +1,7 @@
 #include "extension/LlamaLinear.h"
 
+#include "extension/Profile.h"
+
 #include <algorithm>
 #include <string>
 #include <utility>
@@ -124,6 +126,8 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     //    size of the parent's own a-part. The tile bounds exactly that.
     std::vector<MlweCiphertext<word>> columns;
     columns.reserve(static_cast<size_t>(span) * rank_);
+    {
+    NvtxScope _n("pcmm: ModDecomp");
     for (int p = base; p < base + span; p++) {
       const Ct &parent = x[p];
       Ct lowered;
@@ -136,6 +140,7 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
       mlwe_.ModDecomp(decomposed, *source, small_degree_);
       for (auto &c : decomposed) columns.push_back(std::move(c));
     }
+    }
     AssertTrue(static_cast<int>(columns.size()) == span * rank_,
                "CoeffLinearLeg::Project: ModDecomp did not yield one module "
                "component per input channel");
@@ -146,13 +151,22 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     //    matrix products with no key material at all.
     for (int g = 0; g < groups; g++) {
       PlainMatrix<word> u;
-      EncodeWeights(u, w, in_channels, out_channels, g, w_scale, base, span);
+      {
+        NvtxScope _n("pcmm: EncodeWeights");
+        EncodeWeights(u, w, in_channels, out_channels, g, w_scale, base, span);
+      }
 
       std::vector<MlweCiphertext<word>> product;
-      pcmm_.Multiply(product, u, columns);
+      {
+        NvtxScope _n("pcmm: Multiply");
+        pcmm_.Multiply(product, u, columns);
+      }
 
       Ct repacked;
-      mlwe_.ModPack(context_, repacked, product, modpack_keys_);
+      {
+        NvtxScope _n("pcmm: ModPack");
+        mlwe_.ModPack(context_, repacked, product, modpack_keys_);
+      }
       if (!started) {
         partial[g] = std::move(repacked);
       } else {
@@ -168,7 +182,10 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
   //    GetScale(level)^2; this brings it to GetScale(level - 1), and it is the
   //    single level the product spends however many tiles it took.
   res.resize(groups);
-  for (int g = 0; g < groups; g++) context_->Rescale(res[g], partial[g]);
+  {
+    NvtxScope _n("pcmm: Rescale");
+    for (int g = 0; g < groups; g++) context_->Rescale(res[g], partial[g]);
+  }
 }
 
 template class CoeffLinearLeg<uint32_t>;

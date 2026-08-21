@@ -1,5 +1,7 @@
 #include "extension/SinCAttention.h"
 
+#include "extension/Profile.h"
+
 #include <iostream>
 #include <string>
 #include <utility>
@@ -197,7 +199,10 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
       }
     }
     std::vector<Ct> exchanged;
-    exchange_->Evaluate(exchanged, swapped, evk);
+    {
+      NvtxScope _n("sinc: ct-axis exchange");
+      exchange_->Evaluate(exchanged, swapped, evk);
+    }
     // The exchange hands back the field's value as its array index; the layout
     // wants `column / rank`, which is that value bit-reversed. Eight pointers.
     const int log_cts = Log2Ceil(n);
@@ -213,6 +218,7 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
   }
   res.clear();
   res.resize(n);
+  NvtxScope _n("sinc: SlotToSinC");
   for (int i = 0; i < n; i++) {
     // SlotToSinC is compiled at `sinc_level`, and the three legs reach this
     // point at three different levels: P exactly there, Q at swap_level - 2,
@@ -323,14 +329,26 @@ void SinCAttention<word>::Scores(
                  keys.inverse_ring_switch != nullptr,
              "SinCAttention: Scores needs all four key sets");
   std::vector<Ct> q_op, k_op;
-  Descend(q_op, q, Leg::kQuery, *keys.big);
-  Descend(k_op, k, Leg::kKey, *keys.big);
+  {
+    NvtxScope _n("sinc: descend Q");
+    Descend(q_op, q, Leg::kQuery, *keys.big);
+  }
+  {
+    NvtxScope _n("sinc: descend K");
+    Descend(k_op, k, Leg::kKey, *keys.big);
+  }
   std::vector<Ct> product;
-  ccmm_.Multiply(product, q_op, k_op, *keys.ring_switch,
-                 *keys.inverse_ring_switch, *keys.small);
+  {
+    NvtxScope _n("sinc: CC-MM");
+    ccmm_.Multiply(product, q_op, k_op, *keys.ring_switch,
+                   *keys.inverse_ring_switch, *keys.small);
+  }
   q_op.clear();
   k_op.clear();
-  Ascend(res, product, prefix_[0], shift, *keys.big);
+  {
+    NvtxScope _n("sinc: ascend");
+    Ascend(res, product, prefix_[0], shift, *keys.big);
+  }
 }
 
 template <typename word>
@@ -343,14 +361,26 @@ void SinCAttention<word>::Values(std::vector<Ct> &res,
                  keys.inverse_ring_switch != nullptr,
              "SinCAttention: Values needs all four key sets");
   std::vector<Ct> p_op, v_op;
-  Descend(p_op, p, Leg::kProb, *keys.big);
-  Descend(v_op, v, Leg::kValue, *keys.big);
+  {
+    NvtxScope _n("sinc: descend P");
+    Descend(p_op, p, Leg::kProb, *keys.big);
+  }
+  {
+    NvtxScope _n("sinc: descend V");
+    Descend(v_op, v, Leg::kValue, *keys.big);
+  }
   std::vector<Ct> product;
-  ccmm_.Multiply(product, p_op, v_op, *keys.ring_switch,
-                 *keys.inverse_ring_switch, *keys.small);
+  {
+    NvtxScope _n("sinc: CC-MM");
+    ccmm_.Multiply(product, p_op, v_op, *keys.ring_switch,
+                   *keys.inverse_ring_switch, *keys.small);
+  }
   p_op.clear();
   v_op.clear();
-  Ascend(res, product, prefix_[1], {}, *keys.big);
+  {
+    NvtxScope _n("sinc: ascend");
+    Ascend(res, product, prefix_[1], {}, *keys.big);
+  }
 }
 
 template class SinCAttention<uint32_t>;

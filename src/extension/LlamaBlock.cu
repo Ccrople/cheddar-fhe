@@ -1,5 +1,7 @@
 #include "extension/LlamaBlock.h"
 
+#include "extension/Profile.h"
+
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -587,15 +589,24 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // crossing constant below is stated against unscaled tensors.
   std::vector<Ct> slots, normed, coeff;
   Announce("A  input", x, 0);
-  Lift(slots, x, 1.0, evk_map);
+  {
+    ProfileScope _p("A  lift x");
+    Lift(slots, x, 1.0, evk_map);
+  }
   Announce("A  lifted", slots, sched_->GetSlotLevel() - 1);
   std::vector<std::vector<Complex>> attn_w;
-  SpreadNormWeight(attn_w, w.attn_norm, cal_.attn_alpha / (r * r));
-  attn_norm_->Apply(normed, slots, attn_w, evk_map);
+  {
+    ProfileScope _p("A  RMSNorm(attn)");
+    SpreadNormWeight(attn_w, w.attn_norm, cal_.attn_alpha / (r * r));
+    attn_norm_->Apply(normed, slots, attn_w, evk_map);
+  }
   // One above StC, not on it: Apply ends with Mult(res, res, weight_pt_) and
   // no Rescale, so the ciphertext arrives owing one. ToCoeff settles it.
   Announce("A  RMSNorm (owes a rescale)", normed, sched_->GetStCLevel() + 1);
-  Lower(coeff, normed, evk_map);
+  {
+    ProfileScope _p("A  lower");
+    Lower(coeff, normed, evk_map);
+  }
   Announce("A  lowered", coeff, sched_->GetCoeffLevel());
 
   // THE CHANNEL ORDER RIDES ON THE WEIGHT AND COSTS NOTHING. A projection's
@@ -605,18 +616,27 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // a host-side permutation of a plaintext, rather than with a slot transform
   // and a level on each of Q, K and V.
   std::vector<Ct> q, k, v;
-  leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels,
-              Reorder(wbuf, w.wq, cfg_.num_channels, cfg_.num_channels,
-                      LinearLeg::Tensor::kQuery, false),
-              cal_.size_q, "Q");
-  leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-              Reorder(wbuf, w.wk, cfg_.num_channels, cfg_.num_kv_channels,
-                      LinearLeg::Tensor::kKey, false),
-              cal_.size_k, "K");
-  leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-              Reorder(wbuf, w.wv, cfg_.num_channels, cfg_.num_kv_channels,
-                      LinearLeg::Tensor::kValue, false),
-              cal_.size_v, "V");
+  {
+    ProfileScope _p("A  project Q");
+    leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels,
+                Reorder(wbuf, w.wq, cfg_.num_channels, cfg_.num_channels,
+                        LinearLeg::Tensor::kQuery, false),
+                cal_.size_q, "Q");
+  }
+  {
+    ProfileScope _p("A  project K");
+    leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+                Reorder(wbuf, w.wk, cfg_.num_channels, cfg_.num_kv_channels,
+                        LinearLeg::Tensor::kKey, false),
+                cal_.size_k, "K");
+  }
+  {
+    ProfileScope _p("A  project V");
+    leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+                Reorder(wbuf, w.wv, cfg_.num_channels, cfg_.num_kv_channels,
+                        LinearLeg::Tensor::kValue, false),
+                cal_.size_v, "V");
+  }
 
   // The sink tokens' K and V, put back. Their hidden state never reached the
   // encrypted RMSNorm -- a public filler stood in for it, which is the only
@@ -625,10 +645,13 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // it should have been. Adding the difference is a plaintext addition and
   // costs nothing. It happens before RoPE, which then rotates the sink keys by
   // their own positions exactly as it would have.
-  InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k,
-              k_order_);
-  InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v,
-              v_order_);
+  {
+    ProfileScope _p("A  inject sinks");
+    InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k,
+                k_order_);
+    InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v,
+                v_order_);
+  }
 
   // ---- turn B: RoPE on Q and K, then the score product ------------------
   //
@@ -637,15 +660,24 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // it through unchanged and `Scores` divides both out.
   std::vector<Ct> q_slots, k_slots, v_slots;
   Announce("B  Q from the projection", q, 0);
-  Lift(q_slots, q, 1.0, evk_map);
-  Lift(k_slots, k, 1.0, evk_map);
-  Lift(v_slots, v, 1.0, evk_map);
+  {
+    ProfileScope _p("B  lift Q,K,V");
+    Lift(q_slots, q, 1.0, evk_map);
+    Lift(k_slots, k, 1.0, evk_map);
+    Lift(v_slots, v, 1.0, evk_map);
+  }
   q.clear();
   k.clear();
   v.clear();
   std::vector<Ct> q_rot(q_slots.size()), k_rot(k_slots.size());
-  ApplyRoPe(q_rot, q_slots, *q_rope_, q_variant_, evk_map);
-  ApplyRoPe(k_rot, k_slots, *k_rope_, k_variant_, evk_map);
+  {
+    ProfileScope _p("B  RoPE Q");
+    ApplyRoPe(q_rot, q_slots, *q_rope_, q_variant_, evk_map);
+  }
+  {
+    ProfileScope _p("B  RoPE K");
+    ApplyRoPe(k_rot, k_slots, *k_rope_, k_variant_, evk_map);
+  }
   q_slots.clear();
   k_slots.clear();
   Announce("B  RoPE", q_rot, GetOperandLevel());
@@ -653,10 +685,13 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // alongside Q and K, so it spends RoPE's level doing nothing. A LevelDown is
   // free; what is not free is the bootstrap above, and that one is unavoidable
   // -- the projection left V at level 0 and the product does not start there.
-  for (size_t i = 0; i < v_slots.size(); i++) {
-    Ct dropped;
-    boot_->LevelDown(dropped, v_slots[i], GetOperandLevel());
-    v_slots[i] = std::move(dropped);
+  {
+    ProfileScope _p("B  V level down");
+    for (size_t i = 0; i < v_slots.size(); i++) {
+      Ct dropped;
+      boot_->LevelDown(dropped, v_slots[i], GetOperandLevel());
+      v_slots[i] = std::move(dropped);
+    }
   }
 
   // WHAT SOFTMAX WANTS IS 2 (s - c) / M + 1 ON [-1, 1], AND THE WHOLE AFFINE
@@ -691,22 +726,28 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
              "Calibration::softmax_shift for why a single global one does not "
              "work on real scores");
   std::vector<double> score_shift(static_cast<size_t>(num_rows) * T);
-  for (int rr = 0; rr < num_rows; rr++) {
-    const int query = rr % T;
-    for (int key = 0; key < T; key++) {
-      // Masked entries get pushed down by the calibrated gap so that the
-      // exponential still sees an in-interval argument; the mask zeroes them
-      // a level later, but the polynomial has already run by then.
-      const double extra = (key <= query) ? 0.0 : cal_.softmax_mask_shift;
-      // magnitude * (raw_product + shift) = 2 (u - c - extra) / range + 1, so
-      // the shift is the whole affine map's constant carried back through the
-      // magnitude -- the +1 included, which is why SoftMax's argument needs no
-      // further addition once the product has come back.
-      score_shift[static_cast<size_t>(rr) * T + key] =
-          (cal_.softmax_range / 2.0 - cal_.softmax_shift[rr] - extra) * raw;
+  {
+    ProfileScope _p("B  score shift (host)");
+    for (int rr = 0; rr < num_rows; rr++) {
+      const int query = rr % T;
+      for (int key = 0; key < T; key++) {
+        // Masked entries get pushed down by the calibrated gap so that the
+        // exponential still sees an in-interval argument; the mask zeroes them
+        // a level later, but the polynomial has already run by then.
+        const double extra = (key <= query) ? 0.0 : cal_.softmax_mask_shift;
+        // magnitude * (raw_product + shift) = 2 (u - c - extra) / range + 1, so
+        // the shift is the whole affine map's constant carried back through the
+        // magnitude -- the +1 included, which is why SoftMax's argument needs no
+        // further addition once the product has come back.
+        score_shift[static_cast<size_t>(rr) * T + key] =
+            (cal_.softmax_range / 2.0 - cal_.softmax_shift[rr] - extra) * raw;
+      }
     }
   }
-  leg.Scores(scores, q_rot, k_rot, score_magnitude, score_shift);
+  {
+    ProfileScope _p("B  score product Q K^T");
+    leg.Scores(scores, q_rot, k_rot, score_magnitude, score_shift);
+  }
   q_rot.clear();
   k_rot.clear();
   AssertTrue(static_cast<int>(scores.size()) == NumScoreCiphertexts(),
@@ -730,30 +771,39 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
       };
   Announce("C  scores from the product", scores, GetResultLevel());
   std::vector<std::vector<Complex>> causal_mask;
-  BuildCausalMask(causal_mask);
+  {
+    ProfileScope _p("C  causal mask (host)");
+    BuildCausalMask(causal_mask);
+  }
   const int group = leg.GetScoreGroupSize();
   std::vector<Ct> probs(scores.size());
-  for (size_t base = 0; base < scores.size(); base += group) {
-    std::vector<Ct> in, out;
-    std::vector<std::vector<Complex>> mask;
-    in.reserve(group);
-    mask.reserve(group);
-    // Moved in, not copied: a row group is `group` ciphertexts at the
-    // operator's level and SoftMax holds several more of each while it runs,
-    // so the peak is one group rather than the layer.
-    for (int j = 0; j < group; j++) {
-      in.push_back(std::move(scores[base + j]));
-      mask.push_back(causal_mask[base + j]);
+  {
+    ProfileScope _p("C  SoftMax");
+    for (size_t base = 0; base < scores.size(); base += group) {
+      std::vector<Ct> in, out;
+      std::vector<std::vector<Complex>> mask;
+      in.reserve(group);
+      mask.reserve(group);
+      // Moved in, not copied: a row group is `group` ciphertexts at the
+      // operator's level and SoftMax holds several more of each while it runs,
+      // so the peak is one group rather than the layer.
+      for (int j = 0; j < group; j++) {
+        in.push_back(std::move(scores[base + j]));
+        mask.push_back(causal_mask[base + j]);
+      }
+      softmax_->Apply(out, in, mask, evk_map, nullptr, &aux);
+      for (int j = 0; j < group; j++) probs[base + j] = std::move(out[j]);
     }
-    softmax_->Apply(out, in, mask, evk_map, nullptr, &aux);
-    for (int j = 0; j < group; j++) probs[base + j] = std::move(out[j]);
   }
   scores.clear();
   causal_mask.clear();
   Announce("C  SoftMax", probs, GetProbLevel());
 
   std::vector<Ct> attn;
-  leg.Values(attn, probs, v_slots, cal_.size_attn / cal_.size_v);
+  {
+    ProfileScope _p("C  value product P V");
+    leg.Values(attn, probs, v_slots, cal_.size_attn / cal_.size_v);
+  }
   probs.clear();
   v_slots.clear();
 
@@ -771,42 +821,69 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   std::vector<Ct> attn_coeff, attn_out;
   Announce("D  attention values", attn, GetResultLevel());
   if (untranspose_a_ != nullptr) {
-    std::vector<Ct> flat;
-    Untranspose(flat, attn, evk_map);
-    attn = std::move(flat);
-    Announce("D  untransposed", attn, sched_->GetStCLevel());
+  {
+    ProfileScope _p("D  untranspose");
+      std::vector<Ct> flat;
+      Untranspose(flat, attn, evk_map);
+      attn = std::move(flat);
+      Announce("D  untransposed", attn, sched_->GetStCLevel());
   }
-  Lower(attn_coeff, attn, evk_map);
+  }
+  {
+    ProfileScope _p("D  lower");
+    Lower(attn_coeff, attn, evk_map);
+  }
   attn.clear();
-  leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
-              Reorder(wbuf, w.wo, cfg_.num_channels, cfg_.num_channels,
-                      LinearLeg::Tensor::kAttnOut, true),
-              r / cal_.size_attn, "O");
+  {
+    ProfileScope _p("D  project O");
+    leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
+                Reorder(wbuf, w.wo, cfg_.num_channels, cfg_.num_channels,
+                        LinearLeg::Tensor::kAttnOut, true),
+                r / cal_.size_attn, "O");
+  }
 
   std::vector<Ct> h(x.size());
-  for (size_t i = 0; i < x.size(); i++) {
-    boot_->Add(h[i], x[i], attn_out[i]);
+  {
+    ProfileScope _p("D  residual + attn");
+    for (size_t i = 0; i < x.size(); i++) {
+      boot_->Add(h[i], x[i], attn_out[i]);
+    }
   }
 
   // ---- turn E: RMSNorm(ffn), then the gate and up projections -----------
   std::vector<Ct> h_slots, h_normed, h_coeff;
-  Lift(h_slots, h, 1.0, evk_map);
+  {
+    ProfileScope _p("E  lift");
+    Lift(h_slots, h, 1.0, evk_map);
+  }
   std::vector<std::vector<Complex>> ffn_w;
-  SpreadNormWeight(ffn_w, w.ffn_norm, cal_.ffn_alpha / (r * r));
-  ffn_norm_->Apply(h_normed, h_slots, ffn_w, evk_map);
+  {
+    ProfileScope _p("E  RMSNorm(ffn)");
+    SpreadNormWeight(ffn_w, w.ffn_norm, cal_.ffn_alpha / (r * r));
+    ffn_norm_->Apply(h_normed, h_slots, ffn_w, evk_map);
+  }
   Announce("E  RMSNorm (owes a rescale)", h_normed,
            sched_->GetStCLevel() + 1);
-  Lower(h_coeff, h_normed, evk_map);
+  {
+    ProfileScope _p("E  lower");
+    Lower(h_coeff, h_normed, evk_map);
+  }
 
   std::vector<Ct> gate, up;
   // SiLU is the one operator whose answer depends on the magnitude of its
   // argument, so 1/range is not optional bookkeeping -- it is part of the
   // function. It folds into the gate projection's plaintext, which is where
   // SiLu.h says it belongs, and the crossing constant rides along with it.
-  leg.Project(gate, h_coeff, cfg_.num_channels, cfg_.hidden, w.wgate,
-              cal_.size_gate / cal_.silu_range, "gate");
-  leg.Project(up, h_coeff, cfg_.num_channels, cfg_.hidden, w.wup, cal_.size_up,
-              "up");
+  {
+    ProfileScope _p("E  project gate");
+    leg.Project(gate, h_coeff, cfg_.num_channels, cfg_.hidden, w.wgate,
+                cal_.size_gate / cal_.silu_range, "gate");
+  }
+  {
+    ProfileScope _p("E  project up");
+    leg.Project(up, h_coeff, cfg_.num_channels, cfg_.hidden, w.wup, cal_.size_up,
+                "up");
+  }
 
   // ---- turn F: SiLU, the elementwise gate, then the down projection -----
   //
@@ -814,32 +891,47 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // on. The bootstrap before it saw size_gate/range * g, at most boot_max.
   std::vector<Ct> gate_slots, up_slots;
   Announce("F  gate", gate, 0);
-  Lift(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
-  Lift(up_slots, up, 1.0, evk_map);
+  {
+    ProfileScope _p("F  lift gate,up");
+    Lift(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
+    Lift(up_slots, up, 1.0, evk_map);
+  }
   const auto &mult_key = evk_map.GetMultiplicationKey();
   std::vector<Ct> gated(gate_slots.size());
-  for (size_t i = 0; i < gate_slots.size(); i++) {
-    Ct activated;
-    silu_->Apply(activated, gate_slots[i], evk_map);
-    // `up` was lifted alongside the gate and has spent nothing since, while
-    // SiLU's polynomial has descended ceil(log2(degree+1)) levels. Cheddar's
-    // HMult requires the two operands at the same level and reports the
-    // mismatch as "Number of primes differ" from inside the tensor product,
-    // which names neither operand -- so bring `up` down explicitly.
-    const int level = boot_->param_.NPToLevel(activated.GetNP());
-    Ct levelled;
-    boot_->LevelDown(levelled, up_slots[i], level);
-    boot_->HMult(gated[i], activated, levelled, mult_key);
+  {
+    ProfileScope _p("F  SiLU x up");
+    for (size_t i = 0; i < gate_slots.size(); i++) {
+      Ct activated;
+      silu_->Apply(activated, gate_slots[i], evk_map);
+      // `up` was lifted alongside the gate and has spent nothing since, while
+      // SiLU's polynomial has descended ceil(log2(degree+1)) levels. Cheddar's
+      // HMult requires the two operands at the same level and reports the
+      // mismatch as "Number of primes differ" from inside the tensor product,
+      // which names neither operand -- so bring `up` down explicitly.
+      const int level = boot_->param_.NPToLevel(activated.GetNP());
+      Ct levelled;
+      boot_->LevelDown(levelled, up_slots[i], level);
+      boot_->HMult(gated[i], activated, levelled, mult_key);
+    }
   }
   Announce("F  SiLU * up", gated, -1);
   std::vector<Ct> gated_coeff, ffn_out;
-  Lower(gated_coeff, gated, evk_map);
-  leg.Project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,
-              r / cal_.size_up, "down");
+  {
+    ProfileScope _p("F  lower");
+    Lower(gated_coeff, gated, evk_map);
+  }
+  {
+    ProfileScope _p("F  project down");
+    leg.Project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,
+                r / cal_.size_up, "down");
+  }
 
   res.resize(x.size());
-  for (size_t i = 0; i < x.size(); i++) {
-    boot_->Add(res[i], h[i], ffn_out[i]);
+  {
+    ProfileScope _p("F  residual + ffn");
+    for (size_t i = 0; i < x.size(); i++) {
+      boot_->Add(res[i], h[i], ffn_out[i]);
+    }
   }
 }
 

@@ -57,6 +57,8 @@
 // miscalibration would otherwise be indistinguishable from an approximation
 // error.
 
+#include <cuda_profiler_api.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -71,6 +73,7 @@
 #include "extension/LlamaAttention.h"
 #include "extension/LlamaBlock.h"
 #include "extension/LlamaLinear.h"
+#include "extension/Profile.h"
 
 using word = uint32_t;
 using Block = LlamaBlock<word>;
@@ -1462,9 +1465,36 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
   }
 
   std::vector<Ciphertext<word>> out;
+
+  // PROFILING: A WARM-UP PASS, THEN A MEASURED ONE.
+  //
+  // Everything before this point is setup -- three Contexts, rotation keys,
+  // boot and SinC tables, host encode -- and none of it belongs in a number
+  // that answers "how long does a layer take". `CHEDDAR_PROFILE` runs the
+  // block twice and reports only the second, so the first absorbs whatever
+  // the allocator and the caches want to do once.
+  //
+  // The window between cudaProfilerStart and Stop is what
+  // `nsys --capture-range=cudaProfilerApi` records, so the kernel trace covers
+  // the measured pass alone.
+  if (cheddar::Profile::Enabled()) {
+    std::vector<Ciphertext<word>> warm;
+    block.Run(warm, state, w, sinks, interface_->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    cheddar::Profile::Report("warm-up pass, discarded");
+    cheddar::Profile::Reset();
+    host.seen_.clear();
+    cudaProfilerStart();
+  }
+
   block.Run(out, state, w, sinks, interface_->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  if (cheddar::Profile::Enabled()) {
+    cudaProfilerStop();
+    cheddar::Profile::Report("one decoder block, online evaluation");
+  }
 
   std::cout << "product-leg magnitudes, against the bootstrap's " << kBootMax
             << ":" << std::endl;
