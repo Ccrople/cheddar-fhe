@@ -453,6 +453,14 @@ void LlamaBlock<word>::Announce(const char *what, const std::vector<Ct> &cts,
   if (expect_level >= 0 && level != expect_level) {
     std::cout << "  (EXPECTED " << expect_level << ")";
   }
+  // Device-free at every turn boundary. Memory is what binds this block --
+  // the setup alone is tens of gigabytes of keys and transform plaintexts --
+  // and an allocation failure four frames inside a bootstrap says only
+  // "out_of_memory", never which turn asked.
+  size_t dev_free = 0, dev_total = 0;
+  if (cudaMemGetInfo(&dev_free, &dev_total) == cudaSuccess) {
+    std::cout << ", " << (dev_free >> 20) << " MiB free";
+  }
   std::cout << std::endl;
 }
 

@@ -1474,16 +1474,17 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
                        "in:attn_out", nullptr, nullptr};
   std::cout << "where the block's bits go, turn by turn:" << std::endl;
   for (size_t j = 0; j < points.size(); j++) {
+    // The alternative tag first, where there is one. The O projection's own
+    // probe reads its input in the block packing, and on the SinC leg that
+    // input is the attention output in the LEG's channel order -- the same
+    // numbers in a different place, which would read as noise. The leg's own
+    // probe undoes the permutation and writes the alternative tag.
     const std::vector<double> *got = nullptr;
-    for (const auto &e : host.seen_) {
-      if (e.first == tags[j]) {
-        got = &e.second;
-        break;
-      }
-    }
-    if (got == nullptr && alt[j] != nullptr) {
+    for (int pass = 0; pass < 2 && got == nullptr; pass++) {
+      const char *tag = (pass == 0) ? alt[j] : tags[j];
+      if (tag == nullptr) continue;
       for (const auto &e : host.seen_) {
-        if (e.first == alt[j]) {
+        if (e.first == tag) {
           got = &e.second;
           break;
         }
