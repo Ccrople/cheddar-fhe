@@ -570,8 +570,12 @@ class HostLinearLeg : public Block::LinearLeg {
   // one substitutes for the computation, the other only watches it. Keeping
   // the turn-by-turn ledger is worth a decryption in a test, because without
   // it a block that degrades reports one number and no address.
+  // Both marked because they are test-only cost inside a timed step: each
+  // decrypts and host-decodes every ciphertext it is given, on the path
+  // `UserInterface` states outright is unoptimised.
   void Probe(const std::vector<Ciphertext<word>> &x, int channels,
              const char *name) const {
+    cheddar::NvtxScope _n("probe (test only)");
     std::vector<double> a;
     Gather(a, x, channels);
     seen_.emplace_back(std::string("in:") + name, a);
@@ -579,6 +583,7 @@ class HostLinearLeg : public Block::LinearLeg {
 
   void ProbeOut(const std::vector<Ciphertext<word>> &res, int channels,
                 const char *name) const {
+    cheddar::NvtxScope _n("probe (test only)");
     std::vector<double> y;
     Gather(y, res, channels);
     log_.emplace_back(name, MaxAbs(y));
@@ -860,6 +865,7 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
   // [token][head * head_dim + channel] order.
   void ProbeChannels(const std::vector<Ciphertext<word>> &cts, int channels,
                      Tensor which, const char *name) const {
+    cheddar::NvtxScope _n("probe (test only)");
     std::vector<int> order;
     ChannelOrder(order, which);
     std::vector<int> inv(channels, 0);
@@ -898,6 +904,10 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
   // same reference and at the same magnitude.
   void ProbeLanes(const std::vector<Ciphertext<word>> &cts, int width,
                   const char *name, bool model_order = false) const {
+    // Marked because it is test-only cost sitting inside a timed step: this
+    // decrypts and host-decodes every ciphertext handed to it, on the path
+    // `UserInterface` states outright is unoptimised.
+    cheddar::NvtxScope _n("probe (test only)");
     std::vector<std::vector<Complex>> msg(cts.size());
     for (size_t i = 0; i < cts.size(); i++) {
       Plaintext<word> ptxt;

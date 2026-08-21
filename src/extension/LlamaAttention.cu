@@ -1,5 +1,7 @@
 #include "extension/LlamaAttention.h"
 
+#include "extension/Profile.h"
+
 #include <string>
 #include <utility>
 
@@ -232,7 +234,10 @@ void SinCLinearLeg<word>::Scores(std::vector<Ct> &res,
                                      num_tokens_ * num_tokens_,
              "SinCLinearLeg::Scores: the shift must be one entry per score");
 
-  Retune(magnitude, value_magnitude_);
+  {
+    NvtxScope _n("leg: Retune");
+    Retune(magnitude, value_magnitude_);
+  }
   res.clear();
   res.resize(static_cast<size_t>(groups) * num_cts_);
   for (int g = 0; g < groups; g++) {
@@ -242,7 +247,10 @@ void SinCLinearLeg<word>::Scores(std::vector<Ct> &res,
       kg.push_back(&k[g * num_src_cts_ + i]);
     }
     std::vector<std::vector<Complex>> sh;
-    if (!shift.empty()) BuildShift(sh, shift, g);
+    if (!shift.empty()) {
+      NvtxScope _n("leg: BuildShift");
+      BuildShift(sh, shift, g);
+    }
     std::vector<Ct> out;
     attn_.Scores(out, qg, kg, keys_, sh);
     for (int i = 0; i < num_cts_; i++) {
@@ -266,7 +274,10 @@ void SinCLinearLeg<word>::Values(std::vector<Ct> &res,
                  " ciphertexts against the " +
                  std::to_string(groups * num_src_cts_) + " expected");
 
-  Retune(score_magnitude_, magnitude);
+  {
+    NvtxScope _n("leg: Retune");
+    Retune(score_magnitude_, magnitude);
+  }
   res.clear();
   res.resize(static_cast<size_t>(groups) * num_cts_);
   for (int g = 0; g < groups; g++) {
