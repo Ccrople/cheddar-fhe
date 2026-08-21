@@ -102,7 +102,7 @@ namespace cheddar {
  *
  *     GetScale(L) * w / GetRescalePrimeProd(L) = GetScale(L-1)  =>  w = GetScale(L)
  *
- * `EncodeWeights` uses that and nothing else. A merely plausible scale
+ * `BuildOperands` uses that and nothing else. A merely plausible scale
  * survives every plain operation silently and stops being silent inside
  * `EvalPoly`, which aborts the process -- three layers above here.
  *
