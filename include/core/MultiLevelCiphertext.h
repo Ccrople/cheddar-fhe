@@ -21,27 +21,32 @@ class MultiLevelCiphertext {
 
   std::map<int, Ct> level_map_;
 
-  // Which ring this instance belongs to, taken from its first ciphertext.
-  int degree_ = 0;
+  // WHICH RING THIS BELONGS TO, AND WHY IT IS NOT INFERRED.
+  //
+  // This was a static map keyed by ring degree, on the reasoning that a
+  // ciphertext names its own ring through its NPInfo. It does not. [SYLPH]'s
+  // ladder runs TWO Contexts at the same degree on purpose -- the block's ring
+  // and the switching ring share every prime and differ only in `alpha`, which
+  // is the whole reason `ringswitch16_35` exists -- so the second one's
+  // StaticInit silently replaced the first's entry, and the first ring's
+  // EvalMod then asked a two-level parameter to place a level-27 NPInfo.
+  // Measured, from inside a bootstrap, as
+  // `NPInfo not found: 37 main + 4 terminal, against 2 levels`.
+  //
+  // Every construction site has its Context in hand, so it is passed rather
+  // than looked up.
+  const Parameter<word> *param_ = nullptr;
 
-  // Keyed by ring degree rather than held as a single pointer, so that two
-  // Contexts at different degrees can be alive at once. With a single static
-  // the second Context's StaticInit silently replaced the first's parameter
-  // and level-down constants, and every MultiLevelCiphertext of the first ring
-  // then resolved its levels against the wrong modulus chain.
-  static inline std::map<int, const Parameter<word> *> params_{};
-
-  // different from the one in Context
-  static inline std::map<int, std::vector<Constant<word>>> level_down_consts_{};
-
-  static const Parameter<word> &ParamFor(int degree);
+  // Keyed by the parameter itself, for the same reason.
+  static inline std::map<const Parameter<word> *, std::vector<Constant<word>>>
+      level_down_consts_{};
 
  public:
   static void StaticInit(const Parameter<word> &param,
                          const Encoder<word> &encoder);
   static void StaticDestroy(const Parameter<word> &param);
 
-  MultiLevelCiphertext(Ct &&ct);
+  MultiLevelCiphertext(const Parameter<word> &param, Ct &&ct);
 
   // movable, but not copyable
   MultiLevelCiphertext(MultiLevelCiphertext &&) = default;
@@ -60,10 +65,11 @@ class MultiLevelCiphertext {
   void AllocateLevel(int level);
 
   /**
-   * @param degree ring degree selecting which Context's constants to use
+   * @param param the Context's parameter, selecting which constants to use
    * @param level the level being stepped down from
    */
-  static const Constant<word> &GetLevelDownConst(int degree, int level);
+  static const Constant<word> &GetLevelDownConst(const Parameter<word> &param,
+                                                 int level);
 };
 
 }  // namespace cheddar

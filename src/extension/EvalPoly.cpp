@@ -379,7 +379,7 @@ void BasisMap<word>::Evaluate(ConstContextPtr<word> context,
     } else {
       eval.Evaluate(context, new_base, left, right, mult_key);
     }
-    res.try_emplace(base_degree, std::move(new_base));
+    res.try_emplace(base_degree, context->param_, std::move(new_base));
   }
 }
 
@@ -841,7 +841,7 @@ void EvalPoly<word>::Evaluate(ConstContextPtr<word> context, Ct &res,
   // To prevent problems in in-place operations and also to simplify the code
   Ct input_tmp;
   context->Copy(input_tmp, input);
-  basis.try_emplace(1, std::move(input_tmp));
+  basis.try_emplace(1, context->param_, std::move(input_tmp));
 
   basis_map_.Evaluate(context, basis, mult_key);
   tree_root_->Evaluate(context, res, basis, mult_key);

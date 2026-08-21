@@ -942,7 +942,7 @@ void Context<word>::AddLowerLevelsUntil(MultiLevelCiphertext<word> &ml_ct,
   for (int i = old_min_level - 1; i >= min_level; i--) {
     ml_ct.AllocateLevel(i);
     Mult(tmp, ml_ct.AtLevel(i + 1),
-         MultiLevelCiphertext<word>::GetLevelDownConst(param_.degree_, i + 1));
+         MultiLevelCiphertext<word>::GetLevelDownConst(param_, i + 1));
     Rescale(ml_ct.AtLevel(i), tmp);
   }
 }
