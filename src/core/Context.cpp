@@ -67,6 +67,18 @@ void Context<word>::PrepareNarrowKeySwitch(int level, int num_aux) const {
              "PrepareNarrowKeySwitch: level out of range");
   AssertTrue(num_aux >= 1 && num_aux <= param_.alpha_,
              "PrepareNarrowKeySwitch: num_aux must be in [1, alpha]");
+  // At level 0 a key with fewer than alpha auxiliary primes is ALSO how the
+  // dense-to-sparse key announces itself, and `AdjustLevelForMultKey` tells
+  // the two apart by nothing but the count. Where they would coincide there is
+  // no way to tell, and the failure would be a wrong answer rather than an
+  // error, so the ambiguity is refused rather than resolved. Nothing wants a
+  // narrow basis at level 0 today -- the Llama product level is 1.
+  if (level == 0 && param_.IsUsingSparseSecretEncapsulation()) {
+    AssertTrue(num_aux != param_.LevelToNP(-1).GetNumQ(),
+               "PrepareNarrowKeySwitch: at level 0 this auxiliary count is "
+               "indistinguishable from the dense-to-sparse key's; pick "
+               "another, or move the switch off level 0");
+  }
   if (num_aux == param_.alpha_) return;  // the ordinary handler already exists
   const std::pair<int, int> key(level, num_aux);
   if (narrow_handlers_.count(key) != 0) return;
