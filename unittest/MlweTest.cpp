@@ -296,6 +296,109 @@ TEST_P(Testbed32, ModPackInvertsModDecompAtFullDegree) {
   ASSERT_LT(max_abs, 1e-3);
 }
 
+// The same ModPack against a NARROW auxiliary basis.
+//
+// `alpha_` is one number for the whole parameter set and it is sized for the
+// deepest key switch in it. ModPack runs `rank` switches at one low level, and
+// raising a three-prime ciphertext into a fifteen-prime basis is most of what
+// it costs -- so the switching keys are allowed to carry fewer auxiliary
+// primes than `alpha_`. `PrepareEvk` always built keys that way; what did not
+// exist was a mod-switch handler and a P product on the evaluation side.
+//
+// TWO CONDITIONS PICK THE NUMBER, and only one of them is the obvious one.
+//
+// 1. P must still exceed the key-switch digit, or the switch adds more noise
+//    than it removes.
+// 2. `beta = ceil(padded_num_q / num_aux)`, so dropping below `padded_num_q`
+//    buys nothing: the cost is `beta * (num_q + num_aux)` limbs, and on
+//    sylphflow16_35 at level 1 that is 1 x 15 at alpha = 12, 1 x 8 at
+//    num_aux = 5, and 2 x 7 at num_aux = 4. Four is *worse* than five.
+//
+// So the smallest useful basis is `padded_num_q` primes, and this test takes
+// it whenever that also satisfies (1) with margin.
+//
+// This is a separate test rather than an A/B inside the one above because
+// `PrepareEvk` stores through `try_emplace`: a second `PrepareModPackKeys` at
+// the same rank would silently keep the first set of keys and the comparison
+// would be against itself. A fresh fixture per TEST_P is what keeps them apart.
+TEST_P(Testbed32, ModPackWorksOnANarrowAuxiliaryBasis) {
+  const int degree = 1 << log_degree_;
+  const int small_degree = degree / 2;
+  const int rank = 2;
+  const int level = 2;
+
+  // Condition 2: the fewest auxiliary primes that still leave one digit.
+  const NPInfo level_np = param_->LevelToNP(level);
+  const int padded_num_q = level_np.num_main_ + param_->GetMaxNumTer();
+  const int num_aux = padded_num_q;
+  if (num_aux >= param_->alpha_) {
+    GTEST_SKIP() << "alpha is already " << param_->alpha_
+                 << ", which is no wider than the " << padded_num_q
+                 << " primes one digit needs; nothing to narrow";
+  }
+
+  // Condition 1: P against the modulus at this level, in bits.
+  const NPInfo wide_np = param_->LevelToNP(level, param_->alpha_);
+  const std::vector<word> primes = param_->GetPrimeVector(wide_np);
+  const int num_q = wide_np.GetNumQ();
+  auto bits = [](word p) {
+    int b = 0;
+    for (; p != 0; p >>= 1) b++;
+    return b;
+  };
+  int q_bits = 0, p_bits = 0;
+  for (int i = 0; i < num_q; i++) q_bits += bits(primes[i]);
+  for (int j = 0; j < num_aux; j++) p_bits += bits(primes[num_q + j]);
+  std::cout << "level " << level << ": Q is " << q_bits << " bits, a "
+            << num_aux << "-prime P is " << p_bits << " bits (alpha is "
+            << param_->alpha_ << ")" << std::endl;
+  ASSERT_GT(p_bits, q_bits + 8)
+      << "the narrow P does not exceed the key-switch digit with margin";
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+  interface_->PrepareModPackKeys(small_degree, level, num_aux);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+  ASSERT_EQ(keys[0]->GetNP().num_aux_, num_aux)
+      << "the keys were not built on the narrow basis";
+
+  std::vector<double> coeffs(degree);
+  Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+
+  std::vector<MlweCiphertext<word>> parts;
+  mlwe.ModDecomp(parts, ct, small_degree);
+  ASSERT_EQ(static_cast<int>(parts.size()), rank);
+
+  Ciphertext<word> packed;
+  mlwe.ModPack(context_, packed, parts, keys);
+  ASSERT_EQ(param_->NPToLevel(packed.GetNP()), level);
+
+  Plaintext<word> out;
+  interface_->Decrypt(out, packed);
+  std::vector<double> got;
+  context_->encoder_.DecodeCoeff(got, out);
+  ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+  double max_abs = 0.0;
+  for (int i = 0; i < degree; i++) {
+    max_abs = std::max(max_abs, std::abs(got[i] - coeffs[i]));
+  }
+  std::cout << "degree " << degree << " -> " << small_degree << ", rank "
+            << rank << ", level " << level << ", " << num_aux
+            << " auxiliary primes: max error " << max_abs << std::endl;
+  // The same bound the full-basis test holds itself to. A narrow P that is
+  // still far above the digit should not cost accuracy at all, and if it does
+  // the bound is where it shows.
+  ASSERT_LT(max_abs, 1e-3);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_40.json"),

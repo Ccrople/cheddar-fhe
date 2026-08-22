@@ -381,7 +381,8 @@ void UserInterface<word>::PrepareRotationKey(const EvkRequest &evk_request) {
 }
 
 template <typename word>
-void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level) {
+void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
+                                             int num_aux) {
   const int degree = context_->param_.degree_;
   const int L = context_->param_.L_;
   AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
@@ -396,7 +397,14 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level) {
   if (max_level < 0) max_level = context_->param_.max_level_;
 
   const int rank = degree / small_degree;
-  const NPInfo np = GetNPForEvk(max_level);
+  NPInfo np = GetNPForEvk(max_level);
+  if (num_aux > 0 && num_aux != context_->param_.alpha_) {
+    // A narrower extended basis for these keys alone. The evaluation side
+    // needs a mod-switch handler and a P product to match, and neither exists
+    // until it is asked for.
+    np.num_aux_ = num_aux;
+    context_->PrepareNarrowKeySwitch(max_level, num_aux);
+  }
   const int num_total_primes = np.GetNumTotal();
   const int num_q = np.GetNumQ();
   const int prime_offset = context_->param_.GetMaxNumTer() - np.num_ter_;

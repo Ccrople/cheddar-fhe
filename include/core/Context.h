@@ -1,6 +1,8 @@
 #pragma once
 
+#include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "core/Container.h"
@@ -34,6 +36,7 @@ class Context {
   DvConstView<word> GetPProd(NPInfo &np) const;
   const ModSwitchHandler<word> &GetDtSModSwitchHandler() const;
   const ModSwitchHandler<word> &GetStDModSwitchHandler() const;
+
 
  public:
   void AssertSameScale(const double &scale1, const double &scale2) const;
@@ -89,6 +92,25 @@ class Context {
 
   DeviceVector<word> p_prod_;
   DeviceVector<word> p_prod_dts_;
+
+  /**
+   * @brief Extra mod-switch machinery for key switches on a narrow auxiliary
+   * basis, keyed by (level, num_aux).
+   *
+   * `alpha_` is one number for the whole parameter set and it is sized for the
+   * deepest key switch in it. A switch low in the chain pays for that: ModPack
+   * runs `rank` of them at level 1, where the ciphertext has three primes and
+   * the extended basis has fifteen. Building a second handler for the same
+   * level with fewer auxiliary primes is the whole fix, and it is opt-in
+   * because it changes the key-switch noise -- P must still exceed the digit,
+   * which the caller is responsible for.
+   *
+   * Empty unless `PrepareNarrowKeySwitch` was called, so nothing that does not
+   * ask for one is affected.
+   */
+  mutable std::map<std::pair<int, int>, ModSwitchHandler<word>>
+      narrow_handlers_;
+  mutable std::map<std::pair<int, int>, DeviceVector<word>> narrow_p_prod_;
   std::vector<Const> level_down_consts_;
 
   /**
@@ -421,6 +443,40 @@ class Context {
   void MultKeyNoModDown(Ct &accum, const std::vector<Dv> &a_modup,
                         const Ct &a_orig, const Evk &key) const;
   void MultKeyNoModDown(Ct &accum, const Ct &a, const Evk &key) const;
+
+  /**
+   * @brief Build the mod-switch machinery for key switches at `level` against
+   * keys carrying `num_aux` auxiliary primes instead of `alpha_`.
+   *
+   * Call once, before any switch that uses such a key; the keys themselves are
+   * made by asking `UserInterface` for that `num_aux`. Idempotent.
+   *
+   * ## What the caller is responsible for
+   *
+   * The narrow P must still exceed the key-switch digit, or the switch adds
+   * more noise than it removes. With `beta == 1` the digit is the whole
+   * modulus at `level`, so the condition is `prod(first num_aux aux primes) >
+   * Q_level`, and it wants margin rather than equality. On `sylphflow16_35` at
+   * level 1 that is 2^75.1 against 2^31 per auxiliary prime: three of them is
+   * 2^93 and four is 2^124. Nothing here checks it -- the accuracy of the
+   * circuit is what checks it.
+   *
+   * @param level the level the switch happens at
+   * @param num_aux auxiliary primes in the extended basis, in [1, alpha_]
+   */
+  void PrepareNarrowKeySwitch(int level, int num_aux) const;
+
+  /**
+   * @brief The mod-switch handler and P product for a key switch at `level`
+   * whose key carries `num_aux` auxiliary primes.
+   *
+   * `num_aux == param_.alpha_` gives the ordinary pair, which is every switch
+   * the library made until narrow bases existed. Anything else must have been
+   * asked for through `PrepareNarrowKeySwitch` first.
+   */
+  const ModSwitchHandler<word> &GetModSwitchHandler(int level,
+                                                    int num_aux) const;
+  DvConstView<word> GetPProd(NPInfo &np, int num_aux) const;
 };
 
 template <typename word>

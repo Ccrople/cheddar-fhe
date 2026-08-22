@@ -24,9 +24,22 @@ class ModSwitchHandler {
   const NTTHandler<word> &ntt_handler_;
 
  public:
+  /**
+   * @param num_aux how many auxiliary primes the extended basis carries. 0
+   * takes the parameter set's own `alpha_`, which is what every level had
+   * until now. A smaller basis is legal and is what a key switch low in the
+   * chain wants: `alpha_` is sized for the deepest switch in the set, and
+   * raising a three-prime level-1 ciphertext into a fifteen-prime basis is
+   * most of what ModPack costs. `PrepareEvk` already builds keys against
+   * `np.num_aux_` rather than `alpha_` -- it says so -- so only the
+   * evaluation side had to learn this.
+   */
   ModSwitchHandler(const Parameter<word> &param, int level,
                    const ElementWiseHandler<word> &elem_handler,
-                   const NTTHandler<word> &ntt_handler);
+                   const NTTHandler<word> &ntt_handler, int num_aux = 0);
+
+  /** @brief The auxiliary prime count this handler was built for. */
+  int GetNumAux() const { return num_aux_; }
 
   // diable copying (or moving also)
   ModSwitchHandler(const ModSwitchHandler &) = delete;

@@ -236,13 +236,18 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
 
   const int level = param_.NPToLevel(np);
   AssertTrue(level >= 0, "ModPack: inputs are not at a valid level");
+  const int key_num_aux = keys.at(0)->GetNP().num_aux_;
   for (const auto *key : keys) {
     AssertTrue(key != nullptr, "ModPack: null switching key");
     // The dense-to-sparse key takes a different mod-switch handler inside
     // Context::MultKey (Context.cpp:568). Excluding it here is what lets the
-    // single mod-down below pick its handler by level alone.
-    AssertTrue(key->GetNP().num_aux_ == param_.alpha_,
-               "ModPack: switching keys must be ordinary evaluation keys");
+    // single mod-down below pick its handler by (level, num_aux) rather than
+    // having to know which kind of key it was handed.
+    AssertTrue(key->GetNP().num_aux_ == key_num_aux,
+               "ModPack: switching keys differ in auxiliary prime count");
+    AssertTrue(key_num_aux >= 1 && key_num_aux <= param_.alpha_,
+               "ModPack: switching keys must be ordinary evaluation keys, on "
+               "the full auxiliary basis or a narrower one");
   }
 
   const int num_total_primes = np.GetNumTotal();
@@ -306,7 +311,9 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   res.SetScale(scale);
   res.SetNumSlots(degree / 2);
 
-  const auto &mod_switcher = context->mod_switch_handlers_.at(level);
+  // The accumulator is in whatever extended basis the keys carry, so the
+  // mod-down has to come from the same basis.
+  const auto &mod_switcher = context->GetModSwitchHandler(level, key_num_aux);
   auto res_bx_view = res.BxView();
   auto res_ax_view = res.AxView();
   mod_switcher.ModDown(res_bx_view, accum.BxConstView());

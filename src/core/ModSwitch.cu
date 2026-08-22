@@ -175,9 +175,11 @@ template <typename word>
 ModSwitchHandler<word>::ModSwitchHandler(
     const Parameter<word> &param, int level,
     const ElementWiseHandler<word> &elem_handler,
-    const NTTHandler<word> &ntt_handler)
+    const NTTHandler<word> &ntt_handler, int num_aux /*= 0*/)
     : level_{level},
-      num_aux_{level == -1 ? param.GetSSENumAux() : param.alpha_},
+      num_aux_{num_aux > 0
+                   ? num_aux
+                   : (level == -1 ? param.GetSSENumAux() : param.alpha_)},
       beta_{level == -1 ? 1
                         : DivCeil(param.LevelToNP(level).num_main_ +
                                       param.GetMaxNumTer(),

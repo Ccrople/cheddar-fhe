@@ -111,6 +111,22 @@ const int kSlack = SlackFromEnv();
 // every bootstrap key by the time the O projection runs. Four is 0.8 GB.
 // Bigger is faster (one ModPack per output group per tile is the whole cost of
 // a tile) and this is the knob to turn when a card has room.
+// How many auxiliary primes ModPack's switching keys carry. 0 takes the
+// parameter set's alpha, which is 12 on sylphflow16_35 and is sized for the
+// deepest key switch in the chain -- while ModPack runs 256 of them at level 1,
+// where the ciphertext has three primes. So each switch raises 3 primes into 15
+// for no reason but that alpha is one number for the whole set.
+//
+// The condition on a narrower basis is that P still exceeds the key-switch
+// digit. beta is 1 here, so the digit is the whole modulus at the product
+// level: 2^75.1 against 2^31 per auxiliary prime, which makes 3 the smallest
+// legal choice and 4 the smallest comfortable one. Nothing checks it but the
+// accuracy line at the end of the test, which is the right thing to check it.
+int ModPackAuxFromEnv() {
+  const char *env = std::getenv("CHEDDAR_MODPACK_AUX");
+  return env ? std::atoi(env) : 0;
+}
+
 int TileFromEnv() {
   const char *env = std::getenv("CHEDDAR_PARENTS_PER_TILE");
   return env ? std::atoi(env) : 4;
@@ -1343,7 +1359,14 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
               << "), " << lcfg.parents_per_tile << " parents per tile; device "
               << (dev_free >> 20) << " MiB free of " << (dev_total >> 20)
               << " MiB before keygen" << std::endl;
-    interface_->PrepareModPackKeys(small_degree, lcfg.product_level);
+    const int modpack_aux = ModPackAuxFromEnv();
+    if (modpack_aux > 0) {
+      std::cout << "   ModPack keys on a narrow auxiliary basis: "
+                << modpack_aux << " primes instead of " << param_->alpha_
+                << std::endl;
+    }
+    interface_->PrepareModPackKeys(small_degree, lcfg.product_level,
+                                   modpack_aux);
     modpack_keys.resize(rank);
     for (int j = 0; j < rank; j++) {
       modpack_keys[j] = &interface_->GetModPackKey(rank, j);

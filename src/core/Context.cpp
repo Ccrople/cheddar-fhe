@@ -1,5 +1,8 @@
 #include "core/Context.h"
 
+#include <tuple>
+#include <utility>
+
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "common/PrimeUtils.h"
@@ -34,6 +37,64 @@ DvConstView<word> Context<word>::GetPProd(NPInfo &np) const {
   int prime_offset = param_.GetMaxNumTer() - np.num_ter_;
   int num_q_primes = np.GetNumQ();
   return DvConstView<word>(p_prod_.data() + prime_offset, num_q_primes);
+}
+
+template <typename word>
+DvConstView<word> Context<word>::GetPProd(NPInfo &np, int num_aux) const {
+  if (num_aux == param_.alpha_) return GetPProd(np);
+  const int level = param_.NPToLevel(np);
+  auto it = narrow_p_prod_.find({level, num_aux});
+  AssertTrue(it != narrow_p_prod_.end(),
+             "GetPProd: no narrow key-switch basis was prepared for this "
+             "(level, num_aux); call PrepareNarrowKeySwitch first");
+  return it->second.ConstView(0);
+}
+
+template <typename word>
+const ModSwitchHandler<word> &Context<word>::GetModSwitchHandler(
+    int level, int num_aux) const {
+  if (num_aux == param_.alpha_) return mod_switch_handlers_.at(level);
+  auto it = narrow_handlers_.find({level, num_aux});
+  AssertTrue(it != narrow_handlers_.end(),
+             "GetModSwitchHandler: no narrow key-switch basis was prepared "
+             "for this (level, num_aux); call PrepareNarrowKeySwitch first");
+  return it->second;
+}
+
+template <typename word>
+void Context<word>::PrepareNarrowKeySwitch(int level, int num_aux) const {
+  AssertTrue(level >= 0 && level <= param_.max_level_,
+             "PrepareNarrowKeySwitch: level out of range");
+  AssertTrue(num_aux >= 1 && num_aux <= param_.alpha_,
+             "PrepareNarrowKeySwitch: num_aux must be in [1, alpha]");
+  if (num_aux == param_.alpha_) return;  // the ordinary handler already exists
+  const std::pair<int, int> key(level, num_aux);
+  if (narrow_handlers_.count(key) != 0) return;
+
+  narrow_handlers_.emplace(
+      std::piecewise_construct, std::forward_as_tuple(key),
+      std::forward_as_tuple(param_, level, elem_handler_, ntt_handler_,
+                            num_aux));
+
+  // The P product this basis carries, mod each q prime of the level. Same
+  // shape and same indexing as p_prod_, so GetPProd's callers do not care
+  // which one they were handed -- but over `num_aux` auxiliary primes rather
+  // than all `alpha_`, which is the entire difference.
+  NPInfo np = param_.LevelToNP(level, num_aux);
+  const std::vector<word> primes = param_.GetPrimeVector(np);
+  const int num_q_primes = np.GetNumQ();
+  HostVector<word> h_p_prod(num_q_primes, 1);
+  for (int i = 0; i < num_q_primes; i++) {
+    const word mod_prime = primes[i];
+    for (int j = 0; j < num_aux; j++) {
+      h_p_prod[i] =
+          primeutil::MultMod(h_p_prod[i], primes[num_q_primes + j], mod_prime);
+    }
+    h_p_prod[i] = primeutil::ToMontgomery(h_p_prod[i], mod_prime);
+  }
+  DeviceVector<word> d_p_prod(num_q_primes);
+  CopyHostToDevice(d_p_prod, h_p_prod);
+  narrow_p_prod_.emplace(key, std::move(d_p_prod));
 }
 
 template <typename word>
@@ -568,14 +629,24 @@ void Context<word>::AdjustLevelForMultKey(int &level, const int num_q,
                                           const int num_aux) const {
   if (level == 0) {
     // This still has some issues if alpha == num_q at level 0
-    if (num_aux != param_.alpha_) {
+    //
+    // A key with fewer than alpha auxiliary primes used to mean exactly one
+    // thing here -- the dense-to-sparse key, which is switched on the short
+    // base and so at level -1. A narrow basis that was explicitly prepared is
+    // the other thing it can mean now, and it must not be rerouted.
+    if (num_aux != param_.alpha_ &&
+        narrow_handlers_.count({level, num_aux}) == 0) {
       level = -1;  // maybe...
     }
   }
   if (level == -1) {
     AssertTrue(num_aux == num_q, "Invalid setting for DTS");
   } else {
-    AssertTrue(num_aux == param_.alpha_,
+    // A key on a narrow auxiliary basis is legal exactly when the machinery
+    // for it was built; anything else is the old mistake of handing a key from
+    // one parameter set to another.
+    AssertTrue(num_aux == param_.alpha_ ||
+                   narrow_handlers_.count({level, num_aux}) != 0,
                "Invalid setting for MultKeyNoModDown");
   }
 }
@@ -587,8 +658,9 @@ void Context<word>::MultKey(Ct &res, const Ct &a, const Evk &key) const {
   int num_aux = key.GetNP().num_aux_;
   int num_q = np.GetNumQ();
   AdjustLevelForMultKey(level, num_q, num_aux);
-  const auto &mod_switcher =
-      level == -1 ? GetDtSModSwitchHandler() : mod_switch_handlers_.at(level);
+  const auto &mod_switcher = level == -1
+                                ? GetDtSModSwitchHandler()
+                                : GetModSwitchHandler(level, num_aux);
 
   Ct accum;
   MultKeyNoModDown(accum, a, key);
@@ -662,8 +734,9 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const Ct &a,
       ((level == -1) ? 0 : (param_.GetMaxNumTer() - a_np.num_ter_));
   int padded_num_q = num_q + prime_offset;
   int beta = DivCeil(padded_num_q, num_aux);
-  const auto &mod_switcher =
-      level == -1 ? GetDtSModSwitchHandler() : mod_switch_handlers_.at(level);
+  const auto &mod_switcher = level == -1
+                                ? GetDtSModSwitchHandler()
+                                : GetModSwitchHandler(level, num_aux);
 
   // Mod-up result preparation
   std::vector<Dv> mod_up_result;
@@ -680,8 +753,8 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const Ct &a,
     }
   }
 
-  DvConstView<word> p_prod =
-      (level == -1) ? p_prod_dts_.ConstView(0) : GetPProd(a_np);
+  DvConstView<word> p_prod = (level == -1) ? p_prod_dts_.ConstView(0)
+                                          : GetPProd(a_np, num_aux);
 
   // relinearization or simple mult-key
   if (a.HasRx()) {

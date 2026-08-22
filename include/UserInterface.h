@@ -149,7 +149,16 @@ class UserInterface {
    * @param max_level maximum level for the keys (default: -1 -->
    * param_->max_level_)
    */
-  void PrepareModPackKeys(int small_degree, int max_level = -1);
+  /**
+   * @param num_aux auxiliary primes the switching keys carry. 0 takes the
+   * parameter set's `alpha_`, which is what every key had until narrow bases
+   * existed. ModPack runs `rank` key switches at one low level, and `alpha_`
+   * is sized for the deepest switch in the set, so a narrower basis is most of
+   * what ModPack costs -- see `Context::PrepareNarrowKeySwitch`, which this
+   * calls for you, for the condition P must satisfy.
+   */
+  void PrepareModPackKeys(int small_degree, int max_level = -1,
+                          int num_aux = 0);
 
   /**
    * @brief Prepare the key that switches a ciphertext of this ring onto a
