@@ -4,7 +4,9 @@
 #include <cmath>
 
 #include "common/Assert.h"
+#include "common/Basic.cuh"
 #include "common/CommonUtils.h"
+#include "common/PrimeUtils.h"
 #include "core/BigInt.h"
 #include "core/PcmmBlas.h"
 
@@ -40,13 +42,23 @@ __global__ void SplitGather(int8_t *dst, const word *const *src_ptrs, int cols,
 //
 // Group t holds the sum of every piece product whose combined shift is
 // 7 * t, accumulated in int32 by cuBLAS. Each group is at most
-// 127 * 127 * cols * (pieces per group) which stays inside int32; the
-// recombination needs 64 bits, and doing it once per output element rather
-// than once per product is why the groups exist.
+// 127 * 127 * cols which stays inside int32; the recombination is where the
+// modular arithmetic happens, once per output element rather than once per
+// product, which is why the groups exist.
+//
+// `shift_pow` arrives in Montgomery form and the reduction is Montgomery, not
+// a 64-bit remainder. That is not a micro-optimisation: the plain version ran
+// two `%` on 64-bit operands per group per output word, and this kernel writes
+// 100M words per `Multiply` with 16 groups behind each -- 3.2e9 integer
+// divisions, against a GEMM that takes 30 ms. `MultMontgomery` needs only
+// `a * b` to stay inside `q * 2^31` (Basic.cuh:102), NOT `a < q`: the cuBLAS
+// output is bounded by 127 * 127 * cols, so `cols < 2^31 / 16129` is the whole
+// condition and the caller asserts it.
 template <typename word>
 __global__ void CombineGroups(word *const *dst_ptrs, const int32_t *groups,
                               int num_groups, int rows, int degree,
-                              int limb_offset, word prime,
+                              int limb_offset, const word *prime_ptr,
+                              const make_signed_t<word> *inv_prime_ptr,
                               const word *shift_pow) {
   // Every row at once. Launching this per output row -- 128 rows x 3 primes x
   // 2 components = 768 launches of 4096 elements each -- put about 23 ms of
@@ -57,15 +69,19 @@ __global__ void CombineGroups(word *const *dst_ptrs, const int32_t *groups,
   const size_t idx =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
+  const word prime = basic::StreamingLoadConst(prime_ptr);
+  const make_signed_t<word> inv_prime = basic::StreamingLoadConst(inv_prime_ptr);
   const int row = static_cast<int>(idx / degree);
   const int x = static_cast<int>(idx % degree);
-  uint64_t acc = 0;
+  word acc = 0;
   for (int t = 0; t < num_groups; t++) {
-    const uint64_t part =
-        static_cast<uint64_t>(static_cast<uint32_t>(groups[t * n + idx]));
-    acc = (acc + (part % prime) * static_cast<uint64_t>(shift_pow[t])) % prime;
+    const word part =
+        static_cast<word>(static_cast<uint32_t>(groups[t * n + idx]));
+    const word shift = basic::StreamingLoadConst(shift_pow + t);
+    acc = basic::Add(acc, basic::MultMontgomery(part, shift, prime, inv_prime),
+                     prime);
   }
-  dst_ptrs[row][limb_offset + x] = static_cast<word>(acc);
+  dst_ptrs[row][limb_offset + x] = acc;
 }
 
 }  // namespace kernel
@@ -176,6 +192,11 @@ void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
   chunk -= chunk % kBlock;
   AssertTrue(chunk >= static_cast<size_t>(kBlock),
              "PcmmBlas: the operand is too wide for the scratch budget");
+  // A cuBLAS group entry is at most 127 * 127 * cols. It has to fit int32 for
+  // the GEMM at all, and CombineGroups' Montgomery reduction needs exactly the
+  // same bound (Basic.cuh:102, a * b within q * 2^31).
+  AssertTrue(static_cast<uint64_t>(16129) * cols < (1ull << 31),
+             "PcmmBlas: too many columns for an int32 accumulator");
 
   const size_t src_n = static_cast<size_t>(cols) * chunk;
   const size_t dst_n = static_cast<size_t>(rows) * chunk;
@@ -183,6 +204,8 @@ void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
   DeviceVector<int32_t> groups(static_cast<int>(num_groups * dst_n));
 
   const auto primes = param_.GetPrimeVector(np);
+  const word *prime_ptr = param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_prime_ptr = param_.GetInvPrimesPtr(np);
   const int one = 1, zero = 0;
 
   for (int j = 0; j < num_primes; j++) {
@@ -198,7 +221,8 @@ void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
       }
       for (int l = 0; l < pieces; l++) {
         for (int k = 0; k < pieces; k++) {
-          h_shift[l * pieces + k] = static_cast<word>(pow[k + l]);
+          h_shift[l * pieces + k] = primeutil::ToMontgomery(
+              static_cast<word>(pow[k + l]), primes[j]);
         }
       }
     }
@@ -243,7 +267,7 @@ void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
       kernel::CombineGroups<word>
           <<<static_cast<int>((dst_span + kBlock - 1) / kBlock), kBlock>>>(
               dst_ptrs, groups.data(), num_groups, rows, span, limb_offset,
-              primes[j], d_shift.data());
+              prime_ptr + j, inv_prime_ptr + j, d_shift.data());
     }
   }
 }
