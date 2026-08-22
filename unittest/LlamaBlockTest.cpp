@@ -83,6 +83,22 @@ using Block = LlamaBlock<word>;
 
 namespace {
 
+// Whether the accuracy ledger runs. It is on by default and should stay on:
+// the per-crossing bits below are the only thing that turns "the layer got
+// worse" into an address, and they cost a decryption that a deployment would
+// never do. But they are not free -- 39.1 s of a 82.6 s traced block was the
+// probes, which is the test looking at the layer rather than the layer -- so a
+// run that wants a latency number can set CHEDDAR_LAYER_PROBE=0 and get one.
+// The whole-layer figure at the end is taken from the output ciphertexts and
+// does not go through a probe, so it, and the check on it, survive either way.
+bool ProbesOn() {
+  static const bool on = [] {
+    const char *env = std::getenv("CHEDDAR_LAYER_PROBE");
+    return env == nullptr || !(env[0] == '0' && env[1] == '\0');
+  }();
+  return on;
+}
+
 int SlackFromEnv() {
   const char *env = std::getenv("CHEDDAR_SLACK");
   return env ? std::atoi(env) : 8;
@@ -575,6 +591,7 @@ class HostLinearLeg : public Block::LinearLeg {
   // `UserInterface` states outright is unoptimised.
   void Probe(const std::vector<Ciphertext<word>> &x, int channels,
              const char *name) const {
+    if (!ProbesOn()) return;
     cheddar::NvtxScope _n("probe (test only)");
     std::vector<double> a;
     Gather(a, x, channels);
@@ -583,6 +600,7 @@ class HostLinearLeg : public Block::LinearLeg {
 
   void ProbeOut(const std::vector<Ciphertext<word>> &res, int channels,
                 const char *name) const {
+    if (!ProbesOn()) return;
     cheddar::NvtxScope _n("probe (test only)");
     std::vector<double> y;
     Gather(y, res, channels);
@@ -865,6 +883,7 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
   // [token][head * head_dim + channel] order.
   void ProbeChannels(const std::vector<Ciphertext<word>> &cts, int channels,
                      Tensor which, const char *name) const {
+    if (!ProbesOn()) return;
     cheddar::NvtxScope _n("probe (test only)");
     std::vector<int> order;
     ChannelOrder(order, which);
@@ -907,6 +926,7 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
     // Marked because it is test-only cost sitting inside a timed step: this
     // decrypts and host-decodes every ciphertext handed to it, on the path
     // `UserInterface` states outright is unoptimised.
+    if (!ProbesOn()) return;
     cheddar::NvtxScope _n("probe (test only)");
     std::vector<std::vector<Complex>> msg(cts.size());
     for (size_t i = 0; i < cts.size(); i++) {
