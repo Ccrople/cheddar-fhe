@@ -157,32 +157,45 @@ void RoPeHandler<word>::PlainApply(std::vector<double> &res,
 }
 
 template <typename word>
-void RoPeHandler<word>::Prepare(int first_position, int level,
-                                int variant) const {
+const typename RoPeHandler<word>::Encoded &RoPeHandler<word>::GetTables(
+    int first_position, int level, int variant) const {
   if (level < 0) level = input_level_;
-  if (first_position == cached_position_ && level == cached_level_ &&
-      variant == cached_variant_) {
-    return;
+  // One position at a time. Every table in the map is built for the position
+  // held here, so a move drops all of them together -- which is what keeps a
+  // decode loop from accumulating a set per token.
+  if (first_position != cached_position_) {
+    tables_.clear();
+    cached_position_ = first_position;
   }
+  const std::pair<int, int> key(level, variant);
+  auto it = tables_.find(key);
+  if (it != tables_.end()) return it->second;
+
   const double scale = context_->param_.GetScale(level);
   auto t = BuildTables(num_slots_, num_tokens_, head_dim_, first_position,
                        theta_, ChannelMap(variant));
-  context_->encoder_.Encode(cos_pt_, level, scale, t.cos_t);
-  context_->encoder_.Encode(lower_pt_, level, scale, t.lower);
-  context_->encoder_.Encode(upper_pt_, level, scale, t.upper);
-  cached_position_ = first_position;
-  cached_level_ = level;
-  cached_variant_ = variant;
+  Encoded built;
+  context_->encoder_.Encode(built.cos_pt, level, scale, t.cos_t);
+  context_->encoder_.Encode(built.lower_pt, level, scale, t.lower);
+  context_->encoder_.Encode(built.upper_pt, level, scale, t.upper);
+  return tables_.emplace(key, std::move(built)).first->second;
+}
+
+template <typename word>
+void RoPeHandler<word>::Prepare(int first_position, int level,
+                                int variant) const {
+  GetTables(first_position, level, variant);
 }
 
 template <typename word>
 size_t RoPeHandler<word>::GetPlaintextBytes() const {
-  if (cached_level_ < 0) return 0;
-  const size_t words =
-      static_cast<size_t>(context_->param_.LevelToNP(cached_level_)
-                              .GetNumTotal()) *
-      context_->param_.degree_;
-  return 3 * words * sizeof(word);
+  size_t bytes = 0;
+  for (const auto &e : tables_) {
+    bytes += (e.second.cos_pt.mx_.size() + e.second.lower_pt.mx_.size() +
+              e.second.upper_pt.mx_.size()) *
+             sizeof(word);
+  }
+  return bytes;
 }
 
 template <typename word>
@@ -191,19 +204,15 @@ void RoPeHandler<word>::Apply(Ct &res, const Ct &x, int first_position,
   const int level = context_->param_.NPToLevel(x.GetNP());
   const double scale = context_->param_.GetScale(level);
 
-  // Build the plaintexts only when (first_position, level) has moved. A
-  // Plaintext is fixed by its values, its level and its scale together -- the
-  // same table at a different level is a different object with a different
-  // prime count, and reusing one across levels fails inside the multiply with
-  // "Number of primes differ".
-  // ONE CACHE SLOT, ON PURPOSE. With a channel map per ciphertext the tables
-  // are per ciphertext too, and holding all of them would be three plaintexts
-  // times the tensor ciphertext count -- 120 MB for Q at level 18 on
-  // sylphflow16_35, against 15 MB for one set. Memory is what binds this
-  // block, so the cache holds the last variant and the caller pays one host
-  // encode per ciphertext instead.
-  Prepare(first_position, level, variant);
-  const Pt &cos_pt = cos_pt_, &lower_pt = lower_pt_, &upper_pt = upper_pt_;
+  // Build the plaintexts only the first time this (position, level, variant)
+  // is asked for. A Plaintext is fixed by its values, its level and its scale
+  // together -- the same table at a different level is a different object with
+  // a different prime count, and reusing one across levels fails inside the
+  // multiply with "Number of primes differ". See the cache's own comment in
+  // the header for why it holds every variant of one position.
+  const Encoded &tables = GetTables(first_position, level, variant);
+  const Pt &cos_pt = tables.cos_pt, &lower_pt = tables.lower_pt,
+           &upper_pt = tables.upper_pt;
 
   // Both rotations read the input, so they run at the input level and neither
   // depends on the other.

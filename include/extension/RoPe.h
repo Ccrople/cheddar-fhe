@@ -1,6 +1,8 @@
 #pragma once
 
 #include <climits>
+#include <map>
+#include <utility>
 #include <vector>
 
 #include "core/Container.h"
@@ -78,18 +80,35 @@ class RoPeHandler {
   // shape. Empty for the default packing, where it is `(s / T) % D`.
   std::vector<std::vector<int>> head_channel_;
 
-  // The three plaintexts depend only on (first_position, level), so they are
-  // built once and reused. Encoder::Encode runs SpecialIFFT over every slot and
-  // then num_primes * degree BigInt reductions, single-threaded on the host,
-  // before anything reaches the GPU -- three of those per call was the whole of
-  // RoPE's measured 171 ms against SiLU's 7.8 ms for a much heavier circuit.
-  // Prefill holds first_position fixed across a segment, so the cache hits
-  // every time after the first; decode moves it per token, so it is a memo
-  // rather than a constructor argument.
+  // The three plaintexts depend only on (first_position, level, variant), so
+  // they are built once and reused. Encoder::Encode runs SpecialIFFT over every
+  // slot and then num_primes * degree BigInt reductions, single-threaded on the
+  // host, before anything reaches the GPU -- three of those per call was the
+  // whole of RoPE's measured 171 ms against SiLU's 7.8 ms for a much heavier
+  // circuit.
+  //
+  // ONE SLOT WAS NOT ENOUGH. With a channel map per ciphertext shape the tables
+  // are per variant, and `LlamaBlock::ApplyRoPe` already walks the tensor
+  // variant-major so a single slot would hit within each group -- but the last
+  // variant is the only one that survives to the next call, and Q's variants
+  // are re-encoded from scratch every time the block runs. That was 2.27 s of
+  // the measured block against K's 3.3 ms, K having exactly one variant and so
+  // still holding it from the run before.
+  //
+  // The cache is keyed by (level, variant) and holds one position at a time,
+  // which is what bounds it: prefill fixes first_position across a segment and
+  // fills the map once, decode moves it every token and empties the map on the
+  // way past. So it is `variants * 3` plaintexts at the worst -- 120 MB for Q
+  // at level 18 on sylphflow16_35 -- and never grows with the prompt.
+  struct Encoded {
+    Pt cos_pt, lower_pt, upper_pt;
+  };
   mutable int cached_position_ = INT_MIN;
-  mutable int cached_level_ = -1;
-  mutable int cached_variant_ = -1;
-  mutable Pt cos_pt_, lower_pt_, upper_pt_;
+  mutable std::map<std::pair<int, int>, Encoded> tables_;
+
+  // The three plaintexts for one (position, level, variant), encoding them if
+  // this is the first time they have been asked for.
+  const Encoded &GetTables(int first_position, int level, int variant) const;
 
   // The channel map of one variant, or the default packing's when there is
   // none. Returned by value only where it is built; Apply reads it by
