@@ -52,6 +52,27 @@ namespace cheddar {
  * needs 64-bit intermediates, happens once per output element rather than once
  * per product.
  *
+ * ## The layout is the whole performance story
+ *
+ * int8 cuBLAS has two paths on Ampere and only one of them is the tensor core.
+ * Measured on this A100 at the layer's own shape, m = 32768, n = 256, k = 4096:
+ *
+ *     NN   0.965 ms    71.2 TOPS   ampere_igemm_int8_128x128_ldg4_nn
+ *     NT   0.973 ms    70.6 TOPS   ampere_igemm_int8_128x128_ldg4_nt
+ *     TT   0.966 ms    71.1 TOPS   ampere_igemm_int8_128x128_ldg4_tt
+ *     TN   0.175 ms   392.7 TOPS   cutlass_80_tensorop_i16832gemm_s8_..._tn
+ *
+ * 71 TOPS is not a poor result, it is exactly this card's DP4A ceiling
+ * (19.5 fp32 TFLOP x 4). Three of the four layouts fall on the SIMT integer
+ * kernel; **only TN reaches IMMA**, and it does so because TN is the one
+ * arrangement where the reduction index is contiguous in *both* operands.
+ * U already satisfies it -- `SplitMatrixFrom` writes row-major `[rows][cols]`,
+ * which read as a column-major `cols x rows` is exactly `B` for `OP_N`. The
+ * source did not, so the gather transposes as it splits. Batching the sixteen
+ * shift groups into one `cublasGemmStridedBatchedEx` was measured at the same
+ * time and is worth nothing (421.8 against 411.9 TOPS): at this size the
+ * launches are already long enough to hide their own overhead.
+ *
  * ## Correctness
  *
  * `PcmmHandler::Multiply` stays untouched and is the reference: this path must
@@ -83,6 +104,45 @@ class PcmmBlasHandler {
     NPInfo np;
     // pieces * primes * rows * cols int8 values, piece-major
     DeviceVector<int8_t> data;
+  };
+
+  /**
+   * @brief The source ciphertexts split into int8 pieces, once per tile.
+   *
+   * `CoeffLinearLeg` holds one ModDecomp for a whole tile and multiplies it by
+   * one plaintext matrix per ModPack group -- sixteen of them for Q or O and
+   * fifty-six for the FFN's gate and up. The split of the source does not
+   * depend on which group is being computed, so doing it inside `Multiply` did
+   * it `groups` times over. The whole layer's gather traffic was 1.4 TB for a
+   * job whose actual source is 43 GB.
+   *
+   * Holding it costs nothing net: the split is `pieces` bytes per word against
+   * a word of four, so at four pieces it is exactly the size of the ciphertexts
+   * it came from, and the caller drops those as soon as this exists.
+   *
+   * The buffers are per (prime, chunk) rather than one block because
+   * `DeviceVector` is indexed by `int` and a sixteen-parent tile's a-part is
+   * 3.2e9 pieces.
+   */
+  struct SplitSource {
+    int cols = 0;
+    int pieces = 0;
+    int rank = 0;
+    int degree = 0;  // the small degree, i.e. the b-part's vector length
+    double scale = 0.0;
+    NPInfo np;
+    int chunk_b = 0;
+    int chunk_a = 0;
+    std::vector<DeviceVector<int8_t>> b_data;  // [prime * chunks + chunk]
+    std::vector<DeviceVector<int8_t>> a_data;
+
+    /** @brief Device bytes held. */
+    size_t Bytes() const {
+      size_t n = 0;
+      for (const auto &d : b_data) n += d.size();
+      for (const auto &d : a_data) n += d.size();
+      return n;
+    }
   };
 
   explicit PcmmBlasHandler(const Parameter<word> &param);
@@ -141,19 +201,53 @@ class PcmmBlasHandler {
   void Multiply(std::vector<MlweCiphertext<word>> &res, const SplitMatrix &u,
                 const std::vector<MlweCiphertext<word>> &cts) const;
 
+  /**
+   * @brief Split the source ciphertexts once, for a whole tile.
+   *
+   * `u` is read only for the piece count and the NP, so any of the tile's
+   * plaintext matrices will do -- they all share both.
+   */
+  void PrepareSource(SplitSource &res, const SplitMatrix &u,
+                     const std::vector<MlweCiphertext<word>> &cts) const;
+
+  /**
+   * @brief The MLWE product against a source that is already split.
+   *
+   * Identical in result to the overload above; that one is this one with a
+   * `PrepareSource` in front, kept for callers with a single product to do.
+   */
+  void Multiply(std::vector<MlweCiphertext<word>> &res, const SplitMatrix &u,
+                const SplitSource &src) const;
+
  private:
   /**
-   * @brief One plaintext product against one ciphertext component.
+   * @brief How many words of the vector axis one pass may hold.
+   *
+   * Two things bound it. `DeviceVector` is indexed by `int`, so neither the
+   * `pieces * cols * chunk` split nor the `pieces^2 * rows * chunk`
+   * accumulator may reach 2^31. And the accumulator is real memory that the
+   * product does not otherwise need, so `CHEDDAR_PCMM_SCRATCH_LOG2` caps it.
+   */
+  int ChunkFor(int cols, int rows, int pieces, int vec_len) const;
+
+  /**
+   * @brief Split one ciphertext component into `chunk`-sized int8 buffers.
    *
    * `vec_len` is the number of words a single RNS limb of the component holds:
    * the ring degree for an RLWE component, the small degree for an MLWE b-part
    * and `rank * small_degree` for an MLWE a-part. Everything else about the
-   * product -- the gather, the `pieces^2` GEMMs and the recombination -- is
-   * identical, which is why both public overloads are two calls to this.
+   * product -- the split, the `pieces^2` GEMMs and the recombination -- is
+   * identical, which is why every path is two calls to this pair.
    */
-  void MultiplyComponent(word *const *dst_ptrs, const word *const *src_ptrs,
-                         const SplitMatrix &u, const NPInfo &np,
-                         int vec_len) const;
+  void SplitComponent(std::vector<DeviceVector<int8_t>> &res,
+                      const word *const *src_ptrs, int cols, int pieces,
+                      const NPInfo &np, int vec_len, int chunk) const;
+
+  /** @brief The GEMMs and the recombination, against an already-split source. */
+  void ProductComponent(word *const *dst_ptrs,
+                        const std::vector<DeviceVector<int8_t>> &split,
+                        const SplitMatrix &u, const NPInfo &np, int vec_len,
+                        int chunk) const;
 };
 
 }  // namespace cheddar

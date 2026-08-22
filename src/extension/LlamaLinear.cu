@@ -291,6 +291,21 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     const Operands &ops = cached != nullptr ? *cached : scratch;
     const int first = cached != nullptr ? tile_index * groups : 0;
 
+#ifdef USE_CUBLAS
+    // 1b. Put the decomposition into the form the GEMM consumes, once for the
+    //     tile. Which ModPack group is being computed does not enter the
+    //     split, so doing it inside the product did it `groups` times over --
+    //     fifty-six for gate and up. It replaces `columns` rather than joining
+    //     it: four 7-bit pieces of a 32-bit word are the same four bytes, so
+    //     the tile's footprint does not change.
+    typename PcmmBlasHandler<word>::SplitSource prepared;
+    if (use_blas_) {
+      NvtxScope _n("pcmm: split source (once per tile)");
+      blas_->PrepareSource(prepared, ops.split[first], columns);
+      columns.clear();
+    }
+#endif
+
     // 2. One ModPack group of output channels at a time. The decomposition is
     //    shared by every group, which is why it is hoisted out of this loop --
     //    it is the expensive part, and the product itself is two plaintext
@@ -301,7 +316,7 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
         NvtxScope _n("pcmm: Multiply");
         if (use_blas_) {
 #ifdef USE_CUBLAS
-          blas_->Multiply(product, ops.split[first + g], columns);
+          blas_->Multiply(product, ops.split[first + g], prepared);
 #endif
         } else {
           pcmm_.Multiply(product, ops.u[first + g], columns);

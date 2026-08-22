@@ -245,6 +245,104 @@ TEST_P(Testbed32, PcmmBlasMlweMatchesTheHandKernel) {
       << "the GEMM path disagrees with PcmmAccum on the MLWE format";
   EXPECT_NEAR(got[0].scale_ / want[0].scale_, 1.0, 1e-12);
 }
+
+// The layer prepares the split once per tile and then multiplies it by one
+// plaintext matrix per ModPack group -- fifty-six of them for gate and up. That
+// reuse is the whole point of `PrepareSource`, and it is also the one thing the
+// single-product test above cannot see: a product that left state behind in the
+// split, or a second matrix that quietly received the first one's answer, would
+// pass there and be wrong here.
+TEST_P(Testbed32, PcmmBlasMlweReusesOneSplitSource) {
+  constexpr int kSmallDegree = 256;
+  constexpr int kParents = 4;
+  constexpr int kMatrices = 3;
+  constexpr double kWeightScale = 1073741824.0;
+
+  const int degree = param_->degree_;
+  const int level = default_encryption_level_;
+  const double ct_scale = DetermineScale(level);
+  const int rank = degree / kSmallDegree;
+  const int cols = kParents * rank;
+  const int rows = rank;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+  PcmmHandler<word> pcmm(*param_);
+  PcmmBlasHandler<word> blas(*param_);
+
+  std::vector<MlweCiphertext<word>> columns;
+  {
+    std::vector<double> coeffs(degree, 0.0);
+    Plaintext<word> pt;
+    Ciphertext<word> ct;
+    for (int p = 0; p < kParents; p++) {
+      for (int i = 0; i < degree; i++) {
+        coeffs[i] = 0.009 * static_cast<double>((p * 53 + i * 29) % 211) - 0.9;
+      }
+      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+      interface_->Encrypt(ct, pt);
+      std::vector<MlweCiphertext<word>> decomposed;
+      mlwe.ModDecomp(decomposed, ct, kSmallDegree);
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+    }
+  }
+  ASSERT_EQ(static_cast<int>(columns.size()), cols);
+
+  // Three unrelated plaintext matrices, standing in for three ModPack groups
+  // of one tile, and the reference product for each -- taken before the split
+  // exists, because the reference reads the ciphertexts and the point of the
+  // test is that the GEMM path no longer does.
+  std::vector<typename PcmmBlasHandler<word>::SplitMatrix> us(kMatrices);
+  std::vector<std::vector<MlweCiphertext<word>>> want(kMatrices);
+  for (int m = 0; m < kMatrices; m++) {
+    std::vector<double> values(static_cast<size_t>(rows) * cols);
+    for (size_t i = 0; i < values.size(); i++) {
+      values[i] =
+          0.002 * static_cast<double>((i * 7919 + m * 1237) % 401) - 0.4;
+    }
+    PlainMatrix<word> u;
+    pcmm.EncodeMatrix(u, level, kWeightScale, values, rows, cols);
+    pcmm.Multiply(want[m], u, columns);
+    blas.SplitMatrixFrom(us[m], level, kWeightScale, values, rows, cols);
+  }
+
+  typename PcmmBlasHandler<word>::SplitSource prepared;
+  blas.PrepareSource(prepared, us[0], columns);
+  // What `CoeffLinearLeg::Project` does next: the ciphertexts the split came
+  // from are dropped, so every product below reads only the split.
+  columns.clear();
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  size_t mismatches = 0, words = 0;
+  for (int m = 0; m < kMatrices; m++) {
+    std::vector<MlweCiphertext<word>> got;
+    blas.Multiply(got, us[m], prepared);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(want[m].size(), got.size());
+    for (int i = 0; i < rows; i++) {
+      ASSERT_EQ(want[m][i].a_.size(), got[i].a_.size());
+      ASSERT_EQ(want[m][i].b_.size(), got[i].b_.size());
+      HostVector<word> ha(want[m][i].a_.size()), ga(got[i].a_.size());
+      HostVector<word> hb(want[m][i].b_.size()), gb(got[i].b_.size());
+      CopyDeviceToHost(ha, want[m][i].a_);
+      CopyDeviceToHost(ga, got[i].a_);
+      CopyDeviceToHost(hb, want[m][i].b_);
+      CopyDeviceToHost(gb, got[i].b_);
+      for (size_t k = 0; k < ha.size(); k++) {
+        if (ha[k] != ga[k]) mismatches++;
+      }
+      for (size_t k = 0; k < hb.size(); k++) {
+        if (hb[k] != gb[k]) mismatches++;
+      }
+      words += ha.size() + hb.size();
+    }
+  }
+  std::cout << kMatrices << " matrices against one prepared split; compared "
+            << words << " words" << std::endl;
+  EXPECT_EQ(mismatches, 0u)
+      << "a reused split source does not give the same product as PcmmAccum";
+}
 #endif
 
 INSTANTIATE_TEST_SUITE_P(
