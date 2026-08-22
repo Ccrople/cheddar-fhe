@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "common/Assert.h"
 #include "common/Basic.cuh"
@@ -184,7 +185,20 @@ void PcmmBlasHandler<word>::MultiplyComponent(word *const *dst_ptrs,
   // chunk even where the index would have fitted: at 134M words the two
   // scratch buffers are 134 MB and 537 MB, against a ModDecomp that is already
   // holding gigabytes.
-  constexpr size_t kScratchWords = 1u << 27;
+  //
+  // 2^29 rather than something tighter because the tile-16 measurement said
+  // so: at 2^27 a 4096-column tile chunks the a-part eight ways instead of
+  // two, and the projections gave back about 3.5 s of the 15.5 s that the
+  // wider tile had just saved in ModPack. 2^29 is 537 MB of int8 and 537 MB of
+  // int32 at four pieces. `CHEDDAR_PCMM_SCRATCH_LOG2` moves it for a card that
+  // cannot spare that.
+  static const size_t kScratchWords = [] {
+    const char *v = std::getenv("CHEDDAR_PCMM_SCRATCH_LOG2");
+    int bits = v != nullptr ? std::atoi(v) : 29;
+    if (bits < 20) bits = 20;
+    if (bits > 34) bits = 34;
+    return static_cast<size_t>(1) << bits;
+  }();
   size_t chunk =
       std::min(kScratchWords / (static_cast<size_t>(pieces) * cols),
                kScratchWords / (static_cast<size_t>(num_groups) * rows));
