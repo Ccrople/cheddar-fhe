@@ -730,6 +730,117 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const std::vector<Dv> &a_modup,
 }
 
 template <typename word>
+void Context<word>::ModUpForKeySwitch(std::vector<Dv> &mod_up_result,
+                                      std::vector<DvView<word>> &mod_up_view,
+                                      const Ct &a, const Evk &key,
+                                      const DvConstView<word> *a_coeff) const {
+  NPInfo a_np = a.GetNP();
+  AssertTrue(a_np.num_aux_ == 0,
+             "ModUpForKeySwitch is not supported for ciphertexts with p "
+             "primes");
+  AssertTrue(!a.HasRx(), "ModUpForKeySwitch does not handle an rx_ part");
+
+  int num_q = a_np.GetNumQ();
+  int level = param_.NPToLevel(a_np);
+  int num_aux = key.GetNP().num_aux_;
+  AdjustLevelForMultKey(level, num_q, num_aux);
+  int prime_offset =
+      ((level == -1) ? 0 : (param_.GetMaxNumTer() - a_np.num_ter_));
+  int padded_num_q = num_q + prime_offset;
+  int beta = DivCeil(padded_num_q, num_aux);
+  const auto &mod_switcher = level == -1
+                                 ? GetDtSModSwitchHandler()
+                                 : GetModSwitchHandler(level, num_aux);
+
+  // Reuse whatever the caller's buffers already are. Resizing to the size a
+  // buffer already has does not reallocate, so a loop over switches at one
+  // level pays for its device memory once.
+  if (static_cast<int>(mod_up_result.size()) != beta) {
+    mod_up_result.clear();
+    for (int i = 0; i < beta; i++) {
+      mod_up_result.emplace_back(0);
+    }
+  }
+  mod_up_view.clear();
+  for (int i = 0; i < beta; i++) {
+    int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
+    if (prime_index_end <= prime_offset) {
+      mod_up_result[i].resize(0);
+      mod_up_view.push_back(mod_up_result[i].View(0));
+    } else {
+      mod_up_result[i].resize((num_q + num_aux) * param_.degree_);
+      mod_up_view.push_back(mod_up_result[i].View(num_aux * param_.degree_));
+    }
+  }
+
+  if (a_coeff == nullptr) {
+    mod_switcher.ModUp(mod_up_view, a.AxConstView());
+  } else {
+    mod_switcher.ModUpFromCoeff(mod_up_view, a.AxConstView(), *a_coeff);
+  }
+}
+
+template <typename word>
+void Context<word>::MultKeyAccumNoModDown(
+    Ct &accum, const std::vector<std::vector<Dv>> &a_modups, const Ct &a_orig,
+    const std::vector<const Evk *> &keys, bool accumulate) const {
+  AssertTrue(!keys.empty(), "MultKeyAccumNoModDown: no keys");
+  AssertTrue(a_modups.size() >= keys.size(),
+             "MultKeyAccumNoModDown: fewer mod-up results than keys");
+  AssertTrue(&accum != &a_orig,
+             "In-place operation is not supported for MultKeyAccumNoModDown");
+
+  NPInfo a_orig_np = a_orig.GetNP();
+  int level = param_.NPToLevel(a_orig_np);
+  int num_main = a_orig_np.num_main_;
+  int num_ter = a_orig_np.num_ter_;
+  int num_aux = keys.at(0)->GetNP().num_aux_;
+  int num_q = num_main + num_ter;
+  AdjustLevelForMultKey(level, num_q, num_aux);
+  int prime_offset = ((level == -1) ? 0 : (param_.GetMaxNumTer() - num_ter));
+  int padded_num_q = num_q + prime_offset;
+  int beta = DivCeil(padded_num_q, num_aux);
+
+  NPInfo np(num_main, num_ter, num_aux, param_.degree_);
+  if (accumulate) {
+    AssertTrue(accum.GetNP() == np,
+               "MultKeyAccumNoModDown: the accumulator is on another basis");
+  } else {
+    accum.RemoveRx();
+    accum.ModifyNP(np);
+    accum.SetScale(a_orig.GetScale());
+    accum.SetNumSlots(a_orig.GetNumSlots());
+  }
+
+  std::vector<DvView<word>> accum_views = accum.ViewVector();
+  std::vector<std::vector<DvConstView<word>>> key_views;
+  std::vector<DvConstView<word>> modup_view;
+
+  for (size_t k = 0; k < keys.size(); k++) {
+    const Evk &key = *keys.at(k);
+    AssertTrue(key.GetNP().num_aux_ == num_aux,
+               "MultKeyAccumNoModDown: keys differ in auxiliary prime count");
+    AssertTrue(key.GetBeta() >= beta &&
+                   static_cast<int>(a_modups.at(k).size()) == beta,
+               "Beta mismatch");
+    for (int i = 0; i < beta; i++) {
+      int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
+      if (prime_index_end <= prime_offset) continue;
+      key_views.push_back(key.ConstViewVector(i, prime_offset));
+      modup_view.push_back(
+          a_modups.at(k).at(i).ConstView(num_aux * param_.degree_));
+    }
+  }
+
+  // The accumulator joins as the extra ciphertext CPAccumAdd folds in, which
+  // is what removes the separate addition per switch.
+  if (accumulate) {
+    key_views.push_back(accum.ConstViewVector());
+  }
+  elem_handler_.PAccum(accum_views, np, key_views, modup_view);
+}
+
+template <typename word>
 void Context<word>::MultKeyNoModDown(Ct &accum, const Ct &a,
                                      const Evk &key) const {
   NPInfo a_np = a.GetNP();

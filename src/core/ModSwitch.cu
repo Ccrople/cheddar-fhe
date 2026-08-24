@@ -169,6 +169,28 @@ __global__ void ModSwitchMatrixMult(word *dst, const word *primes,
   }
 }
 
+// The coefficient-domain stand-in for the constant multiply INTTPhase2
+// performs at the end of INTTAndMultConst. `consts` is mod_up1_coeff_ rather
+// than mod_up1_ -- see ModSwitchHandler::ModUpFromCoeff for why the two differ
+// by N. The centred representative is not cosmetic: ModSwitchMatrixMult reads
+// this buffer as signed words, exactly as MultConstNormalize leaves it.
+template <typename word>
+__global__ void ModUpMultConst(make_signed_t<word> *dst, const word *src,
+                               const word *primes,
+                               const make_signed_t<word> *inv_primes,
+                               const word *consts, int log_degree) {
+  using signed_word = make_signed_t<word>;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int prime_index = (i >> log_degree);
+  const word prime = primes[prime_index];
+  const signed_word inv_prime = inv_primes[prime_index];
+  const word temp =
+      basic::MultMontgomery(src[i], consts[prime_index], prime, inv_prime);
+  signed_word result = static_cast<signed_word>(temp);
+  if (temp > (prime >> 1)) result -= static_cast<signed_word>(prime);
+  dst[i] = result;
+}
+
 }  // namespace kernel
 
 template <typename word>
@@ -205,6 +227,7 @@ ModSwitchHandler<word>::ModSwitchHandler(
 
   // mod up constants
   mod_up1_.resize(num_q_primes);
+  mod_up1_coeff_.resize(num_q_primes);
   mod_up2_.resize(beta_);
   for (int i = 0; i < beta_; i++) {
     // absolute index
@@ -229,6 +252,28 @@ ModSwitchHandler<word>::ModSwitchHandler(
     cudaMemcpyAsync(mod_up1_.data() + src_start, mod_up1_tmp.data(),
                     mod_up1_tmp.size() * sizeof(word), cudaMemcpyDeviceToDevice,
                     cudaStreamLegacy);
+
+    // The ModUpFromCoeff constant. PopulateModSwitchConstants folds an N^{-1}
+    // into mod_up1_ to normalise the INTT that consumes it; that INTT does not
+    // run when the caller already holds coefficients, so this one is the same
+    // product inverse without it -- and in Montgomery form, because the kernel
+    // that applies it multiplies with MultMontgomery.
+    HostVector<word> coeff_const(src_primes.size());
+    for (size_t s_idx = 0; s_idx < src_primes.size(); s_idx++) {
+      const word modulus = src_primes[s_idx];
+      word prod = 1;
+      for (size_t t_idx = 0; t_idx < src_primes.size(); t_idx++) {
+        if (t_idx == s_idx) continue;
+        prod = primeutil::MultMod<word>(prod, src_primes[t_idx], modulus);
+      }
+      coeff_const[s_idx] = primeutil::ToMontgomery<word>(
+          primeutil::InvMod<word>(prod, modulus), modulus);
+    }
+    DeviceVector<word> mod_up1_coeff_tmp;
+    CopyHostToDevice(mod_up1_coeff_tmp, coeff_const);
+    cudaMemcpyAsync(mod_up1_coeff_.data() + src_start, mod_up1_coeff_tmp.data(),
+                    mod_up1_coeff_tmp.size() * sizeof(word),
+                    cudaMemcpyDeviceToDevice, cudaStreamLegacy);
   }
 
   std::vector<word> q_primes(level_primes.begin(),
@@ -426,6 +471,20 @@ void ModSwitchHandler<word>::PseudoModUp(
 template <typename word>
 void ModSwitchHandler<word>::ModUp(std::vector<DvView<word>> &dst,
                                    const DvConstView<word> &src) const {
+  ModUpWorker(dst, src, nullptr);
+}
+
+template <typename word>
+void ModSwitchHandler<word>::ModUpFromCoeff(
+    std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+    const DvConstView<word> &src_coeff) const {
+  ModUpWorker(dst, src, &src_coeff);
+}
+
+template <typename word>
+void ModSwitchHandler<word>::ModUpWorker(
+    std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+    const DvConstView<word> *src_coeff) const {
   using signed_word = make_signed_t<word>;
   NPInfo np = param_.LevelToNP(level_, 0);
   int num_q_primes = np.GetNumQ();
@@ -435,11 +494,26 @@ void ModSwitchHandler<word>::ModUp(std::vector<DvView<word>> &dst,
   AssertTrue(src.AuxSize() == 0, "ModUp src aux size mismatch");
   AssertTrue(static_cast<int>(dst.size()) == beta_, "ModUp dst size mismatch");
 
-  // Do NTT
+  // Back to the coefficient domain, scaled by the product inverse. A caller
+  // that never left it says so and pays one constant multiply instead.
   DeviceVector<word> src_intt(num_q_primes * degree);
   DvView<word> src_intt_view = src_intt.View(0, 0);
-  ntt_handler_.INTTAndMultConst(src_intt_view, np, src,
-                                mod_up1_.ConstView(0, 0), true);
+  if (src_coeff == nullptr) {
+    ntt_handler_.INTTAndMultConst(src_intt_view, np, src,
+                                  mod_up1_.ConstView(0, 0), true);
+  } else {
+    AssertTrue(src_coeff->QSize() == num_q_primes * degree,
+               "ModUpFromCoeff src_coeff q size mismatch");
+    AssertTrue(src_coeff->AuxSize() == 0,
+               "ModUpFromCoeff src_coeff aux size mismatch");
+    const int num_words = num_q_primes * degree;
+    AssertTrue(num_words % block_dim_ == 0,
+               "ModUpFromCoeff: degree must be a multiple of the block dim");
+    kernel::ModUpMultConst<word><<<num_words / block_dim_, block_dim_>>>(
+        reinterpret_cast<signed_word *>(src_intt.data()), src_coeff->data(),
+        param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+        mod_up1_coeff_.data(), param_.log_degree_);
+  }
 
   int padded_num_q_primes = num_q_primes + prime_offset;
   // Do some checks and copy some values from src to dst

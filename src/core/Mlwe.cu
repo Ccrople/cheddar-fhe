@@ -292,17 +292,36 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
                   static_cast<size_t>(num_total_primes) * degree * sizeof(word),
                   cudaStreamLegacy);
 
-  Ct accum, partial;
-  for (int j = 0; j < rank; j++) {
-    auto ax_view = input.AxView();
-    ntt_handler_.NTT(ax_view, np, a_coeffs[j].ConstView(), true);
+  // The switches are raised in groups and multiplied in one launch per group.
+  // One at a time costs `rank` products plus `rank - 1` additions, and at
+  // 24 ms a call for a rank of 256 that launch structure, not the arithmetic,
+  // is most of what ModPack is. `kSwitchChunk` is
+  // ElementWiseHandler<word>::max_num_accum_: the number of (key, mod-up)
+  // pairs the accumulating kernel takes at once. A narrower auxiliary basis
+  // raises beta above one and pushes the group past that, which PAccum still
+  // computes correctly -- it splits and recurses -- just in more than one
+  // launch.
+  constexpr int kSwitchChunk = 8;
+  std::vector<std::vector<DeviceVector<word>>> modups(kSwitchChunk);
+  std::vector<std::vector<DvView<word>>> modup_views(kSwitchChunk);
 
-    if (j == 0) {
-      context->MultKeyNoModDown(accum, input, *keys[j]);
-    } else {
-      context->MultKeyNoModDown(partial, input, *keys[j]);
-      context->Add(accum, accum, partial);
+  Ct accum;
+  for (int base = 0; base < rank; base += kSwitchChunk) {
+    const int num_in_chunk = Min(kSwitchChunk, rank - base);
+    std::vector<const Evk *> chunk_keys(keys.begin() + base,
+                                        keys.begin() + base + num_in_chunk);
+
+    for (int i = 0; i < num_in_chunk; i++) {
+      auto ax_view = input.AxView();
+      const auto coeff_view = a_coeffs[base + i].ConstView();
+      ntt_handler_.NTT(ax_view, np, coeff_view, true);
+      // The coefficients go along with the transform of them: the mod-up's
+      // first act is otherwise to undo the NTT on the line above.
+      context->ModUpForKeySwitch(modups[i], modup_views[i], input,
+                                 *keys[base + i], &coeff_view);
     }
+
+    context->MultKeyAccumNoModDown(accum, modups, input, chunk_keys, base > 0);
   }
 
   // 3. One mod-down for all k switches, then the recomposed B.

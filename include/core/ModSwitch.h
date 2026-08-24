@@ -52,6 +52,22 @@ class ModSwitchHandler {
                    const DvConstView<word> &p_prod) const;
   void ModUp(std::vector<DvView<word>> &dst,
              const DvConstView<word> &src) const;
+  /**
+   * @brief ModUp for a caller that still holds the coefficient-domain input.
+   *
+   * The ordinary entry point opens by undoing the NTT it was just handed. A
+   * caller that transformed the polynomial itself immediately beforehand --
+   * ModPack does, once per module component -- can hand both forms over
+   * instead and pay a constant multiply where the INTT was. `src` is the NTT
+   * form, which the limbs that pass through unchanged are still copied from;
+   * `src_coeff` is the same polynomial before that transform.
+   *
+   * The constant is not `mod_up1_`. That one folds in an N^{-1} to normalise
+   * an INTT which, here, does not run.
+   */
+  void ModUpFromCoeff(std::vector<DvView<word>> &dst,
+                      const DvConstView<word> &src,
+                      const DvConstView<word> &src_coeff) const;
   void ModDown(DvView<word> &dst, const DvConstView<word> &src) const;
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
   void ModDownAndRescale(DvView<word> &dst, const DvConstView<word> &src) const;
@@ -59,6 +75,11 @@ class ModSwitchHandler {
  private:
   // ModUp constants
   Dv mod_up1_;
+  // The same constant for ModUpFromCoeff: mod_up1_ * N, in Montgomery form.
+  // The N is there because the INTT that mod_up1_ normalises does not run on
+  // that path, and the Montgomery form because the kernel consuming it
+  // multiplies with MultMontgomery rather than through INTTPhase2.
+  Dv mod_up1_coeff_;
   std::vector<DeviceVector<make_signed_t<word>>> mod_up2_;
 
   // ModDown constants
@@ -97,6 +118,11 @@ class ModSwitchHandler {
                                         const std::vector<word> &src_primes,
                                         const std::vector<word> &dst_primes,
                                         int restore_start, int restore_end);
+
+  // The body behind ModUp and ModUpFromCoeff. A null src_coeff selects the
+  // INTT; a non-null one selects the constant multiply that replaces it.
+  void ModUpWorker(std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+                   const DvConstView<word> *src_coeff) const;
 
   enum class ModDownType { ModDown, Rescale, ModDownAndRescale };
   void ModDownWorker(DvView<word> &dst, const DvConstView<word> &src,
