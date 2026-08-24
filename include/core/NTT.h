@@ -46,18 +46,10 @@ class NTTHandler {
   Dv ci_fwd_twist_;
   Dv ci_inv_twist_;
 
-  // dst = fold(src): the CI coefficient vector reduced mod (Y^degree - i), the
-  // form the butterfly network below diagonalises. Runs before NTT phase 1 and
-  // takes the same grid, so it reads like a phase 0. No-op unless the ring is
-  // conjugate-invariant.
-  void CiFold(make_signed_t<word> *dst, const word *primes,
-              const make_signed_t<word> *inv_primes, int ter_left,
-              int tw_y_extra, int num_q_primes, int num_total_primes,
-              int skip_start, int skip_end, int batch_stride, int batch,
-              const make_signed_t<word> *src, int src_extra) const;
-
-  // The inverse, in place on the INTT's output. Mirrored pairs (j, degree - j)
-  // are recombined by one thread each, so it needs no scratch buffer.
+  // The inverse of the fold NTTPhase1 performs, in place on the INTT output.
+  // Mirrored pairs (j, degree - j) are recombined by one thread each, so it
+  // needs no scratch buffer. This one cannot ride a phase kernel the way the
+  // fold does: it mixes two *outputs*, which live in different blocks.
   void CiUnfold(make_signed_t<word> *dst, const word *primes,
                 const make_signed_t<word> *inv_primes, int ter_left,
                 int tw_y_extra, int num_q_primes, int num_total_primes,

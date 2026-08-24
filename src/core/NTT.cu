@@ -262,68 +262,6 @@ __global__ void INTTPhase2(
 // exactly as it is. Changing the network root instead does not work: its table
 // is psi^brv(j), which satisfies the butterfly recursion only while
 // psi^N = -1. With a 4N-th root only the first stage would be right.
-template <typename word, int log_degree>
-__global__ void CiFoldKernel(make_signed_t<word> *dst, const word *primes,
-                             const make_signed_t<word> *inv_primes,
-                             const word *i_units, const word *fwd_twist,
-                             int tw_y_extra, int num_q_primes, int skip_start,
-                             int skip_end, int batch_stride,
-                             const InputPtrList<make_signed_t<word>, 1> src) {
-  using signed_word = make_signed_t<word>;
-  constexpr int kDegree = 1 << log_degree;
-
-  int y_idx = blockIdx.y;
-  if (y_idx >= skip_start) y_idx += (skip_end - skip_start);
-  const int batch_offset = blockIdx.z * batch_stride;
-
-  const word prime = basic::StreamingLoadConst(primes + y_idx);
-  const signed_word inv_prime = basic::StreamingLoadConst(inv_primes + y_idx);
-  int tw_y_idx = y_idx;
-  const signed_word *src_limb =
-      src.ptrs_[0] + batch_offset + (y_idx << log_degree);
-  if (y_idx >= num_q_primes) {
-    tw_y_idx += tw_y_extra;
-    src_limb += src.extra_;
-  }
-  signed_word *dst_limb = dst + batch_offset + (y_idx << log_degree);
-  const word i_unit = basic::StreamingLoadConst(i_units + tw_y_idx);
-  const word *twist = fwd_twist + (tw_y_idx << log_degree);
-
-  // One thread owns the mirrored pair (t, kDegree - t) and writes both, so the
-  // pass is safe when dst and src are the same buffer -- which they are
-  // whenever Encoder transforms a plaintext in place. Thread 0 has no mirror
-  // partner and takes the two self-paired indices instead.
-  const int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t == 0) {
-    constexpr int kHalf = kDegree / 2;
-    const word head = static_cast<word>(basic::StreamingLoad(src_limb));
-    const word mid = static_cast<word>(basic::StreamingLoad(src_limb + kHalf));
-    // hat_N is zero and psi4^0 is one, so index 0 passes straight through.
-    dst_limb[0] = static_cast<signed_word>(head);
-    const word mid_folded = basic::Sub<word>(
-        mid, basic::MultMontgomery<word>(i_unit, mid, prime, inv_prime), prime);
-    dst_limb[kHalf] = static_cast<signed_word>(basic::MultMontgomery<word>(
-        mid_folded, basic::StreamingLoadConst(twist + kHalf), prime,
-        inv_prime));
-    return;
-  }
-  const int mirror_idx = kDegree - t;
-  const word head = static_cast<word>(basic::StreamingLoad(src_limb + t));
-  const word mirror =
-      static_cast<word>(basic::StreamingLoad(src_limb + mirror_idx));
-  const word head_folded = basic::Sub<word>(
-      head, basic::MultMontgomery<word>(i_unit, mirror, prime, inv_prime),
-      prime);
-  const word mirror_folded = basic::Sub<word>(
-      mirror, basic::MultMontgomery<word>(i_unit, head, prime, inv_prime),
-      prime);
-  dst_limb[t] = static_cast<signed_word>(basic::MultMontgomery<word>(
-      head_folded, basic::StreamingLoadConst(twist + t), prime, inv_prime));
-  dst_limb[mirror_idx] = static_cast<signed_word>(basic::MultMontgomery<word>(
-      mirror_folded, basic::StreamingLoadConst(twist + mirror_idx), prime,
-      inv_prime));
-}
-
 // Undo the twist, then a_j = (g[j] + i * g[N - j]) / 2 for j > 0 and
 // a_0 = g[0]. Mirrored in pairs exactly as the fold is, and for the same
 // reason: this one always runs in place, on the INTT own output.
@@ -386,8 +324,9 @@ template <typename word, int log_degree>
 __global__ void NTTPhase1(
     make_signed_t<word> *dst, const word *primes,
     const make_signed_t<word> *inv_primes, const word *twiddle_factors,
-    int tw_y_extra, int num_q_primes, int skip_start, int skip_end,
-    int batch_stride, const InputPtrList<make_signed_t<word>, 1> src,
+    const word *ci_i_units, const word *ci_twist, int tw_y_extra,
+    int num_q_primes, int skip_start, int skip_end, int batch_stride,
+    const InputPtrList<make_signed_t<word>, 1> src,
     const InputPtrList<word, 1> src_const = InputPtrList<word, 1>()) {
   // Shared memory initialization
   extern __shared__ char shared_mem[];
@@ -441,6 +380,35 @@ __global__ void NTTPhase1(
   for (int i = 0; i < kPerThreadElems; i++) {
     local[i] = basic::StreamingLoad<signed_word>(
         load_ptr + (i << (log_degree - kStageMerging)));
+  }
+
+  // The conjugate-invariant fold, on the values just loaded. It reduces the
+  // ring element mod (Y^N - i) and twists by psi4^-j, which together turn this
+  // negacyclic network into the transform of Z[Y + Y^-1] -- the derivation is
+  // above CiUnfoldKernel. Riding the load rather than running as its own
+  // pass is what keeps it to one extra read instead of a whole round trip, and
+  // it is why NTTForModUp and NTTForModDown need no separate wiring.
+  if (ci_twist != nullptr) {
+    constexpr int kDegree = 1 << log_degree;
+    const word i_unit = basic::StreamingLoadConst(ci_i_units + tw_y_idx);
+    const word *twist_limb = ci_twist + (tw_y_idx << log_degree);
+    const int base = batch_idx + (blockIdx.x << kLogWarpBatching) +
+                     (stage_group_idx << (log_degree - kNumStages));
+    for (int i = 0; i < kPerThreadElems; i++) {
+      const int idx = base + (i << (log_degree - kStageMerging));
+      // hat_N is zero, so coefficient 0 has no mirror; psi4^0 is one, so it is
+      // also the one index the twist leaves alone.
+      const word mirror =
+          (idx == 0) ? static_cast<word>(0)
+                     : static_cast<word>(basic::StreamingLoad<signed_word>(
+                           src_limb + (kDegree - idx)));
+      const word folded = basic::Sub<word>(
+          static_cast<word>(local[i]),
+          basic::MultMontgomery<word>(i_unit, mirror, prime, inv_prime), prime);
+      local[i] = static_cast<signed_word>(basic::MultMontgomery<word>(
+          folded, basic::StreamingLoadConst(twist_limb + idx), prime,
+          inv_prime));
+    }
   }
 
   if (src_const.ptrs_[0] != nullptr) {
@@ -781,33 +749,6 @@ void NTTHandler<word>::AssertNoConjugateInvariant(const char *where) const {
 }
 
 template <typename word>
-void NTTHandler<word>::CiFold(make_signed_t<word> *dst, const word *primes,
-                              const make_signed_t<word> *inv_primes,
-                              int ter_left, int tw_y_extra, int num_q_primes,
-                              int num_total_primes, int skip_start,
-                              int skip_end, int batch_stride, int batch,
-                              const make_signed_t<word> *src,
-                              int src_extra) const {
-  using signed_word = make_signed_t<word>;
-  int log_degree = param_.log_degree_;
-  AssertTrue((param_.degree_ / 2) % kCiBlockDim == 0,
-             "CiFold: degree too small");
-
-  InputPtrList<signed_word, 1> src_ptr_list;
-  src_ptr_list.ptrs_[0] = src;
-  src_ptr_list.extra_ = src_extra;
-
-  dim3 grid_dim(param_.degree_ / 2 / kCiBlockDim, num_total_primes, batch);
-  constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
-    if (log_degree != j) return;
-    kernel::CiFoldKernel<word, j><<<grid_dim, kCiBlockDim>>>(
-        dst, primes, inv_primes, ci_i_.data() + ter_left,
-        ci_fwd_twist_.data() + ter_left * param_.degree_, tw_y_extra,
-        num_q_primes, skip_start, skip_end, batch_stride, src_ptr_list);
-  });
-}
-
-template <typename word>
 void NTTHandler<word>::CiUnfold(make_signed_t<word> *dst, const word *primes,
                                 const make_signed_t<word> *inv_primes,
                                 int ter_left, int tw_y_extra, int num_q_primes,
@@ -855,15 +796,16 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
   const word *tw_ptr = twiddle_factors_.data() + ter_left * param_.degree_;
   const word *tw_msb_ptr =
       twiddle_factors_msb_.data() + ter_left * GetMsbSize();
-
-  // Phase 0: the conjugate-invariant fold, which lands in dst so that phase 1
-  // reads a contiguous buffer and the aux offset is spent exactly once.
-  if (param_.conjugate_invariant_) {
-    CiFold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
-           num_total_primes, 0, 0, 0, 1, src_ptr, src_ptr_list.extra_);
-    src_ptr_list.ptrs_[0] = dst_ptr;
-    src_ptr_list.extra_ = 0;
-  }
+  // Null unless the ring is conjugate-invariant, which is how phase 1 knows
+  // whether to fold -- the same shape of switch NTTPhase1 already uses for
+  // src_const.
+  const word *ci_i_ptr = param_.conjugate_invariant_
+                             ? (ci_i_.data() + ter_left)
+                             : nullptr;
+  const word *ci_twist_ptr =
+      param_.conjugate_invariant_
+          ? (ci_fwd_twist_.data() + ter_left * param_.degree_)
+          : nullptr;
 
   // Phase 1
   int block_dim = GetBlockDim(NTTType::NTT, Phase::Phase1);
@@ -878,12 +820,12 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
       src_const_ptr_list.ptrs_[0] = montgomery_converter_.data() + ter_left;
       src_const_ptr_list.extra_ = main_left;
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0, 0,
-          src_ptr_list, src_const_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, 0, 0, 0, src_ptr_list, src_const_ptr_list);
     } else {
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0, 0,
-          src_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, 0, 0, 0, src_ptr_list);
     }
   });
 
@@ -1070,7 +1012,6 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
                                    const DvConstView<word> &src,
                                    int batch /*= 1*/) const {
   using signed_word = make_signed_t<word>;
-  AssertNoConjugateInvariant("NTTForModUp");
   int log_degree = param_.log_degree_;
   int num_q_primes = np.GetNumQ();
   int q_size = num_q_primes * param_.degree_;
@@ -1110,6 +1051,16 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
   const word *tw_ptr = twiddle_factors_.data() + ter_left * param_.degree_;
   const word *tw_msb_ptr =
       twiddle_factors_msb_.data() + ter_left * GetMsbSize();
+  // Null unless the ring is conjugate-invariant, which is how phase 1 knows
+  // whether to fold -- the same shape of switch NTTPhase1 already uses for
+  // src_const.
+  const word *ci_i_ptr = param_.conjugate_invariant_
+                             ? (ci_i_.data() + ter_left)
+                             : nullptr;
+  const word *ci_twist_ptr =
+      param_.conjugate_invariant_
+          ? (ci_fwd_twist_.data() + ter_left * param_.degree_)
+          : nullptr;
 
   // Phase 1
   int block_dim = GetBlockDim(NTTType::NTT, Phase::Phase1);
@@ -1122,15 +1073,17 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
     // montgomery_conversion is always false
     if constexpr (kFuseMontgomery) {
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes,
-          skip_start, skip_end, batch_stride, src_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, skip_start, skip_end, batch_stride,
+          src_ptr_list);
     } else {
       InputPtrList<word, 1> src_const_ptr_list;
       src_const_ptr_list.ptrs_[0] = montgomery_converter_.data() + ter_left;
       src_const_ptr_list.extra_ = main_left;
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes,
-          skip_start, skip_end, batch_stride, src_ptr_list, src_const_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, skip_start, skip_end, batch_stride,
+          src_ptr_list, src_const_ptr_list);
     }
   });
 
@@ -1159,7 +1112,6 @@ void NTTHandler<word>::NTTForModDown(
     const DvConstView<word> &src2_padding /*= DvConstView<word>(nullptr,
                                                               0)*/) const {
   using signed_word = make_signed_t<word>;
-  AssertNoConjugateInvariant("NTTForModDown");
   int log_degree = param_.log_degree_;
   int num_q_primes = np_src1.GetNumQ();
   int q_size = num_q_primes * param_.degree_;
@@ -1196,6 +1148,16 @@ void NTTHandler<word>::NTTForModDown(
   const word *tw_ptr = twiddle_factors_.data() + ter_left * param_.degree_;
   const word *tw_msb_ptr =
       twiddle_factors_msb_.data() + ter_left * GetMsbSize();
+  // Null unless the ring is conjugate-invariant, which is how phase 1 knows
+  // whether to fold -- the same shape of switch NTTPhase1 already uses for
+  // src_const.
+  const word *ci_i_ptr = param_.conjugate_invariant_
+                             ? (ci_i_.data() + ter_left)
+                             : nullptr;
+  const word *ci_twist_ptr =
+      param_.conjugate_invariant_
+          ? (ci_fwd_twist_.data() + ter_left * param_.degree_)
+          : nullptr;
 
   // Phase 1
   int block_dim = GetBlockDim(NTTType::NTT, Phase::Phase1);
@@ -1208,15 +1170,15 @@ void NTTHandler<word>::NTTForModDown(
     // montgomery_conversion is always false
     if constexpr (kFuseMontgomery) {
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, ntt_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, 0, 0, 0, ntt_ptr_list);
     } else {
       InputPtrList<word, 1> src_const_ptr_list;
       src_const_ptr_list.ptrs_[0] = montgomery_converter_.data() + ter_left;
       src_const_ptr_list.extra_ = main_left;
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
-          dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, ntt_ptr_list, src_const_ptr_list);
+          dst_ptr, primes, inv_primes, tw_ptr, ci_i_ptr, ci_twist_ptr,
+          main_left, num_q_primes, 0, 0, 0, ntt_ptr_list, src_const_ptr_list);
     }
   });
 
