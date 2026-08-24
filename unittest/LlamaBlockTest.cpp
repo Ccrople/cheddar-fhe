@@ -131,6 +131,16 @@ int TileFromEnv() {
   const char *env = std::getenv("CHEDDAR_PARENTS_PER_TILE");
   return env ? std::atoi(env) : 4;
 }
+
+// [SYLPH] section 3.2's own descent for the seven projections: ring-switch to
+// degree 4096 before decomposing, so ModPack runs 16 switches on the small
+// ring per ciphertext of it instead of 256 on the block's. Off by default
+// because it needs the two extra rings and their keys even in `kProjections`
+// mode, where the direct route needs neither.
+bool RingSwitchedPcmmFromEnv() {
+  const char *env = std::getenv("CHEDDAR_PCMM_RING_SWITCH");
+  return env != nullptr && !(env[0] == '0' && env[1] == 0);
+}
 const int kParentsPerTile = TileFromEnv();
 
 constexpr int kAllTokens = 128;
@@ -790,8 +800,10 @@ class EncryptedProjectionLeg : public cheddar::CoeffLinearLeg<word> {
   EncryptedProjectionLeg(cheddar::ConstContextPtr<word> context,
                          const Base::Config &lcfg,
                          std::vector<const EvaluationKey<word> *> keys,
-                         const HostLinearLeg &host)
-      : Base(context, lcfg, std::move(keys)), host_{host} {}
+                         const HostLinearLeg &host,
+                         Base::Descent descent = typename Base::Descent{})
+      : Base(context, lcfg, std::move(keys), std::move(descent)),
+        host_{host} {}
 
   void Project(std::vector<Ciphertext<word>> &res,
                const std::vector<Ciphertext<word>> &x, int in_channels,
@@ -853,9 +865,11 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
                 const cheddar::CoeffLinearLeg<word>::Config &lcfg,
                 std::vector<const EvaluationKey<word> *> modpack_keys,
                 const Testbed32 &bed, const Packing &pack,
-                const HostLinearLeg &host)
+                const HostLinearLeg &host,
+                cheddar::CoeffLinearLeg<word>::Descent descent =
+                    typename cheddar::CoeffLinearLeg<word>::Descent{})
       : Base(std::move(boot), std::move(sw), std::move(small), cfg, acfg, keys,
-             lcfg, std::move(modpack_keys)),
+             lcfg, std::move(modpack_keys), std::move(descent)),
         bed_{bed},
         pack_{pack},
         host_{host},
@@ -1353,31 +1367,82 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
     const int small_degree = Leg::SmallDegreeFor(kTokens);
     const int rank = param_->degree_ / small_degree;
     size_t dev_free = 0, dev_total = 0;
-    cudaMemGetInfo(&dev_free, &dev_total);
-    std::cout << "preparing " << rank << " ModPack keys at level "
-              << lcfg.product_level << " (small degree " << small_degree
-              << "), " << lcfg.parents_per_tile << " parents per tile; device "
-              << (dev_free >> 20) << " MiB free of " << (dev_total >> 20)
-              << " MiB before keygen" << std::endl;
-    const int modpack_aux = ModPackAuxFromEnv();
-    if (modpack_aux > 0) {
-      std::cout << "   ModPack keys on a narrow auxiliary basis: "
-                << modpack_aux << " primes instead of " << param_->alpha_
+
+    // ---- [SYLPH]'s descent, when it is asked for ------------------------
+    //
+    // It has to be settled BEFORE the ModPack keys, because it decides which
+    // ring they are generated on -- and the whole saving is that the block's
+    // 256 are not generated at all. The two rings are the pair the batch CC-MM
+    // already descends through, so in `kFull` the only new key material is the
+    // small ring's `sub_rank` ModPack keys; the two ring-switching keys were
+    // being generated anyway.
+    Leg::Descent descent;
+    if (RingSwitchedPcmmFromEnv()) {
+      sw_ring = std::make_unique<ringfixture::Ring<word>>(
+          "ringswitch16_35.json", interface_->GetSecretCoeffs());
+      small_ring =
+          std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+      const int ring_rank = param_->degree_ / small_ring->Degree();
+      const int sub_rank = small_ring->Degree() / small_degree;
+      cudaMemGetInfo(&dev_free, &dev_total);
+      std::cout << "the PC-MM descends through [SYLPH]'s ring switch: "
+                << param_->degree_ << " -> " << small_ring->Degree() << " -> "
+                << small_degree << ", ModPack " << ring_rank << " x "
+                << sub_rank << " on the small ring instead of " << rank
+                << " on this one; " << (dev_free >> 20)
+                << " MiB free before its keys" << std::endl;
+      sw_ring->ui->PrepareRingSwitchKey(small_ring->Degree(),
+                                        small_ring->ui->GetSecretCoeffs(),
+                                        kProductLevel);
+      sw_ring->ui->PrepareInverseRingSwitchKey(
+          small_ring->Degree(), small_ring->ui->GetSecretCoeffs(),
+          kProductLevel);
+      small_ring->ui->PrepareModPackKeys(small_degree, kProductLevel);
+      descent.switch_context = sw_ring->context;
+      descent.small_context = small_ring->context;
+      descent.forward = &sw_ring->ui->GetRingSwitchKey(ring_rank);
+      descent.inverse = &sw_ring->ui->GetInverseRingSwitchKey(ring_rank);
+      descent.modpack_keys.resize(sub_rank);
+      for (int j = 0; j < sub_rank; j++) {
+        descent.modpack_keys[j] = &small_ring->ui->GetModPackKey(sub_rank, j);
+      }
+      // A sixteenth of the module components means the tiling has nothing left
+      // to bound, and every tile it removes is one ModPack per output group.
+      if (std::getenv("CHEDDAR_PARENTS_PER_TILE") == nullptr) {
+        lcfg.parents_per_tile = 0;
+      }
+      cudaMemGetInfo(&dev_free, &dev_total);
+      std::cout << "device " << (dev_free >> 20)
+                << " MiB free after the descent's keys, " << sub_rank
+                << " of them at degree " << small_ring->Degree() << std::endl;
+    } else {
+      cudaMemGetInfo(&dev_free, &dev_total);
+      std::cout << "preparing " << rank << " ModPack keys at level "
+                << lcfg.product_level << " (small degree " << small_degree
+                << "), " << lcfg.parents_per_tile
+                << " parents per tile; device " << (dev_free >> 20)
+                << " MiB free of " << (dev_total >> 20) << " MiB before keygen"
                 << std::endl;
+      const int modpack_aux = ModPackAuxFromEnv();
+      if (modpack_aux > 0) {
+        std::cout << "   ModPack keys on a narrow auxiliary basis: "
+                  << modpack_aux << " primes instead of " << param_->alpha_
+                  << std::endl;
+      }
+      interface_->PrepareModPackKeys(small_degree, lcfg.product_level,
+                                     modpack_aux);
+      modpack_keys.resize(rank);
+      for (int j = 0; j < rank; j++) {
+        modpack_keys[j] = &interface_->GetModPackKey(rank, j);
+      }
+      cudaMemGetInfo(&dev_free, &dev_total);
+      std::cout << "device " << (dev_free >> 20) << " MiB free after the "
+                << rank << " ModPack keys" << std::endl;
     }
-    interface_->PrepareModPackKeys(small_degree, lcfg.product_level,
-                                   modpack_aux);
-    modpack_keys.resize(rank);
-    for (int j = 0; j < rank; j++) {
-      modpack_keys[j] = &interface_->GetModPackKey(rank, j);
-    }
-    cudaMemGetInfo(&dev_free, &dev_total);
-    std::cout << "device " << (dev_free >> 20) << " MiB free after the "
-              << rank << " ModPack keys" << std::endl;
 
     if (mode == Mode::kProjections) {
-      real_leg = std::make_unique<EncryptedProjectionLeg>(context_, lcfg,
-                                                          modpack_keys, host);
+      real_leg = std::make_unique<EncryptedProjectionLeg>(
+          context_, lcfg, modpack_keys, host, descent);
       leg = real_leg.get();
     } else {
       // ---- THE OTHER TWO RINGS ------------------------------------------
@@ -1394,10 +1459,15 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
                 << kSinCPhases << " phases" << std::endl;
       boot->PrepareSinC(num_slots, kSubDegree, prob_level, prob_level,
                         kSinCPhases);
-      sw_ring = std::make_unique<ringfixture::Ring<word>>(
-          "ringswitch16_35.json", interface_->GetSecretCoeffs());
-      small_ring =
-          std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+      // The descent builds the same two rings when it is on, and they must be
+      // the same objects -- the switching context holds the block's secret and
+      // a second copy would hold a different one.
+      if (sw_ring == nullptr) {
+        sw_ring = std::make_unique<ringfixture::Ring<word>>(
+            "ringswitch16_35.json", interface_->GetSecretCoeffs());
+        small_ring =
+            std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+      }
 
       cheddar::SinCLinearLeg<word>::Config scfg;
       scfg.num_heads = kChannels / kHeadDim;
@@ -1437,7 +1507,7 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
       cheddar::SinCAttention<word>::Keys empty;
       sinc_leg = std::make_unique<ProbedSinCLeg>(
           boot, sw_ring->context, small_ring->context, scfg, acfg, empty, lcfg,
-          modpack_keys, *this, pack, host);
+          modpack_keys, *this, pack, host, descent);
       leg = sinc_leg.get();
       std::cout << "the SinC leg: operands in at " << operand_level
                 << ", swaps at " << acfg.swap_level << "/"
@@ -1482,12 +1552,17 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
     const int rank = acfg_layout.rank;
     size_t before = 0, total = 0, after = 0;
     cudaMemGetInfo(&before, &total);
-    sw_ring->ui->PrepareRingSwitchKey(small_ring->Degree(),
-                                      small_ring->ui->GetSecretCoeffs(),
-                                      kProductLevel);
-    sw_ring->ui->PrepareInverseRingSwitchKey(small_ring->Degree(),
-                                             small_ring->ui->GetSecretCoeffs(),
-                                             kProductLevel);
+    // The descent generates exactly these two, at exactly this level and
+    // rank, so when it is on they are already here and regenerating them would
+    // hand the leg a key its `Descent` no longer points at.
+    if (!RingSwitchedPcmmFromEnv()) {
+      sw_ring->ui->PrepareRingSwitchKey(small_ring->Degree(),
+                                        small_ring->ui->GetSecretCoeffs(),
+                                        kProductLevel);
+      sw_ring->ui->PrepareInverseRingSwitchKey(
+          small_ring->Degree(), small_ring->ui->GetSecretCoeffs(),
+          kProductLevel);
+    }
     for (int idx : sinc_leg->SmallRotationIndices()) {
       small_ring->ui->PrepareRotationKey(idx, kProductLevel);
     }

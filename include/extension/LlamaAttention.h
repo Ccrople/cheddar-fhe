@@ -90,7 +90,12 @@ class SinCLinearLeg : public CoeffLinearLeg<word> {
    *        `swap_level`, `sinc_level` and `prefix_level`
    * @param keys the four key sets one call needs, on both rings
    * @param linear_cfg `CoeffLinearLeg`'s own configuration
-   * @param modpack_keys `CoeffLinearLeg`'s ModPack keys
+   * @param modpack_keys `CoeffLinearLeg`'s ModPack keys, on the block's ring;
+   *        empty when `descent` is filled in
+   * @param descent `CoeffLinearLeg`'s ring-switched descent, or empty for the
+   *        direct one. The two contexts are the same pair this leg already
+   *        holds for the batch CC-MM, so turning it on adds two ring-switching
+   *        keys and `N1 / small_degree` ModPack keys and nothing else.
    */
   SinCLinearLeg(std::shared_ptr<const BootContext<word>> boot,
                 ConstContextPtr<word> switch_ctx,
@@ -98,7 +103,9 @@ class SinCLinearLeg : public CoeffLinearLeg<word> {
                 const typename SinCAttention<word>::Config &attn_cfg,
                 const typename SinCAttention<word>::Keys &keys,
                 const typename CoeffLinearLeg<word>::Config &linear_cfg,
-                std::vector<const EvaluationKey<word> *> modpack_keys);
+                std::vector<const EvaluationKey<word> *> modpack_keys,
+                typename CoeffLinearLeg<word>::Descent descent =
+                    typename CoeffLinearLeg<word>::Descent{});
 
   // disable copying (or moving also)
   SinCLinearLeg(const SinCLinearLeg &) = delete;

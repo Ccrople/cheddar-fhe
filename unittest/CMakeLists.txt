@@ -158,6 +158,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(llama_projection_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # The same projection through [SYLPH] section 3.2's own descent -- ring switch
+  # first, then ModDecomp at rank 16 -- run against the direct route on the same
+  # ciphertexts. Three rings alive at once, so it is its own binary.
+  add_executable(switched_projection_test SwitchedProjectionTest.cpp)
+  target_link_libraries(switched_projection_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Slots <-> SinC, homomorphically: the last stages of SlotToCoeff and nothing
   # else. One level against SlotToCoeff's three, and the piece the batch CC-MM
   # needs before it can take an operand that arrived encrypted.

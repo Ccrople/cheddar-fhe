@@ -3,6 +3,7 @@
 #include "extension/Profile.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -30,14 +31,22 @@ bool EnvOn(const char *name, bool fallback) {
 template <typename word>
 CoeffLinearLeg<word>::CoeffLinearLeg(
     ConstContextPtr<word> context, const Config &cfg,
-    std::vector<const EvaluationKey<word> *> modpack_keys)
+    std::vector<const EvaluationKey<word> *> modpack_keys, Descent descent)
     : context_{context},
       cfg_{cfg},
+      descent_{std::move(descent)},
       small_degree_{SmallDegreeFor(cfg.num_tokens)},
       rank_{context->param_.degree_ / SmallDegreeFor(cfg.num_tokens)},
+      ring_rank_{1},
+      sub_rank_{context->param_.degree_ / SmallDegreeFor(cfg.num_tokens)},
       modpack_keys_{std::move(modpack_keys)},
       mlwe_{context->param_, context->ntt_handler_},
       pcmm_{context->param_},
+      product_param_{&context->param_},
+      product_mlwe_{&mlwe_},
+      product_pcmm_{&pcmm_},
+      product_context_{context},
+      pack_keys_{&modpack_keys_},
       cache_weights_{EnvOn("CHEDDAR_WEIGHT_CACHE", true)},
       use_blas_{false} {
   const int degree = context_->param_.degree_;
@@ -63,25 +72,106 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                  "), or a module component would carry more than one channel "
                  "and no plaintext matrix could separate them");
 
-  AssertTrue(static_cast<int>(modpack_keys_.size()) == rank_,
-             "CoeffLinearLeg: ModPack needs exactly one switching key per "
-             "module component, i.e. " +
-                 std::to_string(rank_));
   AssertTrue(cfg_.product_level >= 1,
              "CoeffLinearLeg: the product rescales, so it cannot run at level "
              "0");
   AssertTrue(cfg_.parents_per_tile >= 0,
              "CoeffLinearLeg: parents_per_tile cannot be negative");
 
+  // ---- [SYLPH]'s descent, when there is one ------------------------------
+  //
+  // Everything above is about the 256 module components and none of it moves:
+  // the rank, the channel alignment and the operand shape are the same by
+  // either route. What the descent changes is how those 256 are reached and
+  // how they are put back, and the whole of the difference is bounded by this
+  // block and by `Component`.
+  if (descent_.Enabled()) {
+    const Parameter<word> &sw_param = descent_.switch_context->param_;
+    const Parameter<word> &sm_param = descent_.small_context->param_;
+    AssertTrue(sw_param.degree_ == degree,
+               "CoeffLinearLeg: the switching context must be at the block's "
+               "own ring degree -- a ciphertext crosses to it unchanged");
+    AssertTrue(sm_param.degree_ < degree && degree % sm_param.degree_ == 0,
+               "CoeffLinearLeg: the product ring's degree must properly "
+               "divide the block's");
+    AssertTrue(sm_param.degree_ % small_degree_ == 0,
+               "CoeffLinearLeg: 2 * num_tokens must divide the product ring's "
+               "degree, or ModDecomp has no rank to run at");
+    ring_rank_ = degree / sm_param.degree_;
+    sub_rank_ = sm_param.degree_ / small_degree_;
+    // The one identity the index permutation rests on. It is arithmetic, not
+    // an assumption, but a parameter pair that broke it would produce a layer
+    // that still decrypts and is wrong.
+    AssertTrue(ring_rank_ * sub_rank_ == rank_,
+               "CoeffLinearLeg: the two strides must compose to the rank the "
+               "channel map is stated against");
+    AssertTrue(descent_.forward != nullptr && descent_.inverse != nullptr,
+               "CoeffLinearLeg: the descent needs both ring-switching keys");
+    AssertTrue(static_cast<int>(descent_.modpack_keys.size()) == sub_rank_,
+               "CoeffLinearLeg: the descent's ModPack runs on the product "
+               "ring, so it needs " +
+                   std::to_string(sub_rank_) +
+                   " keys from that context, not the big ring's " +
+                   std::to_string(rank_));
+    // The operand is encoded against the product ring and the result is
+    // rescaled there, but the block reads the ciphertext back on its own
+    // ladder -- so `GetScale(L)^2 / GetRescalePrimeProd(L) = GetScale(L-1)`
+    // has to hold across the two. It does when they share their primes at
+    // these levels, which is what the pair is for; a set that did not would
+    // land the product off the canonical scale and abort inside a later
+    // `EvalPoly`, three layers from here and with nothing pointing back.
+    AssertTrue(std::abs(sm_param.GetScale(cfg_.product_level) /
+                            context_->param_.GetScale(cfg_.product_level) -
+                        1.0) < 1e-9,
+               "CoeffLinearLeg: the product ring's scale at the product level "
+               "differs from the block's, so the rescaled result would not be "
+               "canonical on the block's ladder");
+    switcher_.reset(new RingSwitchHandler<word>(descent_.switch_context,
+                                                descent_.small_context));
+    AssertTrue(switcher_->GetRank() == ring_rank_,
+               "CoeffLinearLeg: the ring switch disagrees about its own rank");
+    small_mlwe_.reset(
+        new MlweHandler<word>(sm_param, descent_.small_context->ntt_handler_));
+    small_pcmm_.reset(new PcmmHandler<word>(sm_param));
+    product_param_ = &sm_param;
+    product_mlwe_ = small_mlwe_.get();
+    product_pcmm_ = small_pcmm_.get();
+    product_context_ = descent_.small_context;
+    pack_keys_ = &descent_.modpack_keys;
+  } else {
+    AssertTrue(static_cast<int>(modpack_keys_.size()) == rank_,
+               "CoeffLinearLeg: ModPack needs exactly one switching key per "
+               "module component, i.e. " +
+                   std::to_string(rank_));
+  }
+
 #ifdef USE_CUBLAS
   use_blas_ = EnvOn("CHEDDAR_PCMM_BLAS", true);
-  if (use_blas_) blas_.reset(new PcmmBlasHandler<word>(context_->param_));
+  if (use_blas_) {
+    blas_.reset(new PcmmBlasHandler<word>(context_->param_));
+    product_blas_ = blas_.get();
+    if (descent_.Enabled()) {
+      // The split is encoded against the primes of the ring the MLWE
+      // ciphertexts live in, so it follows the product and not the block.
+      small_blas_.reset(new PcmmBlasHandler<word>(*product_param_));
+      product_blas_ = small_blas_.get();
+    }
+  }
 #endif
   std::cout << "CoeffLinearLeg: product on "
             << (use_blas_ ? "cuBLAS int8 GEMM" : "PcmmAccum")
             << ", converted weights "
             << (cache_weights_ ? "cached on the GPU" : "rebuilt every call")
-            << std::endl;
+            << ", descent ";
+  if (descent_.Enabled()) {
+    std::cout << "ring-switched " << degree << " -> "
+              << product_param_->degree_ << " -> " << small_degree_
+              << " (rank " << ring_rank_ << " x " << sub_rank_ << ")";
+  } else {
+    std::cout << "direct " << degree << " -> " << small_degree_ << " (rank "
+              << rank_ << ")";
+  }
+  std::cout << std::endl;
 }
 
 template <typename word>
@@ -117,13 +207,18 @@ void CoeffLinearLeg<word>::GatherWeights(std::vector<double> &values,
   const int log_rank = Log2Ceil(rank_);
   const int cols = num_parents * rank_;
   values.assign(static_cast<size_t>(rank_) * cols, 0.0);
+  // `Component` is the identity on the direct route and the two-stride
+  // reindexing on the ring-switched one; the channel map itself is the same
+  // sentence either way, which is the point of putting the difference here.
   for (int r = 0; r < rank_; r++) {
     const int out_channel =
-        group * rank_ + static_cast<int>(BitReverseInt(r, log_rank));
+        group * rank_ +
+        static_cast<int>(BitReverseInt(Component(r), log_rank));
     for (int p = 0; p < num_parents; p++) {
       for (int i = 0; i < rank_; i++) {
-        const int in_channel = (first_parent + p) * rank_ +
-                               static_cast<int>(BitReverseInt(i, log_rank));
+        const int in_channel =
+            (first_parent + p) * rank_ +
+            static_cast<int>(BitReverseInt(Component(i), log_rank));
         values[static_cast<size_t>(r) * cols + p * rank_ + i] =
             w[static_cast<size_t>(in_channel) * out_channels + out_channel] *
             w_scale;
@@ -141,7 +236,12 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
   // The one scale that leaves the rescaled product canonical at the level
   // below; see the class comment.
   const int level = cfg_.product_level;
-  const double scale = context_->param_.GetScale(level);
+  // The ring the product runs in is the ring the operand is encoded against.
+  // With the descent that is the small one, whose primes are the block's at
+  // this level and whose scale ladder is therefore the same -- but taking it
+  // from the wrong Parameter would be a silent scale error rather than a
+  // mismatch, so it is read from the product's own.
+  const double scale = product_param_->GetScale(level);
   const int cols = num_parents * rank_;
   std::vector<double> values;
   for (int g = 0; g < groups; g++) {
@@ -150,13 +250,13 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
     if (use_blas_) {
 #ifdef USE_CUBLAS
       typename PcmmBlasHandler<word>::SplitMatrix s;
-      blas_->SplitMatrixFrom(s, level, scale, values, rank_, cols);
+      product_blas_->SplitMatrixFrom(s, level, scale, values, rank_, cols);
       res.bytes += PcmmBlasHandler<word>::SplitBytes(s);
       res.split.push_back(std::move(s));
 #endif
     } else {
       PlainMatrix<word> u;
-      pcmm_.EncodeMatrix(u, level, scale, values, rank_, cols);
+      product_pcmm_->EncodeMatrix(u, level, scale, values, rank_, cols);
       res.bytes += static_cast<size_t>(u.data_.size()) * sizeof(word);
       res.u.push_back(std::move(u));
     }
@@ -213,12 +313,69 @@ CoeffLinearLeg<word>::GetOperands(const char *name,
 }
 
 template <typename word>
+void CoeffLinearLeg<word>::Decompose(
+    std::vector<MlweCiphertext<word>> &columns, const std::vector<Ct> &x,
+    int base, int span) const {
+  const int level = cfg_.product_level;
+  columns.clear();
+  columns.reserve(static_cast<size_t>(span) * rank_);
+  for (int p = base; p < base + span; p++) {
+    const Ct &parent = x[p];
+    Ct lowered;
+    const Ct *source = &parent;
+    if (context_->param_.NPToLevel(parent.GetNP()) != level) {
+      context_->LevelDown(lowered, parent, level);
+      source = &lowered;
+    }
+
+    if (!descent_.Enabled()) {
+      // The direct route: one stride, rank 256, and the components are as
+      // large as the parent's own a-part.
+      std::vector<MlweCiphertext<word>> decomposed;
+      mlwe_.ModDecomp(decomposed, *source, small_degree_);
+      AssertTrue(static_cast<int>(decomposed.size()) == rank_,
+                 "CoeffLinearLeg: ModDecomp did not yield one module component "
+                 "per input channel");
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+      continue;
+    }
+
+    // [SYLPH]'s route. One key switch at the block's degree fans the parent
+    // out into `ring_rank_` ciphertexts of the product ring, and each of those
+    // decomposes at rank `sub_rank_` instead of `rank_`. The components come
+    // out in `Component`'s order because the loops are nested that way.
+    std::vector<Ct> parts;
+    {
+      NvtxScope _n("pcmm: RingSwitch");
+      switcher_->Switch(parts, *source, *descent_.forward);
+    }
+    AssertTrue(static_cast<int>(parts.size()) == ring_rank_,
+               "CoeffLinearLeg: the ring switch returned the wrong number of "
+               "parts");
+    NvtxScope _n("pcmm: ModDecomp");
+    for (int i = 0; i < ring_rank_; i++) {
+      std::vector<MlweCiphertext<word>> decomposed;
+      small_mlwe_->ModDecomp(decomposed, parts[i], small_degree_);
+      AssertTrue(static_cast<int>(decomposed.size()) == sub_rank_,
+                 "CoeffLinearLeg: ModDecomp on the product ring did not yield "
+                 "sub_rank components");
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+      // Released as we go: the part has been consumed and the decomposition
+      // of the next one is about to be allocated.
+      parts[i] = Ct();
+    }
+  }
+  AssertTrue(static_cast<int>(columns.size()) == span * rank_,
+             "CoeffLinearLeg: the descent did not yield one module component "
+             "per input channel of the tile");
+}
+
+template <typename word>
 void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
                                    const std::vector<Ct> &x, int in_channels,
                                    int out_channels,
                                    const std::vector<double> &w, double w_scale,
                                    const char *name) const {
-  const int level = cfg_.product_level;
   AssertTrue(static_cast<int>(x.size()) * rank_ == in_channels,
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the input ciphertext count times the rank must be the "
@@ -246,10 +403,14 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
                           groups, tile);
   }
 
-  // The partial sums, one per output group, held at the product's level and
-  // scale. They are ordinary RLWE ciphertexts because they have already been
-  // ModPacked -- there is no MLWE addition to accumulate with instead.
-  std::vector<Ct> partial(groups);
+  // The partial sums, one per output group and -- with the descent -- one per
+  // ciphertext of the product ring within it. They are ordinary RLWE
+  // ciphertexts because they have already been ModPacked; there is no MLWE
+  // addition to accumulate with instead. Accumulating here rather than after
+  // the return trip is what makes a tile cost one ModPack and not one inverse
+  // ring switch as well.
+  std::vector<std::vector<Ct>> partial(groups);
+  for (auto &v : partial) v.resize(ring_rank_);
   bool started = false;
   int tile_index = 0;
 
@@ -257,29 +418,13 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     const int span = std::min(tile, parents - base);
 
     // 1. Descend to the product level and split the channel axis onto the
-    //    ciphertext axis. ModDecomp is the whole of that step and costs
-    //    nothing but memory: `rank` module components per parent, each the
-    //    size of the parent's own a-part. The tile bounds exactly that.
+    //    ciphertext axis. Direct, that is ModDecomp alone and costs nothing
+    //    but memory -- `rank` module components per parent, each the size of
+    //    the parent's own a-part, which is what the tile bounds. Through the
+    //    ring switch it is one key switch per parent and a sixteenth of the
+    //    memory; see `Decompose`.
     std::vector<MlweCiphertext<word>> columns;
-    columns.reserve(static_cast<size_t>(span) * rank_);
-    {
-    NvtxScope _n("pcmm: ModDecomp");
-    for (int p = base; p < base + span; p++) {
-      const Ct &parent = x[p];
-      Ct lowered;
-      const Ct *source = &parent;
-      if (context_->param_.NPToLevel(parent.GetNP()) != level) {
-        context_->LevelDown(lowered, parent, level);
-        source = &lowered;
-      }
-      std::vector<MlweCiphertext<word>> decomposed;
-      mlwe_.ModDecomp(decomposed, *source, small_degree_);
-      for (auto &c : decomposed) columns.push_back(std::move(c));
-    }
-    }
-    AssertTrue(static_cast<int>(columns.size()) == span * rank_,
-               "CoeffLinearLeg::Project: ModDecomp did not yield one module "
-               "component per input channel");
+    Decompose(columns, x, base, span);
 
     // Uncached: this tile's operands, discarded when the tile is done.
     Operands scratch;
@@ -301,7 +446,7 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     typename PcmmBlasHandler<word>::SplitSource prepared;
     if (use_blas_) {
       NvtxScope _n("pcmm: split source (once per tile)");
-      blas_->PrepareSource(prepared, ops.split[first], columns);
+      product_blas_->PrepareSource(prepared, ops.split[first], columns);
       columns.clear();
     }
 #endif
@@ -316,24 +461,34 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
         NvtxScope _n("pcmm: Multiply");
         if (use_blas_) {
 #ifdef USE_CUBLAS
-          blas_->Multiply(product, ops.split[first + g], prepared);
+          product_blas_->Multiply(product, ops.split[first + g], prepared);
 #endif
         } else {
-          pcmm_.Multiply(product, ops.u[first + g], columns);
+          product_pcmm_->Multiply(product, ops.u[first + g], columns);
         }
       }
 
-      Ct repacked;
-      {
-        NvtxScope _n("pcmm: ModPack");
-        mlwe_.ModPack(context_, repacked, product, modpack_keys_);
-      }
-      if (!started) {
-        partial[g] = std::move(repacked);
-      } else {
-        Ct sum;
-        context_->Add(sum, partial[g], repacked);
-        partial[g] = std::move(sum);
+      // ModPack takes the components of ONE ciphertext of the product ring,
+      // so the `rank_` rows come back out in `ring_rank_` runs of
+      // `sub_rank_`. Without the descent there is one run and it is all of
+      // them, which is the old code exactly.
+      NvtxScope _n("pcmm: ModPack");
+      for (int i = 0; i < ring_rank_; i++) {
+        std::vector<MlweCiphertext<word>> component;
+        component.reserve(sub_rank_);
+        for (int n = 0; n < sub_rank_; n++) {
+          component.push_back(std::move(product[i * sub_rank_ + n]));
+        }
+        Ct repacked;
+        product_mlwe_->ModPack(product_context_, repacked, component,
+                               *pack_keys_);
+        if (!started) {
+          partial[g][i] = std::move(repacked);
+        } else {
+          Ct sum;
+          product_context_->Add(sum, partial[g][i], repacked);
+          partial[g][i] = std::move(sum);
+        }
       }
     }
     started = true;
@@ -341,11 +496,25 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
 
   // 3. One rescale, after the whole contraction. The product carries scale
   //    GetScale(level)^2; this brings it to GetScale(level - 1), and it is the
-  //    single level the product spends however many tiles it took.
+  //    single level the product spends however many tiles it took. It happens
+  //    on the product ring, which with the descent is where the ciphertext
+  //    still is -- a rescale there is a sixteenth of the work, and the inverse
+  //    switch then carries a level-0 ciphertext home.
   res.resize(groups);
   {
     NvtxScope _n("pcmm: Rescale");
-    for (int g = 0; g < groups; g++) context_->Rescale(res[g], partial[g]);
+    for (int g = 0; g < groups; g++) {
+      if (!descent_.Enabled()) {
+        product_context_->Rescale(res[g], partial[g][0]);
+        continue;
+      }
+      std::vector<Ct> rescaled(ring_rank_);
+      for (int i = 0; i < ring_rank_; i++) {
+        product_context_->Rescale(rescaled[i], partial[g][i]);
+      }
+      NvtxScope _n2("pcmm: SwitchBack");
+      switcher_->SwitchBack(res[g], rescaled, *descent_.inverse);
+    }
   }
 }
 

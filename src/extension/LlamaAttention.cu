@@ -27,8 +27,10 @@ SinCLinearLeg<word>::SinCLinearLeg(
     const Config &cfg, const typename SinCAttention<word>::Config &attn_cfg,
     const typename SinCAttention<word>::Keys &keys,
     const typename CoeffLinearLeg<word>::Config &linear_cfg,
-    std::vector<const EvaluationKey<word> *> modpack_keys)
-    : CoeffLinearLeg<word>(boot, linear_cfg, std::move(modpack_keys)),
+    std::vector<const EvaluationKey<word> *> modpack_keys,
+    typename CoeffLinearLeg<word>::Descent descent)
+    : CoeffLinearLeg<word>(boot, linear_cfg, std::move(modpack_keys),
+                           std::move(descent)),
       cfg_{cfg},
       attn_{boot, std::move(switch_ctx), std::move(small_ctx), attn_cfg},
       keys_{keys} {
