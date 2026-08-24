@@ -34,6 +34,41 @@ class NTTHandler {
   Dv inv_degree_mont_;
   Dv montgomery_converter_;
 
+  // Conjugate-invariant ring only, all in Montgomery form and all indexed on
+  // the prime axis exactly as twiddle_factors_ is. Per prime:
+  //   ci_i_    = psi4^degree, the square root of -1 that Y^degree reduces to
+  //   ci_inv2_ = 2^-1, which the unfold divides the mirrored pair by
+  // and per prime and coefficient, in natural rather than bit-reversed order:
+  //   ci_fwd_twist_ = psi4^-j, folded in on the way into the network
+  //   ci_inv_twist_ = psi4^j, taken back out on the way from it
+  Dv ci_i_;
+  Dv ci_inv2_;
+  Dv ci_fwd_twist_;
+  Dv ci_inv_twist_;
+
+  // dst = fold(src): the CI coefficient vector reduced mod (Y^degree - i), the
+  // form the butterfly network below diagonalises. Runs before NTT phase 1 and
+  // takes the same grid, so it reads like a phase 0. No-op unless the ring is
+  // conjugate-invariant.
+  void CiFold(make_signed_t<word> *dst, const word *primes,
+              const make_signed_t<word> *inv_primes, int ter_left,
+              int tw_y_extra, int num_q_primes, int num_total_primes,
+              int skip_start, int skip_end, int batch_stride, int batch,
+              const make_signed_t<word> *src, int src_extra) const;
+
+  // The inverse, in place on the INTT's output. Mirrored pairs (j, degree - j)
+  // are recombined by one thread each, so it needs no scratch buffer.
+  void CiUnfold(make_signed_t<word> *dst, const word *primes,
+                const make_signed_t<word> *inv_primes, int ter_left,
+                int tw_y_extra, int num_q_primes, int num_total_primes,
+                int batch_stride, int batch) const;
+
+  // Every entry point below that moves between the coefficient and evaluation
+  // domains needs the pair above when the ring is conjugate-invariant. The
+  // three that do not have it yet refuse rather than transform the wrong
+  // basis.
+  void AssertNoConjugateInvariant(const char *where) const;
+
   int GetLsbSize() const;
   int GetMsbSize() const;
   int GetLogWarpBatching() const;

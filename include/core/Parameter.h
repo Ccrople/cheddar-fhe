@@ -38,13 +38,15 @@ class Parameter {
    * @param aux_primes list of auxiliary primes
    * @param ter_primes list of terminal primes (optional)
    * @param additional_base additional base primes for level 0 (optional)
+   * @param conjugate_invariant work in the conjugate-invariant ring (optional)
    */
   Parameter(int log_degree, double base_scale, int default_encryption_level,
             std::vector<std::pair<int, int>> level_config,
             const std::vector<word> &main_primes,
             const std::vector<word> &aux_primes,
             const std::vector<word> &ter_primes = std::vector<word>{},
-            const std::pair<int, int> &additional_base = kZeroPair);
+            const std::pair<int, int> &additional_base = kZeroPair,
+            bool conjugate_invariant = false);
 
   static constexpr const int word_size_ = sizeof(word);
   // For 32-bit word, we allow up to 2^31 for the primes
@@ -54,6 +56,19 @@ class Parameter {
 
   const int log_degree_;
   const int degree_;
+  // Conjugate-invariant CKKS (Kim and Song, ISISC 2018). The ring is the
+  // maximal real subring Z[Y + Y^-1] of the 4N-th cyclotomic, of rank
+  // `degree_` -- the same rank, and so the same lattice problem, as the
+  // ordinary Z[X]/(X^N + 1). What changes is the canonical embedding: it is
+  // real, so a message is `degree_` real slots rather than `degree_ / 2`
+  // complex ones. Slot-wise multiplication no longer mixes a real part with
+  // an imaginary one, which is the whole reason to want it.
+  //
+  // Concretely, three things move: the NTT root becomes a 4N-th root of unity
+  // (so every prime must be 1 mod 4N), the transform gains a fold and an
+  // unfold around the existing butterfly network, and Galois exponents live
+  // mod 4N with N of them rather than N/2.
+  const bool conjugate_invariant_;
   const int dnum_;
   const int L_;
   const int alpha_;
@@ -76,12 +91,33 @@ class Parameter {
   ~Parameter();
 
   /**
-   * @brief Get Galois factor (galois_number_^i) % (2 * degree_)
+   * @brief Get Galois factor (galois_number_^i) % CyclotomicIndex()
    *
-   * @param i index in range [0, degree_ / 2]
+   * @param i index in range [0, MaxNumSlots()]
    * @return int Galois factor for index i
    */
   int GetGaloisFactor(int i) const;
+
+  /**
+   * @brief Number of slots a full-width message occupies: `degree_` real slots
+   * in the conjugate-invariant ring, `degree_ / 2` complex ones otherwise.
+   *
+   * @return int maximum number of slots
+   */
+  int MaxNumSlots() const {
+    return conjugate_invariant_ ? degree_ : (degree_ / 2);
+  }
+
+  /**
+   * @brief The cyclotomic index M. Galois exponents and the NTT root both live
+   * mod this: 4 * degree_ for the conjugate-invariant ring, 2 * degree_
+   * otherwise. It is also the modulus every prime must be 1 modulo.
+   *
+   * @return int cyclotomic index
+   */
+  int CyclotomicIndex() const {
+    return conjugate_invariant_ ? (4 * degree_) : (2 * degree_);
+  }
 
   /**
    * @brief Get default scale for a given level

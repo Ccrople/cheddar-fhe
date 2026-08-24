@@ -171,10 +171,18 @@ class Testbed : public testing::TestWithParam<const char *> {
       additional_base_ = {additional_base[0], additional_base[1]};
     }
 
+    bool conjugate_invariant = false;
+    if (json_data.contains("conjugate_invariant")) {
+      Check(json_data["conjugate_invariant"].is_boolean(),
+            "conjugate_invariant should be a boolean");
+      conjugate_invariant = json_data["conjugate_invariant"];
+    }
+
     // Initialize Parameter
     param_ = std::make_unique<Parameter<word>>(
         log_degree_, default_scale_, default_encryption_level_, level_config_,
-        main_primes_, aux_primes_, ter_primes_, additional_base_);
+        main_primes_, aux_primes_, ter_primes_, additional_base_,
+        conjugate_invariant);
 
     if (json_data.contains("dense_hamming_weight")) {
       Check(json_data["dense_hamming_weight"].is_number_integer(),

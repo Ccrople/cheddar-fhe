@@ -22,6 +22,15 @@ add_executable(basic_test BasicTest.cpp)
 target_link_libraries(basic_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The conjugate-invariant ring (Kim and Song, ISISC 2018), which is where
+# [SYLPH]'s N real slots come from. Checks the ring's own multiplication --
+# Toeplitz plus Hankel, not negacyclic -- against a host reference, and against
+# the ordinary ring's product so that a half-applied change cannot pass.
+# Degree 4096, so its own binary.
+add_executable(ci_ring_test CiRingTest.cpp)
+target_link_libraries(ci_ring_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Coefficient-domain encoding, for the reduction-based matrix products.
 add_executable(coeff_encode_test CoeffEncodeTest.cpp)
 target_link_libraries(coeff_encode_test
@@ -287,3 +296,5 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_35.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
