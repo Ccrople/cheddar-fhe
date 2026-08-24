@@ -776,7 +776,9 @@ void Context<word>::ModUpForKeySwitch(std::vector<Dv> &mod_up_result,
   if (a_coeff == nullptr) {
     mod_switcher.ModUp(mod_up_view, a.AxConstView());
   } else {
-    mod_switcher.ModUpFromCoeff(mod_up_view, a.AxConstView(), *a_coeff);
+    // `a`'s own ax is not read on this path: the coefficients are the input,
+    // and the caller never has to transform them.
+    mod_switcher.ModUpFromCoeff(mod_up_view, *a_coeff);
   }
 }
 

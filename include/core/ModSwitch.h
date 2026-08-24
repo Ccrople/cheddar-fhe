@@ -55,18 +55,18 @@ class ModSwitchHandler {
   /**
    * @brief ModUp for a caller that still holds the coefficient-domain input.
    *
-   * The ordinary entry point opens by undoing the NTT it was just handed. A
+   * The ordinary entry point opens by undoing the NTT it was just handed, so a
    * caller that transformed the polynomial itself immediately beforehand --
-   * ModPack does, once per module component -- can hand both forms over
-   * instead and pay a constant multiply where the INTT was. `src` is the NTT
-   * form, which the limbs that pass through unchanged are still copied from;
-   * `src_coeff` is the same polynomial before that transform.
+   * ModPack does, once per module component -- should not transform it at all.
+   * Given the coefficients this pays one constant multiply where the INTT was,
+   * carries the limbs that pass through unchanged in the coefficient domain
+   * too, and lets the mod-up's own forward transform cover them along with
+   * everything else. Two launches per switch disappear with the caller's NTT.
    *
    * The constant is not `mod_up1_`. That one folds in an N^{-1} to normalise
    * an INTT which, here, does not run.
    */
   void ModUpFromCoeff(std::vector<DvView<word>> &dst,
-                      const DvConstView<word> &src,
                       const DvConstView<word> &src_coeff) const;
   void ModDown(DvView<word> &dst, const DvConstView<word> &src) const;
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
@@ -80,6 +80,11 @@ class ModSwitchHandler {
   // that path, and the Montgomery form because the kernel consuming it
   // multiplies with MultMontgomery rather than through INTTPhase2.
   Dv mod_up1_coeff_;
+  // R^2 per q prime: what turns a plain residue into its Montgomery form. The
+  // pass-through limbs arrive already transformed and already in Montgomery
+  // form on the ordinary path, and NTTForModUp converts nothing, so on the
+  // coefficient path they have to be put in that form before it runs.
+  Dv mont_r2_;
   std::vector<DeviceVector<make_signed_t<word>>> mod_up2_;
 
   // ModDown constants
@@ -119,9 +124,10 @@ class ModSwitchHandler {
                                         const std::vector<word> &dst_primes,
                                         int restore_start, int restore_end);
 
-  // The body behind ModUp and ModUpFromCoeff. A null src_coeff selects the
-  // INTT; a non-null one selects the constant multiply that replaces it.
-  void ModUpWorker(std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+  // The body behind ModUp and ModUpFromCoeff. Exactly one of the two sources
+  // is given: `src` is an NTT-domain input, `src_coeff` a coefficient-domain
+  // one.
+  void ModUpWorker(std::vector<DvView<word>> &dst, const DvConstView<word> *src,
                    const DvConstView<word> *src_coeff) const;
 
   enum class ModDownType { ModDown, Rescale, ModDownAndRescale };

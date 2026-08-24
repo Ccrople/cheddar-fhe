@@ -175,20 +175,28 @@ __global__ void ModSwitchMatrixMult(word *dst, const word *primes,
 // by N. The centred representative is not cosmetic: ModSwitchMatrixMult reads
 // this buffer as signed words, exactly as MultConstNormalize leaves it.
 template <typename word>
-__global__ void ModUpMultConst(make_signed_t<word> *dst, const word *src,
-                               const word *primes,
+__global__ void ModUpMultConst(make_signed_t<word> *dst, word *dst_mont,
+                               const word *src, const word *primes,
                                const make_signed_t<word> *inv_primes,
-                               const word *consts, int log_degree) {
+                               const word *consts, const word *mont_r2,
+                               int log_degree) {
   using signed_word = make_signed_t<word>;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int prime_index = (i >> log_degree);
   const word prime = primes[prime_index];
   const signed_word inv_prime = inv_primes[prime_index];
+  const word value = src[i];
+
   const word temp =
-      basic::MultMontgomery(src[i], consts[prime_index], prime, inv_prime);
+      basic::MultMontgomery(value, consts[prime_index], prime, inv_prime);
   signed_word result = static_cast<signed_word>(temp);
   if (temp > (prime >> 1)) result -= static_cast<signed_word>(prime);
   dst[i] = result;
+
+  // The same coefficients for the limbs that pass through, in the Montgomery
+  // form the forward transform downstream will not put them in.
+  dst_mont[i] =
+      basic::MultMontgomery(value, mont_r2[prime_index], prime, inv_prime);
 }
 
 }  // namespace kernel
@@ -275,6 +283,16 @@ ModSwitchHandler<word>::ModSwitchHandler(
                     mod_up1_coeff_tmp.size() * sizeof(word),
                     cudaMemcpyDeviceToDevice, cudaStreamLegacy);
   }
+
+  // R^2 per q prime, for the pass-through limbs on the coefficient path.
+  HostVector<word> host_mont_r2(num_q_primes);
+  for (int i = 0; i < num_q_primes; i++) {
+    const word modulus = level_primes[i];
+    host_mont_r2[i] =
+        primeutil::ToMontgomery<word>(primeutil::ToMontgomery<word>(1, modulus),
+                                      modulus);
+  }
+  CopyHostToDevice(mont_r2_, host_mont_r2);
 
   std::vector<word> q_primes(level_primes.begin(),
                              level_primes.begin() + num_q_primes);
@@ -471,49 +489,54 @@ void ModSwitchHandler<word>::PseudoModUp(
 template <typename word>
 void ModSwitchHandler<word>::ModUp(std::vector<DvView<word>> &dst,
                                    const DvConstView<word> &src) const {
-  ModUpWorker(dst, src, nullptr);
+  ModUpWorker(dst, &src, nullptr);
 }
 
 template <typename word>
 void ModSwitchHandler<word>::ModUpFromCoeff(
-    std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+    std::vector<DvView<word>> &dst,
     const DvConstView<word> &src_coeff) const {
-  ModUpWorker(dst, src, &src_coeff);
+  ModUpWorker(dst, nullptr, &src_coeff);
 }
 
 template <typename word>
 void ModSwitchHandler<word>::ModUpWorker(
-    std::vector<DvView<word>> &dst, const DvConstView<word> &src,
+    std::vector<DvView<word>> &dst, const DvConstView<word> *src,
     const DvConstView<word> *src_coeff) const {
   using signed_word = make_signed_t<word>;
   NPInfo np = param_.LevelToNP(level_, 0);
   int num_q_primes = np.GetNumQ();
   int prime_offset = (level_ == -1 ? 0 : param_.GetMaxNumTer() - np.num_ter_);
   int degree = param_.degree_;
-  AssertTrue(src.QSize() == num_q_primes * degree, "ModUp src q size mismatch");
-  AssertTrue(src.AuxSize() == 0, "ModUp src aux size mismatch");
+  AssertTrue((src == nullptr) != (src_coeff == nullptr),
+             "ModUp: exactly one of the two sources is given");
+  const DvConstView<word> &given = (src != nullptr) ? *src : *src_coeff;
+  AssertTrue(given.QSize() == num_q_primes * degree, "ModUp src q size mismatch");
+  AssertTrue(given.AuxSize() == 0, "ModUp src aux size mismatch");
   AssertTrue(static_cast<int>(dst.size()) == beta_, "ModUp dst size mismatch");
 
   // Back to the coefficient domain, scaled by the product inverse. A caller
-  // that never left it says so and pays one constant multiply instead.
+  // that never left it says so and pays one constant multiply instead -- and
+  // the limbs that pass through unchanged then come from that same multiply,
+  // in Montgomery form, rather than from an NTT the caller had to run.
   DeviceVector<word> src_intt(num_q_primes * degree);
   DvView<word> src_intt_view = src_intt.View(0, 0);
+  DeviceVector<word> src_mont;
   if (src_coeff == nullptr) {
-    ntt_handler_.INTTAndMultConst(src_intt_view, np, src,
+    ntt_handler_.INTTAndMultConst(src_intt_view, np, *src,
                                   mod_up1_.ConstView(0, 0), true);
   } else {
-    AssertTrue(src_coeff->QSize() == num_q_primes * degree,
-               "ModUpFromCoeff src_coeff q size mismatch");
-    AssertTrue(src_coeff->AuxSize() == 0,
-               "ModUpFromCoeff src_coeff aux size mismatch");
     const int num_words = num_q_primes * degree;
     AssertTrue(num_words % block_dim_ == 0,
                "ModUpFromCoeff: degree must be a multiple of the block dim");
+    src_mont.resize(num_words);
     kernel::ModUpMultConst<word><<<num_words / block_dim_, block_dim_>>>(
-        reinterpret_cast<signed_word *>(src_intt.data()), src_coeff->data(),
-        param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
-        mod_up1_coeff_.data(), param_.log_degree_);
+        reinterpret_cast<signed_word *>(src_intt.data()), src_mont.data(),
+        src_coeff->data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+        mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_);
   }
+  const word *pass_through =
+      (src_coeff == nullptr) ? src->data() : src_mont.data();
 
   int padded_num_q_primes = num_q_primes + prime_offset;
   // Do some checks and copy some values from src to dst
@@ -536,7 +559,7 @@ void ModSwitchHandler<word>::ModUpWorker(
 
     // Copy values from src to dst (asynchronously)
     cudaMemcpyAsync(dst_i.data() + prime_index_start * degree,
-                    src.data() + prime_index_start * degree,
+                    pass_through + prime_index_start * degree,
                     src_len * degree * sizeof(word), cudaMemcpyDeviceToDevice,
                     cudaStreamLegacy);
   }
@@ -574,8 +597,14 @@ void ModSwitchHandler<word>::ModUpWorker(
     kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
         dst_i.data(), primes, inv_primes, src_len, dst_len, prime_index_start,
         prime_index_end, src_ptr, mod_up2_.at(i).data(), param_.log_degree_);
-    ntt_handler_.NTTForModUp(dst_i, np, prime_index_start, prime_index_end,
-                             dst_i);
+    // On the coefficient path the copied limbs are coefficients too, so they
+    // take the same forward transform as the rest instead of being skipped.
+    if (src_coeff == nullptr) {
+      ntt_handler_.NTTForModUp(dst_i, np, prime_index_start, prime_index_end,
+                               dst_i);
+    } else {
+      ntt_handler_.NTTForModUp(dst_i, np, 0, 0, dst_i);
+    }
   }
 }
 

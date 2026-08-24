@@ -283,14 +283,15 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   //    accumulating before the mod-down. The b-part is zero throughout, so
   //    the p_prod * bx term MultKeyNoModDown folds in contributes nothing and
   //    B can be added once at the end, exactly as the paper writes it.
+  // `input` carries no data any more, only the shape: the switches take their
+  // coefficients directly, and the b-part term that used to need a zeroed bx_
+  // is not computed at all. It is what tells the key switch which level, scale
+  // and slot count it is working at.
   Ct input;
   input.RemoveRx();
   input.ModifyNP(np);
   input.SetScale(scale);
   input.SetNumSlots(degree / 2);
-  cudaMemsetAsync(input.bx_.data(), 0,
-                  static_cast<size_t>(num_total_primes) * degree * sizeof(word),
-                  cudaStreamLegacy);
 
   // The switches are raised in groups and multiplied in one launch per group.
   // One at a time costs `rank` products plus `rank - 1` additions, and at
@@ -312,11 +313,9 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
                                         keys.begin() + base + num_in_chunk);
 
     for (int i = 0; i < num_in_chunk; i++) {
-      auto ax_view = input.AxView();
+      // The coefficients go in as they are. The mod-up used to be handed a
+      // transform of them and open by undoing it.
       const auto coeff_view = a_coeffs[base + i].ConstView();
-      ntt_handler_.NTT(ax_view, np, coeff_view, true);
-      // The coefficients go along with the transform of them: the mod-up's
-      // first act is otherwise to undo the NTT on the line above.
       context->ModUpForKeySwitch(modups[i], modup_views[i], input,
                                  *keys[base + i], &coeff_view);
     }
