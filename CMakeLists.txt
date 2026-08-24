@@ -1,12 +1,23 @@
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
+
+# CUDA 13.0 removed offline compilation below compute capability 7.5, so the
+# default list cannot carry 60/61/70 any more. This has to sit *before*
+# project(): enable_language(CUDA) fills CMAKE_CUDA_ARCHITECTURES in with the
+# compiler's own default (a single architecture), after which a guard here can
+# never fire. It has to be a guard rather than the unconditional set() that was
+# here before, because that one shadowed -DCMAKE_CUDA_ARCHITECTURES on the
+# command line and silently built every architecture instead of the one asked
+# for. Blackwell wants -DCMAKE_CUDA_ARCHITECTURES=100 and a toolkit >= 12.8.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set (CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90)
+endif()
+
 project(cheddar LANGUAGES CUDA CXX)
 
 # Using C++17 standard
 set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CUDA_STANDARD 17)
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-set (CMAKE_CUDA_ARCHITECTURES 60 61 70 75 80 86 89 90)
 
 # Automatically detect the CUDA architecture
 #if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
