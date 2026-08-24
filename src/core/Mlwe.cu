@@ -253,18 +253,18 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   const int num_total_primes = np.GetNumTotal();
   const int log_rank = Log2Floor(rank);
 
-  // 1. X^k-adic recomposition, still in the coefficient domain.
+  // 1. X^k-adic recomposition, still in the coefficient domain. The rank
+  //    a-parts go into one buffer rather than one each: the key switches below
+  //    take a group at a time and want the group's inputs back to back.
   DeviceVector<word> b_coeffs(num_total_primes * degree);
-  std::vector<DeviceVector<word>> a_coeffs(rank);
-  for (auto &a : a_coeffs) {
-    a.resize(num_total_primes * degree);
-  }
+  const int a_words = num_total_primes * degree;
+  DeviceVector<word> a_coeffs(rank * a_words);
 
   HostVector<word *> h_src_a(rank), h_src_b(rank), h_dst_a(rank);
   for (int i = 0; i < rank; i++) {
     h_src_a[i] = const_cast<word *>(cts[i].a_.data());
     h_src_b[i] = const_cast<word *>(cts[i].b_.data());
-    h_dst_a[i] = a_coeffs[i].data();
+    h_dst_a[i] = a_coeffs.data() + i * a_words;
   }
   DeviceVector<word *> d_src_a(rank), d_src_b(rank), d_dst_a(rank);
   CopyHostToDevice(d_src_a, h_src_a);
@@ -303,8 +303,8 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   // computes correctly -- it splits and recurses -- just in more than one
   // launch.
   constexpr int kSwitchChunk = 8;
-  std::vector<std::vector<DeviceVector<word>>> modups(kSwitchChunk);
-  std::vector<std::vector<DvView<word>>> modup_views(kSwitchChunk);
+  DeviceVector<word> modup_buffer;
+  std::vector<std::vector<DvConstView<word>>> modup_views;
 
   Ct accum;
   for (int base = 0; base < rank; base += kSwitchChunk) {
@@ -312,15 +312,15 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
     std::vector<const Evk *> chunk_keys(keys.begin() + base,
                                         keys.begin() + base + num_in_chunk);
 
-    for (int i = 0; i < num_in_chunk; i++) {
-      // The coefficients go in as they are. The mod-up used to be handed a
-      // transform of them and open by undoing it.
-      const auto coeff_view = a_coeffs[base + i].ConstView();
-      context->ModUpForKeySwitch(modups[i], modup_views[i], input,
-                                 *keys[base + i], &coeff_view);
-    }
+    // The coefficients go in as they are, a group at a time. The mod-up used
+    // to be handed a transform of each of them and open by undoing it.
+    DvConstView<word> chunk_coeffs(
+        a_coeffs.data() + base * a_words, num_in_chunk * a_words, 0);
+    context->ModUpForKeySwitchBatch(modup_buffer, modup_views, input,
+                                    *keys[base], chunk_coeffs, num_in_chunk);
 
-    context->MultKeyAccumNoModDown(accum, modups, input, chunk_keys, base > 0);
+    context->MultKeyAccumNoModDown(accum, modup_views, input, chunk_keys,
+                                   base > 0);
   }
 
   // 3. One mod-down for all k switches, then the recomposed B.

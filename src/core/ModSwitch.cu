@@ -26,7 +26,13 @@ __global__ void ModSwitchMatrixMult(word *dst, const word *primes,
                                     const int skip_start, const int skip_end,
                                     const make_signed_t<word> *src,
                                     const make_signed_t<word> *bconv_table,
-                                    const int log_degree) {
+                                    const int log_degree,
+                                    const int dst_stride = 0,
+                                    const int src_stride = 0) {
+  // Several key switches at one level share the conversion table, so they
+  // share a launch: blockIdx.z picks which, and the strides are 0 for one.
+  dst += blockIdx.z * dst_stride;
+  src += blockIdx.z * src_stride;
   // Load bconv_table into shared memory
   using signed_word = make_signed_t<word>;
   using signed_d_word = make_signed_double_word_t<word>;
@@ -179,10 +185,16 @@ __global__ void ModUpMultConst(make_signed_t<word> *dst, word *dst_mont,
                                const word *src, const word *primes,
                                const make_signed_t<word> *inv_primes,
                                const word *consts, const word *mont_r2,
-                               int log_degree) {
+                               int log_degree, int q_words, int mont_stride) {
   using signed_word = make_signed_t<word>;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int prime_index = (i >> log_degree);
+  // blockIdx.y is which key switch this is. The Montgomery output has its own
+  // stride because it is written straight into the extended basis, where each
+  // switch occupies num_q + num_aux limbs rather than num_q.
+  src += blockIdx.y * q_words;
+  dst += blockIdx.y * q_words;
+  dst_mont += blockIdx.y * mont_stride;
   const word prime = primes[prime_index];
   const signed_word inv_prime = inv_primes[prime_index];
   const word value = src[i];
@@ -499,6 +511,69 @@ void ModSwitchHandler<word>::ModUpFromCoeff(
   ModUpWorker(dst, nullptr, &src_coeff);
 }
 
+// Every key switch at one level raises the same three limbs into the same
+// fifteen with the same tables, and each of those launches is a grid of about
+// sixty blocks on a card with a hundred and eight multiprocessors. Doing a
+// group of them at once is three launches for the group rather than five each,
+// and it is the occupancy that matters more than the launch count.
+template <typename word>
+void ModSwitchHandler<word>::ModUpFromCoeffBatch(
+    DvView<word> &dst, const DvConstView<word> &src_coeff, int batch) const {
+  using signed_word = make_signed_t<word>;
+  AssertTrue(batch >= 1, "ModUpFromCoeffBatch: invalid batch");
+  AssertTrue(beta_ == 1,
+             "ModUpFromCoeffBatch: only a single decomposition group is "
+             "batched; a narrower basis takes the per-switch path");
+
+  NPInfo np = param_.LevelToNP(level_, 0);
+  const int num_q_primes = np.GetNumQ();
+  const int degree = param_.degree_;
+  const int q_words = num_q_primes * degree;
+  const int total_limbs = num_q_primes + num_aux_;
+
+  AssertTrue(src_coeff.TotalSize() == batch * q_words,
+             "ModUpFromCoeffBatch: src size mismatch");
+  AssertTrue(dst.TotalSize() == batch * total_limbs * degree,
+             "ModUpFromCoeffBatch: dst size mismatch");
+  AssertTrue(q_words % block_dim_ == 0,
+             "ModUpFromCoeffBatch: degree must be a multiple of the block dim");
+
+  // The product inverse for the matrix product, and the same coefficients in
+  // Montgomery form written straight into the limbs that pass through.
+  DeviceVector<word> src_intt(batch * q_words);
+  dim3 mult_grid(q_words / block_dim_, batch);
+  kernel::ModUpMultConst<word><<<mult_grid, block_dim_>>>(
+      reinterpret_cast<signed_word *>(src_intt.data()), dst.data(),
+      src_coeff.data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+      mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_, q_words,
+      total_limbs * degree);
+
+  np.num_aux_ = num_aux_;
+  const word *primes = param_.GetPrimesPtr(np);
+  const signed_word *inv_primes = param_.GetInvPrimesPtr(np);
+  const int dst_len = num_aux_;
+
+  dim3 grid_dim(degree / kUnrollNumber / kNumThreadsX,
+                DivCeil(dst_len, kLimbBatching * kNumThreadsY), batch);
+  dim3 block_dim(kNumThreadsX, kNumThreadsY);
+  int smem_size = num_q_primes * (kLimbBatching * kNumThreadsY) *
+                  sizeof(signed_word);
+  smem_size += kMaxNumAccum * (kUnrollNumber * kNumThreadsX) *
+               sizeof(signed_word);
+
+  kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+      dst.data(), primes, inv_primes, num_q_primes, dst_len, 0, num_q_primes,
+      reinterpret_cast<const signed_word *>(src_intt.data()),
+      mod_up2_.at(0).data(), param_.log_degree_, total_limbs * degree, q_words);
+
+  // One transform for the whole group. The aux size is chosen so that the
+  // limb-offset correction NTTForModUp applies to the auxiliary part is zero:
+  // this buffer is contiguous and wants no correction.
+  const int total_words = batch * total_limbs * degree;
+  DvView<word> ntt_view(dst.data(), total_words, total_words - q_words);
+  ntt_handler_.NTTForModUp(ntt_view, np, 0, 0, ntt_view, batch);
+}
+
 template <typename word>
 void ModSwitchHandler<word>::ModUpWorker(
     std::vector<DvView<word>> &dst, const DvConstView<word> *src,
@@ -533,7 +608,8 @@ void ModSwitchHandler<word>::ModUpWorker(
     kernel::ModUpMultConst<word><<<num_words / block_dim_, block_dim_>>>(
         reinterpret_cast<signed_word *>(src_intt.data()), src_mont.data(),
         src_coeff->data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
-        mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_);
+        mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_, num_words,
+        num_words);
   }
   const word *pass_through =
       (src_coeff == nullptr) ? src->data() : src_mont.data();

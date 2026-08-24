@@ -445,26 +445,6 @@ class Context {
   void MultKeyNoModDown(Ct &accum, const Ct &a, const Evk &key) const;
 
   /**
-   * @brief The mod-up half of a key switch, on its own.
-   *
-   * `MultKeyNoModDown` raises and multiplies in one step, which is right for a
-   * caller with one switch to perform. A caller with many -- ModPack has one
-   * per module component -- wants the raises separated from the products so
-   * that the products can be accumulated together, and this is that half.
-   * Buffers are reused when the shape already matches, so a loop over switches
-   * at one level allocates once.
-   *
-   * `a_coeff`, when given, is `a`'s ax in the coefficient domain, and selects
-   * `ModSwitchHandler::ModUpFromCoeff` -- the caller is asserting that it
-   * transformed those coefficients into `a` itself and that the INTT which
-   * opens the ordinary path would only undo its own work.
-   */
-  void ModUpForKeySwitch(std::vector<Dv> &mod_up_result,
-                         std::vector<DvView<word>> &mod_up_view, const Ct &a,
-                         const Evk &key,
-                         const DvConstView<word> *a_coeff = nullptr) const;
-
-  /**
    * @brief accumulate <key[k], mod_up[k]> over k, in as few launches as the
    * accumulating kernel allows.
    *
@@ -479,11 +459,26 @@ class Context {
    * The `p_prod * bx` term that `MultKeyNoModDown` folds in is deliberately
    * absent: the only caller switches ciphertexts whose b-part is zero.
    */
-  void MultKeyAccumNoModDown(Ct &accum,
-                             const std::vector<std::vector<Dv>> &a_modups,
-                             const Ct &a_orig,
-                             const std::vector<const Evk *> &keys,
-                             bool accumulate) const;
+  void MultKeyAccumNoModDown(
+      Ct &accum, const std::vector<std::vector<DvConstView<word>>> &a_modups,
+      const Ct &a_orig, const std::vector<const Evk *> &keys,
+      bool accumulate) const;
+
+  /**
+   * @brief The mod-up half for a whole group of switches, into one buffer.
+   *
+   * Every switch in the group shares a level, a key shape and a set of
+   * conversion tables, so on a single decomposition group they share three
+   * kernel launches instead of taking five each -- and, more to the point, one
+   * grid wide enough to fill the card. `a_coeffs` holds the group's
+   * coefficient-domain inputs back to back; `buffer` comes back holding the
+   * extended-basis results the same way, with `mod_up_views` indexing them per
+   * switch and per decomposition group.
+   */
+  void ModUpForKeySwitchBatch(
+      Dv &buffer, std::vector<std::vector<DvConstView<word>>> &mod_up_views,
+      const Ct &a, const Evk &key, const DvConstView<word> &a_coeffs,
+      int batch) const;
 
   /**
    * @brief Build the mod-switch machinery for key switches at `level` against

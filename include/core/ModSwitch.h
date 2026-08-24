@@ -68,6 +68,22 @@ class ModSwitchHandler {
    */
   void ModUpFromCoeff(std::vector<DvView<word>> &dst,
                       const DvConstView<word> &src_coeff) const;
+  /**
+   * @brief ModUpFromCoeff for a whole group of key switches at once.
+   *
+   * `src_coeff` holds `batch` polynomials back to back and `dst` the `batch`
+   * extended-basis results, also back to back. Every switch at one level shares
+   * the conversion table and the twiddles, so the group needs three launches
+   * rather than five each -- and a key switch's transform is a grid of about
+   * sixty blocks, which leaves most of an A100 idle, so the wider grid is worth
+   * more than the launch count is.
+   *
+   * Requires a single decomposition group (`beta_ == 1`). A narrower auxiliary
+   * basis raises beta and takes the per-switch entry point instead.
+   */
+  void ModUpFromCoeffBatch(DvView<word> &dst,
+                           const DvConstView<word> &src_coeff,
+                           int batch) const;
   void ModDown(DvView<word> &dst, const DvConstView<word> &src) const;
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
   void ModDownAndRescale(DvView<word> &dst, const DvConstView<word> &src) const;

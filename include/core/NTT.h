@@ -68,7 +68,7 @@ class NTTHandler {
   // special variants for ModUp and ModDown/Rescale/ModDownAndRescale
 
   void NTTForModUp(DvView<word> &dst, const NPInfo &np, int skip_start,
-                   int skip_end, const DvConstView<word> &src) const;
+                   int skip_end, const DvConstView<word> &src, int batch = 1) const;
   void NTTForModDown(DvView<word> &dst, const NPInfo &np_src1,
                      const NPInfo &np_src2, const DvConstView<word> &src1,
                      const DvConstView<word> &src2,

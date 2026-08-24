@@ -729,16 +729,19 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const std::vector<Dv> &a_modup,
   elem_handler_.PAccum(accum_views, np, key_views, modup_view);
 }
 
+// One contiguous buffer for a whole group of switches, and the batched mod-up
+// when the level allows it. The per-switch entry point above is what a narrower
+// auxiliary basis still takes.
 template <typename word>
-void Context<word>::ModUpForKeySwitch(std::vector<Dv> &mod_up_result,
-                                      std::vector<DvView<word>> &mod_up_view,
-                                      const Ct &a, const Evk &key,
-                                      const DvConstView<word> *a_coeff) const {
+void Context<word>::ModUpForKeySwitchBatch(
+    Dv &buffer, std::vector<std::vector<DvConstView<word>>> &mod_up_views,
+    const Ct &a, const Evk &key, const DvConstView<word> &a_coeffs,
+    int batch) const {
   NPInfo a_np = a.GetNP();
   AssertTrue(a_np.num_aux_ == 0,
-             "ModUpForKeySwitch is not supported for ciphertexts with p "
+             "ModUpForKeySwitchBatch is not supported for ciphertexts with p "
              "primes");
-  AssertTrue(!a.HasRx(), "ModUpForKeySwitch does not handle an rx_ part");
+  AssertTrue(batch >= 1, "ModUpForKeySwitchBatch: invalid batch");
 
   int num_q = a_np.GetNumQ();
   int level = param_.NPToLevel(a_np);
@@ -752,40 +755,46 @@ void Context<word>::ModUpForKeySwitch(std::vector<Dv> &mod_up_result,
                                  ? GetDtSModSwitchHandler()
                                  : GetModSwitchHandler(level, num_aux);
 
-  // Reuse whatever the caller's buffers already are. Resizing to the size a
-  // buffer already has does not reallocate, so a loop over switches at one
-  // level pays for its device memory once.
-  if (static_cast<int>(mod_up_result.size()) != beta) {
-    mod_up_result.clear();
+  const int degree = param_.degree_;
+  const int limb_words = (num_q + num_aux) * degree;
+  const int q_words = num_q * degree;
+  AssertTrue(a_coeffs.TotalSize() == batch * q_words,
+             "ModUpForKeySwitchBatch: coefficient buffer size mismatch");
+  buffer.resize(batch * beta * limb_words);
+
+  // DvConstView holds const members, so it is copy-constructible but not
+  // assignable: build the rows rather than assigning them.
+  mod_up_views.clear();
+  mod_up_views.resize(batch);
+  for (int s = 0; s < batch; s++) {
     for (int i = 0; i < beta; i++) {
-      mod_up_result.emplace_back(0);
-    }
-  }
-  mod_up_view.clear();
-  for (int i = 0; i < beta; i++) {
-    int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
-    if (prime_index_end <= prime_offset) {
-      mod_up_result[i].resize(0);
-      mod_up_view.push_back(mod_up_result[i].View(0));
-    } else {
-      mod_up_result[i].resize((num_q + num_aux) * param_.degree_);
-      mod_up_view.push_back(mod_up_result[i].View(num_aux * param_.degree_));
+      mod_up_views[s].emplace_back(buffer.data() + (s * beta + i) * limb_words,
+                                   limb_words, num_aux * degree);
     }
   }
 
-  if (a_coeff == nullptr) {
-    mod_switcher.ModUp(mod_up_view, a.AxConstView());
-  } else {
-    // `a`'s own ax is not read on this path: the coefficients are the input,
-    // and the caller never has to transform them.
-    mod_switcher.ModUpFromCoeff(mod_up_view, *a_coeff);
+  if (beta == 1) {
+    DvView<word> dst(buffer.data(), batch * limb_words, 0);
+    mod_switcher.ModUpFromCoeffBatch(dst, a_coeffs, batch);
+    return;
+  }
+
+  for (int s = 0; s < batch; s++) {
+    std::vector<DvView<word>> dst_views;
+    for (int i = 0; i < beta; i++) {
+      dst_views.emplace_back(buffer.data() + (s * beta + i) * limb_words,
+                             limb_words, num_aux * degree);
+    }
+    DvConstView<word> coeff_s(a_coeffs.data() + s * q_words, q_words, 0);
+    mod_switcher.ModUpFromCoeff(dst_views, coeff_s);
   }
 }
 
 template <typename word>
 void Context<word>::MultKeyAccumNoModDown(
-    Ct &accum, const std::vector<std::vector<Dv>> &a_modups, const Ct &a_orig,
-    const std::vector<const Evk *> &keys, bool accumulate) const {
+    Ct &accum, const std::vector<std::vector<DvConstView<word>>> &a_modups,
+    const Ct &a_orig, const std::vector<const Evk *> &keys,
+    bool accumulate) const {
   AssertTrue(!keys.empty(), "MultKeyAccumNoModDown: no keys");
   AssertTrue(a_modups.size() >= keys.size(),
              "MultKeyAccumNoModDown: fewer mod-up results than keys");
@@ -829,8 +838,7 @@ void Context<word>::MultKeyAccumNoModDown(
       int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
       if (prime_index_end <= prime_offset) continue;
       key_views.push_back(key.ConstViewVector(i, prime_offset));
-      modup_view.push_back(
-          a_modups.at(k).at(i).ConstView(num_aux * param_.degree_));
+      modup_view.push_back(a_modups.at(k).at(i));
     }
   }
 
