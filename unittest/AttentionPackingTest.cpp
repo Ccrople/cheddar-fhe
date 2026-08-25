@@ -310,6 +310,113 @@ TEST(AttentionPackingHost, TheRingSwitchChainLeavesOneTokenPerSmallRingElement) 
 }
 
 // ---------------------------------------------------------------------------
+// The conjugate-invariant ring. Step 7 of Doing.md 1.5av starts at the layout,
+// because it is the one thing every layer operator reads; its R+ form is
+// pinned here before any of them is built.
+// ---------------------------------------------------------------------------
+
+// The coefficient layout does not change at all on R+: a ciphertext holds
+// `degree` coefficients on either ring, so the [SYLPH] map, the ciphertext
+// count and the channels per ciphertext are ring-independent. Only the slot
+// side moves.
+TEST(AttentionPackingHost, CiKeepsTheCoefficientLayout) {
+  const AttentionPacking ordinary = SylphShape();
+  const AttentionPacking ci(kNumHeads, kHeadDim, kNumTokens, kDegree,
+                            /*conjugate_invariant=*/true);
+  EXPECT_TRUE(ci.IsConjugateInvariant());
+  EXPECT_EQ(ci.GetChannelsPerCiphertext(),
+            ordinary.GetChannelsPerCiphertext());
+  EXPECT_EQ(ci.GetNumCiphertexts(), ordinary.GetNumCiphertexts());
+  EXPECT_EQ(ci.GetNumSlots(), kDegree);
+  EXPECT_EQ(ordinary.GetNumSlots(), kDegree / 2);
+  for (int ct = 0; ct < ci.GetNumCiphertexts(); ct++) {
+    for (int coeff = 0; coeff < kDegree; coeff += 97) {
+      const TensorIndex a = ci.CoeffPosition(ct, coeff);
+      const TensorIndex b = ordinary.CoeffPosition(ct, coeff);
+      ASSERT_EQ(a.head, b.head);
+      ASSERT_EQ(a.channel, b.channel);
+      ASSERT_EQ(a.token, b.token);
+    }
+  }
+}
+
+// The two slot maps are one statement: a bit reversal over the full index is
+// 2 * (the reversal of the low half) + the top bit, so the ordinary ring's
+// (slot s, real) and (slot s, imaginary) become R+ slots 2s and 2s + 1. The
+// real/imaginary flag turns into the LOW slot bit.
+TEST(AttentionPackingHost, CiSlotMapInterleavesTheOrdinaryPairs) {
+  std::vector<int> hits(kDegree, 0);
+  for (int coeff = 0; coeff < kDegree; coeff++) {
+    const SlotPosition ci =
+        AttentionPacking::SlotOfCoeff(coeff, kDegree, true);
+    ASSERT_FALSE(ci.imaginary);
+    ASSERT_GE(ci.slot, 0);
+    ASSERT_LT(ci.slot, kDegree);
+    const SlotPosition ord = AttentionPacking::SlotOfCoeff(coeff, kDegree);
+    ASSERT_EQ(ci.slot, 2 * ord.slot + (ord.imaginary ? 1 : 0));
+    hits[ci.slot]++;
+    ASSERT_EQ(AttentionPacking::CoeffOfSlot(ci, kDegree, true), coeff);
+  }
+  EXPECT_EQ(*std::min_element(hits.begin(), hits.end()), 1);
+  EXPECT_EQ(*std::max_element(hits.begin(), hits.end()), 1);
+}
+
+// The axis exchange survives -- token and channel still trade the fastest- and
+// slowest-varying roles -- and the channel axis owns one MORE slot bit, the
+// old flag. The two channels an ordinary slot held as its real and imaginary
+// parts are slot neighbours on R+: same head, same token, half the
+// channels-per-ciphertext apart, at slot distance ONE instead of inside the
+// same complex number. ImaginaryFlagAxis refuses; nothing is left for it to
+// report.
+TEST(AttentionPackingHost, CiConversionKeepsTheAxisExchange) {
+  const AttentionPacking layout(kNumHeads, kHeadDim, kNumTokens, kDegree,
+                                /*conjugate_invariant=*/true);
+  EXPECT_EQ(layout.CoeffAxisOrder()[0], Axis::kToken);
+  EXPECT_EQ(layout.CoeffAxisOrder()[1], Axis::kHead);
+  EXPECT_EQ(layout.CoeffAxisOrder()[2], Axis::kChannel);
+  EXPECT_EQ(layout.SlotAxisOrder()[0], Axis::kChannel);
+  EXPECT_EQ(layout.SlotAxisOrder()[1], Axis::kHead);
+  EXPECT_EQ(layout.SlotAxisOrder()[2], Axis::kToken);
+  for (int slot = 0; slot < 8; slot += 2) {
+    const TensorIndex even = layout.SlotToTensor(0, {slot, false});
+    const TensorIndex odd = layout.SlotToTensor(0, {slot + 1, false});
+    EXPECT_EQ(even.head, odd.head);
+    EXPECT_EQ(even.token, odd.token);
+    EXPECT_EQ(odd.channel - even.channel,
+              layout.GetChannelsPerCiphertext() / 2);
+  }
+}
+
+TEST(AttentionPackingHost, CiPackingRoundTrips) {
+  const AttentionPacking layout(kNumHeads, kHeadDim, kNumTokens, kDegree,
+                                /*conjugate_invariant=*/true);
+  std::vector<double> tensor(layout.GetTensorSize());
+  for (int i = 0; i < layout.GetTensorSize(); i++) {
+    tensor[i] = std::sin(0.001 * i) + 0.25 * std::cos(0.017 * i);
+  }
+  std::vector<std::vector<Complex>> slot_cts;
+  layout.PackSlot(slot_cts, tensor);
+  ASSERT_EQ(static_cast<int>(slot_cts.size()), layout.GetNumCiphertexts());
+  ASSERT_EQ(static_cast<int>(slot_cts[0].size()), kDegree);
+  std::vector<double> back;
+  layout.UnpackSlot(back, slot_cts);
+  ASSERT_EQ(back.size(), tensor.size());
+  for (size_t i = 0; i < tensor.size(); i++) ASSERT_EQ(back[i], tensor[i]);
+
+  // Every packed slot is purely real, and the slot and coefficient packings
+  // are the same data under the R+ conversion.
+  std::vector<std::vector<double>> coeff_cts;
+  layout.PackCoeff(coeff_cts, tensor);
+  for (int ct = 0; ct < layout.GetNumCiphertexts(); ct++) {
+    for (int coeff = 0; coeff < kDegree; coeff++) {
+      const SlotPosition pos = layout.SlotOfCoeff(coeff);
+      ASSERT_EQ(slot_cts[ct][pos.slot].imag(), 0.0);
+      ASSERT_EQ(slot_cts[ct][pos.slot].real(), coeff_cts[ct][coeff]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The measurement.
 // ---------------------------------------------------------------------------
 
@@ -327,9 +434,14 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
   ASSERT_NE(boot, nullptr);
 
   const int degree = param_->degree_;
-  const int num_slots = degree / 2;
+  // On the conjugate-invariant ring every slot is one real number and there
+  // are `degree` of them; the imaginary reads below are skipped, and the
+  // probes alone cover the whole coefficient index.
+  const bool ci = param_->conjugate_invariant_;
+  const int num_slots = param_->MaxNumSlots();
   const int log_degree = Log2Ceil(degree);
   ASSERT_EQ(degree, kDegree) << "this measurement is written for degree 2^16";
+  ASSERT_EQ(num_slots, ci ? degree : degree / 2);
 
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(num_slots);
@@ -368,10 +480,11 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
 
   double lo = 1e300, hi = -1e300;
   for (int s = 0; s < num_slots; s++) {
-    lo = std::min({lo, std::abs(reference[s].real()),
-                   std::abs(reference[s].imag())});
-    hi = std::max({hi, std::abs(reference[s].real()),
-                   std::abs(reference[s].imag())});
+    lo = std::min(lo, std::abs(reference[s].real()));
+    hi = std::max(hi, std::abs(reference[s].real()));
+    if (ci) continue;  // no coefficient lands in an imaginary part on R+
+    lo = std::min(lo, std::abs(reference[s].imag()));
+    hi = std::max(hi, std::abs(reference[s].imag()));
   }
   std::cout << "reference probe: |value| in [" << lo << ", " << hi << "], "
             << "ratio " << hi / lo << std::endl;
@@ -381,7 +494,8 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
          "permutation exists to measure";
 
   const double sign_re = reference[0].real() > 0 ? 1.0 : -1.0;
-  const double sign_im = reference[0].imag() > 0 ? 1.0 : -1.0;
+  const double sign_im =
+      ci ? 1.0 : (reference[0].imag() > 0 ? 1.0 : -1.0);
   std::cout << "constant sign: real " << sign_re << ", imag " << sign_im
             << " (magnitude " << hi << " for input " << kAmplitude << ")"
             << std::endl;
@@ -397,9 +511,11 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
     double worst_margin = 1e300;
     for (int s = 0; s < num_slots; s++) {
       const double re = slots[s].real() * sign_re;
-      const double im = slots[s].imag() * sign_im;
-      worst_margin = std::min({worst_margin, std::abs(re), std::abs(im)});
+      worst_margin = std::min(worst_margin, std::abs(re));
       if (re < 0) measured_re[s] |= 1 << bit;
+      if (ci) continue;
+      const double im = slots[s].imag() * sign_im;
+      worst_margin = std::min(worst_margin, std::abs(im));
       if (im < 0) measured_im[s] |= 1 << bit;
     }
     std::cout << "probe bit " << bit << ": smallest |value| " << worst_margin
@@ -415,9 +531,10 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
   for (int s = 0; s < num_slots; s++) {
     ASSERT_GE(measured_re[s], 0);
     ASSERT_LT(measured_re[s], degree);
+    hits[measured_re[s]]++;
+    if (ci) continue;
     ASSERT_GE(measured_im[s], 0);
     ASSERT_LT(measured_im[s], degree);
-    hits[measured_re[s]]++;
     hits[measured_im[s]]++;
   }
   EXPECT_EQ(*std::min_element(hits.begin(), hits.end()), 1);
@@ -427,9 +544,12 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
   // And only now, the comparison with the derivation.
   int mismatches = 0;
   for (int s = 0; s < num_slots; s++) {
-    const int want_re = AttentionPacking::CoeffOfSlot({s, false}, degree);
-    const int want_im = AttentionPacking::CoeffOfSlot({s, true}, degree);
-    if (measured_re[s] != want_re || measured_im[s] != want_im) {
+    const int want_re = AttentionPacking::CoeffOfSlot({s, false}, degree, ci);
+    const int want_im =
+        ci ? 0 : AttentionPacking::CoeffOfSlot({s, true}, degree);
+    const bool wrong =
+        measured_re[s] != want_re || (!ci && measured_im[s] != want_im);
+    if (wrong) {
       if (mismatches < 8) {
         std::cout << "  slot " << s << ": measured (re " << measured_re[s]
                   << ", im " << measured_im[s] << "), derived (re " << want_re
@@ -438,7 +558,8 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
       mismatches++;
     }
   }
-  std::cout << "derived map vs measured map: " << mismatches << " of "
+  std::cout << (ci ? "conjugate-invariant" : "ordinary")
+            << " ring, derived map vs measured map: " << mismatches << " of "
             << num_slots << " slots disagree" << std::endl;
   EXPECT_EQ(mismatches, 0)
       << "SlotOfCoeff does not describe what the hardware does; the printed "
@@ -446,7 +567,8 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, Testbed32, testing::Values("bootparam_35.json"),
+    Cheddar, Testbed32,
+    testing::Values("bootparam_35.json", "ci16_35.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

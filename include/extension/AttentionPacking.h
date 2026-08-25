@@ -109,6 +109,38 @@ namespace cheddar {
  * a slot as a single number rather than as two must not cross that axis.
  * ImaginaryFlagAxis reports it, and SlotAxisOrder covers the slot index
  * proper; all three are computed from the map rather than asserted.
+ *
+ * ## The conjugate-invariant ring changes the slot side and nothing else
+ *
+ * On R+ (Doing.md 1.5av) a ciphertext has `degree` REAL slots rather than
+ * `degree/2` complex ones, and the homomorphic transform pair differs from
+ * the host encoder by one bit reversal over the FULL coefficient index --
+ * `Re(A z) = num_slots * BitReverse(E^-1 z)`, verified on the host in
+ * Doing.md 1.5bc and measured on the GPU by AttentionPackingTest -- so
+ *
+ *     coefficient p  ->  slot BitReverse(p, log2 degree),    no flag
+ *
+ * The coefficient layout -- CoeffPosition, PackCoeff, the [SYLPH] map, the
+ * ciphertext count -- does not change at all: a ciphertext holds `degree`
+ * coefficients on either ring. Only where they sit after the conversion
+ * moves, and the two maps are one statement:
+ *
+ *     BitReverse(p, logN) = 2 * BitReverse(p mod N/2, logN - 1) + [p >= N/2]
+ *
+ * so the ordinary ring's (slot s, real) and (slot s, imaginary) become the
+ * conjugate-invariant slots 2s and 2s + 1. The real/imaginary flag turns into
+ * the LOW slot bit, and the axis it used to split -- the channel -- simply
+ * owns one more slot bit: the two channels an ordinary slot carried as one
+ * complex number are slot NEIGHBOURS here, addressable by rotation like any
+ * others. ImaginaryFlagAxis refuses on this ring; there is nothing left for
+ * it to report.
+ *
+ * The flag has to be carried to the static maps by every caller: a
+ * conjugate-invariant ciphertext run through the ordinary map fails no
+ * assertion anywhere and lands every value in the wrong slot -- the same
+ * dropped-flag shape as Doing.md 1.5bg's RingFixture trap. The member forms
+ * carry it from the constructor; on a path that has a layout object, prefer
+ * them.
  */
 class AttentionPacking {
  public:
@@ -125,8 +157,10 @@ class AttentionPacking {
 
   /// Where one coefficient of one ciphertext ends up after the conversion.
   struct SlotPosition {
-    int slot;        ///< complex slot index, in [0, degree/2)
-    bool imaginary;  ///< whether the value is that slot's imaginary part
+    int slot;        ///< slot index: [0, degree/2) complex on the ordinary
+                     ///< ring, [0, degree) real on the conjugate-invariant one
+    bool imaginary;  ///< whether the value is that slot's imaginary part;
+                     ///< always false on the conjugate-invariant ring
   };
 
   /**
@@ -136,14 +170,20 @@ class AttentionPacking {
    * @param head_dim channels per head, a power of two
    * @param num_tokens sequence length, a power of two
    * @param degree ring degree of the ciphertexts holding the tensor
+   * @param conjugate_invariant whether the ring is R+, which has `degree`
+   *        real slots and no real/imaginary flag; see the class comment
    */
-  AttentionPacking(int num_heads, int head_dim, int num_tokens, int degree);
+  AttentionPacking(int num_heads, int head_dim, int num_tokens, int degree,
+                   bool conjugate_invariant = false);
 
   int GetNumHeads() const { return num_heads_; }
   int GetHeadDim() const { return head_dim_; }
   int GetNumTokens() const { return num_tokens_; }
   int GetDegree() const { return degree_; }
-  int GetNumSlots() const { return degree_ / 2; }
+  int GetNumSlots() const {
+    return conjugate_invariant_ ? degree_ : degree_ / 2;
+  }
+  bool IsConjugateInvariant() const { return conjugate_invariant_; }
   int GetNumCiphertexts() const { return num_ciphertexts_; }
   int GetChannelsPerCiphertext() const { return channels_per_ct_; }
   /// Total tensor entries, equal to num_ciphertexts * degree.
@@ -161,16 +201,28 @@ class AttentionPacking {
   void CoeffIndexOf(const TensorIndex &t, int &ct, int &coeff) const;
 
   /// Where the conversion sends a coefficient. Static because it is a property
-  /// of the ring and of the transform, not of this layout.
-  static SlotPosition SlotOfCoeff(int coeff, int degree);
+  /// of the ring and of the transform, not of this layout. The flag picks the
+  /// conjugate-invariant map and every caller on that ring must carry it --
+  /// the ordinary map is well defined on the same inputs and fails no
+  /// assertion (see the class comment). The two-argument forms are the
+  /// ordinary ring.
+  static SlotPosition SlotOfCoeff(int coeff, int degree,
+                                  bool conjugate_invariant);
+  static SlotPosition SlotOfCoeff(int coeff, int degree) {
+    return SlotOfCoeff(coeff, degree, false);
+  }
   /// The inverse of SlotOfCoeff.
-  static int CoeffOfSlot(const SlotPosition &pos, int degree);
+  static int CoeffOfSlot(const SlotPosition &pos, int degree,
+                         bool conjugate_invariant);
+  static int CoeffOfSlot(const SlotPosition &pos, int degree) {
+    return CoeffOfSlot(pos, degree, false);
+  }
 
   SlotPosition SlotOfCoeff(int coeff) const {
-    return SlotOfCoeff(coeff, degree_);
+    return SlotOfCoeff(coeff, degree_, conjugate_invariant_);
   }
   int CoeffOfSlot(const SlotPosition &pos) const {
-    return CoeffOfSlot(pos, degree_);
+    return CoeffOfSlot(pos, degree_, conjugate_invariant_);
   }
 
   /// Which tensor entry sits at a slot position after the conversion, i.e.
@@ -194,8 +246,9 @@ class AttentionPacking {
   /// Which axis the real/imaginary flag of a slot splits. One value of this
   /// axis lives in the real parts and another in the imaginary parts, so an
   /// operator that treats a slot as one number rather than two must not cross
-  /// it.
-  Axis ImaginaryFlagAxis() const { return imaginary_flag_axis_; }
+  /// it. Refuses on the conjugate-invariant ring: a slot there is one real
+  /// number and there is no flag.
+  Axis ImaginaryFlagAxis() const;
 
   /// Human-readable name of an axis, for reports.
   static const char *AxisName(Axis axis);
@@ -235,6 +288,7 @@ class AttentionPacking {
   int head_dim_;
   int num_tokens_;
   int degree_;
+  bool conjugate_invariant_;
   int channels_per_ct_;
   int num_ciphertexts_;
 

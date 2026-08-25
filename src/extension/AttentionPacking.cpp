@@ -9,11 +9,12 @@
 namespace cheddar {
 
 AttentionPacking::AttentionPacking(int num_heads, int head_dim, int num_tokens,
-                                   int degree)
+                                   int degree, bool conjugate_invariant)
     : num_heads_{num_heads},
       head_dim_{head_dim},
       num_tokens_{num_tokens},
-      degree_{degree} {
+      degree_{degree},
+      conjugate_invariant_{conjugate_invariant} {
   AssertTrue(num_heads > 0 && IsPowOfTwo(num_heads),
              "AttentionPacking: num_heads must be a power of two");
   AssertTrue(head_dim > 0 && IsPowOfTwo(head_dim),
@@ -43,7 +44,11 @@ AttentionPacking::AttentionPacking(int num_heads, int head_dim, int num_tokens,
 
   coeff_axis_order_ = DeriveAxisOrder(false);
   slot_axis_order_ = DeriveAxisOrder(true);
-  imaginary_flag_axis_ = DeriveImaginaryFlagAxis();
+  // On R+ there is no flag, and deriving one would ask the map for an
+  // imaginary slot position that does not exist. The getter refuses, so the
+  // placeholder is unreachable.
+  imaginary_flag_axis_ =
+      conjugate_invariant_ ? Axis::kHead : DeriveImaginaryFlagAxis();
 }
 
 int AttentionPacking::TensorOffset(const TensorIndex &t) const {
@@ -82,26 +87,43 @@ void AttentionPacking::CoeffIndexOf(const TensorIndex &t, int &ct,
 // else, while the host encoder's SpecialFFT/SpecialIFFT each carry one
 // BitReverseVector. The difference between the two is therefore exactly one bit
 // reversal, on the slot count rather than on the ring degree, with the top
-// coefficient bit selecting the real or the imaginary part of the slot. The
-// class comment gives the reasoning; AttentionPackingTest measures it.
-AttentionPacking::SlotPosition AttentionPacking::SlotOfCoeff(int coeff,
-                                                             int degree) {
+// coefficient bit selecting the real or the imaginary part of the slot. On the
+// conjugate-invariant ring the slot count IS the ring degree and there is no
+// flag, so the same reversal runs over the full coefficient index (Doing.md
+// 1.5bc's `Re(A z) = num_slots * BitReverse(E^-1 z)`). The class comment gives
+// the reasoning; AttentionPackingTest measures both rings.
+AttentionPacking::SlotPosition AttentionPacking::SlotOfCoeff(
+    int coeff, int degree, bool conjugate_invariant) {
   AssertTrue(degree >= 2 && IsPowOfTwo(degree),
              "SlotOfCoeff: degree must be a power of two");
   AssertTrue(coeff >= 0 && coeff < degree,
              "SlotOfCoeff: coefficient index out of range");
+  SlotPosition pos;
+  if (conjugate_invariant) {
+    pos.imaginary = false;
+    pos.slot = static_cast<int>(BitReverseInt(coeff, Log2Ceil(degree)));
+    return pos;
+  }
   const int num_slots = degree / 2;
   const int log_slots = Log2Ceil(num_slots);
-  SlotPosition pos;
   pos.imaginary = coeff >= num_slots;
   pos.slot = static_cast<int>(
       BitReverseInt(pos.imaginary ? coeff - num_slots : coeff, log_slots));
   return pos;
 }
 
-int AttentionPacking::CoeffOfSlot(const SlotPosition &pos, int degree) {
+int AttentionPacking::CoeffOfSlot(const SlotPosition &pos, int degree,
+                                  bool conjugate_invariant) {
   AssertTrue(degree >= 2 && IsPowOfTwo(degree),
              "CoeffOfSlot: degree must be a power of two");
+  if (conjugate_invariant) {
+    AssertTrue(!pos.imaginary,
+               "CoeffOfSlot: a conjugate-invariant slot is one real number "
+               "and has no imaginary part");
+    AssertTrue(pos.slot >= 0 && pos.slot < degree,
+               "CoeffOfSlot: slot index out of range");
+    return static_cast<int>(BitReverseInt(pos.slot, Log2Ceil(degree)));
+  }
   const int num_slots = degree / 2;
   AssertTrue(pos.slot >= 0 && pos.slot < num_slots,
              "CoeffOfSlot: slot index out of range");
@@ -112,7 +134,9 @@ int AttentionPacking::CoeffOfSlot(const SlotPosition &pos, int degree) {
 
 AttentionPacking::TensorIndex AttentionPacking::SlotToTensor(
     int ct, const SlotPosition &pos) const {
-  return CoeffPosition(ct, CoeffOfSlot(pos, degree_));
+  // Through the member form, which carries the ring flag. The two-argument
+  // static would silently be the ordinary map.
+  return CoeffPosition(ct, CoeffOfSlot(pos));
 }
 
 const char *AttentionPacking::AxisName(Axis axis) {
@@ -140,8 +164,8 @@ const char *AttentionPacking::AxisName(Axis axis) {
 // abort here. It is reported by DeriveImaginaryFlagAxis instead.
 std::array<AttentionPacking::Axis, 3> AttentionPacking::DeriveAxisOrder(
     bool in_slot_domain) const {
-  const int num_slots = degree_ / 2;
-  const int num_bits = in_slot_domain ? Log2Ceil(num_slots) : Log2Ceil(degree_);
+  const int num_bits =
+      in_slot_domain ? Log2Ceil(GetNumSlots()) : Log2Ceil(degree_);
 
   auto position = [&](int index) {
     if (!in_slot_domain) return CoeffPosition(0, index);
@@ -198,6 +222,14 @@ std::array<AttentionPacking::Axis, 3> AttentionPacking::DeriveAxisOrder(
   return {axes[order[0]], axes[order[1]], axes[order[2]]};
 }
 
+AttentionPacking::Axis AttentionPacking::ImaginaryFlagAxis() const {
+  AssertTrue(!conjugate_invariant_,
+             "ImaginaryFlagAxis: a conjugate-invariant slot is one real "
+             "number; there is no real/imaginary flag and no axis for it to "
+             "split");
+  return imaginary_flag_axis_;
+}
+
 AttentionPacking::Axis AttentionPacking::DeriveImaginaryFlagAxis() const {
   const TensorIndex real = SlotToTensor(0, SlotPosition{0, false});
   const TensorIndex imag = SlotToTensor(0, SlotPosition{0, true});
@@ -249,11 +281,12 @@ void AttentionPacking::PackSlot(std::vector<std::vector<Complex>> &res,
                                 const std::vector<double> &tensor) const {
   AssertTrue(static_cast<int>(tensor.size()) == GetTensorSize(),
              "PackSlot: tensor size does not match the layout");
-  res.assign(num_ciphertexts_, std::vector<Complex>(degree_ / 2, Complex(0)));
+  res.assign(num_ciphertexts_,
+             std::vector<Complex>(GetNumSlots(), Complex(0)));
   for (int ct = 0; ct < num_ciphertexts_; ct++) {
     for (int coeff = 0; coeff < degree_; coeff++) {
       const double value = tensor[TensorOffset(CoeffPosition(ct, coeff))];
-      const SlotPosition pos = SlotOfCoeff(coeff, degree_);
+      const SlotPosition pos = SlotOfCoeff(coeff);
       Complex &slot = res[ct][pos.slot];
       slot = pos.imaginary ? Complex(slot.real(), value)
                            : Complex(value, slot.imag());
@@ -268,10 +301,10 @@ void AttentionPacking::UnpackSlot(
              "UnpackSlot: wrong ciphertext count");
   res.assign(GetTensorSize(), 0.0);
   for (int ct = 0; ct < num_ciphertexts_; ct++) {
-    AssertTrue(static_cast<int>(cts[ct].size()) == degree_ / 2,
+    AssertTrue(static_cast<int>(cts[ct].size()) == GetNumSlots(),
                "UnpackSlot: wrong slot count");
     for (int coeff = 0; coeff < degree_; coeff++) {
-      const SlotPosition pos = SlotOfCoeff(coeff, degree_);
+      const SlotPosition pos = SlotOfCoeff(coeff);
       const Complex &slot = cts[ct][pos.slot];
       res[TensorOffset(CoeffPosition(ct, coeff))] =
           pos.imaginary ? slot.imag() : slot.real();
