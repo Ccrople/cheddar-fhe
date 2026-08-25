@@ -797,11 +797,6 @@ __global__ void NTTPhase2ForModDown(
 }  // namespace kernel
 
 // ----- template for each functions ------
-namespace {
-// Both CI passes are elementwise over one limb, so they are launched flat.
-constexpr int kCiBlockDim = 256;
-}  // namespace
-
 template <typename word>
 void NTTHandler<word>::CiFold(make_signed_t<word> *dst, const word *primes,
                               const make_signed_t<word> *inv_primes,
@@ -812,17 +807,17 @@ void NTTHandler<word>::CiFold(make_signed_t<word> *dst, const word *primes,
                               int src_extra) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
-  AssertTrue((param_.degree_ / 2) % kCiBlockDim == 0,
+  AssertTrue((param_.degree_ / 2) % ci_block_dim_ == 0,
              "CiFold: degree too small");
 
   InputPtrList<signed_word, 1> src_ptr_list;
   src_ptr_list.ptrs_[0] = src;
   src_ptr_list.extra_ = src_extra;
 
-  dim3 grid_dim(param_.degree_ / 2 / kCiBlockDim, num_total_primes, batch);
+  dim3 grid_dim(param_.degree_ / 2 / ci_block_dim_, num_total_primes, batch);
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
-    kernel::CiFoldKernel<word, j><<<grid_dim, kCiBlockDim>>>(
+    kernel::CiFoldKernel<word, j><<<grid_dim, ci_block_dim_>>>(
         dst, primes, inv_primes, ci_i_.data() + tw_prime_offset,
         ci_fwd_twist_.data() + tw_prime_offset * param_.degree_, tw_y_extra,
         num_q_primes, skip_start, skip_end, batch_stride, src_ptr_list);
@@ -837,10 +832,10 @@ void NTTHandler<word>::CiUnfold(make_signed_t<word> *dst, const word *primes,
                                 int batch_stride, int batch,
                                 bool normalized) const {
   int log_degree = param_.log_degree_;
-  AssertTrue((param_.degree_ / 2) % kCiBlockDim == 0,
+  AssertTrue((param_.degree_ / 2) % ci_block_dim_ == 0,
              "CiUnfold: degree too small");
 
-  dim3 grid_dim(param_.degree_ / 2 / kCiBlockDim, num_total_primes, batch);
+  dim3 grid_dim(param_.degree_ / 2 / ci_block_dim_, num_total_primes, batch);
   const word *i_ptr = ci_i_.data() + tw_prime_offset;
   const word *inv2_ptr = ci_inv2_.data() + tw_prime_offset;
   const word *twist_ptr =
@@ -848,11 +843,11 @@ void NTTHandler<word>::CiUnfold(make_signed_t<word> *dst, const word *primes,
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
     if (normalized) {
-      kernel::CiUnfoldKernel<word, j, true><<<grid_dim, kCiBlockDim>>>(
+      kernel::CiUnfoldKernel<word, j, true><<<grid_dim, ci_block_dim_>>>(
           dst, primes, inv_primes, i_ptr, inv2_ptr, twist_ptr, tw_y_extra,
           num_q_primes, batch_stride);
     } else {
-      kernel::CiUnfoldKernel<word, j, false><<<grid_dim, kCiBlockDim>>>(
+      kernel::CiUnfoldKernel<word, j, false><<<grid_dim, ci_block_dim_>>>(
           dst, primes, inv_primes, i_ptr, inv2_ptr, twist_ptr, tw_y_extra,
           num_q_primes, batch_stride);
     }

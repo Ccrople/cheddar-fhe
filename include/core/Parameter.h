@@ -104,9 +104,7 @@ class Parameter {
    *
    * @return int maximum number of slots
    */
-  int MaxNumSlots() const {
-    return conjugate_invariant_ ? degree_ : (degree_ / 2);
-  }
+  int MaxNumSlots() const;
 
   /**
    * @brief The cyclotomic index M. Galois exponents and the NTT root both live
@@ -115,9 +113,7 @@ class Parameter {
    *
    * @return int cyclotomic index
    */
-  int CyclotomicIndex() const {
-    return conjugate_invariant_ ? (4 * degree_) : (2 * degree_);
-  }
+  int CyclotomicIndex() const;
 
   /**
    * @brief Get default scale for a given level

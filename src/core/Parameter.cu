@@ -224,6 +224,16 @@ int Parameter<word>::GetGaloisFactor(int i) const {
 }
 
 template <typename word>
+int Parameter<word>::MaxNumSlots() const {
+  return conjugate_invariant_ ? degree_ : (degree_ / 2);
+}
+
+template <typename word>
+int Parameter<word>::CyclotomicIndex() const {
+  return conjugate_invariant_ ? (4 * degree_) : (2 * degree_);
+}
+
+template <typename word>
 double Parameter<word>::GetScale(int level) const {
   if (level == -1) level = 0;
   AssertTrue(level >= 0 && level <= default_encryption_level_,

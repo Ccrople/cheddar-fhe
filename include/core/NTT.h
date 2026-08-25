@@ -46,6 +46,10 @@ class NTTHandler {
   Dv ci_fwd_twist_;
   Dv ci_inv_twist_;
 
+  // Both conjugate-invariant passes are elementwise over one limb, so they are
+  // launched flat rather than through NTTLaunchConfig.
+  static constexpr int ci_block_dim_ = 256;
+
   // dst = fold(src): the ring element reduced mod (Y^degree - i) and twisted,
   // which is the form the butterfly network diagonalises. Runs before NTT
   // phase 1 and cannot be fused into it -- see CiFoldKernel for why.
