@@ -40,6 +40,35 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
     return {num_diag, 1};
   }
 
+  // The conjugate-invariant transforms want a different split, and the reason
+  // is a measured cost ratio, not a preference. A baby-step rotation rides the
+  // double hoisting -- one ModUp shared by the whole step, so each extra
+  // rotation is one fused key multiply, 0.11 ms at the CtS levels on an A100.
+  // A giant-step rotation pays its own ModDown + ModUp + key multiply, 0.77 ms
+  // there. That is a 7x ratio, and the balanced split is bs ~ sqrt(7 D)
+  // rather than sqrt(D). It matters twice as much here as on the ordinary
+  // path because the pair transform runs its giant step once per output half.
+  //
+  // The cap at 16 is the fused kernels: GSFusedComplexKernel carries four
+  // register arrays of the baby-step count, and 4 x 32 words spills where
+  // 4 x 16 holds (~104 registers, measured resident). The ordinary path is
+  // deliberately left on the split below -- its baselines and evk footprints
+  // are measured, and retuning it is its own change.
+  if (conjugate_invariant_) {
+    bs = Min(16, 1 << DivCeil(Log2Ceil(7 * num_diag), 2));
+    // Never let the split collapse to a single giant step. At gs == 1 the
+    // HoistHandler constructor swaps baby for giant, and the swapped layout
+    // answers EvaluateBabyStep with a bare no-aux copy -- a shape the fused
+    // complex giant step does not speak (it read num_aux_ == 0 and divided by
+    // it). The top-stride CtS phase really does land here: its offsets are
+    // multiples of n/16, so it has at most 16 diagonals.
+    while (bs > 2 && DivCeil(num_diag, bs) < 2) bs /= 2;
+    gs = DivCeil(num_diag, bs);
+    AssertTrue(gs >= 2, "BSGSSplit: a conjugate-invariant phase with a "
+                        "single giant step is not supported");
+    return {bs, gs};
+  }
+
   switch (num_diag) {
     case 7:
     case 8:
