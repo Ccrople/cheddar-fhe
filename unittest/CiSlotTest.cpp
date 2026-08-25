@@ -119,7 +119,7 @@ TEST_P(Testbed32, CiSlotEmbedding) {
   const int num_slots = param_->MaxNumSlots();
   const int m = param_->CyclotomicIndex();
 
-  for (int level = 0; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep()) {
     std::vector<double> coeffs;
     SampleSparse(coeffs, degree);
 
@@ -159,7 +159,7 @@ TEST_P(Testbed32, CiSlotRoundTrip) {
   const int num_slots = param_->MaxNumSlots();
   ASSERT_EQ(num_slots, ci ? (1 << log_degree_) : (1 << (log_degree_ - 1)));
 
-  for (int level = 0; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep()) {
     std::vector<Complex> msg;
     // A complex message has nowhere to go on the real subring, and Encode
     // rejects one rather than halving it silently.
@@ -186,6 +186,8 @@ TEST_P(Testbed32, CiSlotSparsePacking) {
   const int max_num_slots = param_->MaxNumSlots();
   const int level = param_->max_level_;
 
+  // Powers of four, so the stride sweep stays a handful of points at logN 16
+  // as well as covering every one of them at logN 12.
   for (int num_slots = 2; num_slots <= max_num_slots; num_slots *= 4) {
     std::vector<Complex> msg;
     GenerateRandomMessage(msg, num_slots, -1.0, 1.0, /*complex=*/!ci);
@@ -212,7 +214,7 @@ TEST_P(Testbed32, CiSlotProduct) {
   const bool ci = param_->conjugate_invariant_;
   const int num_slots = param_->MaxNumSlots();
 
-  for (int level = 1; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep(1)) {
     std::vector<Complex> a, b;
     GenerateRandomMessage(a, num_slots, -1.0, 1.0, /*complex=*/!ci);
     GenerateRandomMessage(b, num_slots, -1.0, 1.0, /*complex=*/!ci);
@@ -248,7 +250,7 @@ TEST_P(Testbed32, CiSlotCiphertextProduct) {
   const bool ci = param_->conjugate_invariant_;
   const int num_slots = param_->MaxNumSlots();
 
-  for (int level = 1; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep(1)) {
     std::vector<Complex> a, b;
     GenerateRandomMessage(a, num_slots, -1.0, 1.0, /*complex=*/!ci);
     GenerateRandomMessage(b, num_slots, -1.0, 1.0, /*complex=*/!ci);
@@ -323,7 +325,7 @@ INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes, the same levels and the same shape
     // with the conjugate-invariant flag off -- the control.
     Cheddar, Testbed32,
-    testing::Values("ci12_30.json", "ringdegree12_30.json"),
+    testing::Values("ci12_30.json", "ci16_35.json", "ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

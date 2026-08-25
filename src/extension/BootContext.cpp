@@ -38,6 +38,16 @@ template <typename word>
 BootContext<word>::BootContext(const Parameter<word> &param,
                                const BootParameter &boot_param)
     : Base(param), boot_param_{boot_param} {
+  // The bootstrap has not moved to the real subring. CoeffToSlot and
+  // SlotToCoeff are the encoding map run as a linear transform, and on R+ that
+  // map is a different one -- N real slots against N/2 complex, so no
+  // real/imaginary split to undo and a transform of twice the width. Refusing
+  // here rather than further down keeps a conjugate-invariant preset that
+  // carries bootstrap primes -- ci16_35 does -- from quietly building the
+  // ordinary ring's matrices.
+  AssertTrue(!param.conjugate_invariant_,
+             "BootContext: the bootstrap has no conjugate-invariant form yet");
+
   // Check if param and boot_param is consistent.
   //
   // The invariant is on where EvalMod *ends*, not on where StC starts. Those

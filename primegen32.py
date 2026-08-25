@@ -1,5 +1,6 @@
 import numpy as np
 import argparse
+import json
 
 
 def log_diff(a, b):
@@ -298,6 +299,111 @@ prime_dict = {
         ], [])
 }
 
+# ---------------------------------------------------------------------------
+# Generated pools, for rings the table above does not cover
+#
+# Every prime here has to be NTT-friendly, which for Z[X]/(X^N + 1) means
+# p = 1 mod 2N. The conjugate-invariant ring is the maximal real subring of the
+# 4N-th cyclotomic (Kim and Song, ISISC 2018), so its transform needs a 4N-th
+# root of unity and the condition becomes p = 1 mod 4N. That halves the supply
+# exactly, and none of the shipped presets survives it whole, so a
+# conjugate-invariant parameter set has to be generated from scratch rather
+# than filtered out of an existing one.
+#
+# The table above is *not* replaced by this in the default case, deliberately.
+# The generated pool for band 27 contains 134348801, which the hand-written
+# list omits, so switching the default would silently move every shipped
+# preset. The table stays authoritative for 1 mod 2^17; this builds the pools
+# for anything else.
+
+# (band key) -> (log2 low edge, log2 high edge). The split between PrimeList's
+# `list_low` and `list_high` is at 2^key, which is how the table above is laid
+# out.
+prime_bands = {
+    25: (24.8, 25.2),
+    26: (25.8, 26.2),
+    27: (26.8, 27.2),
+    28: (27.8, 28.2),
+    29: (28.8, 29.2),
+    30: (29.8, 30.2),
+    31: (30.9, 31.0),
+}
+
+# Primes below the lowest band, which the irregular bases are drawn from.
+irregular_band = (18.0, 24.8)
+
+
+def is_prime(n: int) -> bool:
+    # Miller-Rabin over the first twelve primes, which is deterministic below
+    # 3.3e24 and so exact for everything here.
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def sample_ntt_primes(modulus: int, log_lo: float, log_hi: float) -> list:
+    """Every prime p = 1 mod `modulus` in (2^log_lo, 2^log_hi), ascending."""
+    lo, hi = int(2**log_lo), int(2**log_hi)
+    first = (lo // modulus + 1) * modulus + 1
+    return [p for p in range(first, hi + 1, modulus) if is_prime(p)]
+
+
+def build_prime_dict(modulus: int) -> dict:
+    built = {}
+    for key, (log_lo, log_hi) in prime_bands.items():
+        primes = sample_ntt_primes(modulus, log_lo, log_hi)
+        split = 1 << key
+        built[key] = PrimeList(log_lo, log_hi, [p for p in primes if p < split],
+                               [p for p in primes if p >= split])
+    return built
+
+
+def build_irregular_base(modulus: int, shipped: list) -> list:
+    """The closest NTT-friendly stand-ins for a shipped irregular base.
+
+    The base sets level 0's modulus, so what matters is the product's scale;
+    each shipped prime is matched by log2 and the achieved total is reported,
+    because it will not land exactly. Distinctness is required -- a repeated
+    prime is not a valid RNS basis -- and the pool below 2^24.8 is thin enough
+    that it can genuinely run out, which is a real answer and not a bug.
+    """
+    if not shipped:
+        return []
+    pool = sample_ntt_primes(modulus, *irregular_band)
+    chosen = []
+    for target in shipped:
+        remaining = [p for p in pool if p not in chosen]
+        if not remaining:
+            raise ValueError(
+                f"no NTT-friendly prime left below 2^{irregular_band[1]} for "
+                f"an irregular base of {len(shipped)} primes at modulus "
+                f"{modulus}; the pool holds {len(pool)}")
+        chosen.append(
+            min(remaining, key=lambda p: log_diff(p, target)))
+    shipped_log = sum(np.log2(p) for p in shipped)
+    chosen_log = sum(np.log2(p) for p in chosen)
+    print(f"Irregular base regenerated: {shipped} (2^{shipped_log:.3f}) -> "
+          f"{chosen} (2^{chosen_log:.3f})")
+    return chosen
+
+
 # The below values are just for convenience
 # and can be changed based on the word size requirements
 main_log_scale = 30
@@ -346,13 +452,35 @@ class State:
                      self.irregular_base.copy())
 
 
-default_initial_state = {
-    30: State(30, 0, 0, [786433, 1179649]),
-    35: State(35, 2, 0, []),
-    40: State(40, 2, 0, []),
-    45: State(45, 0, 1, [8519681]),
-    50: State(50, 0, 0, prime_dict[29].sample_many_primes(58, 2))
-}
+# The irregular bases here are the 1 mod 2^17 ones. On another ring they are
+# rebuilt by build_irregular_base; scales 35 and 40 have none, which is why a
+# conjugate-invariant set is easiest to generate at those.
+shipped_irregular_base = {30: [786433, 1179649], 35: [], 40: [], 45: [8519681]}
+
+
+def make_initial_states(pool: dict, modulus: int, regenerate: bool,
+                        wanted: int) -> dict:
+    # Scale 50 draws from the pool, and the shipped generator built this table
+    # at import time -- so every preset in parameters/ depends on those two
+    # primes having been taken out of band 29 before anything else samples.
+    # It stays unconditional for that reason. Only the scale actually asked
+    # for is regenerated, because build_irregular_base can legitimately fail
+    # on a thin pool and that should not happen for a scale nobody wanted.
+    scale_50 = State(50, 0, 0, pool[29].sample_many_primes(58, 2))
+
+    def base(log_scale):
+        shipped = shipped_irregular_base[log_scale]
+        if not regenerate or log_scale != wanted:
+            return list(shipped)
+        return build_irregular_base(modulus, shipped)
+
+    return {
+        30: State(30, 0, 0, base(30)),
+        35: State(35, 2, 0, base(35)),
+        40: State(40, 2, 0, base(40)),
+        45: State(45, 0, 1, base(45)),
+        50: scale_50
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='BitPacker')
@@ -388,11 +516,43 @@ if __name__ == "__main__":
                         type=int,
                         default=0,
                         help='additional main base primes')
+    parser.add_argument('--log_degree',
+                        type=int,
+                        default=16,
+                        help='ring degree exponent')
+    parser.add_argument('--conjugate_invariant',
+                        action='store_true',
+                        help='generate for the conjugate-invariant ring, '
+                        'whose primes must be 1 mod 4N rather than 1 mod 2N')
+    parser.add_argument('--stc_level',
+                        type=int,
+                        default=3,
+                        help='number of StC levels, recorded in the JSON')
+    parser.add_argument('--json',
+                        type=str,
+                        default=None,
+                        help='write the parameter set to this path')
 
     args = parser.parse_args()
+
     log_scale = args.log_scale
     if log_scale not in supported_log_scale:
         raise ValueError(f"Log scale {log_scale} not supported")
+
+    # The NTT modulus condition, which is what the ring changes.
+    degree = 1 << args.log_degree
+    ntt_modulus = (4 if args.conjugate_invariant else 2) * degree
+    regenerate = ntt_modulus != (1 << 17)
+    if regenerate:
+        print(f"Generating prime pools for p = 1 mod {ntt_modulus} "
+              f"(log_degree {args.log_degree}"
+              f"{', conjugate-invariant' if args.conjugate_invariant else ''})")
+        prime_dict = build_prime_dict(ntt_modulus)
+        for key in sorted(prime_dict):
+            held = len(prime_dict[key].list_low) + len(prime_dict[key].list_high)
+            print(f"  band {key}: {held} primes")
+    default_initial_state = make_initial_states(prime_dict, ntt_modulus,
+                                                regenerate, log_scale)
     evalmod_log_scale = args.evalmod_log_scale
     if evalmod_log_scale not in supported_ds_scale:
         raise ValueError(f"EvalMod log scale {evalmod_log_scale} not supported")
@@ -609,6 +769,49 @@ if __name__ == "__main__":
         log_q += np.log2(q)
     for p in aux_primes:
         log_p += np.log2(p)
+
+    if args.json is not None:
+        level_config = [[
+            len(irregular_base_primes) + st.num_main, st.num_terminal
+        ] for st in state_list]
+        # EvalMod and CtS add two main primes per level (three once, where the
+        # generator delays a rescale), exactly as state_list_str records; those
+        # states live past state_list, so replay them the same way.
+        if evalmod_primes or cts_primes:
+            level_config = [[int(x) for x in pair.strip('{}').split(', ')]
+                            for pair in state_list_str.strip('{}').split('}, {')]
+        param = {
+            'log_degree': args.log_degree,
+            'log_default_scale': log_scale,
+            'boot': bool(evalmod_primes and cts_primes),
+            'dense_hamming_weight': degree // 2,
+            'sparse_hamming_weight': 32,
+            'num_cts_levels': cts_level,
+            'num_stc_levels': args.stc_level,
+            'terminal_primes': [int(p) for p in terminal_primes],
+            'main_primes': [int(p) for p in q_primes],
+            'auxiliary_primes': [int(p) for p in aux_primes],
+            'default_encryption_level': normal_level,
+            'level_config': level_config,
+            'additional_base': [
+                args.additional_main_base, args.additional_terminal_base
+            ],
+        }
+        if args.conjugate_invariant:
+            param['conjugate_invariant'] = True
+        for name, primes in (('main', param['main_primes']),
+                             ('terminal', param['terminal_primes']),
+                             ('auxiliary', param['auxiliary_primes'])):
+            for prime in primes:
+                if prime % ntt_modulus != 1:
+                    raise ValueError(
+                        f"{name} prime {prime} is not 1 mod {ntt_modulus}")
+        if len(set(param['main_primes'])) != len(param['main_primes']):
+            raise ValueError("repeated main prime")
+        with open(args.json, 'w') as f:
+            json.dump(param, f, indent=2)
+            f.write('\n')
+        print("Wrote", args.json)
 
     print("Num Q primes:", num_q_t)
     print("Num P primes:", num_aux)

@@ -306,3 +306,7 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)

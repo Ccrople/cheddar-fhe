@@ -232,7 +232,7 @@ TEST_P(Testbed32, CiParameterShape) {
 // anything independent -- the next test does that.
 TEST_P(Testbed32, CiCoeffRoundTrip) {
   const int degree = 1 << log_degree_;
-  for (int level = 0; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep()) {
     std::vector<double> coeffs(degree);
     Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
 
@@ -251,7 +251,7 @@ TEST_P(Testbed32, CiCoeffRoundTrip) {
 // R+ -- and the error sampling on the same fold.
 TEST_P(Testbed32, CiEncryptDecrypt) {
   const int degree = 1 << log_degree_;
-  for (int level = 0; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep()) {
     std::vector<double> coeffs(degree);
     Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
 
@@ -280,7 +280,7 @@ TEST_P(Testbed32, CiRingConvolution) {
   const int degree = 1 << log_degree_;
   // From level 1 up. The product is carried at the two scales multiplied and
   // never rescaled, and level 0's modulus is not wide enough to hold that.
-  for (int level = 1; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep(1)) {
     std::vector<double> a, b;
     SampleSparse(a, degree);
     SampleSparse(b, degree);
@@ -336,7 +336,7 @@ TEST_P(Testbed32, CiRingConvolution) {
 // ordinary ring.
 TEST_P(Testbed32, CiRingConvolutionRescaled) {
   const int degree = 1 << log_degree_;
-  for (int level = 1; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep(1)) {
     std::vector<double> a, b;
     SampleSparse(a, degree);
     SampleSparse(b, degree);
@@ -387,7 +387,7 @@ TEST_P(Testbed32, CiRingConvolutionRescaled) {
 // it can be checked before the automorphisms move to the real subring.
 TEST_P(Testbed32, CiRingCiphertextProduct) {
   const int degree = 1 << log_degree_;
-  for (int level = 1; level <= param_->max_level_; level++) {
+  for (int level : LevelsToSweep(1)) {
     std::vector<double> a, b;
     SampleSparse(a, degree);
     SampleSparse(b, degree);
@@ -497,7 +497,7 @@ INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes, the same levels and the same shape
     // with the conjugate-invariant flag off -- the control.
     Cheddar, Testbed32,
-    testing::Values("ci12_30.json", "ringdegree12_30.json"),
+    testing::Values("ci12_30.json", "ci16_35.json", "ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
