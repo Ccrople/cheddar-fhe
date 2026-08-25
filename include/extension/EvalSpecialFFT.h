@@ -52,6 +52,17 @@ class EvalSpecialFFT {
   int sinc_sub_degree_ = 0;
   std::vector<LinearTransform<word>> sinc_stc_;
   std::vector<LinearTransform<word>> sinc_cts_;
+  // The conjugate-invariant conversions run the same composed stage products
+  // over a complex intermediate carried as a pair of real ciphertexts, like
+  // CtS and StC themselves. Forward: the first phase's input columns outside
+  // block 0 are doubled (the suffix analogue of the StC phase-0 correction).
+  // Inverse: the last phase's rows carry the complex lambda correction of
+  // Doing.md 1.5bn, solved on a 4k reference ring at PrepareSinC time; it is
+  // only built for sub_degree <= 256, and reading the banded basis back
+  // amplifies noise by ~2k/pi -- the same conditioning 1.5bj measured through
+  // the ring switch, intrinsic to the direction, not to this transform.
+  std::vector<ComplexLinearTransform<word>> sinc_stc_ci_;
+  std::vector<ComplexLinearTransform<word>> sinc_cts_ci_;
   std::vector<LinearTransform<word>> sinc_prefix_;
   int sinc_prefix_shift_ = 0;
   int sinc_prefix_level_ = -1;
@@ -145,9 +156,15 @@ class EvalSpecialFFT {
                    int stc_level, int cts_level, int num_phases = 1);
 
   /// How many levels a conversion spends: one per phase.
-  int GetSinCNumPhases() const { return static_cast<int>(sinc_stc_.size()); }
+  int GetSinCNumPhases() const {
+    return static_cast<int>(conjugate_invariant_ ? sinc_stc_ci_.size()
+                                                 : sinc_stc_.size());
+  }
   /// The BSGS split of each forward phase, for reports.
   std::pair<int, int> GetSinCPhaseBSGS(int phase) const {
+    if (conjugate_invariant_) {
+      return {sinc_stc_ci_.at(phase).GetBS(), sinc_stc_ci_.at(phase).GetGS()};
+    }
     return {sinc_stc_.at(phase).GetBS(), sinc_stc_.at(phase).GetGS()};
   }
 

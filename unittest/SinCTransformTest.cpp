@@ -341,3 +341,169 @@ TEST_P(SinCTransformFixture, TheStCPrefixIsWhatHalfBootLeavesUndone) {
       << "HalfBoot alone already returns the slot vector, so this test is not "
          "checking that the prefix does anything";
 }
+// ---------------------------------------------------------------------------
+// The conjugate-invariant form (Doing.md 1.5bn). Same suffix, same stage
+// matrices, evaluated as a pair of real ciphertexts like the CI CtS/StC, with
+// two corrections derived and pinned numerically before this test existed:
+// the forward doubles every input column outside block 0 (the suffix analogue
+// of the full StC's phase-0 fix), and the inverse's last phase carries a
+// complex row scaling lambda solved on a 4k reference ring. The identity is
+// the same shape as the ordinary one -- block index bit-reversed, lanes (all
+// k of them, real) untouched.
+//
+// The inverse is deliberately capped at sub_degree 256: its lambda reaches
+// ~2k/pi -- the same conditioning 1.5bj measured reading SinC lanes through
+// the ring switch -- so at sub_degree 4096 (the ring-switch alignment, tested
+// forward-only below) the return leg belongs to the bootstrap, not to a
+// standalone transform.
+// ---------------------------------------------------------------------------
+
+class CiSinCTransformFixture : public Testbed32 {
+ protected:
+  int BootSlackLevels() const override { return 8; }
+};
+
+INSTANTIATE_TEST_SUITE_P(CheddarCi, CiSinCTransformFixture,
+                         testing::Values("ci16_35.json"),
+                         [](const testing::TestParamInfo<const char *> &info) {
+                           std::string name = info.param;
+                           return name.substr(0, name.find('.')) + "_json";
+                         });
+
+TEST_P(CiSinCTransformFixture, TheSuffixIsTheSinCEncodingOnThePlusRing) {
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  ASSERT_TRUE(param_->conjugate_invariant_);
+  const int degree = param_->degree_;
+  const int num_slots = param_->MaxNumSlots();
+  ASSERT_EQ(num_slots, degree) << "R+ has one real slot per coefficient";
+
+  boot->PrepareEvalSpecialFFT(num_slots);
+
+  struct CiCase {
+    int sub_degree;
+    int phases;
+    bool inverse;  // false above the lambda cap: forward-only
+  };
+  // 4096 is degree / rank, the arrangement whose ring-switch parts land in
+  // slot form; 256 and 32 bracket the per-part conversions the chain needs.
+  const CiCase cases[] = {{4096, 2, false}, {256, 2, true}, {32, 3, true}};
+
+  for (const CiCase &c : cases) {
+    const int sub_degree = c.sub_degree;
+    const int d = degree / sub_degree;
+    const int p = cheddar::Log2Ceil(d);
+
+    const int stc_level = boot->GetBootParameter().GetStCStartLevel();
+    const int cts_level = stc_level;
+    ASSERT_GE(cts_level - c.phases, 1);
+
+    boot->PrepareSinC(num_slots, sub_degree, stc_level, cts_level, c.phases);
+    ASSERT_EQ(boot->GetSinCNumPhases(num_slots), c.phases);
+    EvkRequest req;
+    boot->AddRequiredSinCRotations(req, num_slots);
+    interface_->PrepareRotationKey(req);
+
+    std::vector<Complex> message(num_slots);
+    Random::SampleUniformComplex(message.data(), num_slots, -1.0, 1.0);
+    for (auto &v : message) v = Complex(v.real(), 0.0);
+
+    Ciphertext<word> ct;
+    EncodeAndEncrypt(ct, message, stc_level);
+
+    // ---- forward: slots -> SinC ----------------------------------------
+    Ciphertext<word> sinc;
+    boot->SlotToSinC(sinc, num_slots, ct, interface_->GetEvkMap());
+    EXPECT_EQ(param_->NPToLevel(sinc.GetNP()), stc_level - c.phases);
+    EXPECT_NEAR(sinc.GetScale() / ct.GetScale(), 1.0, 1e-6);
+
+    Plaintext<word> pt;
+    interface_->Decrypt(pt, sinc);
+    std::vector<Complex> got;
+    context_->encoder_.DecodeSinC(got, pt, sub_degree);
+    ASSERT_EQ(static_cast<int>(got.size()), num_slots);
+
+    // Block index bit-reversed, all k real lanes untouched.
+    std::vector<Complex> want(num_slots);
+    for (int i = 0; i < d; i++) {
+      for (int r = 0; r < sub_degree; r++) {
+        want[static_cast<size_t>(i) * sub_degree + r] =
+            message[static_cast<size_t>(BitRev(i, p)) * sub_degree + r];
+      }
+    }
+    double forward_err = 0.0, forward_imag = 0.0, control_err = 0.0;
+    for (int i = 0; i < d; i++) {
+      for (int r = 0; r < sub_degree; r++) {
+        const size_t at = static_cast<size_t>(i) * sub_degree + r;
+        forward_err = std::max(forward_err,
+                               std::abs(got[at].real() - want[at].real()));
+        forward_imag = std::max(forward_imag, std::abs(got[at].imag()));
+        control_err = std::max(control_err,
+                               std::abs(got[at].real() - message[at].real()));
+      }
+    }
+
+    // ---- inverse: SinC -> slots, against the host encoder ---------------
+    double inverse_err = -1.0, round_err = -1.0;
+    if (c.inverse) {
+      Plaintext<word> inv_pt;
+      context_->encoder_.EncodeSinC(inv_pt, cts_level,
+                                    param_->GetScale(cts_level), want,
+                                    sub_degree);
+      Ciphertext<word> inv_ct;
+      interface_->Encrypt(inv_ct, inv_pt);
+
+      Ciphertext<word> back;
+      boot->SinCToSlot(back, num_slots, inv_ct, interface_->GetEvkMap());
+      EXPECT_EQ(param_->NPToLevel(back.GetNP()), cts_level - c.phases);
+      EXPECT_NEAR(back.GetScale() / inv_ct.GetScale(), 1.0, 1e-6);
+
+      std::vector<Complex> undone;
+      DecryptAndDecode(undone, back);
+      inverse_err = 0.0;
+      for (int i = 0; i < num_slots; i++) {
+        inverse_err = std::max(inverse_err, std::abs(undone[i] - message[i]));
+      }
+
+      if (param_->NPToLevel(sinc.GetNP()) == cts_level) {
+        Ciphertext<word> chained;
+        boot->SinCToSlot(chained, num_slots, sinc, interface_->GetEvkMap());
+        std::vector<Complex> round;
+        DecryptAndDecode(round, chained);
+        round_err = 0.0;
+        for (int i = 0; i < num_slots; i++) {
+          round_err = std::max(round_err, std::abs(round[i] - message[i]));
+        }
+      }
+    }
+
+    std::cout << "  CI sub_degree " << sub_degree << " (d = " << d << ", "
+              << sub_degree << " real lanes, " << p << " stages in "
+              << c.phases << " phases): forward " << forward_err
+              << ", imag " << forward_imag << ", inverse " << inverse_err
+              << ", round trip " << round_err
+              << ", control (no bit reversal) " << control_err << std::endl;
+
+    // The entrywise forward comparison READS SinC lanes, and that read is
+    // the scan -- ~2k/pi noise amplification, 1.5bj's conditioning, in the
+    // measurement itself. The coefficient-level noise underneath is uniform
+    // (~2-3e-06 at every k here); the bound scales with the read.
+    EXPECT_LT(forward_err, 2e-5 * sub_degree)
+        << "the corrected suffix is not the CI SinC encoding at sub_degree "
+        << sub_degree;
+    EXPECT_LT(forward_imag, 1e-3);
+    if (c.inverse) {
+      // The inverse carries its ~2k/pi inside the transform (lambda), so its
+      // error is lambda times the base transform noise.
+      EXPECT_LT(inverse_err, 2e-2)
+          << "the lambda-corrected prefix does not undo it at sub_degree "
+          << sub_degree;
+      if (round_err >= 0.0) EXPECT_LT(round_err, 2e-2);
+    }
+    if (p > 0) {
+      EXPECT_GT(control_err, 1e-2)
+          << "the block index is NOT bit-reversed on R+, so this test would "
+             "pass against an unpermuted layout";
+    }
+  }
+}
