@@ -92,6 +92,14 @@ add_executable(mlwe_test MlweTest.cpp)
 target_link_libraries(mlwe_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The same decomposition on the conjugate-invariant ring, where it is a banded
+# map rather than a stride gather. Validated against the ring's own product on
+# a tiny host ring, entry by entry against the host scan at the real degree,
+# and end to end through ModPack's embedded-secret key switches.
+add_executable(ci_mlwe_test CiMlweTest.cpp)
+target_link_libraries(ci_mlwe_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Does the NTT work below log_degree 16? Sylph needs degree 4096 for the batch
 # CC-MM. MUST be run one --gtest_filter per process: __cm_log_degree is
 # write-once per process, so a second degree in the same process would silently

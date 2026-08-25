@@ -138,6 +138,15 @@ class MlweHandler {
    * ciphertexts in the NTT domain but the decomposition is defined on
    * coefficients. No key is used and no security is spent.
    *
+   * On the conjugate-invariant ring the API and the container shapes are
+   * unchanged, but the map inside is not a stride gather: R+ is free over its
+   * rank-N' subring on {1, c_1, ..., c_{k-1}}, and c_i c_{tk} = c_{tk+i} +
+   * c_{tk-i} hits two coefficient classes, so the components come out of an
+   * alternating-sign suffix-sum scan and the a~ arrangement mixes them with
+   * subring coefficients {1, -1, 2, c_k} (Doing.md 1.5ba, and the kernel
+   * comments in Mlwe.cu). Still no key and no security cost; what it does
+   * cost is coefficient growth in the components, about 0.68 sqrt(N') rms.
+   *
    * @param res output, resized to k
    * @param ct input ciphertext, no aux primes and no rx_ part
    * @param small_degree N', a power of two dividing the ring degree
@@ -200,6 +209,13 @@ class MlweHandler {
    * @param res output ciphertext, at the ring degree and in the NTT domain
    * @param cts the k input MLWE ciphertexts, in decomposition-index order,
    *        all sharing one NP, rank and degree, and with no auxiliary primes
+   * On the conjugate-invariant ring the recomposition is the banded two-term
+   * inverse of the scan (see ModDecomp) rather than an interleave, and the
+   * embedded secrets the keys switch from are the scan of the secret's
+   * coefficients rather than stride slices -- UserInterface::
+   * PrepareModPackKeys builds them accordingly. The switches themselves are
+   * ordinary key switches either way.
+   *
    * @param keys the k switching keys, keys[j] switching from the embedded
    *        j-th module component of the secret to the ordinary secret
    */

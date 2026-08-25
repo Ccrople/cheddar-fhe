@@ -411,11 +411,42 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
   const int num_q = np.GetNumQ();
   const int prime_offset = context_->param_.GetMaxNumTer() - np.num_ter_;
 
+  // On the conjugate-invariant ring the j-th module component of the secret
+  // is not a stride slice: {1, c_1, ..., c_{k-1}} multiplies the subring
+  // basis into two coefficient classes, so the components come out of the
+  // alternating-sign suffix-sum scan (Doing.md 1.5ba, and MlweHandler's
+  // kernel comments), here run over the signed ternary coefficients on the
+  // host. The values grow up to the subring rank in the worst case, so they
+  // are ints rather than ternary -- still microscopic against any prime.
+  std::vector<std::vector<int>> ci_components;
+  if (context_->param_.conjugate_invariant_) {
+    ci_components.assign(rank, std::vector<int>(small_degree, 0));
+    for (int t = 0; t < small_degree; t++) {
+      ci_components[0][t] = main_secret_coeffs_[rank * t];
+    }
+    for (int i = 1; i <= rank / 2; i++) {
+      // The i = k/2 class is its own mirror; the two accumulators then track
+      // the same value and the double write is idempotent.
+      const int mi = rank - i;
+      int acc_i = 0;
+      int acc_m = 0;
+      for (int t = small_degree - 1; t >= 0; t--) {
+        const int new_i = main_secret_coeffs_[t * rank + i] - acc_m;
+        const int new_m = main_secret_coeffs_[t * rank + mi] - acc_i;
+        ci_components[i][t] = new_i;
+        ci_components[mi][t] = new_m;
+        acc_i = new_i;
+        acc_m = new_m;
+      }
+    }
+  }
+
   for (int j = 0; j < rank; j++) {
     // The j-th module component of the decomposed secret, embedded back into
-    // R_N: coefficient j + k*s of sk becomes coefficient k*s. Everything off a
-    // multiple of k is zero, which is exactly what makes this an element of
-    // the degree-N' subring seen from the full ring.
+    // R_N: coefficient j + k*s of sk becomes coefficient k*s (on the ordinary
+    // ring; the scan above on R+). Everything off a multiple of k is zero,
+    // which is exactly what makes this an element of the degree-N' subring
+    // seen from the full ring.
     HostVector<word> host(num_total_primes * degree, 0);
     for (int i = 0; i < num_total_primes; i++) {
       // Same prime indexing as SampleRandomPolynomial: the q primes are offset
@@ -424,9 +455,13 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
           (i >= num_q) ? (L + i - num_q) : (i + prime_offset);
       const word prime = all_primes_[prime_index];
       for (int s = 0; s < small_degree; s++) {
-        const int coeff = main_secret_coeffs_[j + rank * s];
+        const int coeff = context_->param_.conjugate_invariant_
+                              ? ci_components[j][s]
+                              : main_secret_coeffs_[j + rank * s];
         if (coeff == 0) continue;
-        host[i * degree + rank * s] = (coeff > 0) ? word{1} : (prime - 1);
+        host[i * degree + rank * s] =
+            (coeff > 0) ? static_cast<word>(coeff)
+                        : prime - static_cast<word>(-coeff);
       }
     }
 

@@ -104,6 +104,193 @@ __global__ void ModPackB(word *dst, const word *const *src_ptrs, int log_rank,
   dst[limb * degree + x] = value;
 }
 
+
+// ---- conjugate-invariant forms ---------------------------------------------
+//
+// On R+ = Z[Y + Y^-1] the module structure over the subring is not a stride
+// interleave. The rank-N' subring is spanned by {1, c_k, c_2k, ...} with
+// c_j = Y^j + Y^-j and k = N/N', and R+ is free over it on
+// {1, c_1, ..., c_{k-1}} -- but c_i c_{tk} = c_{tk+i} + c_{tk-i} hits two
+// coefficient classes, so the change of basis is a banded map rather than a
+// gather (Doing.md 1.5ba). With alpha_i the i-th module component of a (an
+// N'-vector over the subring basis), the coefficient identity is
+//
+//     a[tk + i] = alpha_i[t] + alpha_{k-i}[t+1],      alpha_.[N'] = 0
+//
+// (the i = 0 class is pure), so the decomposition is the alternating-sign
+// suffix-sum scan running down the class pair (i, k-i),
+//
+//     alpha_i[t] = a[tk + i] - alpha_{k-i}[t+1]
+//
+// and the recomposition is the two-term sum above. The i = k/2 class is its
+// own mirror and the recurrence closes on itself; the kernels need no special
+// case for it, because the two accumulators then track the same value and the
+// double write is idempotent.
+
+// One thread per (limb, chain): chain 0 is the i = 0 gather, chain p >= 1 the
+// zigzag over the class pair (p, rank - p). The scan is sequential in t by
+// construction, but the chains are short where it matters -- the PC-MM
+// configuration has N' = 256 -- and a chain's loads do not depend on its
+// accumulator, so they pipeline ahead of the subtraction chain.
+//
+// dst_ptrs[i][limb * limb_stride + t] receives component i's t-th subring
+// coefficient: the b-part passes the per-ciphertext buffers (stride N'), the
+// a-part one workspace cut into rank windows of N' (stride N).
+//
+// grid: 1D over num_limbs * (rank / 2 + 1) threads
+template <typename word>
+__global__ void CiModDecompScan(word *const *dst_ptrs, int limb_stride,
+                                const word *src, const word *primes, int rank,
+                                int small_degree, int degree, int num_limbs) {
+  const int num_chains = rank / 2 + 1;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * num_chains) return;
+  const int limb = tid / num_chains;
+  const int chain = tid - limb * num_chains;
+
+  const word *src_limb = src + limb * degree;
+
+  if (chain == 0) {
+    word *dst = dst_ptrs[0] + limb * limb_stride;
+    for (int t = 0; t < small_degree; t++) {
+      dst[t] = basic::StreamingLoad(src_limb + t * rank);
+    }
+    return;
+  }
+
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  const int i = chain;
+  const int mi = rank - chain;
+  word *dst_i = dst_ptrs[i] + limb * limb_stride;
+  word *dst_m = dst_ptrs[mi] + limb * limb_stride;
+
+  word acc_i = 0;  // alpha_i[t + 1]
+  word acc_m = 0;  // alpha_{k-i}[t + 1]
+  for (int t = small_degree - 1; t >= 0; t--) {
+    const word vi = basic::StreamingLoad(src_limb + t * rank + i);
+    const word vm = basic::StreamingLoad(src_limb + t * rank + mi);
+    const word new_i = basic::Sub(vi, acc_m, prime);
+    const word new_m = basic::Sub(vm, acc_i, prime);
+    dst_i[t] = new_i;
+    dst_m[t] = new_m;
+    acc_i = new_i;
+    acc_m = new_m;
+  }
+}
+
+// The a-part of the i-th output is not a shifted slice of a's components as
+// it is on the power basis. With s = sum_j sigma_j c_j, the module components
+// of a * s follow from c_i c_j = c_{i+j} + c_{|i-j|} and, once i + j crosses
+// k, the re-decomposition c_{k+l} = c_k c_l - c_{k-l}. Collecting terms, the
+// coefficient of sigma_j in component l is
+//
+//     a~_l[j] = alpha_{|l-j|} + [l+j < k] alpha_{l+j}
+//               + [j > l] c'_1 alpha_{k-(j-l)} - [l+j > k] alpha_{2k-l-j}
+//
+// for l, j >= 1; the j = 0 column is alpha_l and the l = 0 row is
+// 2 alpha_j + c'_1 alpha_{k-j}. c'_1 = c_k is the subring generator, whose
+// multiplication is the symmetric shift (c'_1 q)[t] = q[t-1] + q[t+1] under
+// q[-1] = q[1] (since c'_1 c'_1 = c'_2 + 2) and q[N'] = 0 (since c'_{N'} = 0).
+//
+// grid: (small_degree / block, rank /* j */, num_total_primes), looping over
+// l, mirroring ModDecompA.
+template <typename word>
+__global__ void CiModDecompCombine(word *const *dst_ptrs, const word *alpha,
+                                   const word *primes, int rank,
+                                   int small_degree) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  const int j = blockIdx.y;
+  const int limb = blockIdx.z;
+
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  const word *comp = alpha + limb * rank * small_degree;
+
+  // (c'_1 * alpha_x)[t]
+  auto shifted = [&](int x) -> word {
+    const word lo = comp[x * small_degree + (t == 0 ? 1 : t - 1)];
+    const word hi =
+        (t + 1 < small_degree) ? comp[x * small_degree + t + 1] : word{0};
+    return basic::Add(lo, hi, prime);
+  };
+
+  for (int l = 0; l < rank; l++) {
+    word v;
+    if (j == 0) {
+      v = comp[l * small_degree + t];
+    } else if (l == 0) {
+      const word once = comp[j * small_degree + t];
+      v = basic::Add(basic::Add(once, once, prime), shifted(rank - j), prime);
+    } else {
+      const int d = (l > j) ? (l - j) : (j - l);
+      v = comp[d * small_degree + t];
+      if (l + j < rank) {
+        v = basic::Add(v, comp[(l + j) * small_degree + t], prime);
+      }
+      if (j > l) {
+        v = basic::Add(v, shifted(rank - (j - l)), prime);
+      }
+      if (l + j > rank) {
+        v = basic::Sub(v, comp[(2 * rank - l - j) * small_degree + t], prime);
+      }
+    }
+    dst_ptrs[l][(limb * rank + j) * small_degree + t] = v;
+  }
+}
+
+// The inverse interleaving on R+, for the a-part: A_j = sum_l a~_l[j] c_l,
+// which in coefficients is the banded two-term recomposition
+//
+//     A_j[tk + i] = q_i[t] + q_{k-i}[t+1],      q_x = a~_x[j], q_.[N'] = 0
+//
+// with the i = 0 class a pure copy. Indexing by the output coefficient keeps
+// a warp's stores contiguous, exactly as ModPackA does.
+//
+// grid: (degree / block, rank /* j */, num_total_primes)
+template <typename word>
+__global__ void CiModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
+                           const word *primes, int log_rank, int small_degree,
+                           int degree) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int j = blockIdx.y;
+  const int limb = blockIdx.z;
+
+  const int rank = 1 << log_rank;
+  const int i = x & (rank - 1);
+  const int t = x >> log_rank;
+
+  word value = basic::StreamingLoad(src_ptrs[i] +
+                                    (limb * rank + j) * small_degree + t);
+  if (i != 0 && t + 1 < small_degree) {
+    const word prime = basic::StreamingLoadConst(primes + limb);
+    const word mirror = basic::StreamingLoad(
+        src_ptrs[rank - i] + (limb * rank + j) * small_degree + t + 1);
+    value = basic::Add(value, mirror, prime);
+  }
+  dst_ptrs[j][limb * degree + x] = value;
+}
+
+// grid: (degree / block, num_total_primes)
+template <typename word>
+__global__ void CiModPackB(word *dst, const word *const *src_ptrs,
+                           const word *primes, int log_rank, int small_degree,
+                           int degree) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int limb = blockIdx.y;
+
+  const int rank = 1 << log_rank;
+  const int i = x & (rank - 1);
+  const int t = x >> log_rank;
+
+  word value = basic::StreamingLoad(src_ptrs[i] + limb * small_degree + t);
+  if (i != 0 && t + 1 < small_degree) {
+    const word prime = basic::StreamingLoadConst(primes + limb);
+    const word mirror =
+        basic::StreamingLoad(src_ptrs[rank - i] + limb * small_degree + t + 1);
+    value = basic::Add(value, mirror, prime);
+  }
+  dst[limb * degree + x] = value;
+}
+
 }  // namespace kernel
 
 template <typename word>
@@ -200,6 +387,39 @@ void MlweHandler<word>::ModDecomp(std::vector<MlweCiphertext<word>> &res,
   CopyHostToDevice(d_dst_b, h_dst_b);
 
   const word *primes = param_.GetPrimesPtr(np);
+
+  if (param_.conjugate_invariant_) {
+    // The banded form (see the kernel comments): scan the b-part straight
+    // into the per-ciphertext buffers, scan the a-part into a workspace of
+    // module components, and combine those into the a~ arrangement.
+    constexpr int scan_block_dim = 128;
+    const int num_chains = rank / 2 + 1;
+    const int scan_grid_dim =
+        DivCeil(num_total_primes * num_chains, scan_block_dim);
+
+    kernel::CiModDecompScan<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_dst_b.data(), small_degree, b_coeffs.data(), primes, rank,
+        small_degree, degree, num_total_primes);
+
+    DeviceVector<word> alpha(num_total_primes * degree);
+    HostVector<word *> h_alpha(rank);
+    for (int i = 0; i < rank; i++) {
+      h_alpha[i] = alpha.data() + i * small_degree;
+    }
+    DeviceVector<word *> d_alpha(rank);
+    CopyHostToDevice(d_alpha, h_alpha);
+
+    kernel::CiModDecompScan<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_alpha.data(), degree, a_coeffs.data(), primes, rank, small_degree,
+        degree, num_total_primes);
+
+    const dim3 grid_dim(small_degree / kernel_block_dim_, rank,
+                        num_total_primes);
+    kernel::CiModDecompCombine<word><<<grid_dim, kernel_block_dim_>>>(
+        d_dst_a.data(), alpha.data(), primes, rank, small_degree);
+    return;
+  }
+
   const dim3 grid_dim(small_degree / kernel_block_dim_, rank,
                       num_total_primes);
 
@@ -272,12 +492,21 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   CopyHostToDevice(d_dst_a, h_dst_a);
 
   const dim3 grid_a(degree / kernel_block_dim_, rank, num_total_primes);
-  kernel::ModPackA<word><<<grid_a, kernel_block_dim_>>>(
-      d_dst_a.data(), d_src_a.data(), log_rank, small_degree, degree);
-
   const dim3 grid_b(degree / kernel_block_dim_, num_total_primes);
-  kernel::ModPackB<word><<<grid_b, kernel_block_dim_>>>(
-      b_coeffs.data(), d_src_b.data(), log_rank, small_degree, degree);
+  if (param_.conjugate_invariant_) {
+    const word *primes = param_.GetPrimesPtr(np);
+    kernel::CiModPackA<word><<<grid_a, kernel_block_dim_>>>(
+        d_dst_a.data(), d_src_a.data(), primes, log_rank, small_degree,
+        degree);
+    kernel::CiModPackB<word><<<grid_b, kernel_block_dim_>>>(
+        b_coeffs.data(), d_src_b.data(), primes, log_rank, small_degree,
+        degree);
+  } else {
+    kernel::ModPackA<word><<<grid_a, kernel_block_dim_>>>(
+        d_dst_a.data(), d_src_a.data(), log_rank, small_degree, degree);
+    kernel::ModPackB<word><<<grid_b, kernel_block_dim_>>>(
+        b_coeffs.data(), d_src_b.data(), log_rank, small_degree, degree);
+  }
 
   // 2. Key-switch (A_j, 0) from the j-th embedded secret to the ordinary one,
   //    accumulating before the mod-down. The b-part is zero throughout, so
@@ -291,7 +520,7 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   input.RemoveRx();
   input.ModifyNP(np);
   input.SetScale(scale);
-  input.SetNumSlots(degree / 2);
+  input.SetNumSlots(param_.MaxNumSlots());
 
   // The switches are raised in groups and multiplied in one launch per group.
   // One at a time costs `rank` products plus `rank - 1` additions, and at
@@ -327,7 +556,7 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   res.RemoveRx();
   res.ModifyNP(np);
   res.SetScale(scale);
-  res.SetNumSlots(degree / 2);
+  res.SetNumSlots(param_.MaxNumSlots());
 
   // The accumulator is in whatever extended basis the keys carry, so the
   // mod-down has to come from the same basis.
