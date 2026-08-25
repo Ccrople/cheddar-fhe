@@ -140,6 +140,12 @@ add_executable(ci_lift_test CiLiftTest.cpp)
 target_link_libraries(ci_lift_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# ci16 -> RingSwitch -> CiLift -> [KANG] Alg. 4 -> CiDescend -> SwitchBack:
+# the conjugate-invariant CC-MM chain end to end, three rings alive at once.
+add_executable(ci_switched_ccmm_test CiSwitchedCcmmTest.cpp)
+target_link_libraries(ci_switched_ccmm_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # RingSwitch -> ModDecomp -> PC-MM -> ModPack -> Rescale -> SwitchBack, in one
 # process. The only place the chain's level and scale budget is checked.
 add_executable(pipeline_chain_test PipelineChainTest.cpp)
