@@ -27,6 +27,11 @@
 // bootparam_35, where the fold is complex and the code takes the other path, so
 // a half-applied change cannot pass quietly.
 //
+// Each direction is timed as well as checked. The transforms are the only part
+// of the bootstrap the ring changes -- EvalMod is slot-wise polynomial
+// evaluation either way -- so this and boot_test's total are between them the
+// whole cost accounting, and the pair form is where the branch pays.
+//
 // The transforms are compiled standalone rather than through BootContext, whose
 // constructor still refuses the conjugate-invariant flag. cts_const is set to
 // 1 / num_slots and stc_const to 1 so that what comes back is the answer itself
@@ -127,7 +132,9 @@ TEST_P(CiFft, CoeffToSlot) {
   interface_->Encrypt(ct, ptxt);
 
   Ciphertext<word> res_ct;
+  __ProfileStart("CoeffToSlot", 3, );
   fft.EvaluateCtS(context_, res_ct, ct, interface_->GetEvkMap());
+  __ProfileEnd("CoeffToSlot");
 
   std::vector<Complex> res;
   DecryptAndDecode(res, res_ct);
@@ -156,7 +163,9 @@ TEST_P(CiFft, SlotToCoeff) {
   EncodeAndEncrypt(ct, slots, level);
 
   Ciphertext<word> res_ct;
+  __ProfileStart("SlotToCoeff", 3, );
   fft.EvaluateStC(context_, res_ct, ct, interface_->GetEvkMap());
+  __ProfileEnd("SlotToCoeff");
 
   Plaintext<word> res_ptxt;
   interface_->Decrypt(res_ptxt, res_ct);
