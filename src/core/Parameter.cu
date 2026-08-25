@@ -217,6 +217,11 @@ Parameter<word>::Parameter(
 }
 
 template <typename word>
+int Parameter<word>::GetGaloisOffset(int galois_factor) const {
+  return conjugate_invariant_ ? (galois_factor - 1) / 2 : (galois_factor - 1);
+}
+
+template <typename word>
 int Parameter<word>::GetGaloisFactor(int i) const {
   AssertTrue(i >= 0 && i <= MaxNumSlots(),
              "GetGaloisFactor: Invalid Galois factor index");

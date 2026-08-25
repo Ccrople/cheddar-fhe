@@ -22,7 +22,8 @@ __global__ void BSFusedKernel(
     word **dst_bx, word **dst_ax, const word **mod_up, const word **key_bx,
     const word **key_ax, int num_accum, int num_rotations, const word *primes,
     const make_signed_t<word> *inv_primes, int num_q_primes, word *key_extra,
-    const word *input_bx_pseudo_modup, word *galois_factors, int log_degree) {
+    const word *input_bx_pseudo_modup, word *galois_factors,
+    word *galois_offsets, int log_degree) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   int x_idx = i & ((1 << log_degree) - 1);
@@ -41,9 +42,13 @@ __global__ void BSFusedKernel(
         basic::StreamingLoad(input_bx_pseudo_modup + i);
   }
   for (int k = 0; k < num_rotations; k++) {
+    // The same index map ElementWise's Permute kernels apply; see
+    // Parameter::GetGaloisOffset for why the constant term is not always
+    // galois_factor - 1.
     word galois_factor = galois_factors[k];
-    auto dst_index = basic::BitReverse(x_idx, log_degree + 1) + 1;
-    dst_index = dst_index * galois_factor - 1;
+    word galois_offset = galois_offsets[k];
+    auto dst_index = basic::BitReverse(x_idx, log_degree + 1);
+    dst_index = dst_index * galois_factor + galois_offset;
     dst_index = basic::BitReverse(dst_index, log_degree + 1);
 
     word res_bx_value = 0;
@@ -251,6 +256,7 @@ void HoistHandler<word>::BSFusedKeyMult(
   HostVector<word *> dst_a_ptrs(num_rotations, nullptr);
   HostVector<word> key_extra(num_rotations, 0);
   HostVector<word> galois_factors_h(num_rotations, 0);
+  HostVector<word> galois_offsets_h(num_rotations, 0);
 
   for (int i = 0; i < num_rotations; i++) {
     // keys
@@ -275,11 +281,12 @@ void HoistHandler<word>::BSFusedKeyMult(
     if (permute_amount == -1) {
       AssertTrue(false, "Conjugate case should not be handled.");
     }
-    AssertTrue(
-        permute_amount >= 0 && permute_amount < context->param_.degree_ / 2,
-        "Permute: Invalid permute amount");
-    galois_factors_h[i] = context->param_.GetGaloisFactor(
-        context->param_.degree_ / 2 - permute_amount);
+    const int max_num_slots = context->param_.MaxNumSlots();
+    AssertTrue(permute_amount >= 0 && permute_amount < max_num_slots,
+               "Permute: Invalid permute amount");
+    galois_factors_h[i] =
+        context->param_.GetGaloisFactor(max_num_slots - permute_amount);
+    galois_offsets_h[i] = context->param_.GetGaloisOffset(galois_factors_h[i]);
   }
   for (int i = 0; i < num_accum; i++) {
     modup_ptrs[i] = a_modup[i + num_accum_offset].data();
@@ -293,6 +300,7 @@ void HoistHandler<word>::BSFusedKeyMult(
   DeviceVector<word *> dst_a_d_ptrs(num_rotations);
   DeviceVector<word> key_extra_d(num_rotations);
   DeviceVector<word> galois_factors(num_rotations);
+  DeviceVector<word> galois_offsets(num_rotations);
   CopyHostToDevice(modup_d_ptrs, modup_ptrs);
   CopyHostToDevice(key_a_d_ptrs, key_a_ptrs);
   CopyHostToDevice(key_b_d_ptrs, key_b_ptrs);
@@ -300,6 +308,7 @@ void HoistHandler<word>::BSFusedKeyMult(
   CopyHostToDevice(dst_a_d_ptrs, dst_a_ptrs);
   CopyHostToDevice(key_extra_d, key_extra);
   CopyHostToDevice(galois_factors, galois_factors_h);
+  CopyHostToDevice(galois_offsets, galois_offsets_h);
 
   const word *primes = context->param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
@@ -318,7 +327,7 @@ void HoistHandler<word>::BSFusedKeyMult(
         key_b_d_ptrs.data(), key_a_d_ptrs.data(), num_accum, num_rotations,
         primes, inv_primes, num_q_primes, key_extra_d.data(),
         input_bx_pseudo_modup.data(), galois_factors.data(),
-        context->param_.log_degree_);
+        galois_offsets.data(), context->param_.log_degree_);
   });
 }
 

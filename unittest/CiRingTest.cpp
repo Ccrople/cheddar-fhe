@@ -103,6 +103,58 @@ std::vector<double> NegacyclicConvolution(const std::vector<double> &a,
   return res;
 }
 
+// The automorphism Y -> Y^g on R+, in the basis {1, c_1, ..., c_(degree-1)}.
+// It fixes 1 and sends c_j -> c_(jg), folded by c_-m = c_m, c_(m+2N) = -c_m,
+// c_N = 0 and c_0 = 2. That is a different fold from the negacyclic sign rule
+// below, which is what this pair is here to tell apart: the exponent runs mod
+// 4N rather than mod 2N, so the two agree only on the quarter of the indices
+// where jg mod 4N happens to land under N.
+std::vector<double> ConjugateInvariantPermute(const std::vector<double> &a,
+                                              int64_t g, int degree) {
+  std::vector<double> res(degree, 0.0);
+  res[0] = a[0];  // the automorphism fixes 1
+  const int64_t two_n = 2 * degree;
+  const int64_t four_n = 4 * degree;
+  for (int j = 1; j < degree; j++) {
+    if (a[j] == 0.0) continue;
+    int64_t m = (static_cast<int64_t>(j) * g) % four_n;
+    double v = a[j];
+    if (m >= two_n) {  // c_(m + 2N) = -c_m
+      m -= two_n;
+      v = -v;
+    }
+    if (m > degree) {  // c_m = -c_(2N - m)
+      m = two_n - m;
+      v = -v;
+    }
+    if (m == degree) continue;  // c_N = 0
+    if (m == 0) {
+      res[0] += 2.0 * v;  // c_0 = 2
+      continue;
+    }
+    res[m] += v;
+  }
+  return res;
+}
+
+// The ordinary ring's automorphism X -> X^g, for the contrast.
+std::vector<double> NegacyclicPermute(const std::vector<double> &a, int64_t g,
+                                      int degree) {
+  std::vector<double> res(degree, 0.0);
+  const int64_t two_n = 2 * degree;
+  for (int j = 0; j < degree; j++) {
+    if (a[j] == 0.0) continue;
+    int64_t m = (static_cast<int64_t>(j) * g) % two_n;
+    double v = a[j];
+    if (m >= degree) {
+      m -= degree;
+      v = -v;
+    }
+    res[m] += v;
+  }
+  return res;
+}
+
 double MaxAbsDiff(const std::vector<double> &x, const std::vector<double> &y) {
   double worst = 0.0;
   for (size_t i = 0; i < x.size(); i++) {
@@ -377,6 +429,67 @@ TEST_P(Testbed32, CiRingCiphertextProduct) {
            "distinguish them";
     ASSERT_GT(MaxAbsDiff(res, other), separation / 2.0)
         << "the result looks like the other ring product";
+  }
+}
+
+// Galois. HRot is a key switch followed by the index permutation, and the
+// index permutation is the thing this checks -- against the automorphism
+// written out in the ring basis on the host, which is where the two rings
+// visibly part company. It runs on a dense coefficient vector rather than a
+// sparse one so that the contrast is not left to chance: the two maps agree
+// only where jg mod 4N lands under N, which is about a quarter of the
+// indices, and a dense sample makes the remaining three quarters separate
+// them by order 1 every time.
+//
+// The distances are chosen so that a map right only on a subgroup fails: 1,
+// an odd distance that is not a power of two, and the far end of the orbit.
+TEST_P(Testbed32, CiRingRotation) {
+  const int degree = 1 << log_degree_;
+  const bool ci = param_->conjugate_invariant_;
+  const int max_num_slots = param_->MaxNumSlots();
+  const int level = param_->max_level_;
+
+  const std::vector<int> distances = {1, 3, 1234 % max_num_slots,
+                                      max_num_slots / 2 + 1,
+                                      max_num_slots - 1};
+
+  for (int rot : distances) {
+    interface_->PrepareRotationKey(rot, level);
+
+    std::vector<double> a(degree);
+    Random::SampleUniformReal(a.data(), degree, -1.0, 1.0);
+
+    const int64_t g = param_->GetGaloisFactor(rot);
+    const std::vector<double> expected =
+        ci ? ConjugateInvariantPermute(a, g, degree)
+           : NegacyclicPermute(a, g, degree);
+    const std::vector<double> other =
+        ci ? NegacyclicPermute(a, g, degree)
+           : ConjugateInvariantPermute(a, g, degree);
+
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), a);
+
+    Ciphertext<word> ct, ct_res;
+    interface_->Encrypt(ct, pt);
+    context_->HRot(ct_res, ct, interface_->GetRotationKey(rot), rot);
+
+    Plaintext<word> pt_out;
+    interface_->Decrypt(pt_out, ct_res);
+
+    std::vector<double> res;
+    context_->encoder_.DecodeCoeff(res, pt_out);
+
+    CompareCoeffs(expected, res, max_error_,
+                  "CiRingRotation by " + std::to_string(rot) + " (5^" +
+                      std::to_string(rot) + " = " + std::to_string(g) + ")");
+
+    const double separation = MaxAbsDiff(expected, other);
+    ASSERT_GT(separation, 1e-2)
+        << "the two rings' automorphisms are too close for this sample to "
+           "distinguish them";
+    ASSERT_GT(MaxAbsDiff(res, other), separation / 2.0)
+        << "the result looks like the other ring's automorphism";
   }
 }
 

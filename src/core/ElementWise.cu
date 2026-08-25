@@ -373,11 +373,12 @@ __global__ void Permute(int log_degree,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   uint32_t x_idx = i & (degree - 1);
-  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1) + 1;
+  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1);
 
   uint32_t gf = src1.galois_factor_;
-  int src1_idx = (prime_index << log_degree) +
-                 basic::BitReverse(x_idx_rev * gf - 1, log_degree + 1);
+  int src1_idx =
+      (prime_index << log_degree) +
+      basic::BitReverse(x_idx_rev * gf + src1.galois_offset_, log_degree + 1);
   if (prime_index >= num_q_primes) {
     src1_idx += src1.extra_;
   }
@@ -404,7 +405,7 @@ __global__ void PermuteAccum(int log_degree, OutputPtrList<word, num_poly> dst,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   uint32_t x_idx = i & (degree - 1);
-  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1) + 1;
+  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
 
   word result[num_poly] = {0};
@@ -416,7 +417,8 @@ __global__ void PermuteAccum(int log_degree, OutputPtrList<word, num_poly> dst,
   (
       [&] {
         uint32_t gf = srcs.galois_factor_;
-        int src_idx = basic::BitReverse(x_idx_rev * gf - 1, log_degree + 1);
+        int src_idx = basic::BitReverse(x_idx_rev * gf + srcs.galois_offset_,
+                                        log_degree + 1);
         if (aux_part) {
           src_idx += srcs.extra_;
         }
@@ -455,7 +457,7 @@ __global__ void PermuteAccumAdd(int log_degree,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   uint32_t x_idx = i & (degree - 1);
-  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1) + 1;
+  uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
   bool aux_part = (prime_index >= num_q_primes);
 
@@ -476,7 +478,8 @@ __global__ void PermuteAccumAdd(int log_degree,
   (
       [&] {
         uint32_t gf = srcs.galois_factor_;
-        int src_idx = basic::BitReverse(x_idx_rev * gf - 1, log_degree + 1);
+        int src_idx = basic::BitReverse(x_idx_rev * gf + srcs.galois_offset_,
+                                        log_degree + 1);
         if (aux_part) {
           src_idx += srcs.extra_;
         }
@@ -949,9 +952,13 @@ template <typename word>
 uint32_t ElementWiseHandler<word>::PermuteAmountToGaloisFactor(
     int permute_amount) const {
   if (permute_amount == -1) {
+    // Conjugation. On the real subring it is the {+-1} that (Z/4N)^* / {+-1}
+    // quotients out, so it acts trivially and the automorphism is the identity
+    // rather than X -> X^-1.
+    if (param_.conjugate_invariant_) return 1;
     return 2 * param_.degree_ - 1;
   }
-  AssertTrue(permute_amount >= 0 && permute_amount <= param_.degree_ / 2,
+  AssertTrue(permute_amount >= 0 && permute_amount <= param_.MaxNumSlots(),
              "Permute: Invalid permute amount");
   return param_.GetGaloisFactor(permute_amount);
 }
@@ -985,6 +992,7 @@ void ElementWiseHandler<word>::Permute(
     PermuteInputPtrList<word, j> src1_ptr_list(src1);
     src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
     src1_ptr_list.galois_factor_ = galois_factor;
+    src1_ptr_list.galois_offset_ = param_.GetGaloisOffset(galois_factor);
 
     kernel::Permute<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
         dst_ptr_list, num_q_primes, src1_ptr_list);
@@ -1125,6 +1133,8 @@ void ElementWiseHandler<word>::PermuteAccumWorker(
       src_ptr_list.back().extra_ = src_i.at(0).QSize() - q_size;
       src_ptr_list.back().galois_factor_ =
           PermuteAmountToGaloisFactor(permute_amounts.at(i));
+      src_ptr_list.back().galois_offset_ =
+          param_.GetGaloisOffset(src_ptr_list.back().galois_factor_);
     }
 
     if (has_extra_ct) {

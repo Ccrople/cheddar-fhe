@@ -346,9 +346,11 @@ void UserInterface<word>::PrepareRotationKey(int rot_idx, int max_level) {
   int max_num_ter = context_->param_.GetMaxNumTer();
   int degree = context_->param_.degree_;
   NPInfo np = GetNPForEvk(max_level);
-  int half_degree = degree / 2;
+  // The slot orbit, which is N on the real subring and N/2 on the ordinary
+  // ring -- the Galois group acting on the slots is (Z/M)^* / {+-1}.
+  int max_num_slots = context_->param_.MaxNumSlots();
 
-  AssertTrue(rot_idx > 0 && rot_idx < half_degree,
+  AssertTrue(rot_idx > 0 && rot_idx < max_num_slots,
              "Invalid rotation index " + std::to_string(rot_idx));
   if (evk_map_.find(rot_idx) != evk_map_.end()) {  // if already prepared
     const Evk &evk = evk_map_.at(rot_idx);
@@ -365,7 +367,7 @@ void UserInterface<word>::PrepareRotationKey(int rot_idx, int max_level) {
   int ter_left = max_num_ter - np.num_ter_;
 
   // we permute it in the opposite direction
-  context_->elem_handler_.Permute(s_rot, np, half_degree - rot_idx,
+  context_->elem_handler_.Permute(s_rot, np, max_num_slots - rot_idx,
                                   {MainSecretConstView(ter_left)});
   PrepareEvk(rot_idx, np, s_rot_dv, main_secret_);
 }
@@ -547,11 +549,17 @@ void UserInterface<word>::PrepareBasicEvks() {
   PrepareEvk(EvkMap<word>::kMultiplicationKeyIndex, np, main_secret_,
              s_squared);
 
-  // Conjugation key
-  Dv s_conj(np.GetNumTotal() * degree);
-  std::vector<DvView<word>> s_conj_view{s_conj.View(alpha * degree)};
-  context_->elem_handler_.Permute(s_conj_view, np, -1, sx_view);
-  PrepareEvk(EvkMap<word>::kConjugationKeyIndex, np, s_conj, main_secret_);
+  // Conjugation key. Not on the real subring: conjugation there is the
+  // {+-1} that (Z/4N)^* / {+-1} quotients out, so it fixes every element and
+  // the key would switch the secret to itself. Leaving it unbuilt makes an
+  // HConj on that ring fail at GetEvk with the index in the message, rather
+  // than quietly costing a key switch to do nothing.
+  if (!context_->param_.conjugate_invariant_) {
+    Dv s_conj(np.GetNumTotal() * degree);
+    std::vector<DvView<word>> s_conj_view{s_conj.View(alpha * degree)};
+    context_->elem_handler_.Permute(s_conj_view, np, -1, sx_view);
+    PrepareEvk(EvkMap<word>::kConjugationKeyIndex, np, s_conj, main_secret_);
+  }
 
   if (context_->param_.IsUsingSparseSecretEncapsulation()) {
     // Dense to Sparse key

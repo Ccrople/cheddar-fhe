@@ -99,6 +99,38 @@ class Parameter {
   int GetGaloisFactor(int i) const;
 
   /**
+   * @brief The constant term of the index map the Permute kernels apply.
+   *
+   * Writing `w` for the bit-reversed coefficient index, an automorphism reads
+   * its source at `w * g + GetGaloisOffset(g)` mod 2N. On the ordinary ring
+   * that is nothing new -- it is `(w + 1) * g - 1` rearranged, so the offset
+   * is `g - 1`.
+   *
+   * On the conjugate-invariant ring it is not. After the fold and the twist by
+   * `psi4^-j`, the position holding evaluation exponent `u` carries the CI
+   * evaluation point `Y^(2u - 1)`, so the transform's positions carry
+   * `(Z/2N)^*`, which is `Z/2 x Z/(N/2)`, while the slots carry
+   * `(Z/4N)^* / {+-1}`, which is **cyclic of order N**. The bijection between
+   * them, `k = 2u - 1`, is therefore not a group map and `Y -> Y^g` comes out
+   * affine rather than multiplicative:
+   *
+   *     u' = u g + (1 - g)/2   (mod 2N)
+   *
+   * which is exact, since `2u' - 1 = g (2u - 1)` identically. In `w` it is the
+   * same shape with the offset `(g - 1)/2` -- an integer because every Galois
+   * factor here is 1 mod 4, and even, so `u'` stays odd.
+   *
+   * No fixed twist removes this. A twist by `psi4^c` gives evaluation
+   * exponents `2 * 5^p + c`, and a cyclic slot order needs `c = 5c`, i.e.
+   * `c = 0 mod N`, against `c = 3 mod 4`: impossible for any N >= 4. So the
+   * offset is the whole of what the real subring costs the automorphism.
+   *
+   * @param galois_factor as returned by GetGaloisFactor
+   * @return int the additive half of the index map
+   */
+  int GetGaloisOffset(int galois_factor) const;
+
+  /**
    * @brief Number of slots a full-width message occupies: `degree_` real slots
    * in the conjugate-invariant ring, `degree_ / 2` complex ones otherwise.
    *

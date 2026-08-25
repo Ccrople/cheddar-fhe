@@ -600,6 +600,9 @@ void Context<word>::Permute(Ct &res, const Ct &a, int rot_dist) const {
 
 template <typename word>
 void Context<word>::PermuteConjugate(Ct &res, const Ct &a) const {
+  // On the conjugate-invariant ring this is the identity, and correctly so:
+  // conjugation is the {+-1} the acting group quotients out. It is left
+  // callable rather than refused because the identity is the right answer.
   static constexpr int conj_rot_idx = -1;
   // in-place operation is not supported
   if (&res == &a) {
@@ -997,6 +1000,10 @@ void Context<word>::HRot(Ct &res, const Ct &a, const Evk &rot_key,
 
 template <typename word>
 void Context<word>::HConj(Ct &res, const Ct &a, const Evk &conj_key) const {
+  AssertTrue(!param_.conjugate_invariant_,
+             "HConj: conjugation acts trivially on the real subring, so this "
+             "is a key switch that computes the identity -- use the "
+             "ciphertext itself");
   Ct tmp;
   MultKey(tmp, a, conj_key);
   PermuteConjugate(res, tmp);
@@ -1040,6 +1047,9 @@ void Context<word>::HRotAdd(Ct &res, const Ct &a, const Ct &b,
 template <typename word>
 void Context<word>::HConjAdd(Ct &res, const Ct &a, const Ct &b,
                              const Evk &conj_key) const {
+  AssertTrue(!param_.conjugate_invariant_,
+             "HConjAdd: conjugation acts trivially on the real subring -- this "
+             "is Add");
   AssertSameNP(a, b);
   AssertSameScale(a, b);
   int num_slots = Max(a.GetNumSlots(), b.GetNumSlots());

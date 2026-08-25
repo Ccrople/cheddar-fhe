@@ -278,6 +278,47 @@ TEST_P(Testbed32, CiSlotCiphertextProduct) {
   }
 }
 
+// The same automorphisms, read in the slot domain, which is where they are
+// supposed to be a cyclic shift. That they are is the payoff of the affine
+// index map: the transform's own positions carry (Z/2N)^*, the slots carry
+// (Z/4N)^* / {+-1}, and only in the slot coordinate does the action come out
+// as "move everything along by r".
+TEST_P(Testbed32, CiSlotRotation) {
+  const bool ci = param_->conjugate_invariant_;
+  const int num_slots = param_->MaxNumSlots();
+  const int level = param_->max_level_;
+
+  const std::vector<int> distances = {1, 3, 1234 % num_slots,
+                                      num_slots / 2 + 1, num_slots - 1};
+
+  for (int rot : distances) {
+    interface_->PrepareRotationKey(rot, level);
+
+    std::vector<Complex> msg;
+    GenerateRandomMessage(msg, num_slots, -1.0, 1.0, /*complex=*/!ci);
+    std::vector<Complex> expected(num_slots);
+    for (int i = 0; i < num_slots; i++) {
+      expected[i] = msg[(i + rot) % num_slots];
+    }
+
+    Plaintext<word> pt;
+    context_->encoder_.Encode(pt, level, DetermineScale(level), msg);
+
+    Ciphertext<word> ct, ct_res;
+    interface_->Encrypt(ct, pt);
+    context_->HRot(ct_res, ct, interface_->GetRotationKey(rot), rot);
+
+    Plaintext<word> pt_out;
+    interface_->Decrypt(pt_out, ct_res);
+
+    std::vector<Complex> res;
+    context_->encoder_.Decode(res, pt_out);
+
+    CompareSlots(expected, res, max_error_,
+                 "CiSlotRotation by " + std::to_string(rot));
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes, the same levels and the same shape
     // with the conjugate-invariant flag off -- the control.

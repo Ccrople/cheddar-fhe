@@ -66,7 +66,12 @@ template <typename word, int num_poly>
 struct PermuteInputPtrList {
   const word *ptrs_[num_poly];
   int extra_ = 0;
+  // The automorphism's index map, as Parameter::GetGaloisOffset describes it:
+  // the source of the bit-reversed index w is w * galois_factor_ +
+  // galois_offset_, taken mod 2N by the reversal that follows. The defaults
+  // are the identity.
   uint32_t galois_factor_ = 1;
+  uint32_t galois_offset_ = 0;
 
   PermuteInputPtrList() {
     for (int i = 0; i < num_poly; i++) {
