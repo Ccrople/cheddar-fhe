@@ -623,6 +623,11 @@ void Context<word>::PermuteConjugate(Ct &res, const Ct &a) const {
 
 template <typename word>
 void Context<word>::MultImaginaryUnit(Ct &res, const Ct &a) const {
+  // R+ is totally real: multiplying its slots by i lands outside the ring, and
+  // the ordinary ring's imaginary unit is not even an element of it.
+  AssertTrue(!param_.conjugate_invariant_,
+             "MultImaginaryUnit: the conjugate-invariant ring is totally real "
+             "and has no imaginary unit");
   MatchResultWith(res, a);
   res.SetNumSlots(a.GetNumSlots());
   res.SetScale(a.GetScale());

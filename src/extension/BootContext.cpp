@@ -38,16 +38,6 @@ template <typename word>
 BootContext<word>::BootContext(const Parameter<word> &param,
                                const BootParameter &boot_param)
     : Base(param), boot_param_{boot_param} {
-  // The bootstrap has not moved to the real subring. CoeffToSlot and
-  // SlotToCoeff are the encoding map run as a linear transform, and on R+ that
-  // map is a different one -- N real slots against N/2 complex, so no
-  // real/imaginary split to undo and a transform of twice the width. Refusing
-  // here rather than further down keeps a conjugate-invariant preset that
-  // carries bootstrap primes -- ci16_35 does -- from quietly building the
-  // ordinary ring's matrices.
-  AssertTrue(!param.conjugate_invariant_,
-             "BootContext: the bootstrap has no conjugate-invariant form yet");
-
   // Check if param and boot_param is consistent.
   //
   // The invariant is on where EvalMod *ends*, not on where StC starts. Those
@@ -98,7 +88,18 @@ BootContext<word>::BootContext(const Parameter<word> &param,
                          param.GetRescalePrimeProd(eval_mod_start_level - i);
   }
 
-  // See the development notes for details
+  // See the development notes for details.
+  //
+  // Both constants carry over to the real subring unchanged, which is not
+  // obvious and was verified numerically before it was relied on. The 1/degree
+  // in cts_const_ is the product of three factors that shift against each
+  // other: Trace contributes MaxNumSlots() / num_slots, the CtS stages
+  // contribute num_slots, and the ordinary ring's real/imaginary split
+  // contributes a further 2 that the real subring does not need -- because its
+  // MaxNumSlots() is degree where the ordinary ring's is degree / 2. Both
+  // products are degree. stc_const_ needs no adjustment either: SlotToCoeff
+  // lands on E a exactly, once the diag(1, 2, ..., 2) that E^T E leaves behind
+  // is folded into its first phase (EvalSpecialFFT.cpp).
   cts_const_ =
       (UINT64_C(1) << (log_eval_mod_start_scale - this->param_.log_degree_)) /
       (q0_prod * actual_K);
@@ -148,14 +149,14 @@ double BootContext<word>::GetStCConst(BootVariant variant) const {
 template <typename word>
 int BootContext<word>::GetBootEnabledNumSlots(int num_slots) const {
   int orig_num_slots = num_slots;
-  int half_degree = this->param_.degree_ / 2;
-  AssertTrue(num_slots <= half_degree, "num_slots exceeds max_num_slots");
+  int max_num_slots = this->param_.MaxNumSlots();
+  AssertTrue(num_slots <= max_num_slots, "num_slots exceeds max_num_slots");
   AssertTrue(IsPowOfTwo(num_slots), "Num slots must be power of 2");
   if (!IsBootPrepared(num_slots)) {
     Warn("BootContext not prepared for num slots: " +
          std::to_string(num_slots));
     num_slots *= 2;
-    while (num_slots <= half_degree) {
+    while (num_slots <= max_num_slots) {
       if (IsBootPrepared(num_slots)) {
         Warn("Using BootContext prepared for num slots: " +
              std::to_string(num_slots));
@@ -163,7 +164,7 @@ int BootContext<word>::GetBootEnabledNumSlots(int num_slots) const {
       }
       num_slots *= 2;
     }
-    if (num_slots > half_degree) {
+    if (num_slots > max_num_slots) {
       Fail("No BootContext available for num slots: " +
            std::to_string(orig_num_slots));
     }
@@ -184,6 +185,15 @@ template <typename word>
 void BootContext<word>::PrepareEvalSpecialFFT(int num_slots,
                                               BootVariant variant) {
   AssertTrue(IsPowOfTwo(num_slots), "Only power-of-two slots are supported");
+  // Both non-default variants are statements about an imaginary part: one
+  // removes it after StC, the other packs two real messages into one complex
+  // ciphertext. The real subring has no imaginary part to remove and no second
+  // axis to pack into -- its slots are already real and already all used.
+  AssertTrue(!this->param_.conjugate_invariant_ ||
+                 variant == BootVariant::kNormal,
+             "PrepareEvalSpecialFFT: kImaginaryRemoving and kMergeTwoReal are "
+             "statements about an imaginary part the real subring does not "
+             "have");
   // TODO: Implement PrepareBootConversionMatrices
   eval_fft_.try_emplace(num_slots, GetContext(), boot_param_, num_slots,
                         GetCtSConst(), GetStCConst(variant));
@@ -199,7 +209,7 @@ bool BootContext<word>::IsBootPrepared(int num_slots) const {
 template <typename word>
 void BootContext<word>::AddRequiredRotations(EvkRequest &req, int num_slots,
                                              bool min_ks) const {
-  int max_num_slots = this->param_.degree_ / 2;
+  int max_num_slots = this->param_.MaxNumSlots();
   num_slots = GetBootEnabledNumSlots(num_slots);
   // Trace and rotations for possible slot modification after StC
   for (int ns = num_slots; ns < max_num_slots; ns *= 2) {
@@ -400,12 +410,48 @@ void BootContext<word>::EvaluateMod(Ct &res, const Ct &input,
 }
 
 template <typename word>
+void BootContext<word>::EvaluateModAfterCtS(Ct &res, Ct &main_ct,
+                                            bool full_slot,
+                                            const EvkMap<word> &evk_map) const {
+  main_ct.SetScale(eval_mod_->start_scale_);
+
+  if (this->param_.conjugate_invariant_) {
+    // Nothing to unpick. CoeffToSlot on the real subring lands the coefficient
+    // vector in REAL slots, so the modular reduction runs once over all of
+    // them. The ordinary ring spends two EvalMod calls separating a real half
+    // from an imaginary one, or one plus a conjugation key switch when there
+    // are spare slots to merge into -- and it needs two ciphertexts to carry
+    // what this carries in one. That is where the branch earns back the
+    // transform costing twice as much (Doing.md 1.5bb).
+    EvaluateMod(res, main_ct, evk_map.GetMultiplicationKey());
+    return;
+  }
+
+  if (full_slot) {
+    Ct ct_conj;
+    this->HConj(ct_conj, main_ct, evk_map.GetConjugationKey());
+    // Perform eval mod on real and imag part separately
+    this->Add(res, main_ct, ct_conj);
+    this->Sub(ct_conj, ct_conj, main_ct);
+    this->MultImaginaryUnit(ct_conj, ct_conj);
+    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
+    EvaluateMod(ct_conj, ct_conj, evk_map.GetMultiplicationKey());
+    this->MultImaginaryUnit(ct_conj, ct_conj);
+    this->Add(res, res, ct_conj);
+  } else {
+    // Can merge real and imag part using extra slots
+    this->HConjAdd(res, main_ct, main_ct, evk_map.GetConjugationKey());
+    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
+  }
+}
+
+template <typename word>
 void BootContext<word>::Boot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
-  int half_degree = this->param_.degree_ / 2;
+  int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
   int num_slots = GetBootEnabledNumSlots(input_num_slots);
-  bool full_slot = (num_slots == half_degree);
+  bool full_slot = (num_slots == max_num_slots);
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
 
   Ct main_ct;
@@ -434,31 +480,15 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
   ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel());
 
   // Perform trace
-  main_ct.SetNumSlots(half_degree);
-  Trace(main_ct, num_slots, (half_degree / num_slots), main_ct, evk_map);
+  main_ct.SetNumSlots(max_num_slots);
+  Trace(main_ct, num_slots, (max_num_slots / num_slots), main_ct, evk_map);
   main_ct.SetNumSlots(num_slots);
 
   // 2. Perform CtS
   CoeffToSlot(main_ct, num_slots, main_ct, evk_map, min_ks);
 
-  // 3. Extract real/imag part and perform EvalMod
-  main_ct.SetScale(eval_mod_->start_scale_);
-  if (full_slot) {
-    Ct ct_conj;
-    this->HConj(ct_conj, main_ct, evk_map.GetConjugationKey());
-    // Perform eval mod on real and imag part separately
-    this->Add(res, main_ct, ct_conj);
-    this->Sub(ct_conj, ct_conj, main_ct);
-    this->MultImaginaryUnit(ct_conj, ct_conj);
-    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
-    EvaluateMod(ct_conj, ct_conj, evk_map.GetMultiplicationKey());
-    this->MultImaginaryUnit(ct_conj, ct_conj);
-    this->Add(res, res, ct_conj);
-  } else {
-    // Can merge real and imag part using extra slots
-    this->HConjAdd(res, main_ct, main_ct, evk_map.GetConjugationKey());
-    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
-  }
+  // 3. Take the coefficients through EvalMod.
+  EvaluateModAfterCtS(res, main_ct, full_slot, evk_map);
 
   // 4. Finally, perform StC.
   //
@@ -506,10 +536,10 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
 template <typename word>
 void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
-  int half_degree = this->param_.degree_ / 2;
+  int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
   int num_slots = GetBootEnabledNumSlots(input_num_slots);
-  bool full_slot = (num_slots == half_degree);
+  bool full_slot = (num_slots == max_num_slots);
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
 
   Ct main_ct;
@@ -538,31 +568,15 @@ void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
   ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel());
 
   // Perform trace
-  main_ct.SetNumSlots(half_degree);
-  Trace(main_ct, num_slots, (half_degree / num_slots), main_ct, evk_map);
+  main_ct.SetNumSlots(max_num_slots);
+  Trace(main_ct, num_slots, (max_num_slots / num_slots), main_ct, evk_map);
   main_ct.SetNumSlots(num_slots);
 
   // 2. Perform CtS
   CoeffToSlot(main_ct, num_slots, main_ct, evk_map, min_ks);
 
-  // 3. Extract real/imag part and perform EvalMod
-  main_ct.SetScale(eval_mod_->start_scale_);
-  if (full_slot) {
-    Ct ct_conj;
-    this->HConj(ct_conj, main_ct, evk_map.GetConjugationKey());
-    // Perform eval mod on real and imag part separately
-    this->Add(res, main_ct, ct_conj);
-    this->Sub(ct_conj, ct_conj, main_ct);
-    this->MultImaginaryUnit(ct_conj, ct_conj);
-    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
-    EvaluateMod(ct_conj, ct_conj, evk_map.GetMultiplicationKey());
-    this->MultImaginaryUnit(ct_conj, ct_conj);
-    this->Add(res, res, ct_conj);
-  } else {
-    // Can merge real and imag part using extra slots
-    this->HConjAdd(res, main_ct, main_ct, evk_map.GetConjugationKey());
-    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
-  }
+  // 3. Take the coefficients through EvalMod.
+  EvaluateModAfterCtS(res, main_ct, full_slot, evk_map);
 
   // 4. NO StC. Boot's CoeffToSlot/SlotToCoeff pair is what makes it
   // domain-preserving; stopping here leaves the input's *coefficients* sitting

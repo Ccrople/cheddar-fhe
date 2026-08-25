@@ -57,6 +57,21 @@ class BootContext : public Context<word>,
 
   int GetBootEnabledNumSlots(int num_slots) const;
 
+  /**
+   * @brief Step 3 of the bootstrap, shared by Boot and HalfBoot: take what
+   * CoeffToSlot produced through EvalMod.
+   *
+   * Three shapes, and which one applies is a fact about the ring rather than
+   * about the schedule. The ordinary ring's CtS leaves the coefficient vector
+   * folded into complex slots, so the halves have to be separated before a
+   * real modular reduction can act on them -- two EvalMod calls at full slot,
+   * or one plus a conjugation key switch when sparse packing leaves room to
+   * merge them. On the real subring the slots are already real and there is
+   * nothing to separate: one EvalMod, no conjugation key, and none is built.
+   */
+  void EvaluateModAfterCtS(Ct &res, Ct &main_ct, bool full_slot,
+                           const EvkMap<word> &evk_map) const;
+
   ContextPtr<word> GetContext();
   ConstContextPtr<word> GetContext() const;
 
