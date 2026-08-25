@@ -34,12 +34,21 @@
 //   PcmmOnComponentsMatchesHostMap -- the product itself between the two:
 //       ModDecomp, the scalar PC-MM across the module components, ModPack,
 //       decrypt, against the same map in exact arithmetic on the host.
+//
+//   PcmmBlasMatchesTheHandKernelOnComponents (USE_CUBLAS) -- the int8
+//       tensor-core route against the hand kernel, bit for bit, at the
+//       projection's own small degree of 256. On ci16_35 that is rank 256
+//       out of degree 65536 -- the real configuration's first device run,
+//       which the indexing test above also spot-checks semantically.
 
 #undef ENABLE_EXTENSION
 
 #include "Testbed.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
+#ifdef USE_CUBLAS
+#include "core/PcmmBlas.h"
+#endif
 
 using word = uint32_t;
 
@@ -292,15 +301,36 @@ TEST_P(Testbed32, CiModDecompMatchesHostIndexing) {
   mlwe.ComponentToHostCoeffs(host_a, ct.AxConstView(), np);
   mlwe.ComponentToHostCoeffs(host_b, ct.BxConstView(), np);
 
-  for (int small_degree : {degree / 4, degree / 16}) {
+  std::vector<int> small_degrees{degree / 4, degree / 16};
+  // The projection's own small degree. degree / 16 already is 256 on the
+  // degree-4096 presets; on ci16_35 this adds rank 256, the real
+  // configuration.
+  if (degree / 16 != 256) small_degrees.push_back(256);
+
+  for (int small_degree : small_degrees) {
     const int rank = degree / small_degree;
+
+    // The full a~ table costs rank^2 * N' on the host, so above rank 16 the
+    // comparison narrows to a spot set of components and columns that still
+    // hits every branch of the formula: the pure column, the l = 0 row, both
+    // mirror halves, the self-mirror class, the l+j = k boundary and the
+    // l+j > k negative branch. The kernels themselves have no rank-dependent
+    // branches beyond these.
+    std::vector<int> spots;
+    if (rank <= 16) {
+      for (int i = 0; i < rank; i++) spots.push_back(i);
+    } else {
+      spots = {0,        1,            2,            rank / 2 - 1,
+               rank / 2, rank / 2 + 1, rank - 2,     rank - 1};
+    }
 
     std::vector<MlweCiphertext<word>> parts;
     mlwe.ModDecomp(parts, ct, small_degree);
     ASSERT_EQ(static_cast<int>(parts.size()), rank);
 
     std::cout << "CI ModDecomp degree " << degree << " -> " << small_degree
-              << ", rank " << rank << ", " << num_total_primes << " limbs"
+              << ", rank " << rank << ", " << num_total_primes << " limbs, "
+              << spots.size() << " of " << rank << " components checked"
               << std::endl;
 
     // The scan and the a~ combination per limb, from the host coefficients.
@@ -317,7 +347,7 @@ TEST_P(Testbed32, CiModDecompMatchesHostIndexing) {
       beta[limb] = CiDecompose(b_limb, rank, small_degree, p);
     }
 
-    for (int i = 0; i < rank; i++) {
+    for (int i : spots) {
       ASSERT_EQ(parts[i].rank_, rank);
       ASSERT_EQ(parts[i].degree_, small_degree);
 
@@ -346,7 +376,7 @@ TEST_P(Testbed32, CiModDecompMatchesHostIndexing) {
           }
         }
 
-        for (int j = 0; j < rank; j++) {
+        for (int j : spots) {
           const IPoly expected_a = ATildeCi(alpha[limb], i, j, rank, p);
           for (int t = 0; t < small_degree; t++) {
             const uint64_t obtained =
@@ -509,6 +539,90 @@ TEST_P(Testbed32, PcmmOnComponentsMatchesHostMap) {
             << level << ": max error " << max_abs << std::endl;
   ASSERT_LT(max_abs, 1e-3);
 }
+
+#ifdef USE_CUBLAS
+// The int8 tensor-core route against the hand kernel, bit for bit -- the
+// PcmmBlasTest standard, on this ring. The GEMM path splits residues into
+// int8 pieces and recombines them mod p, and none of that sees the basis;
+// what it must not trip over is the container the conjugate-invariant
+// ModDecomp filled and this parameter set's 1-mod-4N primes. kSmallDegree is
+// 256, the degree the projections actually run at, so on ci16_35 this drives
+// ModDecomp and both products at rank 256 out of degree 65536 -- the real
+// configuration -- with the semantic anchor carried by the indexing test's
+// spot checks and by the hand kernel's own end-to-end test above.
+TEST_P(Testbed32, PcmmBlasMatchesTheHandKernelOnComponents) {
+  constexpr int kSmallDegree = 256;
+  constexpr int kParents = 2;
+  constexpr double kWeightScale = 1073741824.0;  // 2^30, as in PcmmBlasTest
+
+  const int degree = param_->degree_;
+  const int level = std::min(2, param_->max_level_);
+  const double ct_scale = DetermineScale(level);
+  const int rank = degree / kSmallDegree;
+  const int cols = kParents * rank;
+  const int rows = rank;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+  PcmmHandler<word> pcmm(*param_);
+  PcmmBlasHandler<word> blas(*param_);
+
+  std::vector<MlweCiphertext<word>> columns;
+  {
+    std::vector<double> coeffs(degree);
+    Plaintext<word> pt;
+    Ciphertext<word> ct;
+    for (int parent = 0; parent < kParents; parent++) {
+      Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+      interface_->Encrypt(ct, pt);
+      std::vector<MlweCiphertext<word>> decomposed;
+      mlwe.ModDecomp(decomposed, ct, kSmallDegree);
+      for (auto &c : decomposed) columns.push_back(std::move(c));
+    }
+  }
+  ASSERT_EQ(static_cast<int>(columns.size()), cols);
+
+  std::vector<double> values(static_cast<size_t>(rows) * cols);
+  Random::SampleUniformReal(values.data(), values.size(), -0.5, 0.5);
+
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, kWeightScale, values, rows, cols);
+  typename PcmmBlasHandler<word>::SplitMatrix us;
+  blas.SplitMatrixFrom(us, level, kWeightScale, values, rows, cols);
+
+  std::vector<MlweCiphertext<word>> want, got;
+  pcmm.Multiply(want, u, columns);
+  blas.Multiply(got, us, columns);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(want.size(), got.size());
+
+  size_t mismatches = 0, words = 0;
+  for (int i = 0; i < rows; i++) {
+    ASSERT_EQ(want[i].a_.size(), got[i].a_.size());
+    ASSERT_EQ(want[i].b_.size(), got[i].b_.size());
+    HostVector<word> ha(want[i].a_.size()), ga(got[i].a_.size());
+    HostVector<word> hb(want[i].b_.size()), gb(got[i].b_.size());
+    CopyDeviceToHost(ha, want[i].a_);
+    CopyDeviceToHost(ga, got[i].a_);
+    CopyDeviceToHost(hb, want[i].b_);
+    CopyDeviceToHost(gb, got[i].b_);
+    for (size_t k = 0; k < ha.size(); k++) {
+      if (ha[k] != ga[k]) mismatches++;
+    }
+    for (size_t k = 0; k < hb.size(); k++) {
+      if (hb[k] != gb[k]) mismatches++;
+    }
+    words += ha.size() + hb.size();
+  }
+  std::cout << (param_->conjugate_invariant_ ? "CI" : "ordinary")
+            << " blas-vs-hand at degree " << degree << " -> " << kSmallDegree
+            << ", rank " << rank << ", " << cols << " columns, level " << level
+            << ": compared " << words << " words" << std::endl;
+  EXPECT_EQ(mismatches, 0u)
+      << "the cuBLAS path does not reproduce PcmmAccum on this ring";
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes and shape with the flag off -- the
