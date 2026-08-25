@@ -31,6 +31,14 @@ add_executable(ci_ring_test CiRingTest.cpp)
 target_link_libraries(ci_ring_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The conjugate-invariant slot encoding, which is what the ring is for: N real
+# slots against the ordinary ring's N/2 complex ones. Validated against the
+# canonical embedding summed directly on the host, so the encoder's own
+# transform is not its own reference.
+add_executable(ci_slot_test CiSlotTest.cpp)
+target_link_libraries(ci_slot_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # Coefficient-domain encoding, for the reduction-based matrix products.
 add_executable(coeff_encode_test CoeffEncodeTest.cpp)
 target_link_libraries(coeff_encode_test

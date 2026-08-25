@@ -14,9 +14,9 @@ Encoder<word>::Encoder(const Parameter<word> &param,
                        const NTTHandler<word> &ntt_handler)
     : param_{param},
       ntt_handler_{ntt_handler},
-      M_{param.degree_ * 2},
-      twiddle_factors_(param.degree_ * 2) {
-  for (int i = 0; i < param.degree_ * 2; i++) {
+      M_{param.CyclotomicIndex()},
+      twiddle_factors_(param.CyclotomicIndex()) {
+  for (int i = 0; i < M_; i++) {
     // e^(2*pi*sqrt(-1)*i/M)
     twiddle_factors_[i] = std::polar(1.0, 2.0 * M_PI * i / M_);
   }
@@ -28,8 +28,28 @@ void Encoder<word>::Encode(Plaintext<word> &ptxt, int level, double scale,
                            int num_aux /*= 0*/) const {
   int msg_length = message.size();
   int num_slots = 1 << Log2Ceil<int>(msg_length);
+  AssertTrue(num_slots <= param_.MaxNumSlots(),
+             "Encode: too many slots for this ring");
   std::vector<Complex> padded_msg(num_slots);
   std::copy(message.begin(), message.end(), padded_msg.begin());
+
+  if (param_.conjugate_invariant_) {
+    // R+ is totally real: a slot is one real number and there is nowhere for
+    // an imaginary part to go. Dropping it quietly would encode something the
+    // caller did not ask for, so it is a caller error. The bound is relative,
+    // because a message built out of cosines carries a rounding-sized
+    // imaginary residue that means nothing.
+    double max_real = 0.0;
+    double max_imag = 0.0;
+    for (const auto &value : padded_msg) {
+      max_real = std::max(max_real, std::abs(value.real()));
+      max_imag = std::max(max_imag, std::abs(value.imag()));
+    }
+    AssertTrue(max_imag <= 1e-8 * std::max(max_real, 1.0),
+               "Encode: the conjugate-invariant ring has real slots, and this "
+               "message has an imaginary part");
+  }
+
   EncodeWorker(ptxt, level, scale, padded_msg, num_aux);
 }
 
@@ -38,7 +58,11 @@ void Encoder<word>::EncodeWorker(Plaintext<word> &ptxt, int level, double scale,
                                  std::vector<Complex> &message,
                                  int num_aux /*= 0*/) const {
   SpecialIFFT(message);
-  ComplexVectorToPlaintext(ptxt, level, scale, message, num_aux);
+  if (param_.conjugate_invariant_) {
+    FoldedVectorToPlaintext(ptxt, level, scale, message, num_aux);
+  } else {
+    ComplexVectorToPlaintext(ptxt, level, scale, message, num_aux);
+  }
   NPInfo np = param_.LevelToNP(level, num_aux);
   auto mx_temp = ptxt.View();
   ntt_handler_.NTT(mx_temp, np, ptxt.ConstView(), true);
@@ -47,30 +71,11 @@ void Encoder<word>::EncodeWorker(Plaintext<word> &ptxt, int level, double scale,
 template <typename word>
 void Encoder<word>::Decode(std::vector<Complex> &message,
                            const Plaintext<word> &ptxt) const {
-  // Message padding
   Plaintext<word> tmp;
   NPInfo np = ptxt.GetNP();
   AssertTrue(np.num_aux_ == 0, "Decode: Aux primes not supported");
-  auto primes = param_.GetPrimeVector(np);
-  int num_total_primes = np.GetNumTotal();
-  word degree = param_.degree_;
 
-  // Create iCRT constants
-  HostVector<word> icrt1(num_total_primes);
-  for (int i = 0; i < num_total_primes; i++) {
-    word mod_prime = primes[i];
-    word prod = 1;
-    for (int j = 0; j < num_total_primes; j++) {
-      if (i == j) continue;
-      prod = primeutil::MultMod(prod, primes[j], mod_prime);
-    }
-    prod = primeutil::MultMod(prod, degree, mod_prime);
-    // deliberately not using the Montgomery form here
-    icrt1[i] = primeutil::InvMod(prod, mod_prime);
-  }
-
-  DeviceVector<word> icrt1_dv(num_total_primes);
-  CopyHostToDevice(icrt1_dv, icrt1);
+  DeviceVector<word> icrt1_dv = MakeICRTConstants(np);
 
   tmp.ModifyNP(np);
   tmp.SetNumSlots(ptxt.GetNumSlots());
@@ -79,7 +84,11 @@ void Encoder<word>::Decode(std::vector<Complex> &message,
   auto mx_temp = tmp.View();
   ntt_handler_.INTTAndMultConst(mx_temp, np, ptxt.ConstView(),
                                 icrt1_dv.ConstView());
-  PlaintextToComplexVector(message, tmp);
+  if (param_.conjugate_invariant_) {
+    PlaintextToFoldedVector(message, tmp);
+  } else {
+    PlaintextToComplexVector(message, tmp);
+  }
   SpecialFFT(message);
 }
 
@@ -176,7 +185,7 @@ void Encoder<word>::RealVectorToPlaintext(Plaintext<word> &ptxt, int level,
   ptxt.ModifyNP(np);
   // Coefficient encoding occupies every coefficient, so the slot metadata is
   // set to the full width; it is not meaningful for this encoding.
-  ptxt.SetNumSlots(degree / 2);
+  ptxt.SetNumSlots(param_.MaxNumSlots());
   ptxt.SetScale(scale);
   CopyHostToDevice(ptxt.mx_, mx);
 }
@@ -225,6 +234,63 @@ void Encoder<word>::PlaintextToRealVector(std::vector<double> &coeffs,
     }
     BigInt::NormalizeMod(icrt, icrt, prime_prod, half_prime_prod);
     coeffs[i] = icrt.GetDouble() / scale;
+  }
+}
+
+// The conjugate-invariant counterparts of the two functions above.
+//
+// SpecialIFFT at S slots returns the fold of the rank-S subring element, so
+// the ring basis is its real part and its imaginary part is the same
+// coefficients mirrored:
+//
+//     f[r] = a_(r*gap) - i a_((S-r)*gap),   gap = degree / S,   f[0] = a_0
+//
+// -- f[0] has no mirror partner because the lift's coefficient at Y^N is zero,
+// which is the one place the antisymmetry pins a value rather than relating
+// two. That the imaginary half carries nothing new is exactly the halving,
+// restated on the host: N real slots out of the same N coefficients.
+template <typename word>
+void Encoder<word>::FoldedVectorToPlaintext(Plaintext<word> &ptxt, int level,
+                                            double scale,
+                                            const std::vector<Complex> &data,
+                                            int num_aux /*= 0*/) const {
+  int num_slots = data.size();
+  int degree = param_.degree_;
+
+  AssertTrue(num_slots == (1 << Log2Ceil(num_slots)),
+             "FoldedVectorToPlaintext: Power of 2 num slots only");
+  AssertTrue(num_slots <= degree, "FoldedVectorToPlaintext: Too many slots");
+  int gap = degree / num_slots;
+
+  std::vector<double> coeffs(degree, 0.0);
+  for (int i = 0; i < num_slots; i++) {
+    coeffs[i * gap] = data[i].real();
+  }
+
+  RealVectorToPlaintext(ptxt, level, scale, coeffs, num_aux);
+  // RealVectorToPlaintext has no slot count of its own to record; this one
+  // does, and a sparsely packed message needs it to decode.
+  ptxt.SetNumSlots(num_slots);
+}
+
+template <typename word>
+void Encoder<word>::PlaintextToFoldedVector(std::vector<Complex> &data,
+                                            const Plaintext<word> &ptxt) const {
+  int num_slots = ptxt.GetNumSlots();
+  int degree = param_.degree_;
+
+  AssertTrue(num_slots == (1 << Log2Ceil(num_slots)),
+             "PlaintextToFoldedVector: Power of 2 num slots only");
+  AssertTrue(num_slots <= degree, "PlaintextToFoldedVector: Too many slots");
+  int gap = degree / num_slots;
+
+  std::vector<double> coeffs;
+  PlaintextToRealVector(coeffs, ptxt);
+
+  data.resize(num_slots);
+  data[0] = Complex(coeffs[0], 0.0);
+  for (int i = 1; i < num_slots; i++) {
+    data[i] = Complex(coeffs[i * gap], -coeffs[(num_slots - i) * gap]);
   }
 }
 
@@ -423,6 +489,14 @@ void Encoder<word>::EncodeSinC(Plaintext<word> &ptxt, int level, double scale,
                                const std::vector<Complex> &message,
                                int sub_degree, int num_aux /*= 0*/) const {
   const int degree = param_.degree_;
+  // SinC reads R_N as a free module over R_k on {Y^i}, which is what makes
+  // "offset i, stride N/k" a bijection onto the coefficients. R+ is free over
+  // its own rank-k subring on {c_i} as a module, but the multiplication is
+  // not a stride gather there -- c_i c_(km) = c_(km+i) + c_(km-i) hits two
+  // indices -- so the interleave has to become a banded map first. That is
+  // the same open item as ModDecomp, and it is not settled here.
+  AssertTrue(!param_.conjugate_invariant_,
+             "EncodeSinC: no conjugate-invariant form yet");
   const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
   AssertTrue(static_cast<int>(message.size()) == degree / 2,
              "EncodeSinC: message must fill every slot of the ring");
@@ -455,6 +529,9 @@ void Encoder<word>::DecodeSinC(std::vector<Complex> &message,
                                const Plaintext<word> &ptxt,
                                int sub_degree) const {
   const int degree = param_.degree_;
+  // See EncodeSinC.
+  AssertTrue(!param_.conjugate_invariant_,
+             "DecodeSinC: no conjugate-invariant form yet");
   const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
 
   std::vector<double> coeffs;

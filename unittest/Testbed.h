@@ -265,8 +265,7 @@ class Testbed : public testing::TestWithParam<const char *> {
   void GenerateRandomMessage(std::vector<Complex> &res, int num_slots = -1,
                              double range_min = -1.0, double range_max = 1.0,
                              bool complex = true) {
-    int degree = 1 << log_degree_;
-    if (num_slots == -1) num_slots = degree / 2;
+    if (num_slots == -1) num_slots = param_->MaxNumSlots();
 
     res.resize(num_slots);
     std::fill(res.begin(), res.end(), Complex(0, 0));

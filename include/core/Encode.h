@@ -34,6 +34,11 @@ class Encoder {
                                 int num_aux = 0) const;
   void PlaintextToComplexVector(std::vector<Complex> &data,
                                 const Plaintext<word> &ptxt) const;
+  void FoldedVectorToPlaintext(Plaintext<word> &ptxt, int level, double scale,
+                               const std::vector<Complex> &data,
+                               int num_aux = 0) const;
+  void PlaintextToFoldedVector(std::vector<Complex> &data,
+                               const Plaintext<word> &ptxt) const;
   void RealVectorToPlaintext(Plaintext<word> &ptxt, int level, double scale,
                              const std::vector<double> &coeffs,
                              int num_aux = 0) const;
@@ -54,19 +59,47 @@ class Encoder {
 
   /**
    * @brief Encode a message into a plaintext for a given level and scale.
-   * The message will be padded to the nearest power of 2.
+   * The message will be padded to the nearest power of 2, and may hold up to
+   * `Parameter::MaxNumSlots()` entries.
+   *
+   * ## The conjugate-invariant ring
+   *
+   * R+ = Z[Y + Y^-1] is totally real, so its canonical embedding lands in R^N
+   * and there are **N real slots** where the ordinary ring has N/2 complex
+   * ones. The message is then a real vector, and a complex one is rejected
+   * rather than silently halved -- there is no imaginary axis for it to use.
+   *
+   * No new host transform was needed for it. SpecialFFT's twiddle stride is
+   * `gap = M_ / st8`, so `twiddle_factors_[k * gap] = exp(2 pi i k / st8)` and
+   * the transform depends only on the slot count: at S slots it evaluates a
+   * length-S vector at the 4S-th roots of unity `w^(5^t)`. Taking `M_` to be
+   * the cyclotomic index -- 4N here rather than 2N -- lets S run up to N, and
+   * then the same loop is the real embedding. What changes is only the vector
+   * handed to it, which is the fold
+   *
+   *     f[j] = a_j - i a_(N-j)  =  (a mod (Y^N - i))[j],   f[0] = a_0
+   *
+   * the same fold the NTT carries on the device, in the same direction. The
+   * ring basis is read straight off its real parts.
    *
    * @param ptxt output plaintext (NTT-applied)
    * @param level level of the plaintext
    * @param scale scale to apply
-   * @param message complex message to encode.
+   * @param message complex message to encode; real on the conjugate-invariant
+   *        ring, where the imaginary parts are asserted to vanish
    * @param num_aux number of auxiliary primes
    */
   void Encode(Plaintext<word> &ptxt, int level, double scale,
               const std::vector<Complex> &message, int num_aux = 0) const;
 
   /**
-   * @brief Decode a plaintext into a complex message.
+   * @brief Decode a plaintext into a complex message. Inverse of Encode.
+   *
+   * On the conjugate-invariant ring the slots are real, so the imaginary part
+   * of every entry comes back as the residue of the mirrored coefficient pair
+   * against itself -- it is zero up to rounding, and is left in place rather
+   * than cleared because it is a free measure of how far the message has
+   * drifted off the real subring.
    *
    * @param message output complex message
    * @param ptxt input plaintext (NTT-applied)
