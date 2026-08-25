@@ -44,38 +44,34 @@ namespace cheddar {
  * ## What it costs, and what it does not
  *
  * The BABY steps -- the rotations of the input -- are shared: Re(M) and Im(M)
- * are compiled from the same offsets, so one baby-step map per input ciphertext
- * feeds both.
+ * are compiled from the same offsets, so one baby-step map per input
+ * ciphertext feeds both.
  *
- * The GIANT steps are shared too, and that needs a trick. A giant step is
- * `sum_g rot_g( sum_b pt[g][b] * bs[b] )`, and HoistHandler looks its
- * ciphertexts up by baby-step index as a plain map key. So `merged_` holds
- * Re(M) at key `b` and Im(M) at key `b + width`, over one set of giant steps,
- * and the caller hands it a map carrying two different ciphertexts under those
- * two key blocks. One rotation per giant step then produces a combination of
- * both inputs:
- *
- *     re' = Re(M) re - Im(M) im   <-  merged_( {b: re, b+w: -im} )
- *     im' = Im(M) re + Re(M) im   <-  merged_( {b: im, b+w:  re} )
- *
- * The negation is one element-wise pass over the baby-step results, which is
- * nothing beside a key switch. The fused plaintext-accumulation kernel takes
- * the doubled baby-step count in its stride, so the two halves are one launch
- * rather than two. Against one ordinary LinearTransform at `bs + gs` rotations:
+ * The GIANT step runs once over both halves
+ * (HoistHandler::EvaluateGiantStepComplex): one kernel streams every
+ * plaintext limb once and feeds all four real products from it, with the
+ * minus sign carried as a modular subtraction, and then each output half is
+ * rotated and mod-downed as an ordinary giant step. Against one ordinary
+ * LinearTransform at bs + gs rotations:
  *
  *     EvaluateFromReal   1 * bs + 2 * gs   (one real input, complex output)
  *     EvaluatePair       2 * bs + 2 * gs
  *     EvaluateToReal     2 * bs + 1 * gs   (only the real part is wanted)
  *
- * min_ks does not take this route: its giant step derives a single stride from
- * the baby-step sequence, and the aliased keys are not that sequence. It falls
- * back to four unfused passes, which is what min_ks trades anyway -- key count
- * against time.
+ * and the plaintext STREAM per phase is one pass over Re and Im together --
+ * less than the two passes two ordinary transforms make over their own
+ * matrices, because here the matrix is shared between the outputs.
  *
- * The plaintexts are compiled four times over -- Re and Im standalone for
- * EvaluateFromReal and for the baby-step index set, and again inside `merged_`.
- * A diagonal whose part vanishes is kept rather than pruned, so that the halves
- * present identical baby/giant structure and can share a map.
+ * min_ks does not take this route: its giant step derives a single stride
+ * from the baby-step sequence and rotates sequentially, which the fused pass
+ * has no analogue of. It falls back to four unfused passes, which is what
+ * min_ks trades anyway -- key count against time.
+ *
+ * The plaintexts are compiled twice -- Re(M) and Im(M), each a full
+ * LinearTransform -- and a diagonal whose part vanishes is kept rather than
+ * pruned, so that the halves present identical baby/giant structure. That is
+ * 2x an ordinary transform's plaintext memory, which is what the doubled
+ * matrix content costs and no more.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -87,16 +83,8 @@ class ComplexLinearTransform {
   LinearTransform<word> re_;
   LinearTransform<word> im_;
 
-  // Re(M) at baby-step key b, Im(M) at b + alias_offset_, over one set of giant
-  // steps. Never asked for its own baby step or its own rotations: the aliased
-  // keys are not rotation amounts, and re_ / im_ answer for both.
-  const int alias_offset_;
-  HoistHandler<word> merged_;
 
   static StripedMatrix TakePart(const StripedMatrix &matrix, bool imaginary);
-  static PlainHoistMap MergedHoistMap(const StripedMatrix &matrix, int bs,
-                                      int gs, int pre_rotation,
-                                      int additional_pt_rot, int alias_offset);
 
  public:
   ComplexLinearTransform(ConstContextPtr<word> context,

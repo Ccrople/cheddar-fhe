@@ -6,8 +6,7 @@
 namespace cheddar {
 
 template <typename word>
-int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix, int bs_,
-                                           int gs_, int pre_rotation_) {
+int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix) {
   int gcd_rot = 0;
   int max_rot = 0;
   int num_pt = 0;
@@ -40,8 +39,7 @@ int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix, int bs_,
 
 template <typename word>
 PlainHoistMap LinearTransform<word>::ConstructPlainHoistMap(
-    const StripedMatrix &matrix, int stride_, int bs_, int pre_rotation_,
-    int additional_pt_rot_) {
+    const StripedMatrix &matrix) {
   int height = matrix.GetHeight();
   int width = matrix.GetWidth();
 
@@ -88,12 +86,9 @@ LinearTransform<word>::LinearTransform(ConstContextPtr<word> context,
       gs_{gs},
       pre_rotation_{pre_rotation},
       additional_pt_rot_{additional_pt_rot},
-      stride_{DetermineStride(matrix, bs, gs, pre_rotation)},
+      stride_{DetermineStride(matrix)},
       diag_offsets_{ExtractDiagOffsets(matrix)},
-      hoist_{context,
-             ConstructPlainHoistMap(matrix, stride_, bs, pre_rotation,
-                                    additional_pt_rot),
-             pt_level, pt_scale} {}
+      hoist_{context, ConstructPlainHoistMap(matrix), pt_level, pt_scale} {}
 
 template <typename word>
 std::set<int> LinearTransform<word>::ExtractDiagOffsets(
@@ -155,6 +150,17 @@ void LinearTransform<word>::EvaluateGiantStep(ConstContextPtr<word> context,
                                               const EvkMap<word> &evk_map,
                                               bool min_ks /*= false*/) const {
   hoist_.EvaluateGiantStep(context, res, bs, evk_map, min_ks);
+}
+
+template <typename word>
+void LinearTransform<word>::EvaluateGiantStepComplex(
+    ConstContextPtr<word> context, Ct &res_re, Ct *res_im,
+    const LinearTransform &re_t, const LinearTransform &im_t,
+    const std::map<int, Ct> &bs_re, const std::map<int, Ct> *bs_im,
+    const EvkMap<word> &evk_map) {
+  HoistHandler<word>::EvaluateGiantStepComplex(context, res_re, res_im,
+                                               re_t.hoist_, im_t.hoist_, bs_re,
+                                               bs_im, evk_map);
 }
 
 template class LinearTransform<uint32_t>;

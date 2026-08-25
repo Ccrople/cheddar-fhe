@@ -39,6 +39,7 @@
 
 #include "Testbed.h"
 #include "extension/EvalSpecialFFT.h"
+#include "extension/Profile.h"
 
 using word = uint32_t;
 
@@ -132,9 +133,11 @@ TEST_P(CiFft, CoeffToSlot) {
   interface_->Encrypt(ct, ptxt);
 
   Ciphertext<word> res_ct;
+  Profile::Reset();
   __ProfileStart("CoeffToSlot", 3, );
   fft.EvaluateCtS(context_, res_ct, ct, interface_->GetEvkMap());
   __ProfileEnd("CoeffToSlot");
+  Profile::Report("CoeffToSlot breakdown, all warm-ups included");
 
   std::vector<Complex> res;
   DecryptAndDecode(res, res_ct);
@@ -163,9 +166,11 @@ TEST_P(CiFft, SlotToCoeff) {
   EncodeAndEncrypt(ct, slots, level);
 
   Ciphertext<word> res_ct;
+  Profile::Reset();
   __ProfileStart("SlotToCoeff", 3, );
   fft.EvaluateStC(context_, res_ct, ct, interface_->GetEvkMap());
   __ProfileEnd("SlotToCoeff");
+  Profile::Report("SlotToCoeff breakdown, all warm-ups included");
 
   Plaintext<word> res_ptxt;
   interface_->Decrypt(res_ptxt, res_ct);

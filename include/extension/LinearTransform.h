@@ -38,22 +38,11 @@ class LinearTransform {
   std::set<int> diag_offsets_;
   HoistHandler<word> hoist_;
 
+  int DetermineStride(const StripedMatrix &matrix);
+  PlainHoistMap ConstructPlainHoistMap(const StripedMatrix &matrix);
   static std::set<int> ExtractDiagOffsets(const StripedMatrix &matrix);
 
  public:
-  /**
-   * @brief The two setup steps, as free functions, so that a caller can build a
-   * hoist map this class would not: `ComplexLinearTransform` merges the maps of
-   * two matrices under one set of giant steps, which needs both halves compiled
-   * against the same stride and split.
-   */
-  static int DetermineStride(const StripedMatrix &matrix, int bs, int gs,
-                             int pre_rotation);
-  static PlainHoistMap ConstructPlainHoistMap(const StripedMatrix &matrix,
-                                              int stride, int bs,
-                                              int pre_rotation,
-                                              int additional_pt_rot);
-
   LinearTransform(ConstContextPtr<word> context, const StripedMatrix &matrix,
                   int pt_level, double pt_scale, int bs, int gs = 1,
                   int pre_rotation = 0, int additional_pt_rot = 0);
@@ -91,6 +80,19 @@ class LinearTransform {
                          const std::map<int, Ct> &bs,
                          const EvkMap<word> &evk_map,
                          bool min_ks = false) const;
+
+  /**
+   * @brief `HoistHandler::EvaluateGiantStepComplex` over the handlers of two
+   * transforms holding Re(M) and Im(M); see Hoist.h for the contract. Here
+   * because the handlers are private to the transforms that own them.
+   */
+  static void EvaluateGiantStepComplex(ConstContextPtr<word> context,
+                                       Ct &res_re, Ct *res_im,
+                                       const LinearTransform &re_t,
+                                       const LinearTransform &im_t,
+                                       const std::map<int, Ct> &bs_re,
+                                       const std::map<int, Ct> *bs_im,
+                                       const EvkMap<word> &evk_map);
 
   /// The diagonal offsets the matrix was compiled from, for a caller pairing
   /// two transforms and needing to know they line up.

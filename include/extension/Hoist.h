@@ -58,6 +58,13 @@ class HoistHandler {
   void GSFusedPAccum(ConstContextPtr<word> context, std::map<int, Ct> &results,
                      const std::vector<int> &gs_indices,
                      const std::map<int, Ct> &bs) const;
+  static void GSFusedComplexPAccum(ConstContextPtr<word> context,
+                                   std::map<int, Ct> &results_re,
+                                   std::map<int, Ct> *results_im,
+                                   const HoistHandler &re_h,
+                                   const HoistHandler &im_h,
+                                   const std::map<int, Ct> &bs_re,
+                                   const std::map<int, Ct> *bs_im);
   void BSFusedKeyMult(ConstContextPtr<word> context, std::map<int, Ct> &res,
                       std::vector<Dv> &a_modup, const Ct &a_orig,
                       const EvkMap<word> &keys, std::vector<int> &rotations,
@@ -101,6 +108,34 @@ class HoistHandler {
                          const std::map<int, Ct> &bs,
                          const EvkMap<word> &evk_map,
                          bool min_ks = false) const;
+
+  /**
+   * @brief The giant step of a COMPLEX matrix over a pair of real
+   * ciphertexts, with every plaintext streamed once.
+   *
+   *     res_re = Re res_in_re - Im res_in_im
+   *     res_im = Im res_in_re + Re res_in_im
+   *
+   * `re_h` and `im_h` hold the two matrix halves and must have been compiled
+   * with identical baby/giant structure (same offsets, stride, bs, gs,
+   * pre-rotations) -- ComplexLinearTransform builds them that way and this
+   * asserts it. The minus sign lives in the kernel as a modular Sub, so no
+   * negated copy of any baby step is ever materialised.
+   *
+   * `bs_im == nullptr` is the pair lift: one real input, both outputs.
+   * `res_im == nullptr` is the drop back to real: both inputs, one output.
+   * Baby steps come from `EvaluateBabyStep` of either handler -- the two
+   * share baby structure, which is the point.
+   *
+   * No min_ks form: the caller falls back to four unfused passes there.
+   */
+  static void EvaluateGiantStepComplex(ConstContextPtr<word> context,
+                                       Ct &res_re, Ct *res_im,
+                                       const HoistHandler &re_h,
+                                       const HoistHandler &im_h,
+                                       const std::map<int, Ct> &bs_re,
+                                       const std::map<int, Ct> *bs_im,
+                                       const EvkMap<word> &evk_map);
 };
 
 }  // namespace cheddar
