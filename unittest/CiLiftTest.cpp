@@ -50,6 +50,32 @@
 //       decrypt on R+: slotwise z * w. The product's message is even because
 //       the real subring is closed under multiplication, so the descent
 //       loses nothing.
+//
+//   ABatchCcmmOnTheLiftedRingComputesTheCiProducts -- [KANG] Algorithm 4 run
+//       UNMODIFIED on the lifted ring at sub-degree 2k over lifted CI SinC
+//       operands. The lift is not block-clean: per lane the lifted bundle is
+//       Lambda = I + w^-1 * P E of the CI batch, with P the block flip
+//       i -> d-i, E killing block 0 and w the lane's primitive (4k)-th root
+//       -- c_i = X^i - X^(N-i) splits across the ordinary blocks i and d-i.
+//       A full contraction therefore computes A (I + cos(theta) P E) B, not
+//       A B. The contract that removes the twist exactly: the lhs bundle
+//       uses only ciphertexts x < d/2, and the rhs confines its data to CI
+//       blocks x < d/2. Then every term of A P E B pairs a live lhs column
+//       with a dead rhs row, the contamination is zero identically --
+//       Algorithm 4 unchanged, no extra key, no noise price -- and the
+//       descent reads the exact per-lane real products (d x d/2)(d/2 x d)
+//       against a host reference. Over these operands the product is even
+//       BEFORE the descent (D0 P conj(Lambda AB) = Lambda AB), and that is
+//       checked on the big ring's own coefficients.
+//
+//   TheFullContractionCarriesTheCosineTwistedFlip -- the same run without
+//       the contract, as the measured form of the twist: per CI lane the
+//       excess over A B must be exactly lambda_t * A P E B for a fitted
+//       scalar lambda_t, and the multiset of the lambda_t must be the k
+//       cosines cos(pi (2j+1) / 2k) of the primitive (4k)-th roots. That
+//       pins the whole Lambda algebra the contract is derived from, and
+//       doubles as the negative control: without the contract the naive
+//       read is wrong by O(1).
 
 #undef ENABLE_EXTENSION
 
@@ -61,9 +87,11 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/BatchCcmm.h"
 #include "core/CiLift.h"
 
 using word = uint32_t;
+using cheddar::BatchCcmmHandler;
 using cheddar::Ciphertext;
 using cheddar::CiLiftHandler;
 using cheddar::Complex;
@@ -346,4 +374,248 @@ TEST(CiLift, AProductOnTheLiftedRingDescendsToTheCiProduct) {
   std::cout << "lift -> HMult(8192) -> descend: max error " << worst
             << std::endl;
   ASSERT_LT(worst, 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// The batch CC-MM on the lifted ring (Doing.md 1.5bl). Helpers shared by the
+// two tests below; k is the CI sub-degree, the lifted ring runs [KANG]
+// Algorithm 4 at 2k, and d = n/k = N/2k is the block and bundle size on both
+// rings at once.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kCiSubDegree = 128;
+
+// [lane][row][col] at the CI level, k lanes of d x d.
+using RealBatch = std::vector<std::vector<std::vector<double>>>;
+
+RealBatch SampleBatch(int lanes, int d, int live_rows, int live_cols,
+                      double bound, std::mt19937_64 &gen) {
+  std::uniform_real_distribution<double> dist(-bound, bound);
+  RealBatch m(lanes,
+              std::vector<std::vector<double>>(d, std::vector<double>(d, 0.0)));
+  for (int t = 0; t < lanes; t++) {
+    for (int i = 0; i < live_rows; i++) {
+      for (int x = 0; x < live_cols; x++) m[t][i][x] = dist(gen);
+    }
+  }
+  return m;
+}
+
+// CI MatEcd composed with the lift: ciphertext x carries column x -- block i,
+// lane t of its SinC message holds m[t][i][x] -- encrypted on R+, lifted.
+void EncryptLiftedColumns(ringfixture::Ring<word> &ci,
+                          const CiLiftHandler<word> &lift, const RealBatch &m,
+                          int level, double scale,
+                          std::vector<Ciphertext<word>> &out) {
+  const int k = kCiSubDegree;
+  const int d = static_cast<int>(m[0].size());
+  const int degree = ci.Degree();
+  out.resize(d);
+  std::vector<Complex> message(degree);
+  Plaintext<word> pt;
+  Ciphertext<word> ct;
+  for (int x = 0; x < d; x++) {
+    for (int i = 0; i < d; i++) {
+      for (int t = 0; t < k; t++) {
+        message[static_cast<size_t>(i) * k + t] = Complex(m[t][i][x], 0.0);
+      }
+    }
+    ci.context->encoder_.EncodeSinC(pt, level, scale, message, k);
+    ci.ui->Encrypt(ct, pt);
+    lift.Lift(out[x], ct);
+  }
+}
+
+void DescendAndDecode(ringfixture::Ring<word> &ci,
+                      const CiLiftHandler<word> &lift,
+                      const std::vector<Ciphertext<word>> &res,
+                      std::vector<std::vector<Complex>> &got) {
+  got.resize(res.size());
+  Ciphertext<word> down;
+  Plaintext<word> out;
+  for (size_t j = 0; j < res.size(); j++) {
+    lift.Descend(down, res[j]);
+    ci.ui->Decrypt(out, down);
+    ci.context->encoder_.DecodeSinC(got[j], out, kCiSubDegree);
+  }
+}
+
+}  // namespace
+
+// The clean contract: lhs ciphertexts confined to x < d/2, rhs data confined
+// to CI blocks x < d/2, and Algorithm 4 -- unmodified, at sub-degree 2k --
+// descends to the exact per-lane products.
+TEST(CiLift, ABatchCcmmOnTheLiftedRingComputesTheCiProducts) {
+  Ring ci(kCiParam);
+  Ring big(kBigParam,
+           CiLiftHandler<word>::LiftSecret(ci.ui->GetSecretCoeffs()));
+
+  const int n = ci.Degree();
+  const int N = big.Degree();
+  const int k = kCiSubDegree;
+  const int d = n / k;
+  const int c = d / 2;
+  const int level = ci.param->max_level_;
+  const double scale = ci.param->GetScale(level);
+  ASSERT_EQ(level, 1) << "Algorithm 4 needs exactly the one level this "
+                         "chain has above its floor";
+
+  CiLiftHandler<word> lift(ci.context, big.context);
+  BatchCcmmHandler<word> ccmm(*big.param, big.context->ntt_handler_);
+  for (int index : ccmm.RotationIndices(2 * k)) {
+    big.ui->PrepareRotationKey(index, level);
+  }
+
+  std::mt19937_64 gen(0xCC33);
+  const RealBatch a = SampleBatch(k, d, d, c, 0.15, gen);
+  const RealBatch b = SampleBatch(k, d, c, d, 0.15, gen);
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  EncryptLiftedColumns(ci, lift, a, level, scale, lhs);
+  EncryptLiftedColumns(ci, lift, b, level, scale, rhs);
+  ccmm.Multiply(big.context, res, lhs, rhs, 2 * k, big.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(res.size()), d);
+  for (const auto &r : res) {
+    ASSERT_EQ(big.param->NPToLevel(r.GetNP()), level - 1)
+        << "Algorithm 4 spends exactly one level";
+    EXPECT_NEAR(r.GetScale() / big.param->GetScale(level - 1), 1.0, 1e-6);
+  }
+
+  // Under the contract the product is even before the descent: its big-ring
+  // coefficients must already be mirror-antisymmetric, so the trace loses
+  // nothing. This is the sigma-free midpoint probe.
+  {
+    Plaintext<word> mid;
+    big.ui->Decrypt(mid, res[0]);
+    std::vector<double> mc;
+    big.context->encoder_.DecodeCoeff(mc, mid);
+    double worst_odd = std::abs(mc[n]);
+    for (int j = 1; j < n; j++) {
+      worst_odd = std::max(worst_odd, std::abs(mc[j] + mc[N - j]));
+    }
+    std::cout << "midpoint evenness on the big ring: max |m_j + m_(N-j)| = "
+              << worst_odd << std::endl;
+    EXPECT_LT(worst_odd, 1e-2);
+  }
+
+  std::vector<std::vector<Complex>> got;
+  DescendAndDecode(ci, lift, res, got);
+
+  double worst = 0.0;
+  double worst_imag = 0.0;
+  for (int j = 0; j < d; j++) {
+    ASSERT_EQ(static_cast<int>(got[j].size()), n);
+    for (int i = 0; i < d; i++) {
+      for (int t = 0; t < k; t++) {
+        double want = 0.0;
+        for (int x = 0; x < d; x++) want += a[t][i][x] * b[t][x][j];
+        const Complex &g = got[j][static_cast<size_t>(i) * k + t];
+        worst = std::max(worst, std::abs(g.real() - want));
+        worst_imag = std::max(worst_imag, std::abs(g.imag()));
+      }
+    }
+  }
+  std::cout << "lifted batch CCMM: " << k << " real lanes of (" << d << "x"
+            << c << ")(" << c << "x" << d << "), max error " << worst
+            << ", max imag " << worst_imag << std::endl;
+  ASSERT_LT(worst, 1e-2);
+  ASSERT_LT(worst_imag, 1e-2);
+}
+
+// Without the contract the naive read is wrong by design, and wrong in
+// exactly the derived way: per lane the excess over A*B is a single scalar
+// times the block-flipped product A*(P E B), and the scalars are the
+// cosines of the primitive (4k)-th roots. Fitting the scalar per lane and
+// comparing the multiset against the cosines pins the Lambda algebra with
+// no reference to the slot correspondence between the two rings.
+TEST(CiLift, TheFullContractionCarriesTheCosineTwistedFlip) {
+  Ring ci(kCiParam);
+  Ring big(kBigParam,
+           CiLiftHandler<word>::LiftSecret(ci.ui->GetSecretCoeffs()));
+
+  const int n = ci.Degree();
+  const int k = kCiSubDegree;
+  const int d = n / k;
+  const int level = ci.param->max_level_;
+  const double scale = ci.param->GetScale(level);
+
+  CiLiftHandler<word> lift(ci.context, big.context);
+  BatchCcmmHandler<word> ccmm(*big.param, big.context->ntt_handler_);
+  for (int index : ccmm.RotationIndices(2 * k)) {
+    big.ui->PrepareRotationKey(index, level);
+  }
+
+  std::mt19937_64 gen(0xC0517);
+  const RealBatch a = SampleBatch(k, d, d, d, 0.15, gen);
+  const RealBatch b = SampleBatch(k, d, d, d, 0.15, gen);
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  EncryptLiftedColumns(ci, lift, a, level, scale, lhs);
+  EncryptLiftedColumns(ci, lift, b, level, scale, rhs);
+  ccmm.Multiply(big.context, res, lhs, rhs, 2 * k, big.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::vector<std::vector<Complex>> got;
+  DescendAndDecode(ci, lift, res, got);
+
+  double worst_naive = 0.0;
+  double worst_resid = 0.0;
+  double worst_imag = 0.0;
+  std::vector<double> lambda(k);
+  std::vector<std::vector<double>> excess(d, std::vector<double>(d));
+  std::vector<std::vector<double>> flip(d, std::vector<double>(d));
+  for (int t = 0; t < k; t++) {
+    double num = 0.0;
+    double den = 0.0;
+    for (int i = 0; i < d; i++) {
+      for (int j = 0; j < d; j++) {
+        double ab = 0.0;
+        double fl = 0.0;
+        for (int x = 0; x < d; x++) ab += a[t][i][x] * b[t][x][j];
+        for (int x = 1; x < d; x++) fl += a[t][i][x] * b[t][d - x][j];
+        const Complex &g = got[j][static_cast<size_t>(i) * k + t];
+        excess[i][j] = g.real() - ab;
+        flip[i][j] = fl;
+        worst_naive = std::max(worst_naive, std::abs(excess[i][j]));
+        worst_imag = std::max(worst_imag, std::abs(g.imag()));
+        num += excess[i][j] * fl;
+        den += fl * fl;
+      }
+    }
+    lambda[t] = num / den;
+    for (int i = 0; i < d; i++) {
+      for (int j = 0; j < d; j++) {
+        worst_resid = std::max(
+            worst_resid, std::abs(excess[i][j] - lambda[t] * flip[i][j]));
+      }
+    }
+  }
+
+  std::sort(lambda.begin(), lambda.end());
+  const double pi = std::acos(-1.0);
+  std::vector<double> want_cos(k);
+  for (int j = 0; j < k; j++) {
+    want_cos[j] = std::cos(pi * (2 * j + 1) / (2 * k));
+  }
+  std::sort(want_cos.begin(), want_cos.end());
+  double worst_cos = 0.0;
+  for (int t = 0; t < k; t++) {
+    worst_cos = std::max(worst_cos, std::abs(lambda[t] - want_cos[t]));
+  }
+
+  std::cout << "full contraction: naive |got - AB| max " << worst_naive
+            << ", rank-one residual max " << worst_resid
+            << ", |sorted lambda - sorted cos| max " << worst_cos
+            << ", max imag " << worst_imag << std::endl;
+  ASSERT_GT(worst_naive, 0.05) << "the twist should be O(1), not noise";
+  ASSERT_LT(worst_resid, 1e-2)
+      << "the excess must be exactly lambda * A(PE B) per lane";
+  ASSERT_LT(worst_cos, 5e-3)
+      << "the lambdas must be the primitive (4k)-th root cosines";
+  ASSERT_LT(worst_imag, 1e-2);
 }
