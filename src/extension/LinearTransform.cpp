@@ -6,7 +6,8 @@
 namespace cheddar {
 
 template <typename word>
-int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix) {
+int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix, int bs_,
+                                           int gs_, int pre_rotation_) {
   int gcd_rot = 0;
   int max_rot = 0;
   int num_pt = 0;
@@ -39,7 +40,8 @@ int LinearTransform<word>::DetermineStride(const StripedMatrix &matrix) {
 
 template <typename word>
 PlainHoistMap LinearTransform<word>::ConstructPlainHoistMap(
-    const StripedMatrix &matrix) {
+    const StripedMatrix &matrix, int stride_, int bs_, int pre_rotation_,
+    int additional_pt_rot_) {
   int height = matrix.GetHeight();
   int width = matrix.GetWidth();
 
@@ -86,9 +88,12 @@ LinearTransform<word>::LinearTransform(ConstContextPtr<word> context,
       gs_{gs},
       pre_rotation_{pre_rotation},
       additional_pt_rot_{additional_pt_rot},
-      stride_{DetermineStride(matrix)},
+      stride_{DetermineStride(matrix, bs, gs, pre_rotation)},
       diag_offsets_{ExtractDiagOffsets(matrix)},
-      hoist_{context, ConstructPlainHoistMap(matrix), pt_level, pt_scale} {}
+      hoist_{context,
+             ConstructPlainHoistMap(matrix, stride_, bs, pre_rotation,
+                                    additional_pt_rot),
+             pt_level, pt_scale} {}
 
 template <typename word>
 std::set<int> LinearTransform<word>::ExtractDiagOffsets(
