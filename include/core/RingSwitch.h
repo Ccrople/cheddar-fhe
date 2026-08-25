@@ -34,6 +34,13 @@ namespace cheddar {
  * arrangement of a. Here step 2 is a plain stride-k gather on both components
  * and nothing else.
  *
+ * On the conjugate-invariant ring the collapse survives verbatim -- the
+ * embedded secret zeroes every module component but the first, and with it
+ * every c_k-carrying term of the a~ arrangement -- but the components are the
+ * alternating-sign suffix-sum scan of Mlwe.cu rather than stride slices, and
+ * the recomposition its banded inverse. `ci_ringswitch16_35.json` and
+ * `ci12_35.json` are the conjugate-invariant pair, on 1-mod-4N primes.
+ *
  * ## Why this needs its own parameter set
  *
  * The switching key is published at modulus P*Q, and an attacker can apply

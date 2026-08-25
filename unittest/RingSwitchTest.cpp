@@ -61,6 +61,42 @@ const char *kSwitchParam = ParamFromEnv("CHEDDAR_SWITCH_PARAM",
 const char *kSmallParam = ParamFromEnv("CHEDDAR_SMALL_PARAM",
                                        "ringdegree12_30.json");
 
+// On the conjugate-invariant pair (`ci_ringswitch16_35` / `ci12_35`) the
+// switched components are not stride slices: the subring secret still
+// collapses the module rank to one, but the components come out of the
+// alternating-sign suffix-sum scan down each class pair (i, k-i) -- the same
+// map ModDecomp uses there (Doing.md 1.5ba). The host expectation below
+// computes it in exact real arithmetic; the ordinary ring is the stride.
+std::vector<std::vector<double>> HostComponents(
+    const std::vector<double> &coeffs, int rank, int small_degree,
+    bool conjugate_invariant) {
+  std::vector<std::vector<double>> comp(rank,
+                                        std::vector<double>(small_degree));
+  if (!conjugate_invariant) {
+    for (int i = 0; i < rank; i++) {
+      for (int t = 0; t < small_degree; t++) {
+        comp[i][t] = coeffs[t * rank + i];
+      }
+    }
+    return comp;
+  }
+  for (int t = 0; t < small_degree; t++) comp[0][t] = coeffs[t * rank];
+  for (int i = 1; i <= rank / 2; i++) {
+    const int mi = rank - i;
+    double acc_i = 0.0;
+    double acc_m = 0.0;
+    for (int t = small_degree - 1; t >= 0; t--) {
+      const double new_i = coeffs[t * rank + i] - acc_m;
+      const double new_m = coeffs[t * rank + mi] - acc_i;
+      comp[i][t] = new_i;
+      comp[mi][t] = new_m;
+      acc_i = new_i;
+      acc_m = new_m;
+    }
+  }
+  return comp;
+}
+
 }  // namespace
 
 // The two parameter files have to describe the same modulus chain, or step 2
@@ -86,7 +122,7 @@ TEST(RingSwitch, ParameterSetsShareTheirPrimes) {
             << big.param->alpha_ << std::endl;
 }
 
-TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
+TEST(RingSwitch, SwitchesAndPreservesTheComponents) {
   Ring big(kSwitchParam);
   Ring small(kSmallParam);
 
@@ -94,6 +130,7 @@ TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
   const int small_degree = small.Degree();
   const int rank = degree / small_degree;
   ASSERT_EQ(rank, 16);
+  const bool ci = big.param->conjugate_invariant_;
 
   // The key is built in the big ring but targets the small ring's own secret,
   // which only the small ring's UserInterface knows.
@@ -123,6 +160,8 @@ TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
+  const auto expected = HostComponents(coeffs, rank, small_degree, ci);
+
   double worst = 0.0;
   int worst_i = -1, worst_s = -1;
   for (int i = 0; i < rank; i++) {
@@ -135,7 +174,7 @@ TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
     ASSERT_EQ(static_cast<int>(got.size()), small_degree);
 
     for (int s = 0; s < small_degree; s++) {
-      const double d = std::abs(got[s] - coeffs[i + rank * s]);
+      const double d = std::abs(got[s] - expected[i][s]);
       if (d > worst) {
         worst = d;
         worst_i = i;
@@ -144,8 +183,9 @@ TEST(RingSwitch, SwitchesAndPreservesTheStridedSlices) {
     }
   }
 
-  std::cout << "ring switch " << degree << " -> " << rank << " x "
-            << small_degree << ": max |diff| = " << worst << " (i=" << worst_i
+  std::cout << (ci ? "CI " : "ordinary ") << "ring switch " << degree
+            << " -> " << rank << " x " << small_degree
+            << ": max |diff| = " << worst << " (i=" << worst_i
             << ", s=" << worst_s << ")" << std::endl;
 
   // A key switch adds noise on top of the encryption noise, and this one uses
@@ -241,6 +281,10 @@ TEST(RingSwitch, RoundTripsThroughTheSmallRing) {
 TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
   Ring big(kSwitchParam);
   Ring small(kSmallParam);
+
+  if (big.param->conjugate_invariant_) {
+    GTEST_SKIP() << "EncodeSinC has no conjugate-invariant form yet";
+  }
 
   const int degree = big.Degree();
   const int small_degree = small.Degree();

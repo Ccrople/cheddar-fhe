@@ -75,9 +75,15 @@ struct Ring {
       additional_base = {j["additional_base"][0], j["additional_base"][1]};
     }
 
+    // A second parser has to carry the flag too: without it a
+    // conjugate-invariant preset loads as a well-formed ORDINARY ring --
+    // 1 mod 4N implies 1 mod 2N, so nothing rejects the primes -- and every
+    // test runs, passes, and tests the wrong ring.
+    const bool conjugate_invariant =
+        j.contains("conjugate_invariant") && bool(j["conjugate_invariant"]);
     param = std::make_unique<cheddar::Parameter<word>>(
         log_degree, scale, enc_level, level_config, main_primes, aux_primes,
-        ter_primes, additional_base);
+        ter_primes, additional_base, conjugate_invariant);
     if (j.contains("dense_hamming_weight")) {
       param->SetDenseHammingWeight(int(j["dense_hamming_weight"]));
     }

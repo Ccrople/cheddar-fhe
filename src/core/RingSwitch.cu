@@ -38,6 +38,86 @@ __global__ void RingSwitchScatter(word *dst, const word *const *src_ptrs,
       basic::StreamingLoad(src_ptrs[i] + limb * small_degree + s);
 }
 
+// The conjugate-invariant forms. On R+ the subring secret still zeroes every
+// module component but the first -- with sigma_j = 0 for j >= 1 the a~
+// formula of Mlwe.cu collapses to a~_l[0] = alpha_l -- so the switch stays
+// "one key switch, then split the components". What changes is the split
+// itself: the components are not stride slices but the alternating-sign
+// suffix-sum scan down each class pair (i, k-i),
+//
+//     alpha_i[t] = a[tk + i] - alpha_{k-i}[t+1]
+//
+// and the recomposition is the banded two-term inverse. Both kernels mirror
+// Mlwe.cu's CiModDecompScan and CiModPackB, the way RingSwitchGather mirrors
+// ModDecompB; see the comments there for the derivation and the launch
+// reasoning.
+//
+// grid: 1D over num_limbs * (rank / 2 + 1) threads
+template <typename word>
+__global__ void CiRingSwitchScan(word *const *dst_ptrs, const word *src,
+                                 const word *primes, int rank,
+                                 int small_degree, int degree, int num_limbs) {
+  const int num_chains = rank / 2 + 1;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * num_chains) return;
+  const int limb = tid / num_chains;
+  const int chain = tid - limb * num_chains;
+
+  const word *src_limb = src + limb * degree;
+
+  if (chain == 0) {
+    word *dst = dst_ptrs[0] + limb * small_degree;
+    for (int t = 0; t < small_degree; t++) {
+      dst[t] = basic::StreamingLoad(src_limb + t * rank);
+    }
+    return;
+  }
+
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  const int i = chain;
+  const int mi = rank - chain;
+  word *dst_i = dst_ptrs[i] + limb * small_degree;
+  word *dst_m = dst_ptrs[mi] + limb * small_degree;
+
+  word acc_i = 0;  // alpha_i[t + 1]
+  word acc_m = 0;  // alpha_{k-i}[t + 1]
+  for (int t = small_degree - 1; t >= 0; t--) {
+    const word vi = basic::StreamingLoad(src_limb + t * rank + i);
+    const word vm = basic::StreamingLoad(src_limb + t * rank + mi);
+    const word new_i = basic::Sub(vi, acc_m, prime);
+    const word new_m = basic::Sub(vm, acc_i, prime);
+    dst_i[t] = new_i;
+    dst_m[t] = new_m;
+    acc_i = new_i;
+    acc_m = new_m;
+  }
+}
+
+// dst[limb][tk + i] = src_i[limb][t] + src_{k-i}[limb][t+1], the banded
+// inverse of the scan; the i = 0 class is a pure copy.
+//
+// grid: (degree / block, num_total_primes)
+template <typename word>
+__global__ void CiRingSwitchRecompose(word *dst, const word *const *src_ptrs,
+                                      const word *primes, int log_rank,
+                                      int small_degree, int degree) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int limb = blockIdx.y;
+
+  const int rank = 1 << log_rank;
+  const int i = x & (rank - 1);
+  const int t = x >> log_rank;
+
+  word value = basic::StreamingLoad(src_ptrs[i] + limb * small_degree + t);
+  if (i != 0 && t + 1 < small_degree) {
+    const word prime = basic::StreamingLoadConst(primes + limb);
+    const word mirror =
+        basic::StreamingLoad(src_ptrs[rank - i] + limb * small_degree + t + 1);
+    value = basic::Add(value, mirror, prime);
+  }
+  dst[limb * degree + x] = value;
+}
+
 }  // namespace kernel
 
 template <typename word>
@@ -55,6 +135,11 @@ RingSwitchHandler<word>::RingSwitchHandler(ConstContextPtr<word> big,
   AssertTrue(small_degree % kernel_block_dim_ == 0,
              "RingSwitchHandler: small degree must be a multiple of the block "
              "dim");
+  AssertTrue(big_->param_.conjugate_invariant_ ==
+                 small_->param_.conjugate_invariant_,
+             "RingSwitchHandler: the two rings must be the same kind -- a "
+             "conjugate-invariant ciphertext has no home in a cyclotomic "
+             "subring, nor the reverse");
 
   // The switched ciphertext keeps the RNS limbs it arrived with -- step 2 only
   // re-indexes coefficients -- so the two rings have to agree on the primes at
@@ -122,7 +207,7 @@ void RingSwitchHandler<word>::Switch(std::vector<Ct> &res, const Ct &ct,
   for (auto &r : res) {
     r.RemoveRx();
     r.ModifyNP(small_np);
-    r.SetNumSlots(small_degree / 2);
+    r.SetNumSlots(small_->param_.MaxNumSlots());
     r.SetScale(switched.GetScale());
   }
 
@@ -141,12 +226,26 @@ void RingSwitchHandler<word>::Switch(std::vector<Ct> &res, const Ct &ct,
   CopyHostToDevice(d_dst_a, h_dst_a);
   CopyHostToDevice(d_dst_b, h_dst_b);
 
-  const dim3 grid_dim(small_degree / kernel_block_dim_, rank_,
-                      num_total_primes);
-  kernel::RingSwitchGather<word><<<grid_dim, kernel_block_dim_>>>(
-      d_dst_a.data(), a_coeffs.data(), rank_, small_degree, degree);
-  kernel::RingSwitchGather<word><<<grid_dim, kernel_block_dim_>>>(
-      d_dst_b.data(), b_coeffs.data(), rank_, small_degree, degree);
+  if (big_->param_.conjugate_invariant_) {
+    const word *primes = big_->param_.GetPrimesPtr(np);
+    constexpr int scan_block_dim = 128;
+    const int num_chains = rank_ / 2 + 1;
+    const int scan_grid_dim =
+        DivCeil(num_total_primes * num_chains, scan_block_dim);
+    kernel::CiRingSwitchScan<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_dst_a.data(), a_coeffs.data(), primes, rank_, small_degree, degree,
+        num_total_primes);
+    kernel::CiRingSwitchScan<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_dst_b.data(), b_coeffs.data(), primes, rank_, small_degree, degree,
+        num_total_primes);
+  } else {
+    const dim3 grid_dim(small_degree / kernel_block_dim_, rank_,
+                        num_total_primes);
+    kernel::RingSwitchGather<word><<<grid_dim, kernel_block_dim_>>>(
+        d_dst_a.data(), a_coeffs.data(), rank_, small_degree, degree);
+    kernel::RingSwitchGather<word><<<grid_dim, kernel_block_dim_>>>(
+        d_dst_b.data(), b_coeffs.data(), rank_, small_degree, degree);
+  }
 
   // 3. Back into the NTT domain, now at the small degree. Cheddar keeps
   //    ciphertexts transformed, and the Montgomery convention matches the one
@@ -208,12 +307,24 @@ void RingSwitchHandler<word>::SwitchBack(Ct &res, const std::vector<Ct> &parts,
   //    N under the subring secret.
   DeviceVector<word> a_full(num_total_primes * degree);
   DeviceVector<word> b_full(num_total_primes * degree);
-  const dim3 grid_dim(small_degree / kernel_block_dim_, rank_,
-                      num_total_primes);
-  kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
-      a_full.data(), d_src_a.data(), rank_, small_degree, degree);
-  kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
-      b_full.data(), d_src_b.data(), rank_, small_degree, degree);
+  if (big_->param_.conjugate_invariant_) {
+    const word *primes = small_->param_.GetPrimesPtr(small_np);
+    const int log_rank = Log2Floor(rank_);
+    const dim3 grid_dim(degree / kernel_block_dim_, num_total_primes);
+    kernel::CiRingSwitchRecompose<word><<<grid_dim, kernel_block_dim_>>>(
+        a_full.data(), d_src_a.data(), primes, log_rank, small_degree,
+        degree);
+    kernel::CiRingSwitchRecompose<word><<<grid_dim, kernel_block_dim_>>>(
+        b_full.data(), d_src_b.data(), primes, log_rank, small_degree,
+        degree);
+  } else {
+    const dim3 grid_dim(small_degree / kernel_block_dim_, rank_,
+                        num_total_primes);
+    kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
+        a_full.data(), d_src_a.data(), rank_, small_degree, degree);
+    kernel::RingSwitchScatter<word><<<grid_dim, kernel_block_dim_>>>(
+        b_full.data(), d_src_b.data(), rank_, small_degree, degree);
+  }
 
   // 3. Back into the NTT domain at the big degree, as one ciphertext of the
   //    big Context.
@@ -221,7 +332,7 @@ void RingSwitchHandler<word>::SwitchBack(Ct &res, const std::vector<Ct> &parts,
   Ct recomposed;
   recomposed.RemoveRx();
   recomposed.ModifyNP(big_np);
-  recomposed.SetNumSlots(degree / 2);
+  recomposed.SetNumSlots(big_->param_.MaxNumSlots());
   recomposed.SetScale(parts.at(0).GetScale());
   auto ax_view = recomposed.AxView();
   auto bx_view = recomposed.BxView();
