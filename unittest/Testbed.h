@@ -276,29 +276,6 @@ class Testbed : public testing::TestWithParam<const char *> {
     return levels;
   }
 
-  // The levels a sweep should visit, from `lowest` upward. All of them when
-  // there are few, as at logN 12; at logN 16 there are 32 and the host-side
-  // CRT inside Encode/Decode is the unoptimised test-only path UserInterface
-  // warns about, so visiting every one costs minutes and buys nothing. The
-  // ends, the middle and the step below the top stand in for the rest.
-  std::vector<int> LevelsToSweep(int lowest = 0) const {
-    const int max_level = param_->max_level_;
-    std::vector<int> levels;
-    if (max_level - lowest <= 4) {
-      for (int level = lowest; level <= max_level; level++) {
-        levels.push_back(level);
-      }
-      return levels;
-    }
-    for (int level : {lowest, lowest + 1, max_level / 2, max_level - 1,
-                      max_level}) {
-      if (level >= lowest && level <= max_level) levels.push_back(level);
-    }
-    std::sort(levels.begin(), levels.end());
-    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
-    return levels;
-  }
-
   double DetermineScale(int level) const {
     if (level <= default_encryption_level_) {
       return param_->GetScale(level);
