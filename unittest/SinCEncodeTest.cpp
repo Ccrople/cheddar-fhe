@@ -22,6 +22,14 @@
 // A round trip alone would pass with a transposed or mis-strided layout; these
 // two would not.
 //
+// ON THE CONJUGATE-INVARIANT RING the same file runs with three changes of
+// meaning: a block is k REAL slots (the subring of R+ is itself totally
+// real), the component-to-coefficient map is ModDecomp's banded two-term map
+// rather than a stride, and the k = 2 endpoint has no pre-existing twin --
+// the pinned endpoint is k = degree, which must equal the ring's own Encode.
+// The subring-product test multiplies in the c-basis, where the folds are
+// c_0 = 2, c_N = 0, c_m = -c_{2N-m}.
+//
 // SEPARATE BINARY. Testbed builds one Context per process from one parameter
 // file, and this needs ringdegree12_30.json at degree 4096. Appending it to a
 // suite that instantiates bootparam_* first would silently run at 65536; see
@@ -65,6 +73,80 @@ std::vector<double> NegacyclicMul(const std::vector<double> &a,
   return res;
 }
 
+// --- the conjugate-invariant counterparts ----------------------------------
+
+// Multiplication in R+ of rank n, in the c-basis {1, c_1, ..., c_{n-1}}, on
+// real coefficients: c_j c_k = c_{j+k} + c_{|j-k|} with the folds c_0 = 2,
+// c_n = 0, c_m = -c_{2n-m}. The double version of CiMlweTest's CiMulMod.
+std::vector<double> CiBasisMul(const std::vector<double> &a,
+                               const std::vector<double> &b) {
+  const int n = static_cast<int>(a.size());
+  std::vector<double> res(n, 0.0);
+  auto add = [&res, n](int m, double v) {
+    if (m == n) return;  // c_n = 0
+    if (m > n) {         // c_m = -c_{2n-m}
+      m = 2 * n - m;
+      v = -v;
+    }
+    if (m == 0) v *= 2.0;  // c_0 = 2
+    res[m] += v;
+  };
+
+  res[0] += a[0] * b[0];
+  for (int k = 1; k < n; k++) res[k] += a[0] * b[k] + a[k] * b[0];
+  for (int j = 1; j < n; j++) {
+    for (int k = 1; k < n; k++) {
+      const double v = a[j] * b[k];
+      add(j + k, v);
+      add(j > k ? j - k : k - j, v);
+    }
+  }
+  return res;
+}
+
+// The banded component map of Doing.md 1.5ba, in real arithmetic: the scan
+// down each class pair (i, d-i) and its two-term inverse. The same maps the
+// encoder implements; kept here as well so the product test states its own
+// arithmetic.
+std::vector<std::vector<double>> CiDecomposeBlocks(
+    const std::vector<double> &coeffs, int num_blocks, int sub_degree) {
+  std::vector<std::vector<double>> comp(
+      num_blocks, std::vector<double>(sub_degree, 0.0));
+  for (int t = 0; t < sub_degree; t++) {
+    comp[0][t] = coeffs[static_cast<size_t>(t) * num_blocks];
+  }
+  for (int i = 1; i <= num_blocks / 2; i++) {
+    const int mi = num_blocks - i;
+    double acc_i = 0.0;
+    double acc_m = 0.0;
+    for (int t = sub_degree - 1; t >= 0; t--) {
+      const double new_i =
+          coeffs[static_cast<size_t>(t) * num_blocks + i] - acc_m;
+      const double new_m =
+          coeffs[static_cast<size_t>(t) * num_blocks + mi] - acc_i;
+      comp[i][t] = new_i;
+      comp[mi][t] = new_m;
+      acc_i = new_i;
+      acc_m = new_m;
+    }
+  }
+  return comp;
+}
+
+std::vector<double> CiRecomposeBlocks(
+    const std::vector<std::vector<double>> &comp, int num_blocks,
+    int sub_degree) {
+  std::vector<double> out(static_cast<size_t>(num_blocks) * sub_degree, 0.0);
+  for (int t = 0; t < sub_degree; t++) {
+    for (int i = 0; i < num_blocks; i++) {
+      double v = comp[i][t];
+      if (i != 0 && t + 1 < sub_degree) v += comp[num_blocks - i][t + 1];
+      out[static_cast<size_t>(t) * num_blocks + i] = v;
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 // The geometry, before anything numerical: every coefficient must be written
@@ -72,6 +154,29 @@ std::vector<double> NegacyclicMul(const std::vector<double> &a,
 // arithmetic on the index map and it is where an off-by-one would live.
 TEST_P(Testbed32, SinCIndexMapIsABijection) {
   const int degree = param_->degree_;
+
+  if (param_->conjugate_invariant_) {
+    // The stride map is not the geometry here: the component-to-coefficient
+    // map is the banded two-term recomposition, and the check with the same
+    // job is that it and the scan invert each other at every admissible k.
+    std::mt19937_64 gen(0xC1B45E);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (int sub_degree = 2; sub_degree <= degree; sub_degree *= 2) {
+      const int num_blocks = degree / sub_degree;
+      std::vector<double> coeffs(degree);
+      for (auto &c : coeffs) c = dist(gen);
+      const auto comp = CiDecomposeBlocks(coeffs, num_blocks, sub_degree);
+      const auto back = CiRecomposeBlocks(comp, num_blocks, sub_degree);
+      double worst = 0.0;
+      for (int c = 0; c < degree; c++) {
+        worst = std::max(worst, std::abs(back[c] - coeffs[c]));
+      }
+      ASSERT_LT(worst, 1e-9)
+          << "the banded map does not invert at sub_degree " << sub_degree;
+    }
+    return;
+  }
+
   for (int sub_degree = 2; sub_degree <= degree; sub_degree *= 2) {
     const int num_blocks = degree / sub_degree;
     const int slots_per_block = sub_degree / 2;
@@ -93,12 +198,23 @@ TEST_P(Testbed32, SinCIndexMapIsABijection) {
 // Round trip at every sub-degree the ring admits, at every level.
 TEST_P(Testbed32, SinCRoundTrips) {
   const int degree = param_->degree_;
-  for (int level = 0; level <= param_->max_level_; level++) {
+  const bool ci = param_->conjugate_invariant_;
+  // Every level on the one-level rings; a sample of four on the deep ones,
+  // where the full sweep would dominate the binary for no extra coverage.
+  std::vector<int> levels;
+  if (param_->max_level_ <= 3) {
+    for (int level = 0; level <= param_->max_level_; level++) {
+      levels.push_back(level);
+    }
+  } else {
+    levels = {0, 1, param_->max_level_ / 2, param_->max_level_};
+  }
+  for (int level : levels) {
     const double scale = DetermineScale(level);
     for (int sub_degree : {2, 4, 16, 128, degree}) {
       std::vector<Complex> msg;
-      GenerateRandomMessage(msg);
-      ASSERT_EQ(static_cast<int>(msg.size()), degree / 2);
+      GenerateRandomMessage(msg, -1, -1.0, 1.0, !ci);
+      ASSERT_EQ(static_cast<int>(msg.size()), param_->MaxNumSlots());
 
       Plaintext<word> ptxt;
       context_->encoder_.EncodeSinC(ptxt, level, scale, msg, sub_degree);
@@ -120,6 +236,11 @@ TEST_P(Testbed32, SinCRoundTrips) {
 // the limbs through RealVectorToPlaintext, so this is bit-exact, not merely
 // close.
 TEST_P(Testbed32, SinCAtTwoIsCoefficientEncoding) {
+  if (param_->conjugate_invariant_) {
+    GTEST_SKIP() << "the k = 2 endpoint has no pre-existing twin on the "
+                    "conjugate-invariant ring; the pinned endpoint is "
+                    "k = degree, and k = 2 is covered by the round trip";
+  }
   const int degree = param_->degree_;
   const int level = param_->max_level_;
   const double scale = DetermineScale(level);
@@ -164,7 +285,7 @@ TEST_P(Testbed32, SinCAtFullDegreeIsSlotEncoding) {
   const double scale = DetermineScale(level);
 
   std::vector<Complex> msg;
-  GenerateRandomMessage(msg);
+  GenerateRandomMessage(msg, -1, -1.0, 1.0, !param_->conjugate_invariant_);
 
   Plaintext<word> ptxt;
   context_->encoder_.EncodeSinC(ptxt, level, scale, msg, degree);
@@ -202,9 +323,10 @@ TEST_P(Testbed32, SinCSubringProductIsSlotwiseWithinABlock) {
 
   // Half-range inputs: the product of two blocks is compared directly, and
   // keeping |z| <= 0.5 keeps the encoded product inside the modulus.
+  const bool ci = param_->conjugate_invariant_;
   std::vector<Complex> z, w;
-  GenerateRandomMessage(z, -1, -0.5, 0.5);
-  GenerateRandomMessage(w, -1, -0.5, 0.5);
+  GenerateRandomMessage(z, -1, -0.5, 0.5, !ci);
+  GenerateRandomMessage(w, -1, -0.5, 0.5, !ci);
 
   Plaintext<word> pz, pw;
   context_->encoder_.EncodeSinC(pz, level, scale, z, sub_degree);
@@ -215,17 +337,30 @@ TEST_P(Testbed32, SinCSubringProductIsSlotwiseWithinABlock) {
   context_->encoder_.DecodeCoeff(cz, pz);
   context_->encoder_.DecodeCoeff(cw, pw);
 
-  // Multiply the two subring elements of each block, on the host, in R_k.
+  // Multiply the two subring elements of each block, on the host -- through
+  // the stride view and the negacyclic product on the ordinary ring, through
+  // the banded component map and the c-basis product on the conjugate-
+  // invariant one.
   std::vector<double> product_coeffs(degree, 0.0);
-  for (int i = 0; i < num_blocks; i++) {
-    std::vector<double> mi(sub_degree), ni(sub_degree);
-    for (int t = 0; t < sub_degree; t++) {
-      mi[t] = cz[i + t * num_blocks];
-      ni[t] = cw[i + t * num_blocks];
+  if (ci) {
+    const auto compz = CiDecomposeBlocks(cz, num_blocks, sub_degree);
+    const auto compw = CiDecomposeBlocks(cw, num_blocks, sub_degree);
+    std::vector<std::vector<double>> compp(num_blocks);
+    for (int i = 0; i < num_blocks; i++) {
+      compp[i] = CiBasisMul(compz[i], compw[i]);
     }
-    const std::vector<double> prod = NegacyclicMul(mi, ni);
-    for (int t = 0; t < sub_degree; t++) {
-      product_coeffs[i + t * num_blocks] = prod[t];
+    product_coeffs = CiRecomposeBlocks(compp, num_blocks, sub_degree);
+  } else {
+    for (int i = 0; i < num_blocks; i++) {
+      std::vector<double> mi(sub_degree), ni(sub_degree);
+      for (int t = 0; t < sub_degree; t++) {
+        mi[t] = cz[i + t * num_blocks];
+        ni[t] = cw[i + t * num_blocks];
+      }
+      const std::vector<double> prod = NegacyclicMul(mi, ni);
+      for (int t = 0; t < sub_degree; t++) {
+        product_coeffs[i + t * num_blocks] = prod[t];
+      }
     }
   }
 
@@ -236,8 +371,9 @@ TEST_P(Testbed32, SinCSubringProductIsSlotwiseWithinABlock) {
   std::vector<Complex> got;
   context_->encoder_.DecodeSinC(got, pprod, sub_degree);
 
-  std::vector<Complex> want(degree / 2);
-  for (int s = 0; s < degree / 2; s++) want[s] = z[s] * w[s];
+  const int num_slots = param_->MaxNumSlots();
+  std::vector<Complex> want(num_slots);
+  for (int s = 0; s < num_slots; s++) want[s] = z[s] * w[s];
 
   const double worst = MaxAbsDiff(got, want);
   std::cout << "SinC subring product, k=" << sub_degree << ", " << num_blocks
@@ -246,7 +382,9 @@ TEST_P(Testbed32, SinCSubringProductIsSlotwiseWithinABlock) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    SinC, Testbed32, testing::Values("ringdegree12_30.json"),
+    SinC, Testbed32,
+    testing::Values("ringdegree12_30.json", "ci12_30.json", "ci12_35.json",
+                    "ci16_35.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

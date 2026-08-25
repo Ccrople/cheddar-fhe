@@ -103,7 +103,10 @@ void SubringMatrixHandler<word>::EncodeWeights(
              "EncodeWeights: sub_degree must be a power of two dividing the "
              "ring degree");
 
-  const int lanes = sub_degree / 2;      // k/2, the batch size
+  // k/2 complex matrices per pass -- or k REAL ones on the conjugate-
+  // invariant ring, whose subring is itself totally real with k real slots.
+  const int lanes =
+      param_.conjugate_invariant_ ? sub_degree : sub_degree / 2;
   const int num_blocks = degree / sub_degree;  // d, the Vec dimension
   AssertTrue(static_cast<int>(values.size()) == lanes,
              "EncodeWeights: expected one matrix per lane");
@@ -139,7 +142,11 @@ void SubringMatrixHandler<word>::EncodeWeights(
   // index, leaving DFT_k and therefore the lane structure intact, so a
   // lane-independence check still passes and only the values are wrong, high
   // by the sqrt(d) of a sum over blocks.
-  std::vector<Complex> message(degree / 2, Complex(0.0, 0.0));
+  // (On the conjugate-invariant ring "block 0" and "multiples of X^d" read
+  // as component 0 of the banded map and c-coefficients at multiples of d;
+  // the statement and the failure mode are otherwise identical.)
+  std::vector<Complex> message(
+      param_.conjugate_invariant_ ? degree : degree / 2, Complex(0.0, 0.0));
   Pt entry;
   for (int j = 0; j < cols_in; j++) {
     for (int l = 0; l < cols_out; l++) {

@@ -482,6 +482,56 @@ SinCLayout MakeSinCLayout(int degree, int sub_degree) {
   return SinCLayout{degree / sub_degree, sub_degree / 2};
 }
 
+// The conjugate-invariant ring is free over its rank-k subring on
+// {1, c_1, ..., c_{d-1}} rather than on monomials, and the change of basis
+// between the full ring's c-coefficients and the d module components is the
+// banded two-term map of Doing.md 1.5ba -- the same one MlweHandler's
+// ModDecomp implements on the device, in real arithmetic here because the
+// encoder works on messages. Recompose:
+//
+//     coeffs[t*d + i] = comp_i[t] + comp_{d-i}[t+1],    comp_.[k] = 0
+//
+// with the i = 0 class pure, and the inverse the alternating-sign suffix-sum
+// scan down each class pair (i, d-i).
+std::vector<double> CiSinCRecompose(
+    const std::vector<std::vector<double>> &comp, int num_blocks,
+    int sub_degree) {
+  std::vector<double> out(static_cast<size_t>(num_blocks) * sub_degree, 0.0);
+  for (int t = 0; t < sub_degree; t++) {
+    for (int i = 0; i < num_blocks; i++) {
+      double v = comp[i][t];
+      if (i != 0 && t + 1 < sub_degree) v += comp[num_blocks - i][t + 1];
+      out[static_cast<size_t>(t) * num_blocks + i] = v;
+    }
+  }
+  return out;
+}
+
+std::vector<std::vector<double>> CiSinCDecompose(
+    const std::vector<double> &coeffs, int num_blocks, int sub_degree) {
+  std::vector<std::vector<double>> comp(
+      num_blocks, std::vector<double>(sub_degree, 0.0));
+  for (int t = 0; t < sub_degree; t++) {
+    comp[0][t] = coeffs[static_cast<size_t>(t) * num_blocks];
+  }
+  for (int i = 1; i <= num_blocks / 2; i++) {
+    const int mi = num_blocks - i;
+    double acc_i = 0.0;
+    double acc_m = 0.0;
+    for (int t = sub_degree - 1; t >= 0; t--) {
+      const double new_i =
+          coeffs[static_cast<size_t>(t) * num_blocks + i] - acc_m;
+      const double new_m =
+          coeffs[static_cast<size_t>(t) * num_blocks + mi] - acc_i;
+      comp[i][t] = new_i;
+      comp[mi][t] = new_m;  // mi == i rewrites the same value
+      acc_i = new_i;
+      acc_m = new_m;
+    }
+  }
+  return comp;
+}
+
 }  // namespace
 
 template <typename word>
@@ -489,15 +539,45 @@ void Encoder<word>::EncodeSinC(Plaintext<word> &ptxt, int level, double scale,
                                const std::vector<Complex> &message,
                                int sub_degree, int num_aux /*= 0*/) const {
   const int degree = param_.degree_;
-  // SinC reads R_N as a free module over R_k on {Y^i}, which is what makes
-  // "offset i, stride N/k" a bijection onto the coefficients. R+ is free over
-  // its own rank-k subring on {c_i} as a module, but the multiplication is
-  // not a stride gather there -- c_i c_(km) = c_(km+i) + c_(km-i) hits two
-  // indices -- so the interleave has to become a banded map first. That is
-  // the same open item as ModDecomp, and it is not settled here.
-  AssertTrue(!param_.conjugate_invariant_,
-             "EncodeSinC: no conjugate-invariant form yet");
   const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
+
+  if (param_.conjugate_invariant_) {
+    // R+ is free over its rank-k subring on {1, c_1, ..., c_{d-1}}, so a
+    // block is still one subring element per module component -- but the
+    // component-to-coefficient map is the banded two-term recomposition of
+    // Doing.md 1.5ba, not a stride, and a block holds k REAL slots, the
+    // subring being itself totally real. The per-block transform is the
+    // conjugate-invariant encoder at size k: SpecialIFFT and the real part,
+    // which is EncodeWorker's own fold at the subring's degree.
+    const int num_blocks = degree / sub_degree;
+    AssertTrue(static_cast<int>(message.size()) == degree,
+               "EncodeSinC: message must fill every real slot of the ring");
+    double max_real = 0.0;
+    double max_imag = 0.0;
+    for (const auto &value : message) {
+      max_real = std::max(max_real, std::abs(value.real()));
+      max_imag = std::max(max_imag, std::abs(value.imag()));
+    }
+    AssertTrue(max_imag <= 1e-8 * std::max(max_real, 1.0),
+               "EncodeSinC: the conjugate-invariant ring has real slots, and "
+               "this message has an imaginary part");
+
+    std::vector<std::vector<double>> comp(
+        num_blocks, std::vector<double>(sub_degree));
+    std::vector<Complex> block(sub_degree);
+    for (int i = 0; i < num_blocks; i++) {
+      std::copy(message.begin() + static_cast<size_t>(i) * sub_degree,
+                message.begin() + static_cast<size_t>(i + 1) * sub_degree,
+                block.begin());
+      SpecialIFFT(block);
+      for (int t = 0; t < sub_degree; t++) comp[i][t] = block[t].real();
+    }
+
+    EncodeCoeff(ptxt, level, scale,
+                CiSinCRecompose(comp, num_blocks, sub_degree), num_aux);
+    return;
+  }
+
   AssertTrue(static_cast<int>(message.size()) == degree / 2,
              "EncodeSinC: message must fill every slot of the ring");
 
@@ -529,15 +609,33 @@ void Encoder<word>::DecodeSinC(std::vector<Complex> &message,
                                const Plaintext<word> &ptxt,
                                int sub_degree) const {
   const int degree = param_.degree_;
-  // See EncodeSinC.
-  AssertTrue(!param_.conjugate_invariant_,
-             "DecodeSinC: no conjugate-invariant form yet");
   const SinCLayout layout = MakeSinCLayout(degree, sub_degree);
 
   std::vector<double> coeffs;
   DecodeCoeff(coeffs, ptxt);
   AssertTrue(static_cast<int>(coeffs.size()) == degree,
              "DecodeSinC: unexpected coefficient count");
+
+  if (param_.conjugate_invariant_) {
+    // The inverse of the conjugate-invariant EncodeSinC: the scan back to
+    // the module components, then per block the fold-and-transform that
+    // PlaintextToFoldedVector performs, at the subring's size.
+    const int num_blocks = degree / sub_degree;
+    const auto comp = CiSinCDecompose(coeffs, num_blocks, sub_degree);
+
+    message.resize(degree);
+    std::vector<Complex> block(sub_degree);
+    for (int i = 0; i < num_blocks; i++) {
+      block[0] = Complex(comp[i][0], 0.0);
+      for (int t = 1; t < sub_degree; t++) {
+        block[t] = Complex(comp[i][t], -comp[i][sub_degree - t]);
+      }
+      SpecialFFT(block);
+      std::copy(block.begin(), block.end(),
+                message.begin() + static_cast<size_t>(i) * sub_degree);
+    }
+    return;
+  }
 
   message.resize(degree / 2);
   std::vector<Complex> block(layout.slots_per_block);

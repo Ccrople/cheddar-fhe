@@ -202,10 +202,24 @@ class Encoder {
    * two levels puts log2 QP at 130.75 and the security at 101.3 gate bits. The
    * encoding itself is free, which is why it is the first thing built.
    *
+   * ## The conjugate-invariant ring
+   *
+   * R+ has N real slots and is free over its rank-k subring on
+   * {1, c_1, ..., c_{d-1}}, so the message is `degree` real values in d
+   * consecutive blocks of k, each block one subring element. Two things
+   * change against the ordinary form: the component-to-coefficient map is
+   * the banded two-term recomposition ModDecomp uses (Doing.md 1.5ba/1.5bh),
+   * not a stride, and the per-block transform is the conjugate-invariant
+   * encoder at size k -- SpecialIFFT and the real part. The k = degree
+   * endpoint is the ring's own Encode (pinned by
+   * SinCAtFullDegreeIsSlotEncoding); k = 2 collapses to nothing that
+   * pre-existed on this ring and is covered by the round trip instead.
+   *
    * @param ptxt output plaintext (NTT-applied, as for Encode)
    * @param level level of the plaintext
    * @param scale scale to apply
-   * @param message complex message, exactly `degree / 2` entries
+   * @param message the message: exactly `degree / 2` complex entries, or
+   *        `degree` real-valued entries on the conjugate-invariant ring
    * @param sub_degree k, a power of two dividing the ring degree, >= 2
    * @param num_aux number of auxiliary primes
    */
@@ -218,7 +232,9 @@ class Encoder {
    * be given the same `sub_degree` -- the encoding does not record it, exactly
    * as the coefficient encoding does not record that it is one.
    *
-   * @param message output complex message (resized to `degree / 2`)
+   * @param message output complex message, resized to the ring's slot count
+   *        -- `degree / 2`, or `degree` of real values on the
+   *        conjugate-invariant ring
    * @param ptxt input plaintext (NTT-applied)
    * @param sub_degree k, the same value used to encode
    */

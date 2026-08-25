@@ -461,14 +461,19 @@ TEST(RingSwitch, DescendsToTheProjectionShapeAndReturns) {
 // scrambled the blocks, so the comparison is entrywise against the exact
 // prediction above, and a control that omits the `j + r * i'` interleave has
 // to fail.
+//
+// ON THE CONJUGATE-INVARIANT PAIR the index identity does not survive: the
+// switch is the scan, and at the block level a part's blocks are a
+// triangular mix of the big blocks with seam terms that cross into the
+// neighbouring subring position -- not a redistribution. The comparison
+// there is against the exact composition of the validated component map
+// with the small ring's own DecodeSinC, and the ordinary interleave becomes
+// the control that has to FAIL.
 TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
   Ring big(kSwitchParam);
   Ring small(kSmallParam);
 
-  if (big.param->conjugate_invariant_) {
-    GTEST_SKIP() << "EncodeSinC has no conjugate-invariant form yet";
-  }
-
+  const bool ci = big.param->conjugate_invariant_;
   const int degree = big.Degree();
   const int small_degree = small.Degree();
   const int rank = degree / small_degree;
@@ -484,13 +489,16 @@ TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
   for (int k : {32, 128}) {
     const int d_big = degree / k;
     const int d_small = small_degree / k;
-    const int lanes = k / 2;
+    const int lanes = ci ? k : k / 2;
     ASSERT_EQ(d_big, rank * d_small);
 
     std::mt19937_64 gen(0x51C0DEULL ^ static_cast<unsigned long long>(k));
     std::uniform_real_distribution<double> dist(-1.0, 1.0);
-    std::vector<cheddar::Complex> msg(degree / 2);
-    for (auto &z : msg) z = cheddar::Complex(dist(gen), dist(gen));
+    std::vector<cheddar::Complex> msg(ci ? degree : degree / 2);
+    for (auto &z : msg) {
+      z = ci ? cheddar::Complex(dist(gen), 0.0)
+             : cheddar::Complex(dist(gen), dist(gen));
+    }
 
     Plaintext<word> pt;
     big.context->encoder_.EncodeSinC(pt, level, big.param->GetScale(level),
@@ -505,12 +513,46 @@ TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
     double worst = 0.0, control = 0.0;
+
+    // On the conjugate-invariant pair there is no index formula to check:
+    // the parts carry the block-level SCAN of the big blocks, seam terms
+    // included, not a redistribution. Each part is still a well-formed SinC
+    // ciphertext, and its exact message is predicted by composing the
+    // validated component map with the small ring's own DecodeSinC. The
+    // ordinary interleave is kept as the control that has to fail there.
+    std::vector<std::vector<double>> comp;
+    if (ci) {
+      std::vector<double> big_coeffs;
+      big.context->encoder_.DecodeCoeff(big_coeffs, pt);
+      comp = HostComponents(big_coeffs, rank, small_degree, true);
+    }
+
     for (int j = 0; j < rank; j++) {
       Plaintext<word> back;
       small.ui->Decrypt(back, parts[j]);
       std::vector<cheddar::Complex> got;
       small.context->encoder_.DecodeSinC(got, back, k);
-      ASSERT_EQ(static_cast<int>(got.size()), small_degree / 2);
+      ASSERT_EQ(static_cast<int>(got.size()),
+                ci ? small_degree : small_degree / 2);
+
+      if (ci) {
+        Plaintext<word> pred_pt;
+        small.context->encoder_.EncodeCoeff(pred_pt, small.param->max_level_,
+                                            big.param->GetScale(level),
+                                            comp[j]);
+        std::vector<cheddar::Complex> want;
+        small.context->encoder_.DecodeSinC(want, pred_pt, k);
+
+        for (int ip = 0; ip < d_small; ip++) {
+          for (int t = 0; t < lanes; t++) {
+            const auto v = got[ip * lanes + t];
+            worst = std::max(worst, std::abs(v - want[ip * lanes + t]));
+            control = std::max(
+                control, std::abs(v - msg[(j + rank * ip) * lanes + t]));
+          }
+        }
+        continue;
+      }
 
       for (int ip = 0; ip < d_small; ip++) {
         for (int t = 0; t < lanes; t++) {
@@ -526,15 +568,19 @@ TEST(RingSwitch, CarriesTheSinCEncodingToTheSmallRing) {
       }
     }
 
-    std::cout << "SinC k=" << k << ": " << degree << " (" << d_big
-              << " blocks) -> " << rank << " x " << small_degree << " ("
-              << d_small << " blocks, " << lanes
-              << " lanes): max |diff| = " << worst
-              << ", control (no interleave) = " << control << std::endl;
+    std::cout << (ci ? "CI " : "ordinary ") << "SinC k=" << k << ": "
+              << degree << " (" << d_big << " blocks) -> " << rank << " x "
+              << small_degree << " (" << d_small << " blocks, " << lanes
+              << " lanes): max |diff| = " << worst << ", control ("
+              << (ci ? "ordinary interleave" : "no interleave")
+              << ") = " << control << std::endl;
 
-    EXPECT_LT(worst, 2e-3) << "the switch did not carry SinC(" << k << ")";
+    EXPECT_LT(worst, ci ? 5e-3 : 2e-3)
+        << "the switch did not carry SinC(" << k << ")";
     EXPECT_GT(control, 1e-2)
-        << "the blocks are NOT interleaved, so this test would pass against a "
-           "switch that laid them out contiguously";
+        << (ci ? "the parts read as an ordinary block interleave, which the "
+                 "banded module structure says cannot happen"
+               : "the blocks are NOT interleaved, so this test would pass "
+                 "against a switch that laid them out contiguously");
   }
 }

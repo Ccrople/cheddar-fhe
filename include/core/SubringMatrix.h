@@ -74,6 +74,12 @@ namespace cheddar {
  * with the `d` rows living inside a single ciphertext and the `d'` contraction
  * running across ciphertexts.
  *
+ * On the conjugate-invariant ring the same holds with **k real lanes**: the
+ * subring is totally real with k real slots, `Vec` is the banded component
+ * map of ModDecomp rather than a stride, and the R_k-linearity argument is
+ * basis-independent -- the ciphertext-level product is unchanged and only
+ * EncodeWeights' lane count moves.
+ *
  * ## Level budget
  *
  * One plaintext multiplication and one rescale: **depth 1**, no rotation,

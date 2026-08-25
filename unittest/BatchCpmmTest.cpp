@@ -20,6 +20,12 @@
 // rotation, automorphism or relinearization key is involved, which is what
 // [KANG] Table 1 claims for Algorithm 1 and what makes it affordable here.
 //
+// ON THE CONJUGATE-INVARIANT RING (ci12_30 / ci12_35 via CHEDDAR_SMALL_PARAM)
+// the lanes are k REAL matrices rather than k/2 complex ones, and everything
+// else holds verbatim: the R_k-linearity that collapses the product to a
+// ciphertext linear combination is basis-independent, so the same pass
+// evaluates 128 real products where the ordinary ring evaluates 64 complex.
+//
 // SEPARATE BINARY, degree 4096; see SmallRingNttTest.cpp for the trap.
 
 #undef ENABLE_EXTENSION
@@ -55,7 +61,8 @@ constexpr int kColsOut = 3;  // d'', output ciphertexts
 // The product, against a host reference that is a loop over lanes.
 TEST_P(Testbed32, BatchCpmmMatchesPerLaneMatrixProducts) {
   const int degree = param_->degree_;
-  const int lanes = kSubDegree / 2;             // k/2 = 64 matrices at once
+  const bool ci = param_->conjugate_invariant_;
+  const int lanes = ci ? kSubDegree : kSubDegree / 2;  // 128 real or 64 complex
   const int num_blocks = degree / kSubDegree;   // d = 32 rows per ciphertext
   const int level = param_->max_level_;
   ASSERT_EQ(level, 1) << "this ring must have exactly one multiplicative level";
@@ -68,8 +75,8 @@ TEST_P(Testbed32, BatchCpmmMatchesPerLaneMatrixProducts) {
   std::vector<std::vector<Complex>> z(kColsIn);
   std::vector<Ciphertext<word>> cts(kColsIn);
   for (int j = 0; j < kColsIn; j++) {
-    GenerateRandomMessage(z[j], -1, -0.5, 0.5);
-    ASSERT_EQ(static_cast<int>(z[j].size()), degree / 2);
+    GenerateRandomMessage(z[j], -1, -0.5, 0.5, !ci);
+    ASSERT_EQ(static_cast<int>(z[j].size()), param_->MaxNumSlots());
     Plaintext<word> pt;
     context_->encoder_.EncodeSinC(pt, level, scale, z[j], kSubDegree);
     interface_->Encrypt(cts[j], pt);
@@ -79,7 +86,7 @@ TEST_P(Testbed32, BatchCpmmMatchesPerLaneMatrixProducts) {
   // carry different matrices -- identical ones would hide any leakage.
   std::vector<std::vector<Complex>> u(lanes);
   for (int t = 0; t < lanes; t++) {
-    GenerateRandomMessage(u[t], kColsIn * kColsOut, -0.5, 0.5);
+    GenerateRandomMessage(u[t], kColsIn * kColsOut, -0.5, 0.5, !ci);
   }
 
   SubringWeights<word> weights;
@@ -103,7 +110,7 @@ TEST_P(Testbed32, BatchCpmmMatchesPerLaneMatrixProducts) {
     interface_->Decrypt(out, res[l]);
     std::vector<Complex> got;
     context_->encoder_.DecodeSinC(got, out, kSubDegree);
-    ASSERT_EQ(static_cast<int>(got.size()), degree / 2);
+    ASSERT_EQ(static_cast<int>(got.size()), param_->MaxNumSlots());
 
     for (int i = 0; i < num_blocks; i++) {
       for (int t = 0; t < lanes; t++) {
@@ -131,7 +138,8 @@ TEST_P(Testbed32, BatchCpmmMatchesPerLaneMatrixProducts) {
 // carrying the same matrix, and that is the shape a broadcasting bug takes.
 TEST_P(Testbed32, BatchCpmmLanesAreIndependent) {
   const int degree = param_->degree_;
-  const int lanes = kSubDegree / 2;
+  const bool ci = param_->conjugate_invariant_;
+  const int lanes = ci ? kSubDegree : kSubDegree / 2;
   const int num_blocks = degree / kSubDegree;
   const int level = param_->max_level_;
   const double scale = DetermineScale(level);
@@ -142,7 +150,7 @@ TEST_P(Testbed32, BatchCpmmLanesAreIndependent) {
   std::vector<std::vector<Complex>> z(kColsIn);
   std::vector<Ciphertext<word>> cts(kColsIn);
   for (int j = 0; j < kColsIn; j++) {
-    GenerateRandomMessage(z[j], -1, -0.5, 0.5);
+    GenerateRandomMessage(z[j], -1, -0.5, 0.5, !ci);
     Plaintext<word> pt;
     context_->encoder_.EncodeSinC(pt, level, scale, z[j], kSubDegree);
     interface_->Encrypt(cts[j], pt);
@@ -150,7 +158,7 @@ TEST_P(Testbed32, BatchCpmmLanesAreIndependent) {
 
   std::vector<std::vector<Complex>> u(lanes);
   for (int t = 0; t < lanes; t++) {
-    GenerateRandomMessage(u[t], kColsIn * kColsOut, -0.5, 0.5);
+    GenerateRandomMessage(u[t], kColsIn * kColsOut, -0.5, 0.5, !ci);
   }
   std::fill(u[silenced].begin(), u[silenced].end(), Complex(0.0, 0.0));
 
