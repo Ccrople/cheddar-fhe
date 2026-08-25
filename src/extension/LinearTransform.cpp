@@ -87,7 +87,18 @@ LinearTransform<word>::LinearTransform(ConstContextPtr<word> context,
       pre_rotation_{pre_rotation},
       additional_pt_rot_{additional_pt_rot},
       stride_{DetermineStride(matrix)},
+      diag_offsets_{ExtractDiagOffsets(matrix)},
       hoist_{context, ConstructPlainHoistMap(matrix), pt_level, pt_scale} {}
+
+template <typename word>
+std::set<int> LinearTransform<word>::ExtractDiagOffsets(
+    const StripedMatrix &matrix) {
+  std::set<int> offsets;
+  for (const auto &[i, _] : matrix) {
+    offsets.insert(i);
+  }
+  return offsets;
+}
 
 template <typename word>
 bool LinearTransform<word>::IsUsingBSGS() const {
@@ -121,6 +132,24 @@ void LinearTransform<word>::Evaluate(ConstContextPtr<word> context, Ct &res,
                                      const EvkMap<word> &evk_map,
                                      bool min_ks /*= false*/) const {
   hoist_.Evaluate(context, res, input, evk_map, min_ks);
+}
+
+template <typename word>
+void LinearTransform<word>::EvaluateBabyStep(ConstContextPtr<word> context,
+                                             std::map<int, Ct> &bs,
+                                             const Ct &input,
+                                             const EvkMap<word> &evk_map,
+                                             bool min_ks /*= false*/) const {
+  hoist_.EvaluateBabyStep(context, bs, input, evk_map, min_ks);
+}
+
+template <typename word>
+void LinearTransform<word>::EvaluateGiantStep(ConstContextPtr<word> context,
+                                              Ct &res,
+                                              const std::map<int, Ct> &bs,
+                                              const EvkMap<word> &evk_map,
+                                              bool min_ks /*= false*/) const {
+  hoist_.EvaluateGiantStep(context, res, bs, evk_map, min_ks);
 }
 
 template class LinearTransform<uint32_t>;

@@ -200,6 +200,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # CoeffToSlot and SlotToCoeff on the real subring, against the encoder rather
+  # than against another run of the transform. Compiles the transforms
+  # standalone, since BootContext still refuses the conjugate-invariant flag,
+  # and runs unchanged on bootparam_35 as the control.
+  add_executable(ci_fft_test CiFftTest.cpp)
+  target_link_libraries(ci_fft_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)
@@ -306,7 +314,5 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)

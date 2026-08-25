@@ -7,6 +7,7 @@
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
 #include "extension/BootParameter.h"
+#include "extension/ComplexLinearTransform.h"
 #include "extension/LinearTransform.h"
 
 namespace cheddar {
@@ -31,9 +32,16 @@ class EvalSpecialFFT {
   const double cts_const_;
   const double stc_const_;
   const bool full_slot_;
+  // The real subring runs the same stage matrices over a complex intermediate
+  // carried as a pair of real ciphertexts, so its phases are a different type.
+  // Exactly one of the two pairs of vectors below is populated.
+  const bool conjugate_invariant_;
 
   std::vector<LinearTransform<word>> cts_phases_;
   std::vector<LinearTransform<word>> stc_phases_;
+
+  std::vector<ComplexLinearTransform<word>> cts_ci_phases_;
+  std::vector<ComplexLinearTransform<word>> stc_ci_phases_;
 
   std::vector<StripedMatrix> plain_fft_stages_;
   std::vector<StripedMatrix> plain_ifft_stages_;

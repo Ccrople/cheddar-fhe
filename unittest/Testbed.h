@@ -88,6 +88,8 @@ class Testbed : public testing::TestWithParam<const char *> {
   std::vector<word> aux_primes_;
   std::vector<std::pair<int, int>> level_config_;
   std::pair<int, int> additional_base_;
+  int num_cts_levels_ = 0;
+  int num_stc_levels_ = 0;
 
  protected:
   static inline constexpr double max_error_ = 1e-3;
@@ -205,20 +207,25 @@ class Testbed : public testing::TestWithParam<const char *> {
     }
 
     if (enable_boot) {
-      std::cout << "Bootstrapping enabled" << std::endl;
+      // Parsed whether or not a BootContext is built: a test that only wants
+      // the transforms still has to compile them against the same level split.
       Check(json_data.contains("num_cts_levels"),
             "Missing num_cts_levels in JSON file");
       Check(json_data["num_cts_levels"].is_number_integer(),
             "num_cts_levels should be an integer");
-      int num_cts_levels = json_data["num_cts_levels"];
+      num_cts_levels_ = json_data["num_cts_levels"];
       Check(json_data.contains("num_stc_levels"),
             "Missing num_stc_levels in JSON file");
       Check(json_data["num_stc_levels"].is_number_integer(),
             "num_stc_levels should be an integer");
-      int num_stc_levels = json_data["num_stc_levels"];
+      num_stc_levels_ = json_data["num_stc_levels"];
+    }
+
+    if (enable_boot && UseBootContext()) {
+      std::cout << "Bootstrapping enabled" << std::endl;
       context_ = BootContext<word>::Create(
-          *param_, BootParameter(BootMaxLevel(), num_cts_levels,
-                                 num_stc_levels, 5, BootSlackLevels()));
+          *param_, BootParameter(BootMaxLevel(), num_cts_levels_,
+                                 num_stc_levels_, 5, BootSlackLevels()));
     } else {
       context_ = Context<word>::Create(*param_);
     }
@@ -239,6 +246,12 @@ class Testbed : public testing::TestWithParam<const char *> {
   // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
   // the slot domain before the conversion -- overrides it.
   virtual int BootSlackLevels() const { return 0; }
+
+  // Whether SetUp builds a BootContext when the preset asks for one. A test
+  // that needs the extension's transforms but not the bootstrap -- the real
+  // subring, where BootContext's constructor still refuses -- overrides this
+  // to false and gets a plain Context out of a preset carrying boot primes.
+  virtual bool UseBootContext() const { return true; }
 
   void TearDown() override {
     interface_.reset();

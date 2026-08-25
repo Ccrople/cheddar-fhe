@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <map>
 #include <set>
 #include <unordered_map>
 
@@ -34,10 +35,12 @@ class LinearTransform {
 
   // shoule be the last members
   int stride_;
+  std::set<int> diag_offsets_;
   HoistHandler<word> hoist_;
 
   int DetermineStride(const StripedMatrix &matrix);
   PlainHoistMap ConstructPlainHoistMap(const StripedMatrix &matrix);
+  static std::set<int> ExtractDiagOffsets(const StripedMatrix &matrix);
 
  public:
   LinearTransform(ConstContextPtr<word> context, const StripedMatrix &matrix,
@@ -53,6 +56,34 @@ class LinearTransform {
 
   void Evaluate(ConstContextPtr<word> context, Ct &res, const Ct &input,
                 const EvkMap<word> &evk_map, bool min_ks = false) const;
+
+  /**
+   * @brief The two halves of Evaluate, separately.
+   *
+   * `Evaluate` is `EvaluateBabyStep` followed by `EvaluateGiantStep`, and the
+   * baby step is where the rotations of the *input* happen -- so a caller with
+   * more than one matrix to apply to the same input pays for them once by
+   * doing the split itself. That is what `ComplexLinearTransform` needs: on the
+   * real subring a complex matrix is a pair of real ones over the same
+   * ciphertext, and running them as two `Evaluate` calls would rotate the input
+   * twice for no reason.
+   *
+   * The `bs` map is keyed by baby-step index, and `EvaluateGiantStep` looks its
+   * entries up by that key alone. Two transforms compiled from matrices with
+   * the same diagonal offsets, `bs`, `gs` and `pre_rotation` therefore share a
+   * baby-step map exactly; `ComplexLinearTransform` asserts that they do.
+   */
+  void EvaluateBabyStep(ConstContextPtr<word> context, std::map<int, Ct> &bs,
+                        const Ct &input, const EvkMap<word> &evk_map,
+                        bool min_ks = false) const;
+  void EvaluateGiantStep(ConstContextPtr<word> context, Ct &res,
+                         const std::map<int, Ct> &bs,
+                         const EvkMap<word> &evk_map,
+                         bool min_ks = false) const;
+
+  /// The diagonal offsets the matrix was compiled from, for a caller pairing
+  /// two transforms and needing to know they line up.
+  const std::set<int> &GetDiagonalOffsets() const { return diag_offsets_; }
 };
 
 }  // namespace cheddar

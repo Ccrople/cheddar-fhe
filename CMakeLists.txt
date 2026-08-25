@@ -88,6 +88,7 @@ if(ENABLE_EXTENSION)
     src/extension/AttentionPacking.cpp
     src/extension/BootContext.cpp
     src/extension/BootParameter.cpp
+    src/extension/ComplexLinearTransform.cpp
     src/extension/EvalMod.cpp
     src/extension/EvalPoly.cpp
     src/extension/EvalSpecialFFT.cpp

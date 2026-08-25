@@ -19,11 +19,12 @@ EvalSpecialFFT<word>::EvalSpecialFFT(ConstContextPtr<word> context,
       boot_param_{boot_param},
       cts_const_{cts_const},
       stc_const_{stc_const},
-      full_slot_{num_slots == context->param_.degree_ / 2} {
+      full_slot_{num_slots == context->param_.MaxNumSlots()},
+      conjugate_invariant_{context->param_.conjugate_invariant_} {
   AssertTrue(num_slots >= 256,
              "Currently only high number of slots are supported");
   AssertTrue(IsPowOfTwo(num_slots), "Number of slots must be a power of 2");
-  AssertTrue(num_slots <= context->param_.degree_ / 2,
+  AssertTrue(num_slots <= context->param_.MaxNumSlots(),
              "Number of slots exceeds the maximum possible");
   PopulatePlainMatrices(context);
   PreparePlaintexts(context);
@@ -67,7 +68,13 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
 template <typename word>
 void EvalSpecialFFT<word>::PopulatePlainMatrices(
     ConstContextPtr<word> context) {
-  int M = context->param_.degree_ * 2;
+  // The twiddle a stage wants is exp(2 pi i (5^j mod st8) / st8), and it is
+  // looked up as GetTwiddleFactor((5^j mod st8) * (M / st8)) against a table of
+  // M-th roots -- so M cancels and the stage matrices depend on the slot count
+  // alone. That is why the real subring needs no new plain matrices at all;
+  // what it does need is for M here to be the ring's own cyclotomic index (4N,
+  // not 2N), or the division M / st8 truncates and the lookup lands elsewhere.
+  int M = context->param_.CyclotomicIndex();
   const auto &encoder = context->encoder_;
 
   int num_stages = Log2Ceil(num_slots_);
@@ -213,7 +220,7 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
 
     // Decomposing into Wx and -iWx part for later decomposition of real and
     // imag part for non-full-slot cases
-    if (i == num_cts_phases - 1 && !full_slot_) {
+    if (i == num_cts_phases - 1 && !full_slot_ && !conjugate_invariant_) {
       StripedMatrix extended(num_slots_ * 2, num_slots_ * 2);
       for (auto &[i, diag] : phase_matrix) {
         int dst_idx = i;
@@ -249,9 +256,17 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
     // std::cout << "Pre rotation: " << pre_rotation << std::endl;
     // std::cout << "Additional pt rot: " << additional_pt_rot << std::endl;
 
-    cts_phases_.emplace_back(context, phase_matrix, cts_level - i,
-                             context->param_.GetRescalePrimeProd(cts_level - i),
-                             bs, gs, pre_rotation, additional_pt_rot);
+    const double cts_pt_scale =
+        context->param_.GetRescalePrimeProd(cts_level - i);
+    if (conjugate_invariant_) {
+      cts_ci_phases_.emplace_back(context, phase_matrix, cts_level - i,
+                                  cts_pt_scale, bs, gs, pre_rotation,
+                                  additional_pt_rot);
+    } else {
+      cts_phases_.emplace_back(context, phase_matrix, cts_level - i,
+                               cts_pt_scale, bs, gs, pre_rotation,
+                               additional_pt_rot);
+    }
     cts_stages_cumul += num_stages;
   }
 
@@ -269,7 +284,29 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
       phase_matrix = StripedMatrix::Mult(plain_fft_stages_[j], phase_matrix);
     }
 
-    if (i == 0 && !full_slot_) {
+    if (conjugate_invariant_ && i == 0) {
+      // WHERE THE FACTOR OF TWO COMES FROM. The composed StC stage product is
+      // the adjoint of the CtS one -- plain_fft_stages_[i] is exactly
+      // plain_ifft_stages_[L-1-i] conjugate-transposed -- so taking the real
+      // part after it gives Re(A^T), which is the transpose of what CtS
+      // computes. On the real subring E^T E is diag(n, 2n, ..., 2n) rather than
+      // a multiple of the identity, because the basis vector 1 has no conjugate
+      // partner where every c_j has one, so the transpose is E^-1 only up to
+      // that diagonal. Undoing it is a column scaling of the first phase, which
+      // is free: the plaintexts were being built anyway.
+      //
+      // Index 0 is the odd one out in the CtS-output (bit-reversed) order too,
+      // since BitReverse fixes it. Verified against the host encoder for every
+      // degree and sparse slot count.
+      for (auto &[idx, diag] : phase_matrix) {
+        for (int j = 0; j < num_slots_; j++) {
+          int col = ((j + idx) % num_slots_ + num_slots_) % num_slots_;
+          if (col != 0) diag[j] *= 2.0;
+        }
+      }
+    }
+
+    if (i == 0 && !full_slot_ && !conjugate_invariant_) {
       StripedMatrix extended(num_slots_ * 2, num_slots_ * 2);
       for (auto &[i, diag] : phase_matrix) {
         int dst_idx = i;
@@ -308,8 +345,14 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
 
     // double stc_scale = context->param_.GetScale(stc_level - i);
     double stc_scale = context->param_.GetRescalePrimeProd(stc_level - i);
-    stc_phases_.emplace_back(context, phase_matrix, stc_level - i, stc_scale,
-                             bs, gs, pre_rotation, additional_pt_rot);
+    if (conjugate_invariant_) {
+      stc_ci_phases_.emplace_back(context, phase_matrix, stc_level - i,
+                                  stc_scale, bs, gs, pre_rotation,
+                                  additional_pt_rot);
+    } else {
+      stc_phases_.emplace_back(context, phase_matrix, stc_level - i, stc_scale,
+                               bs, gs, pre_rotation, additional_pt_rot);
+    }
     stc_stages_cumul += num_stages;
   }
 }
@@ -323,7 +366,17 @@ void EvalSpecialFFT<word>::AddRequiredRotations(EvkRequest &req,
   for (const auto &stc_phase : stc_phases_) {
     stc_phase.AddRequiredRotations(req, min_ks);
   }
-  if (!full_slot_) {
+  for (const auto &cts_phase : cts_ci_phases_) {
+    cts_phase.AddRequiredRotations(req, min_ks);
+  }
+  for (const auto &stc_phase : stc_ci_phases_) {
+    stc_phase.AddRequiredRotations(req, min_ks);
+  }
+  if (!full_slot_ && !conjugate_invariant_) {
+    // The sparse-packing path folds Wx and -iWx into a transform of twice the
+    // width and then merges the halves with a rotation by num_slots_. The real
+    // subring has no such extension: the intermediate is a pair of ciphertexts
+    // whatever the slot count, so nothing extra is rotated here.
     req.AddRequest(num_slots_, boot_param_.GetEndLevel());
   }
 }
@@ -333,6 +386,24 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
                                        const Ct &input,
                                        const EvkMap<word> &evk_map,
                                        bool min_ks) const {
+  if (conjugate_invariant_) {
+    // Real in, complex through the middle, real out. The first phase lifts the
+    // input to a pair, the last drops the imaginary half it does not need, and
+    // what comes back is the coefficient vector in bit-reversed order -- the
+    // same thing the ordinary path returns, only real.
+    int num_phases = static_cast<int>(cts_ci_phases_.size());
+    Ct im;
+    cts_ci_phases_.at(0).EvaluateFromReal(context, res, im, input, evk_map,
+                                          min_ks);
+    for (int i = 1; i < num_phases - 1; i++) {
+      cts_ci_phases_.at(i).EvaluatePair(context, res, im, res, im, evk_map,
+                                        min_ks);
+    }
+    cts_ci_phases_.at(num_phases - 1)
+        .EvaluateToReal(context, res, res, im, evk_map, min_ks);
+    res.SetNumSlots(num_slots_);
+    return;
+  }
   int num_cts_phases = cts_phases_.size();
   cts_phases_.at(0).Evaluate(context, res, input, evk_map, min_ks);
   for (int i = 1; i < num_cts_phases; i++) {
@@ -348,6 +419,20 @@ void EvalSpecialFFT<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
                                        const Ct &input,
                                        const EvkMap<word> &evk_map,
                                        bool min_ks) const {
+  if (conjugate_invariant_) {
+    int num_phases = static_cast<int>(stc_ci_phases_.size());
+    Ct im;
+    stc_ci_phases_.at(0).EvaluateFromReal(context, res, im, input, evk_map,
+                                          min_ks);
+    for (int i = 1; i < num_phases - 1; i++) {
+      stc_ci_phases_.at(i).EvaluatePair(context, res, im, res, im, evk_map,
+                                        min_ks);
+    }
+    stc_ci_phases_.at(num_phases - 1)
+        .EvaluateToReal(context, res, res, im, evk_map, min_ks);
+    res.SetNumSlots(num_slots_);
+    return;
+  }
   int num_stc_phases = stc_phases_.size();
   stc_phases_.at(0).Evaluate(context, res, input, evk_map, min_ks);
   for (int i = 1; i < num_stc_phases; i++) {
@@ -369,6 +454,10 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
                                        int sub_degree, int stc_level,
                                        int cts_level, int num_phases) {
   const int degree = context->param_.degree_;
+  AssertTrue(!conjugate_invariant_,
+             "PrepareSinC: the SinC conversions read R_N as free over R_k on {Y^i}, "
+             "and the real subring is not -- c_i c_(km) = c_(km+i) + c_(km-i) "
+             "hits two coefficient classes. Same open item as ModDecomp");
   AssertTrue(full_slot_,
              "PrepareSinC: the SinC conversions are defined on the full slot "
              "count; the sparse-packing path is a different transform");
@@ -516,6 +605,11 @@ void EvalSpecialFFT<word>::PrepareSinC(ConstContextPtr<word> context,
 template <typename word>
 StripedMatrix EvalSpecialFFT<word>::SinCPrefixMatrix(int sub_degree,
                                                      int &window) const {
+  AssertTrue(!conjugate_invariant_,
+             "SinCPrefixMatrix: the SinC conversions read R_N as free over R_k on "
+             "{Y^i}, and the real subring is not -- c_i c_(km) = "
+             "c_(km+i) + c_(km-i) hits two coefficient classes. The "
+             "same open item as ModDecomp");
   AssertTrue(full_slot_,
              "SinCPrefixMatrix: the SinC conversions are defined on the full "
              "slot count");
@@ -542,6 +636,11 @@ void EvalSpecialFFT<word>::PrepareSinCPrefix(ConstContextPtr<word> context,
                                              int num_phases, double constant,
                                              double pt_scale) {
   const int degree = context->param_.degree_;
+  AssertTrue(!conjugate_invariant_,
+             "PrepareSinCPrefix: the SinC conversions read R_N as free over R_k on "
+             "{Y^i}, and the real subring is not -- c_i c_(km) = "
+             "c_(km+i) + c_(km-i) hits two coefficient classes. The "
+             "same open item as ModDecomp");
   AssertTrue(full_slot_,
              "PrepareSinCPrefix: the SinC conversions are defined on the full "
              "slot count");
