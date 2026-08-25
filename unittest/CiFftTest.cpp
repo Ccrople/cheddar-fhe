@@ -39,6 +39,12 @@ using word = uint32_t;
 
 namespace {
 
+int Log2(int value) {
+  int bits = 0;
+  while ((1 << bits) < value) bits++;
+  return bits;
+}
+
 int BitReverse(int value, int num_bits) {
   int res = 0;
   for (int i = 0; i < num_bits; i++) {
@@ -90,7 +96,7 @@ class CiFft : public Testbed<word> {
     const int degree = 1 << log_degree_;
     const int gap = param_->MaxNumSlots() / num_slots;
     const bool ci = param_->conjugate_invariant_;
-    const int log_num_slots = Log2Ceil(num_slots);
+    const int log_num_slots = Log2(num_slots);
 
     expected.assign(num_slots, Complex(0, 0));
     for (int j = 0; j < num_slots; j++) {
