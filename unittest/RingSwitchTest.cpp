@@ -36,10 +36,17 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/Mlwe.h"
+#include "core/Pcmm.h"
 #include "core/RingSwitch.h"
 
 using word = uint32_t;
 using cheddar::Ciphertext;
+using cheddar::EvaluationKey;
+using cheddar::MlweCiphertext;
+using cheddar::MlweHandler;
+using cheddar::PcmmHandler;
+using cheddar::PlainMatrix;
 using cheddar::Plaintext;
 using cheddar::RingSwitchHandler;
 using Ring = ringfixture::Ring<word>;
@@ -95,6 +102,25 @@ std::vector<std::vector<double>> HostComponents(
     }
   }
   return comp;
+}
+
+// The inverse of HostComponents: the banded two-term recomposition on the
+// conjugate-invariant ring, the plain interleave on the ordinary one -- what
+// ModPack and SwitchBack both implement over their own containers.
+std::vector<double> HostRecompose(const std::vector<std::vector<double>> &comp,
+                                  int rank, int small_degree,
+                                  bool conjugate_invariant) {
+  std::vector<double> out(static_cast<size_t>(rank) * small_degree, 0.0);
+  for (int t = 0; t < small_degree; t++) {
+    for (int i = 0; i < rank; i++) {
+      double v = comp[i][t];
+      if (conjugate_invariant && i != 0 && t + 1 < small_degree) {
+        v += comp[rank - i][t + 1];
+      }
+      out[static_cast<size_t>(t) * rank + i] = v;
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -251,6 +277,163 @@ TEST(RingSwitch, RoundTripsThroughTheSmallRing) {
             << " (coefficient " << worst_c << ")" << std::endl;
 
   // Two key switches now, so a little looser than the one-way bound.
+  EXPECT_LT(worst, 2e-3);
+}
+
+// ---------------------------------------------------------------------------
+// The switched descent at the layer's own shape (Doing.md 1.5bh): switch to
+// the small ring, ModDecomp every part to the projection degree of 128, mix
+// all 512 module components with one 512 x 512 plaintext matrix -- the shape
+// of one weight tile -- then ModPack each part with the SMALL ring's 32
+// embedded-secret keys and switch back up. Against the same composition of
+// maps in exact real arithmetic on the host.
+//
+// This is the whole switched leg of the PC-MM: every key the route needs
+// exists here (one switch key, one inverse key, and 32 small-ring ModPack
+// keys serving all 16 parts -- against the direct route's 512 keys at the
+// big degree), and the reported error is the route's noise datum at the real
+// shape, the other half of the measurement the descent choice of 1.5bg/1.5bh
+// waits on. On the conjugate-invariant pair both the switch and the
+// decomposition are scans, and the mixing destroys the coherence that lets a
+// pure round trip contract them back out -- which is exactly why this is a
+// measurement and not an estimate.
+TEST(RingSwitch, DescendsToTheProjectionShapeAndReturns) {
+  Ring big(kSwitchParam);
+  Ring small(kSmallParam);
+
+  const int degree = big.Degree();
+  const int small_ring_degree = small.Degree();
+  const int rank = degree / small_ring_degree;
+  const int proj_degree = 128;
+  const int mlwe_rank = small_ring_degree / proj_degree;
+  const int cols = rank * mlwe_rank;
+  const bool ci = big.param->conjugate_invariant_;
+  constexpr double kWeightScale = 268435456.0;  // 2^28
+
+  const int level = big.param->max_level_;
+  const auto &small_secret = small.ui->GetSecretCoeffs();
+  big.ui->PrepareRingSwitchKey(small_ring_degree, small_secret, level);
+  big.ui->PrepareInverseRingSwitchKey(small_ring_degree, small_secret, level);
+  small.ui->PrepareModPackKeys(proj_degree);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < mlwe_rank; j++) {
+    keys.push_back(&small.ui->GetModPackKey(mlwe_rank, j));
+  }
+
+  // On the conjugate-invariant pair the components grow twice over -- the
+  // switch's scan of chain 4096 and the decomposition's of chain 128 -- and
+  // the product's scale has to fit what remains of a terminal-prime modulus,
+  // so the inputs start at a quarter of the usual range.
+  std::mt19937_64 gen(0x5CA1AB1E);
+  std::uniform_real_distribution<double> dist(-0.25, 0.25);
+  std::vector<double> coeffs(degree);
+  for (auto &c : coeffs) c = dist(gen);
+
+  Plaintext<word> pt;
+  big.context->encoder_.EncodeCoeff(pt, level, big.param->GetScale(level),
+                                    coeffs);
+  Ciphertext<word> ct;
+  big.ui->Encrypt(ct, pt);
+
+  RingSwitchHandler<word> rs(big.context, small.context);
+  std::vector<Ciphertext<word>> parts;
+  rs.Switch(parts, ct, big.ui->GetRingSwitchKey(rank));
+  ASSERT_EQ(static_cast<int>(parts.size()), rank);
+
+  // Decompose every part; column j of the product is module component
+  // j % mlwe_rank of part j / mlwe_rank.
+  MlweHandler<word> mlwe(*small.param, small.context->ntt_handler_);
+  std::vector<MlweCiphertext<word>> columns;
+  columns.reserve(cols);
+  for (int p = 0; p < rank; p++) {
+    std::vector<MlweCiphertext<word>> decomposed;
+    mlwe.ModDecomp(decomposed, parts[p], proj_degree);
+    ASSERT_EQ(static_cast<int>(decomposed.size()), mlwe_rank);
+    for (auto &c : decomposed) columns.push_back(std::move(c));
+  }
+
+  // One tile-shaped mixing matrix across all parts, normalized by
+  // 1/sqrt(cols) so the mixed magnitude stays at the components' own.
+  std::vector<double> values(static_cast<size_t>(cols) * cols);
+  {
+    std::uniform_real_distribution<double> wdist(-1.0, 1.0);
+    const double norm = 1.0 / std::sqrt(static_cast<double>(cols));
+    for (auto &v : values) v = wdist(gen) * norm;
+  }
+
+  const int part_level = small.param->NPToLevel(columns[0].np_);
+  ASSERT_GE(part_level, 0);
+  PcmmHandler<word> pcmm(*small.param);
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, part_level, kWeightScale, values, cols, cols);
+
+  std::vector<MlweCiphertext<word>> mixed;
+  pcmm.Multiply(mixed, u, columns);
+  ASSERT_EQ(static_cast<int>(mixed.size()), cols);
+
+  // Pack rows [mlwe_rank*p, mlwe_rank*(p+1)) back into small-ring ciphertext
+  // p -- the same 32 keys serve every part, which is the switched route's
+  // key-count argument.
+  std::vector<Ciphertext<word>> packed(rank);
+  for (int p = 0; p < rank; p++) {
+    std::vector<MlweCiphertext<word>> group;
+    group.reserve(mlwe_rank);
+    for (int j = 0; j < mlwe_rank; j++) {
+      group.push_back(std::move(mixed[static_cast<size_t>(p) * mlwe_rank + j]));
+    }
+    mlwe.ModPack(small.context, packed[p], group, keys);
+  }
+
+  Ciphertext<word> back;
+  rs.SwitchBack(back, packed, big.ui->GetInverseRingSwitchKey(rank));
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  Plaintext<word> back_pt;
+  big.ui->Decrypt(back_pt, back);
+  std::vector<double> got;
+  big.context->encoder_.DecodeCoeff(got, back_pt);
+  ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+  // The same composition on the host, in exact real arithmetic.
+  const auto comp16 = HostComponents(coeffs, rank, small_ring_degree, ci);
+  std::vector<std::vector<double>> columns_host;
+  columns_host.reserve(cols);
+  for (int p = 0; p < rank; p++) {
+    auto sub = HostComponents(comp16[p], mlwe_rank, proj_degree, ci);
+    for (auto &s : sub) columns_host.push_back(std::move(s));
+  }
+  std::vector<std::vector<double>> parts_host(rank);
+  for (int p = 0; p < rank; p++) {
+    std::vector<std::vector<double>> mixed_host(
+        mlwe_rank, std::vector<double>(proj_degree, 0.0));
+    for (int l = 0; l < mlwe_rank; l++) {
+      const double *row =
+          values.data() + (static_cast<size_t>(p) * mlwe_rank + l) * cols;
+      for (int j = 0; j < cols; j++) {
+        const double w = row[j];
+        for (int t = 0; t < proj_degree; t++) {
+          mixed_host[l][t] += w * columns_host[j][t];
+        }
+      }
+    }
+    parts_host[p] = HostRecompose(mixed_host, mlwe_rank, proj_degree, ci);
+  }
+  const auto expected = HostRecompose(parts_host, rank, small_ring_degree, ci);
+
+  double worst = 0.0;
+  int worst_c = -1;
+  for (int c = 0; c < degree; c++) {
+    const double d = std::abs(got[c] - expected[c]);
+    if (d > worst) {
+      worst = d;
+      worst_c = c;
+    }
+  }
+  std::cout << (ci ? "CI " : "ordinary ") << "switched descent " << degree
+            << " -> " << rank << " x " << small_ring_degree << " -> " << cols
+            << " x " << proj_degree << " -> back: max |diff| = " << worst
+            << " (coefficient " << worst_c << ")" << std::endl;
   EXPECT_LT(worst, 2e-3);
 }
 

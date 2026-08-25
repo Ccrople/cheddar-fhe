@@ -342,8 +342,12 @@ void MlweHandler<word>::ModDecomp(std::vector<MlweCiphertext<word>> &res,
                  degree % small_degree == 0 && small_degree < degree,
              "ModDecomp: small_degree must be a power of two properly "
              "dividing the ring degree");
-  AssertTrue(small_degree % kernel_block_dim_ == 0,
-             "ModDecomp: small_degree must be a multiple of the block dim");
+  // The conjugate-invariant projection runs at small_degree = 128 (Doing.md
+  // 1.5bh), below the 256-thread block every per-position launch here used
+  // to assume. small_degree is a power of two, so when it is the smaller of
+  // the two it divides the block dim exactly and the launches simply shrink
+  // their block instead of refusing the shape.
+  const int block_dim = Min(small_degree, kernel_block_dim_);
 
   const NPInfo np = ct.GetNP();
   AssertTrue(np.num_aux_ == 0, "ModDecomp: aux primes are not supported");
@@ -413,19 +417,17 @@ void MlweHandler<word>::ModDecomp(std::vector<MlweCiphertext<word>> &res,
         d_alpha.data(), degree, a_coeffs.data(), primes, rank, small_degree,
         degree, num_total_primes);
 
-    const dim3 grid_dim(small_degree / kernel_block_dim_, rank,
-                        num_total_primes);
-    kernel::CiModDecompCombine<word><<<grid_dim, kernel_block_dim_>>>(
+    const dim3 grid_dim(small_degree / block_dim, rank, num_total_primes);
+    kernel::CiModDecompCombine<word><<<grid_dim, block_dim>>>(
         d_dst_a.data(), alpha.data(), primes, rank, small_degree);
     return;
   }
 
-  const dim3 grid_dim(small_degree / kernel_block_dim_, rank,
-                      num_total_primes);
+  const dim3 grid_dim(small_degree / block_dim, rank, num_total_primes);
 
-  kernel::ModDecompB<word><<<grid_dim, kernel_block_dim_>>>(
+  kernel::ModDecompB<word><<<grid_dim, block_dim>>>(
       d_dst_b.data(), b_coeffs.data(), rank, small_degree, degree);
-  kernel::ModDecompA<word><<<grid_dim, kernel_block_dim_>>>(
+  kernel::ModDecompA<word><<<grid_dim, block_dim>>>(
       d_dst_a.data(), a_coeffs.data(), primes, rank, small_degree, degree);
 }
 

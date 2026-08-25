@@ -192,7 +192,13 @@ template <typename word>
 int PcmmBlasHandler<word>::ChunkFor(int cols, int rows, int pieces,
                                     int vec_len) const {
   const int num_groups = pieces * pieces;
-  AssertTrue(vec_len % kBlock == 0,
+  // Chunk boundaries stay aligned to the flat kernels' block, except when the
+  // whole component is shorter than one block -- the b-part at the conjugate-
+  // invariant projection degree of 128 (Doing.md 1.5bh) -- where the single
+  // chunk is the component itself. Both lengths are powers of two, so the
+  // smaller of the two divides the larger.
+  const int align = std::min(kBlock, vec_len);
+  AssertTrue(vec_len % align == 0,
              "PcmmBlas: the component length must be a multiple of the block "
              "dim");
 
@@ -223,8 +229,8 @@ int PcmmBlasHandler<word>::ChunkFor(int cols, int rows, int pieces,
   chunk = std::min(chunk,
                    kScratchWords / (static_cast<size_t>(num_groups) * rows));
   chunk = std::min(chunk, static_cast<size_t>(vec_len));
-  chunk -= chunk % kBlock;
-  AssertTrue(chunk >= static_cast<size_t>(kBlock),
+  chunk -= chunk % align;
+  AssertTrue(chunk >= static_cast<size_t>(align),
              "PcmmBlas: the operand is too wide for the scratch budget");
   return static_cast<int>(chunk);
 }

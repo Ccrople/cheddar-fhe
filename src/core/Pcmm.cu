@@ -217,9 +217,6 @@ void PcmmHandler<word>::Multiply(
     AssertTrue(ct.rank_ == rank && ct.degree_ == small_degree,
                "Pcmm::Multiply(MLWE): ciphertexts differ in rank or degree");
   }
-  AssertTrue(small_degree % kernel_block_dim_ == 0,
-             "Pcmm::Multiply(MLWE): degree must be a multiple of the block "
-             "dim");
 
   // Aliasing would make the accumulation read partially-written rows.
   for (const auto &r : res) {
@@ -266,13 +263,19 @@ void PcmmHandler<word>::Multiply(
   const word *primes = param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = param_.GetInvPrimesPtr(np);
 
-  const dim3 grid_b(small_degree / kernel_block_dim_, rows, num_total_primes);
-  kernel::PcmmAccum<word><<<grid_b, kernel_block_dim_>>>(
+  // The b-part is one small_degree-vector per limb, and the conjugate-
+  // invariant projection's small degree of 128 (Doing.md 1.5bh) sits below
+  // the 256-thread block: shrink the block rather than refuse the shape.
+  // Both lengths are powers of two, so the smaller divides the other.
+  const int block_b = Min(small_degree, kernel_block_dim_);
+  const dim3 grid_b(small_degree / block_b, rows, num_total_primes);
+  kernel::PcmmAccum<word><<<grid_b, block_b>>>(
       d_dst_b.data(), d_src_b.data(), u.data_.data(), primes, inv_primes, rows,
       cols, small_degree);
 
-  const dim3 grid_a(a_stride / kernel_block_dim_, rows, num_total_primes);
-  kernel::PcmmAccum<word><<<grid_a, kernel_block_dim_>>>(
+  const int block_a = Min(a_stride, kernel_block_dim_);
+  const dim3 grid_a(a_stride / block_a, rows, num_total_primes);
+  kernel::PcmmAccum<word><<<grid_a, block_a>>>(
       d_dst_a.data(), d_src_a.data(), u.data_.data(), primes, inv_primes, rows,
       cols, a_stride);
 }

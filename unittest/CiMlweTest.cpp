@@ -35,11 +35,19 @@
 //       ModDecomp, the scalar PC-MM across the module components, ModPack,
 //       decrypt, against the same map in exact arithmetic on the host.
 //
+//   PcmmRunsAtTheLayerShape -- the same product at 1.5bh's conjugate-
+//       invariant alignment, small_degree = T = 128: rank 512 out of degree
+//       65536 (the direct descent's real shape, and the first 512-key
+//       ModPack) and rank 32 out of 4096 (the switched descent's small-ring
+//       half). The printed error is the direct route's noise datum at the
+//       real shape.
+//
 //   PcmmBlasMatchesTheHandKernelOnComponents (USE_CUBLAS) -- the int8
 //       tensor-core route against the hand kernel, bit for bit, at the
-//       projection's own small degree of 256. On ci16_35 that is rank 256
-//       out of degree 65536 -- the real configuration's first device run,
-//       which the indexing test above also spot-checks semantically.
+//       ordinary projection degree of 256 (on ci16_35 that is rank 256 out
+//       of degree 65536 -- the real configuration's first device run) and at
+//       the conjugate-invariant 128, whose b-part component is shorter than
+//       the split/combine block.
 
 #undef ENABLE_EXTENSION
 
@@ -306,6 +314,10 @@ TEST_P(Testbed32, CiModDecompMatchesHostIndexing) {
   // degree-4096 presets; on ci16_35 this adds rank 256, the real
   // configuration.
   if (degree / 16 != 256) small_degrees.push_back(256);
+  // 1.5bh's conjugate-invariant alignment, small_degree = T = 128: rank 512
+  // out of degree 65536 and rank 32 out of 4096 -- the two descent shapes --
+  // and the first small degree below the 256-thread launch block.
+  small_degrees.push_back(128);
 
   for (int small_degree : small_degrees) {
     const int rank = degree / small_degree;
@@ -540,87 +552,179 @@ TEST_P(Testbed32, PcmmOnComponentsMatchesHostMap) {
   ASSERT_LT(max_abs, 1e-3);
 }
 
+// The product at the layer's own shape (Doing.md 1.5bh): on the conjugate-
+// invariant ring the PC-MM alignment puts the projection at small_degree =
+// T = 128, which is rank 512 out of degree 65536 -- the direct descent's
+// shape -- and rank 32 out of 4096, the small-ring half of the switched one.
+// Both sit below the 256-thread block the launches assumed until now, and
+// rank 512 is also the first 512-key ModPack. The mixing matrix is
+// normalized by 1/sqrt(cols) so the mixed magnitude stays at the components'
+// own, which is what the thin bottom levels of the degree-4096 presets ask
+// for. The printed error is the direct descent's noise datum at the real
+// shape -- half of the measurement the descent choice of 1.5bg/1.5bh waits
+// on; the other half is ring_switch_test's switched-descent run.
+TEST_P(Testbed32, PcmmRunsAtTheLayerShape) {
+  const int degree = param_->degree_;
+  const int small_degree = 128;
+  const int rank = degree / small_degree;
+  constexpr double kWeightScale = 33554432.0;  // 2^25, as above
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+  PcmmHandler<word> pcmm(*param_);
+
+  const int level = std::min(2, param_->max_level_);
+  interface_->PrepareModPackKeys(small_degree, level);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  std::vector<double> coeffs(degree);
+  Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+
+  std::vector<MlweCiphertext<word>> parts;
+  mlwe.ModDecomp(parts, ct, small_degree);
+  ASSERT_EQ(static_cast<int>(parts.size()), rank);
+
+  std::vector<double> values(static_cast<size_t>(rank) * rank);
+  Random::SampleUniformReal(values.data(), values.size(), -1.0, 1.0);
+  const double norm = 1.0 / std::sqrt(static_cast<double>(rank));
+  for (auto &v : values) v *= norm;
+
+  PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, level, kWeightScale, values, rank, rank);
+
+  std::vector<MlweCiphertext<word>> mixed;
+  pcmm.Multiply(mixed, u, parts);
+  ASSERT_EQ(static_cast<int>(mixed.size()), rank);
+
+  Ciphertext<word> packed;
+  mlwe.ModPack(context_, packed, mixed, keys);
+  ASSERT_EQ(param_->NPToLevel(packed.GetNP()), level);
+
+  Plaintext<word> out;
+  interface_->Decrypt(out, packed);
+  std::vector<double> got;
+  context_->encoder_.DecodeCoeff(got, out);
+  ASSERT_EQ(static_cast<int>(got.size()), degree);
+
+  const bool ci = param_->conjugate_invariant_;
+  const auto comp = RealDecompose(coeffs, rank, small_degree, ci);
+  std::vector<RPoly> mixed_host(rank, RPoly(small_degree, 0.0));
+  for (int l = 0; l < rank; l++) {
+    for (int j = 0; j < rank; j++) {
+      const double weight = values[static_cast<size_t>(l) * rank + j];
+      for (int t = 0; t < small_degree; t++) {
+        mixed_host[l][t] += weight * comp[j][t];
+      }
+    }
+  }
+  const RPoly expected = RealRecompose(mixed_host, rank, small_degree, ci);
+
+  double max_abs = 0.0;
+  for (int i = 0; i < degree; i++) {
+    max_abs = std::max(max_abs, std::abs(got[i] - expected[i]));
+  }
+  std::cout << (ci ? "CI" : "ordinary") << " layer-shape PC-MM degree "
+            << degree << " -> " << small_degree << ", rank " << rank
+            << ", level " << level << ": max error " << max_abs << std::endl;
+  ASSERT_LT(max_abs, 1e-3);
+}
+
 #ifdef USE_CUBLAS
 // The int8 tensor-core route against the hand kernel, bit for bit -- the
 // PcmmBlasTest standard, on this ring. The GEMM path splits residues into
 // int8 pieces and recombines them mod p, and none of that sees the basis;
 // what it must not trip over is the container the conjugate-invariant
-// ModDecomp filled and this parameter set's 1-mod-4N primes. kSmallDegree is
-// 256, the degree the projections actually run at, so on ci16_35 this drives
-// ModDecomp and both products at rank 256 out of degree 65536 -- the real
-// configuration -- with the semantic anchor carried by the indexing test's
-// spot checks and by the hand kernel's own end-to-end test above.
+// ModDecomp filled and this parameter set's 1-mod-4N primes. Two small
+// degrees run: 256 is the ordinary projections' (rank 256 out of degree
+// 65536 on ci16_35 at full rows), and 128 is 1.5bh's conjugate-invariant
+// alignment, whose b-part component is shorter than the split/combine block
+// -- the shrunken chunk alignment's first exercise on this route. At 128 the
+// row count is capped at 64: the hand kernel is the reference and its cost
+// grows with rows * cols, while nothing in the route's chunking, splitting
+// or GEMM layout depends on the row count. The semantic anchor is carried by
+// the indexing test's spot checks and the end-to-end tests above.
 TEST_P(Testbed32, PcmmBlasMatchesTheHandKernelOnComponents) {
-  constexpr int kSmallDegree = 256;
   constexpr int kParents = 2;
   constexpr double kWeightScale = 1073741824.0;  // 2^30, as in PcmmBlasTest
 
   const int degree = param_->degree_;
   const int level = std::min(2, param_->max_level_);
   const double ct_scale = DetermineScale(level);
-  const int rank = degree / kSmallDegree;
-  const int cols = kParents * rank;
-  const int rows = rank;
 
   MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
   PcmmHandler<word> pcmm(*param_);
   PcmmBlasHandler<word> blas(*param_);
 
-  std::vector<MlweCiphertext<word>> columns;
-  {
-    std::vector<double> coeffs(degree);
-    Plaintext<word> pt;
-    Ciphertext<word> ct;
-    for (int parent = 0; parent < kParents; parent++) {
-      Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
-      context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
-      interface_->Encrypt(ct, pt);
-      std::vector<MlweCiphertext<word>> decomposed;
-      mlwe.ModDecomp(decomposed, ct, kSmallDegree);
-      for (auto &c : decomposed) columns.push_back(std::move(c));
+  for (const int small_degree : {256, 128}) {
+    const int rank = degree / small_degree;
+    const int cols = kParents * rank;
+    const int rows = small_degree == 256 ? rank : std::min(rank, 64);
+
+    std::vector<MlweCiphertext<word>> columns;
+    {
+      std::vector<double> coeffs(degree);
+      Plaintext<word> pt;
+      Ciphertext<word> ct;
+      for (int parent = 0; parent < kParents; parent++) {
+        Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+        context_->encoder_.EncodeCoeff(pt, level, ct_scale, coeffs);
+        interface_->Encrypt(ct, pt);
+        std::vector<MlweCiphertext<word>> decomposed;
+        mlwe.ModDecomp(decomposed, ct, small_degree);
+        for (auto &c : decomposed) columns.push_back(std::move(c));
+      }
     }
+    ASSERT_EQ(static_cast<int>(columns.size()), cols);
+
+    std::vector<double> values(static_cast<size_t>(rows) * cols);
+    Random::SampleUniformReal(values.data(), values.size(), -0.5, 0.5);
+
+    PlainMatrix<word> u;
+    pcmm.EncodeMatrix(u, level, kWeightScale, values, rows, cols);
+    typename PcmmBlasHandler<word>::SplitMatrix us;
+    blas.SplitMatrixFrom(us, level, kWeightScale, values, rows, cols);
+
+    std::vector<MlweCiphertext<word>> want, got;
+    pcmm.Multiply(want, u, columns);
+    blas.Multiply(got, us, columns);
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    ASSERT_EQ(want.size(), got.size());
+
+    size_t mismatches = 0, words = 0;
+    for (int i = 0; i < rows; i++) {
+      ASSERT_EQ(want[i].a_.size(), got[i].a_.size());
+      ASSERT_EQ(want[i].b_.size(), got[i].b_.size());
+      HostVector<word> ha(want[i].a_.size()), ga(got[i].a_.size());
+      HostVector<word> hb(want[i].b_.size()), gb(got[i].b_.size());
+      CopyDeviceToHost(ha, want[i].a_);
+      CopyDeviceToHost(ga, got[i].a_);
+      CopyDeviceToHost(hb, want[i].b_);
+      CopyDeviceToHost(gb, got[i].b_);
+      for (size_t k = 0; k < ha.size(); k++) {
+        if (ha[k] != ga[k]) mismatches++;
+      }
+      for (size_t k = 0; k < hb.size(); k++) {
+        if (hb[k] != gb[k]) mismatches++;
+      }
+      words += ha.size() + hb.size();
+    }
+    std::cout << (param_->conjugate_invariant_ ? "CI" : "ordinary")
+              << " blas-vs-hand at degree " << degree << " -> "
+              << small_degree << ", rank " << rank << ", " << cols
+              << " columns, " << rows << " rows, level " << level
+              << ": compared " << words << " words" << std::endl;
+    EXPECT_EQ(mismatches, 0u)
+        << "the cuBLAS path does not reproduce PcmmAccum on this ring at "
+        << "small degree " << small_degree;
   }
-  ASSERT_EQ(static_cast<int>(columns.size()), cols);
-
-  std::vector<double> values(static_cast<size_t>(rows) * cols);
-  Random::SampleUniformReal(values.data(), values.size(), -0.5, 0.5);
-
-  PlainMatrix<word> u;
-  pcmm.EncodeMatrix(u, level, kWeightScale, values, rows, cols);
-  typename PcmmBlasHandler<word>::SplitMatrix us;
-  blas.SplitMatrixFrom(us, level, kWeightScale, values, rows, cols);
-
-  std::vector<MlweCiphertext<word>> want, got;
-  pcmm.Multiply(want, u, columns);
-  blas.Multiply(got, us, columns);
-  cudaDeviceSynchronize();
-  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  ASSERT_EQ(want.size(), got.size());
-
-  size_t mismatches = 0, words = 0;
-  for (int i = 0; i < rows; i++) {
-    ASSERT_EQ(want[i].a_.size(), got[i].a_.size());
-    ASSERT_EQ(want[i].b_.size(), got[i].b_.size());
-    HostVector<word> ha(want[i].a_.size()), ga(got[i].a_.size());
-    HostVector<word> hb(want[i].b_.size()), gb(got[i].b_.size());
-    CopyDeviceToHost(ha, want[i].a_);
-    CopyDeviceToHost(ga, got[i].a_);
-    CopyDeviceToHost(hb, want[i].b_);
-    CopyDeviceToHost(gb, got[i].b_);
-    for (size_t k = 0; k < ha.size(); k++) {
-      if (ha[k] != ga[k]) mismatches++;
-    }
-    for (size_t k = 0; k < hb.size(); k++) {
-      if (hb[k] != gb[k]) mismatches++;
-    }
-    words += ha.size() + hb.size();
-  }
-  std::cout << (param_->conjugate_invariant_ ? "CI" : "ordinary")
-            << " blas-vs-hand at degree " << degree << " -> " << kSmallDegree
-            << ", rank " << rank << ", " << cols << " columns, level " << level
-            << ": compared " << words << " words" << std::endl;
-  EXPECT_EQ(mismatches, 0u)
-      << "the cuBLAS path does not reproduce PcmmAccum on this ring";
 }
 #endif
 
