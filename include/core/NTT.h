@@ -100,18 +100,40 @@ class NTTHandler {
                         bool normalize = false) const;
 
   // special variants for ModUp and ModDown/Rescale/ModDownAndRescale
+  //
+  // ci_prefolded (conjugate-invariant ring only): the caller already wrote
+  // the input in the folded basis -- the base conversion feeding this
+  // transform folds its output in registers on the way out
+  // (ModSwitchMatrixMultCi) -- so skip the CiFold pass.
 
   void NTTForModUp(DvView<word> &dst, const NPInfo &np, int skip_start,
-                   int skip_end, const DvConstView<word> &src, int batch = 1) const;
+                   int skip_end, const DvConstView<word> &src, int batch = 1,
+                   bool ci_prefolded = false) const;
   void NTTForModDown(DvView<word> &dst, const NPInfo &np_src1,
                      const NPInfo &np_src2, const DvConstView<word> &src1,
                      const DvConstView<word> &src2,
                      const DvConstView<word> &inv_p_prod,
                      const DvConstView<word> &src2_padding =
-                         DvConstView<word>(nullptr, 0)) const;
+                         DvConstView<word>(nullptr, 0),
+                     bool ci_prefolded = false) const;
   void INTTForModDown(DvView<word> &dst, const NPInfo &np_src,
                       const NPInfo &np_non_intt, const DvConstView<word> &src,
                       const DvConstView<word> &src_const) const;
+
+  // The conjugate-invariant per-prime constants, for the one caller that
+  // carries the fold itself: the base conversion in ModSwitch. All Montgomery
+  // form, indexed by absolute prime slot exactly as twiddle_factors_ is, the
+  // twists with stride degree.
+  struct CiConstantsView {
+    const word *i_units;
+    const word *inv2_units;
+    const word *fwd_twist;
+    const word *inv_twist;
+  };
+  CiConstantsView GetCiConstants() const {
+    return {ci_i_.data(), ci_inv2_.data(), ci_fwd_twist_.data(),
+            ci_inv_twist_.data()};
+  }
 
   DvConstView<word> ImaginaryUnitConstView(const NPInfo &np) const;
 

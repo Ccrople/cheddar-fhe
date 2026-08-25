@@ -1089,7 +1089,8 @@ template <typename word>
 void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
                                    int skip_start, int skip_end,
                                    const DvConstView<word> &src,
-                                   int batch /*= 1*/) const {
+                                   int batch /*= 1*/,
+                                   bool ci_prefolded /*= false*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_q_primes = np.GetNumQ();
@@ -1132,8 +1133,9 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
       twiddle_factors_msb_.data() + ter_left * GetMsbSize();
 
   // Phase 0, on the limbs this transform touches: the skipped ones arrived in
-  // the evaluation domain already and must not be folded.
-  if (param_.conjugate_invariant_) {
+  // the evaluation domain already and must not be folded. A caller whose base
+  // conversion already folded on the way out says so and skips the pass.
+  if (param_.conjugate_invariant_ && !ci_prefolded) {
     CiFold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
            num_total_primes, skip_start, skip_end, batch_stride, batch,
            src_ptr, src_ptr_list.extra_);
@@ -1186,8 +1188,8 @@ void NTTHandler<word>::NTTForModDown(
     DvView<word> &dst, const NPInfo &np_src1, const NPInfo &np_src2,
     const DvConstView<word> &src1, const DvConstView<word> &src2,
     const DvConstView<word> &inv_p_prod,
-    const DvConstView<word> &src2_padding /*= DvConstView<word>(nullptr,
-                                                              0)*/) const {
+    const DvConstView<word> &src2_padding /*= DvConstView<word>(nullptr, 0)*/,
+    bool ci_prefolded /*= false*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_q_primes = np_src1.GetNumQ();
@@ -1227,8 +1229,9 @@ void NTTHandler<word>::NTTForModDown(
       twiddle_factors_msb_.data() + ter_left * GetMsbSize();
 
   // Phase 0. src2 is already in the evaluation domain -- phase 2 subtracts it
-  // there -- so only src1 is folded.
-  if (param_.conjugate_invariant_) {
+  // there -- so only src1 is folded, and not even src1 when the base
+  // conversion that produced it folded on the way out.
+  if (param_.conjugate_invariant_ && !ci_prefolded) {
     CiFold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
            num_total_primes, 0, 0, 0, 1, src1_ptr, ntt_ptr_list.extra_);
     ntt_ptr_list.ptrs_[0] = dst_ptr;

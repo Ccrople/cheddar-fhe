@@ -16,6 +16,11 @@
 #define kNumThreadsY 4
 
 #define kMaxNumAccum 4
+
+// Conjugate-invariant pair windows: half the unroll, so that a thread's own
+// columns and their mirror columns together cost exactly the ordinary
+// kernel's registers, shared tile and grid.
+#define kCiUnroll (kUnrollNumber / 2)
 namespace cheddar {
 namespace kernel {
 
@@ -209,6 +214,305 @@ __global__ void ModUpMultConst(make_signed_t<word> *dst, word *dst_mont,
   // form the forward transform downstream will not put them in.
   dst_mont[i] =
       basic::MultMontgomery(value, mont_r2[prime_index], prime, inv_prime);
+}
+
+// ----- Conjugate-invariant ring: the conversion carries the fold ----- //
+//
+// A key switch runs INTT -> base conversion -> NTT, and on the
+// conjugate-invariant ring each transform carries a fold pass of its own
+// (CiUnfold / CiFold in NTT.cu): one full extra read-modify-write of every
+// limb it touches. The FOLD side collapses into the conversion: the kernel
+// below reapplies the fold in registers on the way out, and the forward
+// transform then starts straight at phase 1 (ci_prefolded) -- for ModUp,
+// ModDown, Rescale and ModDownAndRescale alike, which is every key switch
+// and every rescale in the system. The UNFOLD side stays where it was: the
+// INTT keeps its own cheap elementwise pass. Carrying it in here was built
+// and measured twice -- undone at the shared-memory load it cost occupancy
+// (72 registers, and 67 us against the ordinary kernel's 27), undone at the
+// accumulator read it ran once per destination-limb triple instead of once
+// (89 us) -- and the fold-only form below, at 40 us, is what actually beats
+// the separate passes.
+//
+// The fold pairs column t with degree - t (and 0 with degree / 2), so where
+// the ordinary kernel hands a thread kUnrollNumber consecutive columns, this
+// one hands it kCiUnroll consecutive values of t in [0, degree / 2) AND
+// their mirrors: the same column count, register budget, shared tile and
+// grid. The matrix arithmetic in the middle is the ordinary kernel's,
+// unchanged. Mirror-side global accesses run at odd offsets and stay scalar;
+// consecutive threads still touch consecutive addresses, descending.
+template <typename word>
+__global__ void __launch_bounds__(kNumThreadsPerBlock, 4) ModSwitchMatrixMultCi(
+    word *dst, const word *primes, const make_signed_t<word> *inv_primes,
+    const int src_len, const int dst_len, const int skip_start,
+    const int skip_end, const make_signed_t<word> *src,
+    const make_signed_t<word> *bconv_table, const int log_degree,
+    const word *ci_i, const word *ci_fwd_twist, const int dst_tw_offset,
+    const int dst_tw_num_q, const int dst_tw_extra, const int dst_stride = 0,
+    const int src_stride = 0) {
+  dst += blockIdx.z * dst_stride;
+  src += blockIdx.z * src_stride;
+  using signed_word = make_signed_t<word>;
+  using signed_d_word = make_signed_double_word_t<word>;
+
+  extern __shared__ char __smem[];
+
+  const int degree = 1 << log_degree;
+  const int half = degree >> 1;
+  constexpr int kWindow = kNumThreadsX * kCiUnroll;
+
+  signed_word *bconv_vector = reinterpret_cast<signed_word *>(__smem);
+  int bconv_vector_size = src_len * (kLimbBatching * kNumThreadsY);
+
+  signed_word *poly_frag = bconv_vector + bconv_vector_size;
+
+  // Loading bconv table into shared memory, exactly as the ordinary kernel
+  int thread_idx_flattened = threadIdx.x + threadIdx.y * kNumThreadsX;
+  int block_offset = blockIdx.y * bconv_vector_size;
+  int bconv_table_size = src_len * dst_len;
+  for (int i = thread_idx_flattened; i < bconv_vector_size;
+       i += (kNumThreadsX * kNumThreadsY)) {
+    int bconv_table_index = i + block_offset;
+    if (bconv_table_index < bconv_table_size) {
+      bconv_vector[i] = bconv_table[bconv_table_index];
+    }
+  }
+
+  // The block owns kWindow consecutive values of t and their mirror columns.
+  // Row r of the shared tile holds the t window at [0, kWindow) and the
+  // mirror window at [kWindow, 2 * kWindow), t-indexed both, so the matrix
+  // loop below sees plain consecutive slots either way.
+  const int t_base = blockIdx.x * kWindow;
+  bconv_vector += src_len * threadIdx.y * kLimbBatching;
+  poly_frag += threadIdx.x * kCiUnroll;
+
+  signed_d_word accum[kLimbBatching][2 * kCiUnroll] = {0};
+  signed_word reg_poly[2 * kCiUnroll];
+  int dst_y_position =
+      blockIdx.y * (kLimbBatching * kNumThreadsY) + threadIdx.y * kLimbBatching;
+
+  word reg_primes[kLimbBatching];
+  signed_word reg_inv_primes[kLimbBatching];
+  for (int i = 0; i < kLimbBatching; i++) {
+    int prime_index = dst_y_position + i;
+    if (prime_index >= dst_len) break;
+
+    if (prime_index >= skip_start) {
+      prime_index += (skip_end - skip_start);
+    }
+    reg_primes[i] = basic::StreamingLoadConst(primes + prime_index);
+    reg_inv_primes[i] = basic::StreamingLoadConst(inv_primes + prime_index);
+  }
+
+  const int t0 = t_base + threadIdx.x * kCiUnroll;
+  int num_accumulated = 0;
+  for (int i = 0; i < src_len; i += kMaxNumAccum) {
+    // 1. Load the pair windows into shared memory. The own side is a plain
+    // vector move; the mirror side descends and starts at an odd offset, so
+    // it stays scalar -- consecutive threads still touch consecutive
+    // addresses.
+    if (i > 0)
+      __syncthreads();  // works like a lock_acquire
+#pragma unroll
+    for (int j = 0; j < (kMaxNumAccum / kNumThreadsY); j++) {
+      int y_pos = j * kNumThreadsY + threadIdx.y;
+      if (i + y_pos >= src_len) break;
+      const signed_word *src_limb = src + (y_pos << log_degree);
+      signed_word *frag_row = poly_frag + y_pos * (2 * kWindow);
+      basic::VectorizedMove<signed_word, kCiUnroll>(frag_row, src_limb + t0);
+#pragma unroll
+      for (int e = 0; e < kCiUnroll; e++) {
+        const int t = t0 + e;
+        const int mirror = (t == 0) ? half : (degree - t);
+        frag_row[kWindow + e] = basic::StreamingLoad(src_limb + mirror);
+      }
+    }
+    __syncthreads();  // works like a lock_release
+
+    // 2. Perform actual matrix multiplication -- the ordinary kernel's loop
+    // over the same number of columns per thread.
+    for (int j = 0; j < kMaxNumAccum; j++) {
+      if (i + j >= src_len) break;
+
+      basic::VectorizedMove<signed_word, kCiUnroll>(
+          reg_poly, poly_frag + j * (2 * kWindow));
+      basic::VectorizedMove<signed_word, kCiUnroll>(
+          reg_poly + kCiUnroll, poly_frag + j * (2 * kWindow) + kWindow);
+      for (int k = 0; k < kLimbBatching; k++) {
+        if (dst_y_position + k > dst_len) break;  // out of bounds
+        signed_word bconv_const = bconv_vector[src_len * k];
+#pragma unroll
+        for (int l = 0; l < 2 * kCiUnroll; l++) {
+          accum[k][l] += basic::detail::__mult_wide(reg_poly[l], bconv_const);
+        }
+      }
+      bconv_vector += 1;
+      num_accumulated += 1;
+    }
+
+    // 3. Normalize temporary result if necessary
+    if constexpr (std::is_same_v<word, uint32_t>) {
+      if (num_accumulated >= kMaxNumAccum) {
+        for (int k = 0; k < kLimbBatching; k++) {
+          if (dst_y_position + k >= dst_len) break;  // out of bound
+          signed_d_word prime_th = reg_primes[k];
+          prime_th <<= (sizeof(word) * 8);
+          signed_d_word prime_th_half = prime_th >> 1;
+#pragma unroll
+          for (int l = 0; l < 2 * kCiUnroll; l++) {
+            if (accum[k][l] < 0) accum[k][l] += prime_th;
+            if (accum[k][l] >= prime_th_half) accum[k][l] -= prime_th;
+          }
+        }
+        num_accumulated -= kMaxNumAccum;
+      }
+    }
+
+    // src offset: i * kMaxNumAccum * degree
+    src += (kMaxNumAccum << log_degree);
+  }
+
+  for (int k = 0; k < kLimbBatching; k++) {
+    int prime_index = dst_y_position + k;
+    if (dst_y_position + k >= dst_len) break;  // out of bound
+    if (prime_index >= skip_start) {
+      prime_index += (skip_end - skip_start);
+    }
+    word prime = reg_primes[k];
+    signed_word inv_prime = reg_inv_primes[k];
+
+    // Reapply the fold on the way out, so the transform downstream starts
+    // straight at phase 1. Exactly CiFoldKernel, element for element.
+    const int tw = dst_tw_offset + prime_index +
+                   (prime_index >= dst_tw_num_q ? dst_tw_extra : 0);
+    const word i_unit = ci_i[tw];
+    const word *ftw = ci_fwd_twist + (tw << log_degree);
+
+    word v[2 * kCiUnroll];
+#pragma unroll
+    for (int l = 0; l < 2 * kCiUnroll; l++) {
+      v[l] = basic::ReduceMontgomery(accum[k][l], prime, inv_prime);
+    }
+    word out_own[kCiUnroll];
+    word out_mir[kCiUnroll];
+#pragma unroll
+    for (int e = 0; e < kCiUnroll; e++) {
+      const int t = t0 + e;
+      const word raw_own = v[e];
+      const word raw_mir = v[kCiUnroll + e];
+      if (t == 0) {
+        // hat_N is zero and psi4^0 is one, so column 0 passes straight
+        // through; column degree / 2 folds with itself.
+        out_own[e] = raw_own;
+        const word m_folded = basic::Sub<word>(
+            raw_mir,
+            basic::MultMontgomery<word>(i_unit, raw_mir, prime, inv_prime),
+            prime);
+        out_mir[e] = basic::MultMontgomery<word>(m_folded, ftw[half], prime,
+                                                 inv_prime);
+      } else {
+        out_own[e] = basic::MultMontgomery<word>(
+            basic::Sub<word>(raw_own,
+                             basic::MultMontgomery<word>(i_unit, raw_mir,
+                                                         prime, inv_prime),
+                             prime),
+            ftw[t], prime, inv_prime);
+        out_mir[e] = basic::MultMontgomery<word>(
+            basic::Sub<word>(raw_mir,
+                             basic::MultMontgomery<word>(i_unit, raw_own,
+                                                         prime, inv_prime),
+                             prime),
+            ftw[degree - t], prime, inv_prime);
+      }
+    }
+    word *dst_limb = dst + (prime_index << log_degree);
+    basic::VectorizedMove<word, kCiUnroll>(dst_limb + t0, out_own);
+    if (t0 == 0) {
+      dst_limb[half] = out_mir[0];
+#pragma unroll
+      for (int e = 1; e < kCiUnroll; e++) {
+        dst_limb[degree - (t0 + e)] = out_mir[e];
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < kCiUnroll; e++) {
+        dst_limb[degree - (t0 + e)] = out_mir[e];
+      }
+    }
+  }
+}
+
+// The conjugate-invariant ModUpMultConst: the raw centred copy for the
+// matrix product is written exactly as the ordinary kernel writes it, and
+// the Montgomery copy for the limbs that pass through is written already
+// folded, because the transform it feeds starts straight at phase 1. One
+// thread owns the mirrored column pair, as everywhere on this ring.
+template <typename word>
+__global__ void ModUpMultConstCi(make_signed_t<word> *dst, word *dst_mont,
+                                 const word *src, const word *primes,
+                                 const make_signed_t<word> *inv_primes,
+                                 const word *consts, const word *mont_r2,
+                                 const word *ci_i, const word *ci_fwd_twist,
+                                 int tw_offset, int log_degree, int q_words,
+                                 int mont_stride) {
+  using signed_word = make_signed_t<word>;
+  const int log_half = log_degree - 1;
+  const int half = 1 << log_half;
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  const int prime_index = pair >> log_half;
+  const int t = pair & (half - 1);
+  const int mirror = (t == 0) ? half : ((half << 1) - t);
+  src += blockIdx.y * q_words;
+  dst += blockIdx.y * q_words;
+  dst_mont += blockIdx.y * mont_stride;
+  const word prime = primes[prime_index];
+  const signed_word inv_prime = inv_primes[prime_index];
+  const word mult_const = consts[prime_index];
+  const word r2 = mont_r2[prime_index];
+  const int tw = tw_offset + prime_index;
+  const word i_unit = basic::StreamingLoadConst(ci_i + tw);
+  const word *ftw = ci_fwd_twist + (tw << log_degree);
+  const int base = prime_index << log_degree;
+
+  const word value_own = src[base + t];
+  const word value_mir = src[base + mirror];
+
+  const word temp_own =
+      basic::MultMontgomery(value_own, mult_const, prime, inv_prime);
+  signed_word result = static_cast<signed_word>(temp_own);
+  if (temp_own > (prime >> 1)) result -= static_cast<signed_word>(prime);
+  dst[base + t] = result;
+  const word temp_mir =
+      basic::MultMontgomery(value_mir, mult_const, prime, inv_prime);
+  result = static_cast<signed_word>(temp_mir);
+  if (temp_mir > (prime >> 1)) result -= static_cast<signed_word>(prime);
+  dst[base + mirror] = result;
+
+  // The fold commutes with the Montgomery conversion -- both are per-limb
+  // scalar multiplies -- so folding the converted values is folding the
+  // coefficients.
+  const word mv_own = basic::MultMontgomery(value_own, r2, prime, inv_prime);
+  const word mv_mir = basic::MultMontgomery(value_mir, r2, prime, inv_prime);
+  if (t == 0) {
+    dst_mont[base] = mv_own;
+    const word m_folded = basic::Sub<word>(
+        mv_mir, basic::MultMontgomery<word>(i_unit, mv_mir, prime, inv_prime),
+        prime);
+    dst_mont[base + half] = basic::MultMontgomery<word>(
+        m_folded, basic::StreamingLoadConst(ftw + half), prime, inv_prime);
+  } else {
+    dst_mont[base + t] = basic::MultMontgomery<word>(
+        basic::Sub<word>(mv_own,
+                         basic::MultMontgomery<word>(i_unit, mv_mir, prime,
+                                                     inv_prime),
+                         prime),
+        basic::StreamingLoadConst(ftw + t), prime, inv_prime);
+    dst_mont[base + mirror] = basic::MultMontgomery<word>(
+        basic::Sub<word>(mv_mir,
+                         basic::MultMontgomery<word>(i_unit, mv_own, prime,
+                                                     inv_prime),
+                         prime),
+        basic::StreamingLoadConst(ftw + mirror), prime, inv_prime);
+  }
 }
 
 }  // namespace kernel
@@ -539,14 +843,32 @@ void ModSwitchHandler<word>::ModUpFromCoeffBatch(
              "ModUpFromCoeffBatch: degree must be a multiple of the block dim");
 
   // The product inverse for the matrix product, and the same coefficients in
-  // Montgomery form written straight into the limbs that pass through.
+  // Montgomery form written straight into the limbs that pass through. On the
+  // conjugate-invariant ring the pass-through copy is written already folded
+  // and the conversion output below folds itself, so the transform at the end
+  // skips its fold pass -- see ModSwitchMatrixMultCi.
+  const bool ci = param_.conjugate_invariant_;
+  const int tw_ter_left = param_.GetMaxNumTer() - np.num_ter_;
   DeviceVector<word> src_intt(batch * q_words);
-  dim3 mult_grid(q_words / block_dim_, batch);
-  kernel::ModUpMultConst<word><<<mult_grid, block_dim_>>>(
-      reinterpret_cast<signed_word *>(src_intt.data()), dst.data(),
-      src_coeff.data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
-      mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_, q_words,
-      total_limbs * degree);
+  if (ci) {
+    AssertTrue((q_words / 2) % block_dim_ == 0,
+               "ModUpFromCoeffBatch: degree must be a multiple of twice the "
+               "block dim");
+    auto cic = ntt_handler_.GetCiConstants();
+    dim3 mult_grid((q_words / 2) / block_dim_, batch);
+    kernel::ModUpMultConstCi<word><<<mult_grid, block_dim_>>>(
+        reinterpret_cast<signed_word *>(src_intt.data()), dst.data(),
+        src_coeff.data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+        mod_up1_coeff_.data(), mont_r2_.data(), cic.i_units, cic.fwd_twist,
+        tw_ter_left, param_.log_degree_, q_words, total_limbs * degree);
+  } else {
+    dim3 mult_grid(q_words / block_dim_, batch);
+    kernel::ModUpMultConst<word><<<mult_grid, block_dim_>>>(
+        reinterpret_cast<signed_word *>(src_intt.data()), dst.data(),
+        src_coeff.data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+        mod_up1_coeff_.data(), mont_r2_.data(), param_.log_degree_, q_words,
+        total_limbs * degree);
+  }
 
   np.num_aux_ = num_aux_;
   const word *primes = param_.GetPrimesPtr(np);
@@ -561,17 +883,29 @@ void ModSwitchHandler<word>::ModUpFromCoeffBatch(
   smem_size += kMaxNumAccum * (kUnrollNumber * kNumThreadsX) *
                sizeof(signed_word);
 
-  kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
-      dst.data(), primes, inv_primes, num_q_primes, dst_len, 0, num_q_primes,
-      reinterpret_cast<const signed_word *>(src_intt.data()),
-      mod_up2_.at(0).data(), param_.log_degree_, total_limbs * degree, q_words);
+  if (ci) {
+    auto cic = ntt_handler_.GetCiConstants();
+    kernel::ModSwitchMatrixMultCi<word><<<grid_dim, block_dim, smem_size>>>(
+        dst.data(), primes, inv_primes, num_q_primes, dst_len, 0, num_q_primes,
+        reinterpret_cast<const signed_word *>(src_intt.data()),
+        mod_up2_.at(0).data(), param_.log_degree_, cic.i_units, cic.fwd_twist,
+        tw_ter_left, num_q_primes, param_.GetMaxNumMain() - np.num_main_,
+        total_limbs * degree, q_words);
+  } else {
+    kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+        dst.data(), primes, inv_primes, num_q_primes, dst_len, 0, num_q_primes,
+        reinterpret_cast<const signed_word *>(src_intt.data()),
+        mod_up2_.at(0).data(), param_.log_degree_, total_limbs * degree,
+        q_words);
+  }
 
   // One transform for the whole group. The aux size is chosen so that the
   // limb-offset correction NTTForModUp applies to the auxiliary part is zero:
   // this buffer is contiguous and wants no correction.
   const int total_words = batch * total_limbs * degree;
   DvView<word> ntt_view(dst.data(), total_words, total_words - q_words);
-  ntt_handler_.NTTForModUp(ntt_view, np, 0, 0, ntt_view, batch);
+  ntt_handler_.NTTForModUp(ntt_view, np, 0, 0, ntt_view, batch,
+                           /*ci_prefolded=*/ci);
 }
 
 template <typename word>
@@ -594,12 +928,27 @@ void ModSwitchHandler<word>::ModUpWorker(
   // that never left it says so and pays one constant multiply instead -- and
   // the limbs that pass through unchanged then come from that same multiply,
   // in Montgomery form, rather than from an NTT the caller had to run.
+  const bool ci = param_.conjugate_invariant_;
+  const int tw_ter_left = param_.GetMaxNumTer() - np.num_ter_;
   DeviceVector<word> src_intt(num_q_primes * degree);
   DvView<word> src_intt_view = src_intt.View(0, 0);
   DeviceVector<word> src_mont;
   if (src_coeff == nullptr) {
     ntt_handler_.INTTAndMultConst(src_intt_view, np, *src,
                                   mod_up1_.ConstView(0, 0), true);
+  } else if (ci) {
+    const int num_words = num_q_primes * degree;
+    AssertTrue((num_words / 2) % block_dim_ == 0,
+               "ModUpFromCoeff: degree must be a multiple of twice the block "
+               "dim");
+    src_mont.resize(num_words);
+    auto cic = ntt_handler_.GetCiConstants();
+    kernel::ModUpMultConstCi<word><<<(num_words / 2) / block_dim_,
+                                     block_dim_>>>(
+        reinterpret_cast<signed_word *>(src_intt.data()), src_mont.data(),
+        src_coeff->data(), param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np),
+        mod_up1_coeff_.data(), mont_r2_.data(), cic.i_units, cic.fwd_twist,
+        tw_ter_left, param_.log_degree_, num_words, num_words);
   } else {
     const int num_words = num_q_primes * degree;
     AssertTrue(num_words % block_dim_ == 0,
@@ -670,16 +1019,28 @@ void ModSwitchHandler<word>::ModUpWorker(
     const signed_word *src_ptr = reinterpret_cast<const signed_word *>(
         src_intt.data() + prime_index_start * degree);
 
-    kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
-        dst_i.data(), primes, inv_primes, src_len, dst_len, prime_index_start,
-        prime_index_end, src_ptr, mod_up2_.at(i).data(), param_.log_degree_);
+    if (ci) {
+      // The destination rows take the transform's own skip mapping; on the
+      // twiddle axis they are the q basis followed by the aux limbs.
+      auto cic = ntt_handler_.GetCiConstants();
+      kernel::ModSwitchMatrixMultCi<word><<<grid_dim, block_dim, smem_size>>>(
+          dst_i.data(), primes, inv_primes, src_len, dst_len,
+          prime_index_start, prime_index_end, src_ptr, mod_up2_.at(i).data(),
+          param_.log_degree_, cic.i_units, cic.fwd_twist, tw_ter_left,
+          num_q_primes, param_.GetMaxNumMain() - np.num_main_);
+    } else {
+      kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+          dst_i.data(), primes, inv_primes, src_len, dst_len,
+          prime_index_start, prime_index_end, src_ptr, mod_up2_.at(i).data(),
+          param_.log_degree_);
+    }
     // On the coefficient path the copied limbs are coefficients too, so they
     // take the same forward transform as the rest instead of being skipped.
     if (src_coeff == nullptr) {
       ntt_handler_.NTTForModUp(dst_i, np, prime_index_start, prime_index_end,
-                               dst_i);
+                               dst_i, 1, /*ci_prefolded=*/ci);
     } else {
-      ntt_handler_.NTTForModUp(dst_i, np, 0, 0, dst_i);
+      ntt_handler_.NTTForModUp(dst_i, np, 0, 0, dst_i, 1, /*ci_prefolded=*/ci);
     }
   }
 }
@@ -779,6 +1140,12 @@ void ModSwitchHandler<word>::ModDownWorker(DvView<word> &dst,
            : (type == ModDownType::Rescale
                   ? rescale1_.ConstView()
                   : mod_down_rescale1_.ConstView(num_src_aux)));
+  // On the conjugate-invariant ring, with the fused epilogue, the conversion
+  // below folds its output in registers on the way out and the forward
+  // transform starts straight at phase 1; the INTT keeps its own unfold
+  // pass. Without the fused epilogue the plain-NTT fallback folds for
+  // itself, so everything keeps its own passes.
+  const bool ci = param_.conjugate_invariant_ && kFuseModDownEpilogue;
   ntt_handler_.INTTForModDown(src_intt_view, np_src, np_non_intt, src_view,
                               const1);
 
@@ -804,9 +1171,20 @@ void ModSwitchHandler<word>::ModDownWorker(DvView<word> &dst,
   smem_size +=
       kMaxNumAccum * (kUnrollNumber * kNumThreadsX) * sizeof(signed_word);
 
-  kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
-      dst.data(), primes, inv_primes, src_len, dst_len, 0, 0, src_ptr,
-      bconv_table, param_.log_degree_);
+  if (ci) {
+    // The destination rows are the plain q basis of np_dst; the source
+    // arrives raw from the INTT and only the fold on the way out is carried
+    // here.
+    auto cic = ntt_handler_.GetCiConstants();
+    kernel::ModSwitchMatrixMultCi<word><<<grid_dim, block_dim, smem_size>>>(
+        dst.data(), primes, inv_primes, src_len, dst_len, 0, 0, src_ptr,
+        bconv_table, param_.log_degree_, cic.i_units, cic.fwd_twist,
+        param_.GetMaxNumTer() - np_dst.num_ter_, dst_len, 0);
+  } else {
+    kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+        dst.data(), primes, inv_primes, src_len, dst_len, 0, 0, src_ptr,
+        bconv_table, param_.log_degree_);
+  }
 
   // Prepare the constants for ModDownEpilogue
   int pad_start = 0;
@@ -838,7 +1216,8 @@ void ModSwitchHandler<word>::ModDownWorker(DvView<word> &dst,
 
   if (kFuseModDownEpilogue) {
     ntt_handler_.NTTForModDown(dst, np_dst, np_non_intt, DvConstView<word>(dst),
-                               src2, inv_prime_prod, src2_padding);
+                               src2, inv_prime_prod, src2_padding,
+                               /*ci_prefolded=*/ci);
 
   } else {
     ntt_handler_.NTT(dst, np_dst, DvConstView<word>(dst), false);
