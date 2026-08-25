@@ -134,6 +134,12 @@ add_executable(ring_switch_test RingSwitchTest.cpp)
 target_link_libraries(ring_switch_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The keyless lift of a conjugate-invariant ciphertext into the ordinary ring
+# of the same conductor, and the keyless descent back (Doing.md 1.5bk).
+add_executable(ci_lift_test CiLiftTest.cpp)
+target_link_libraries(ci_lift_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # RingSwitch -> ModDecomp -> PC-MM -> ModPack -> Rescale -> SwitchBack, in one
 # process. The only place the chain's level and scale budget is checked.
 add_executable(pipeline_chain_test PipelineChainTest.cpp)
@@ -328,3 +334,5 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci_ringswitch16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_35.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree13_35.json COPYONLY)
