@@ -35,7 +35,17 @@ constexpr int kNumNonzero = 8;
 // Scale of the plaintext operand. The product is never rescaled -- Rescale
 // goes through ModDown, which does not carry the fold yet -- so the two scales
 // have to multiply to something the modulus at this level holds comfortably.
-constexpr double kOperandScale = 1024.0;
+//
+// It also has to be large enough that EncodeCoeff rounding does not dominate.
+// At 2^10 it did: round(b_i * 1024) carries up to half a unit, so every
+// coefficient of b came in with ~5e-4 of absolute error and the product
+// inherited it. Three runs then landed at 2.5e-04, 3.8e-04 and 4.7e-04 against
+// a 1e-3 tolerance -- passing, but on a distribution whose tail crosses it,
+// which is how this test failed on a fresh box having passed on another. At
+// 2^20 the rounding contributes ~5e-7 and the margin is three orders of
+// magnitude. The modulus is not the binding constraint: the product sits at
+// 2^30 * 2^20 = 2^50 against a level-1 modulus of 2^69.8.
+constexpr double kOperandScale = 1048576.0;  // 2^20
 
 // Multiplication in the conjugate-invariant ring R+ = Z[Y + Y^-1] of rank
 // `degree`, in the basis {1, c_1, ..., c_{degree-1}}. Index 0 is the
