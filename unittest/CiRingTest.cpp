@@ -276,6 +276,110 @@ TEST_P(Testbed32, CiRingConvolution) {
   }
 }
 
+// The same product, but rescaled -- which is the only thing here that goes
+// through ModDown, and so the only thing that exercises the unfold on the
+// centred representative MultConstNormalize leaves behind. Both operands are
+// encoded at the level scale, so the result lands one level down at the
+// canonical scale, exactly as CoeffNegacyclicConvolution does for the
+// ordinary ring.
+TEST_P(Testbed32, CiRingConvolutionRescaled) {
+  const int degree = 1 << log_degree_;
+  for (int level = 1; level <= param_->max_level_; level++) {
+    std::vector<double> a, b;
+    SampleSparse(a, degree);
+    SampleSparse(b, degree);
+
+    const bool ci = param_->conjugate_invariant_;
+    const std::vector<double> expected =
+        ci ? ConjugateInvariantConvolution(a, b, degree)
+           : NegacyclicConvolution(a, b, degree);
+    const std::vector<double> other =
+        ci ? NegacyclicConvolution(a, b, degree)
+           : ConjugateInvariantConvolution(a, b, degree);
+
+    const double scale = DetermineScale(level);
+    Plaintext<word> pt_a, pt_b;
+    context_->encoder_.EncodeCoeff(pt_a, level, scale, a);
+    context_->encoder_.EncodeCoeff(pt_b, level, scale, b);
+
+    Ciphertext<word> ct_a;
+    interface_->Encrypt(ct_a, pt_a);
+
+    Ciphertext<word> ct_prod, ct_res;
+    context_->Mult(ct_prod, ct_a, pt_b);  // scale^2, not rescaled
+    context_->Rescale(ct_res, ct_prod);   // back to ~scale, level - 1
+
+    Plaintext<word> pt_out;
+    interface_->Decrypt(pt_out, ct_res);
+
+    std::vector<double> res;
+    context_->encoder_.DecodeCoeff(res, pt_out);
+
+    CompareCoeffs(expected, res, max_error_,
+                  "CiRingConvolutionRescaled at level " +
+                      std::to_string(level) + " -> " +
+                      std::to_string(level - 1));
+
+    const double separation = MaxAbsDiff(expected, other);
+    ASSERT_GT(separation, 1e-2)
+        << "the two rings products are too close for this sample to "
+           "distinguish them";
+    ASSERT_GT(MaxAbsDiff(res, other), separation / 2.0)
+        << "the result looks like the other ring product";
+  }
+}
+
+// Both operands encrypted, so the product needs relinearizing -- and that is
+// a key switch, which is ModUp followed by ModDown. It is the one thing here
+// that drives the whole mod-switch machinery, and it needs no Galois key, so
+// it can be checked before the automorphisms move to the real subring.
+TEST_P(Testbed32, CiRingCiphertextProduct) {
+  const int degree = 1 << log_degree_;
+  for (int level = 1; level <= param_->max_level_; level++) {
+    std::vector<double> a, b;
+    SampleSparse(a, degree);
+    SampleSparse(b, degree);
+
+    const bool ci = param_->conjugate_invariant_;
+    const std::vector<double> expected =
+        ci ? ConjugateInvariantConvolution(a, b, degree)
+           : NegacyclicConvolution(a, b, degree);
+    const std::vector<double> other =
+        ci ? NegacyclicConvolution(a, b, degree)
+           : ConjugateInvariantConvolution(a, b, degree);
+
+    const double scale = DetermineScale(level);
+    Plaintext<word> pt_a, pt_b;
+    context_->encoder_.EncodeCoeff(pt_a, level, scale, a);
+    context_->encoder_.EncodeCoeff(pt_b, level, scale, b);
+
+    Ciphertext<word> ct_a, ct_b;
+    interface_->Encrypt(ct_a, pt_a);
+    interface_->Encrypt(ct_b, pt_b);
+
+    Ciphertext<word> ct_res;
+    context_->HMult(ct_res, ct_a, ct_b, interface_->GetMultiplicationKey(),
+                    true);
+
+    Plaintext<word> pt_out;
+    interface_->Decrypt(pt_out, ct_res);
+
+    std::vector<double> res;
+    context_->encoder_.DecodeCoeff(res, pt_out);
+
+    CompareCoeffs(expected, res, max_error_,
+                  "CiRingCiphertextProduct at level " + std::to_string(level) +
+                      " -> " + std::to_string(level - 1));
+
+    const double separation = MaxAbsDiff(expected, other);
+    ASSERT_GT(separation, 1e-2)
+        << "the two rings products are too close for this sample to "
+           "distinguish them";
+    ASSERT_GT(MaxAbsDiff(res, other), separation / 2.0)
+        << "the result looks like the other ring product";
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes, the same levels and the same shape
     // with the conjugate-invariant flag off -- the control.

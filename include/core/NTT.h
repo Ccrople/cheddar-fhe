@@ -46,20 +46,23 @@ class NTTHandler {
   Dv ci_fwd_twist_;
   Dv ci_inv_twist_;
 
-  // The inverse of the fold NTTPhase1 performs, in place on the INTT output.
+  // dst = fold(src): the ring element reduced mod (Y^degree - i) and twisted,
+  // which is the form the butterfly network diagonalises. Runs before NTT
+  // phase 1 and cannot be fused into it -- see CiFoldKernel for why.
+  void CiFold(make_signed_t<word> *dst, const word *primes,
+              const make_signed_t<word> *inv_primes, int tw_prime_offset,
+              int tw_y_extra, int num_q_primes, int num_total_primes,
+              int skip_start, int skip_end, int batch_stride, int batch,
+              const make_signed_t<word> *src, int src_extra) const;
+
+  // The inverse, in place on the INTT output.
   // Mirrored pairs (j, degree - j) are recombined by one thread each, so it
   // needs no scratch buffer. This one cannot ride a phase kernel the way the
   // fold does: it mixes two *outputs*, which live in different blocks.
   void CiUnfold(make_signed_t<word> *dst, const word *primes,
-                const make_signed_t<word> *inv_primes, int ter_left,
+                const make_signed_t<word> *inv_primes, int tw_prime_offset,
                 int tw_y_extra, int num_q_primes, int num_total_primes,
-                int batch_stride, int batch) const;
-
-  // Every entry point below that moves between the coefficient and evaluation
-  // domains needs the pair above when the ring is conjugate-invariant. The
-  // three that do not have it yet refuse rather than transform the wrong
-  // basis.
-  void AssertNoConjugateInvariant(const char *where) const;
+                int batch_stride, int batch, bool normalized) const;
 
   int GetLsbSize() const;
   int GetMsbSize() const;
