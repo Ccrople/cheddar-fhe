@@ -376,6 +376,22 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
                                    int out_channels,
                                    const std::vector<double> &w, double w_scale,
                                    const char *name) const {
+  RunProjection(res, x, in_channels, out_channels, w, w_scale, name, false);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ProjectMerged(
+    std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
+    int out_channels, const std::vector<double> &w, double w_scale,
+    const char *name, const Context<word> &) const {
+  RunProjection(res, x, in_channels, out_channels, w, w_scale, name, true);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::RunProjection(
+    std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
+    int out_channels, const std::vector<double> &w, double w_scale,
+    const char *name, bool merge) const {
   AssertTrue(static_cast<int>(x.size()) * rank_ == in_channels,
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the input ciphertext count times the rank must be the "
@@ -390,6 +406,15 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
 
   const int parents = static_cast<int>(x.size());
   const int groups = out_channels / rank_;
+  AssertTrue(!merge || groups % 2 == 0,
+             std::string("CoeffLinearLeg::ProjectMerged(") + name +
+                 "): an odd number of output ciphertexts has no pairing");
+  // WHAT MERGING BUYS, AND WHERE IT HAS TO HAPPEN. `ModPack` is `rank` key
+  // switches per output ciphertext -- 81% of the block's seven projections
+  // against 6% for the product itself -- so putting two outputs in one
+  // ciphertext before the pack halves the pack, while doing it after would buy
+  // nothing. The product runs twice either way; it is the cheap half.
+  const int out_groups = merge ? groups / 2 : groups;
   const int tile = (cfg_.parents_per_tile > 0 && cfg_.parents_per_tile < parents)
                        ? cfg_.parents_per_tile
                        : parents;
@@ -409,7 +434,7 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
   // addition to accumulate with instead. Accumulating here rather than after
   // the return trip is what makes a tile cost one ModPack and not one inverse
   // ring switch as well.
-  std::vector<std::vector<Ct>> partial(groups);
+  std::vector<std::vector<Ct>> partial(out_groups);
   for (auto &v : partial) v.resize(ring_rank_);
   bool started = false;
   int tile_index = 0;
@@ -455,17 +480,33 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
     //    shared by every group, which is why it is hoisted out of this loop --
     //    it is the expensive part, and the product itself is two plaintext
     //    matrix products with no key material at all.
-    for (int g = 0; g < groups; g++) {
-      std::vector<MlweCiphertext<word>> product;
-      {
+    for (int g = 0; g < out_groups; g++) {
+      const int lo_group = merge ? 2 * g : g;
+      auto mix = [&](std::vector<MlweCiphertext<word>> &out, int which) {
         NvtxScope _n("pcmm: Multiply");
         if (use_blas_) {
 #ifdef USE_CUBLAS
-          product_blas_->Multiply(product, ops.split[first + g], prepared);
+          product_blas_->Multiply(out, ops.split[first + which], prepared);
 #endif
         } else {
-          product_pcmm_->Multiply(product, ops.u[first + g], columns);
+          product_pcmm_->Multiply(out, ops.u[first + which], columns);
         }
+      };
+      std::vector<MlweCiphertext<word>> product;
+      mix(product, lo_group);
+      if (merge) {
+        // The second output's payload into the coefficients the first leaves
+        // empty. `AddShiftedHalf` is `Y^(N'/2)` on every module component,
+        // which packing turns into `X^(N/2)` on the big ring -- exactly the
+        // merge `HalfBootSplit` expects, arrived at one pack earlier.
+        NvtxScope _n("pcmm: MergeHalves");
+        std::vector<MlweCiphertext<word>> upper;
+        mix(upper, lo_group + 1);
+        std::vector<MlweCiphertext<word>> both(product.size());
+        for (size_t j = 0; j < product.size(); j++) {
+          product_mlwe_->AddShiftedHalf(both[j], product[j], upper[j]);
+        }
+        product = std::move(both);
       }
 
       // ModPack takes the components of ONE ciphertext of the product ring,
@@ -500,10 +541,10 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
   //    on the product ring, which with the descent is where the ciphertext
   //    still is -- a rescale there is a sixteenth of the work, and the inverse
   //    switch then carries a level-0 ciphertext home.
-  res.resize(groups);
+  res.resize(out_groups);
   {
     NvtxScope _n("pcmm: Rescale");
-    for (int g = 0; g < groups; g++) {
+    for (int g = 0; g < out_groups; g++) {
       if (!descent_.Enabled()) {
         product_context_->Rescale(res[g], partial[g][0]);
         continue;

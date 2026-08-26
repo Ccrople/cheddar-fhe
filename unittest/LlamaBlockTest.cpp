@@ -814,6 +814,23 @@ class EncryptedProjectionLeg : public cheddar::CoeffLinearLeg<word> {
     host_.ProbeOut(res, out_channels, name);
   }
 
+  // The merged projection is a different virtual, so without this the ledger
+  // would quietly lose the points that read a projection's INPUT -- and "not
+  // recorded" reads like a broken probe rather than an unrouted one. The input
+  // is the same unmerged coefficient stream either way, so that probe transfers
+  // verbatim. The OUTPUT probe does not: `res` holds two output ciphertexts per
+  // entry and `ProbeOut` reads one, so it is dropped here rather than fed a
+  // layout it does not speak.
+  void ProjectMerged(std::vector<Ciphertext<word>> &res,
+                     const std::vector<Ciphertext<word>> &x, int in_channels,
+                     int out_channels, const std::vector<double> &w,
+                     double w_scale, const char *name,
+                     const cheddar::Context<word> &context) const override {
+    host_.Probe(x, in_channels, name);
+    Base::ProjectMerged(res, x, in_channels, out_channels, w, w_scale, name,
+                        context);
+  }
+
   // Still the stand-in. Turn C's and turn B's products decrypt, multiply on
   // the host and re-encrypt.
   void Scores(std::vector<Ciphertext<word>> &res,
@@ -882,6 +899,23 @@ class ProbedSinCLeg : public cheddar::SinCLinearLeg<word> {
     host_.Probe(x, in_channels, name);
     Base::Project(res, x, in_channels, out_channels, w, w_scale, name);
     host_.ProbeOut(res, out_channels, name);
+  }
+
+  // The merged projection is a different virtual, so without this the ledger
+  // would quietly lose the points that read a projection's INPUT -- and "not
+  // recorded" reads like a broken probe rather than an unrouted one. The input
+  // is the same unmerged coefficient stream either way, so that probe transfers
+  // verbatim. The OUTPUT probe does not: `res` holds two output ciphertexts per
+  // entry and `ProbeOut` reads one, so it is dropped here rather than fed a
+  // layout it does not speak.
+  void ProjectMerged(std::vector<Ciphertext<word>> &res,
+                     const std::vector<Ciphertext<word>> &x, int in_channels,
+                     int out_channels, const std::vector<double> &w,
+                     double w_scale, const char *name,
+                     const cheddar::Context<word> &context) const override {
+    host_.Probe(x, in_channels, name);
+    Base::ProjectMerged(res, x, in_channels, out_channels, w, w_scale, name,
+                        context);
   }
 
   void Scores(std::vector<Ciphertext<word>> &res,

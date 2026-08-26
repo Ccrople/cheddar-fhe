@@ -1,6 +1,7 @@
 #include "extension/EvalSpecialFFT.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <utility>
 #include <vector>
@@ -11,6 +12,28 @@
 namespace cheddar {
 
 namespace {
+
+// How far to push the ordinary path's baby-step count above the heuristic's
+// choice, as a power of two. Read once. `BSGSSplit` documents why the dial
+// exists; **1 is the measured optimum** and 0 restores the split every earlier
+// baseline was taken with.
+//
+//   HalfBoot, bootparam_35, one A100, one process per point:
+//     shift 0  28.52 ms     shift 2  26.65 ms
+//     shift 1  26.59 ms     shift 3  26.75 ms
+//
+// A U with a floor one doubling up and a flat, slightly worse tail above it --
+// which is what a 7:1 giant-to-baby cost ratio predicts, and is the first
+// direct confirmation of that ratio on the ordinary path.
+int BabyStepShift() {
+  static const int shift = []() {
+    const char *env = std::getenv("CHEDDAR_BSGS_BABY_SHIFT");
+    if (env == nullptr) return 1;
+    const int v = std::atoi(env);
+    return (v < 0) ? 0 : ((v > 5) ? 5 : v);
+  }();
+  return shift;
+}
 
 // ===========================================================================
 // The inverse SinC conversion's row correction on the real subring, solved on
@@ -334,6 +357,30 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
     default:  // over 127, don't care actually
       bs = 1 << DivCeil(Log2Ceil(num_diag), 2);
       break;
+  }
+
+  // THE ORDINARY PATH'S SPLIT IS A MEASUREMENT WAITING TO BE TAKEN.
+  //
+  // The heuristic above prices a baby-step rotation and a giant-step rotation
+  // the same. They are not: a baby step rides the double hoisting, one ModUp
+  // shared across the whole step, while every giant rotation pays its own
+  // ModDown + ModUp + key multiply -- a 7x ratio measured at the CtS levels
+  // (Doing.md 1.5bd). The conjugate-invariant phases were rebalanced for it at
+  // `b1fea6a` and the ordinary path deliberately left alone, because its
+  // baselines and its evk footprint are measured and retuning it is its own
+  // change. This is the dial that change needs; the default is still the
+  // heuristic, exactly as before.
+  //
+  // `GSFusedKernel` is instantiated to `max_log_bs_` = 7, so the ordinary path
+  // takes baby steps up to 128 -- the cap at 16 belongs to the CI branch's
+  // fused complex kernel and not here.
+  const int shift = BabyStepShift();
+  if (shift > 0) {
+    bs = Min(1 << 7, bs << shift);
+    if (bs > num_diag) bs = 1 << Log2Ceil(num_diag);
+    // A single giant step fires HoistHandler's bs <-> gs swap, whose layout the
+    // fused giant step does not speak. The CI branch found this the hard way.
+    while (bs > 1 && DivCeil(num_diag, bs) < 2) bs /= 2;
   }
   gs = DivCeil(num_diag, bs);
 

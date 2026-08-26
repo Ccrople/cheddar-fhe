@@ -334,6 +334,21 @@ class BootContext : public Context<word>,
   void HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo, const Ct &hi,
                     const EvkMap<word> &evk_map, bool min_ks = false) const;
 
+  /**
+   * @brief `HalfBootPair` for a caller that already holds the merged form.
+   *
+   * The merge is `lo + X^(N/2) * hi` and a producer upstream may be able to
+   * make it more cheaply than one multiply and one add here -- the projection
+   * can, by merging at the module component and halving its ModPack
+   * (`MlweHandler::AddShiftedHalf`), which is worth far more than the merge
+   * itself. Such a caller has no unmerged pair to hand `HalfBootPair`.
+   *
+   * @param merged coefficient-encoded, payload of one ciphertext in
+   *        coefficients `0 .. N/2-1` and of the other in `N/2 .. N-1`
+   */
+  void HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
+                     const EvkMap<word> &evk_map, bool min_ks = false) const;
+
   // Other functions...
 
   /**

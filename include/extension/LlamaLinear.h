@@ -218,7 +218,20 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
                int out_channels, const std::vector<double> &w, double w_scale,
                const char *name) const override;
 
+  /// The pair merged where it is worth something: before ModPack, not after.
+  void ProjectMerged(std::vector<Ct> &res, const std::vector<Ct> &x,
+                     int in_channels, int out_channels,
+                     const std::vector<double> &w, double w_scale,
+                     const char *name,
+                     const Context<word> &context) const override;
+
  private:
+  /// Both of the above; `merge` is the only difference between them.
+  void RunProjection(std::vector<Ct> &res, const std::vector<Ct> &x,
+                     int in_channels, int out_channels,
+                     const std::vector<double> &w, double w_scale,
+                     const char *name, bool merge) const;
+
   /**
    * @brief The plaintext operands of one projection, converted once.
    *

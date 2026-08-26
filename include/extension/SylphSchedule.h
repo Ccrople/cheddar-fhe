@@ -245,6 +245,15 @@ class SylphSchedule {
    */
   double ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo, const Ct &hi,
                     const EvkMap<word> &evk_map, bool min_ks = false) const;
+
+  /**
+   * @brief `ToSlotPair` for a caller whose producer already merged the pair.
+   *
+   * @param merged coefficient-encoded, one payload in coefficients
+   *        `0 .. N/2-1` and the other in `N/2 .. N-1`
+   */
+  double ToSlotSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
+                     const EvkMap<word> &evk_map, bool min_ks = false) const;
 };
 
 }  // namespace cheddar

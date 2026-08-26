@@ -322,6 +322,25 @@ double SylphSchedule<word>::ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
   return drift;
 }
 
+template <typename word>
+double SylphSchedule<word>::ToSlotSplit(Ct &res_lo, Ct &res_hi,
+                                        const Ct &merged,
+                                        const EvkMap<word> &evk_map,
+                                        bool min_ks /*= false*/) const {
+  const int level = boot_->param_.NPToLevel(merged.GetNP());
+  double drift = 1.0;
+  if (level > 0) {
+    const double before = merged.GetScale();
+    Ct low;
+    boot_->LevelDown(low, merged, 0);
+    drift = low.GetScale() / before;
+    boot_->HalfBootSplit(res_lo, res_hi, low, evk_map, min_ks);
+  } else {
+    boot_->HalfBootSplit(res_lo, res_hi, merged, evk_map, min_ks);
+  }
+  return drift;
+}
+
 template class SylphSchedule<uint32_t>;
 template class SylphSchedule<uint64_t>;
 

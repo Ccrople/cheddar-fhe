@@ -399,6 +399,112 @@ TEST_P(Testbed32, ModPackWorksOnANarrowAuxiliaryBasis) {
   ASSERT_LT(max_abs, 1e-3);
 }
 
+// ---------------------------------------------------------------------------
+// TWO PAYLOADS, ONE PACK.
+//
+// `ModPack` is `rank` key switches per output ciphertext, and in the layer that
+// is 81% of what the seven projections cost -- against 6% for the product
+// itself (Doing.md 1.5cn). Halving the number of packs therefore nearly halves
+// the projection, and the way to halve it is to put two outputs in one
+// ciphertext BEFORE the pack.
+//
+// `AddShiftedHalf` is that merge, at the module component: `lo + Y^(N'/2) * hi`.
+// Packing sends entry `s` of component `n` to big coefficient `n + rank*s`, so
+// a shift by `N'/2` on every component is a shift by `rank * N'/2 = N/2` on the
+// packed ciphertext. The claim this test makes is that identity, and it makes
+// it the only way that means anything: by running BOTH sides.
+//
+//     ModPack(lo + Y^(N'/2) hi)  ==  ModPack(lo) + X^(N/2) ModPack(hi)
+//
+// The right-hand side is two packs and the left is one, which is the entire
+// point. `MultImaginaryUnit` supplies `X^(N/2)` -- it evaluates to `i` at every
+// slot because `5^j = 1 mod 4`, and multiplying by it is exactly that monomial.
+TEST_P(Testbed32, AddShiftedHalfPutsTwoPayloadsInOnePack) {
+  const int degree = 1 << log_degree_;
+  const int small_degree = degree / 2;
+  const int rank = 2;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  const int level = 2;
+  interface_->PrepareModPackKeys(small_degree, level);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  // Two payloads confined to the lower coefficient half, which is the contract
+  // the merge is used under -- the projection's outputs are 128 tokens and 128
+  // zeros per component, and this is that shape.
+  std::vector<double> lo_coeffs(degree, 0.0), hi_coeffs(degree, 0.0);
+  Random::SampleUniformReal(lo_coeffs.data(), degree / 2, -1.0, 1.0);
+  Random::SampleUniformReal(hi_coeffs.data(), degree / 2, -1.0, 1.0);
+
+  auto decompose = [&](std::vector<MlweCiphertext<word>> &parts,
+                       const std::vector<double> &coeffs) {
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+    Ciphertext<word> ct;
+    interface_->Encrypt(ct, pt);
+    mlwe.ModDecomp(parts, ct, small_degree);
+    ASSERT_EQ(static_cast<int>(parts.size()), rank);
+  };
+  std::vector<MlweCiphertext<word>> lo_parts, hi_parts;
+  decompose(lo_parts, lo_coeffs);
+  decompose(hi_parts, hi_coeffs);
+
+  // ONE pack, on the merged components.
+  std::vector<MlweCiphertext<word>> merged(rank);
+  for (int j = 0; j < rank; j++) {
+    mlwe.AddShiftedHalf(merged[j], lo_parts[j], hi_parts[j]);
+  }
+  Ciphertext<word> one;
+  mlwe.ModPack(context_, one, merged, keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // TWO packs and a monomial, which is what it replaces.
+  Ciphertext<word> packed_lo, packed_hi, shifted, two;
+  mlwe.ModPack(context_, packed_lo, lo_parts, keys);
+  mlwe.ModPack(context_, packed_hi, hi_parts, keys);
+  context_->MultImaginaryUnit(shifted, packed_hi);
+  context_->Add(two, packed_lo, shifted);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  auto read = [&](const Ciphertext<word> &ct) {
+    Plaintext<word> out;
+    interface_->Decrypt(out, ct);
+    std::vector<double> got;
+    context_->encoder_.DecodeCoeff(got, out);
+    return got;
+  };
+  const auto got_one = read(one);
+  const auto got_two = read(two);
+
+  // Against each other, and against the truth: coefficients 0..N/2-1 are `lo`
+  // and N/2..N-1 are `hi`, which is what makes the two payloads separable.
+  double vs_two = 0.0, vs_true = 0.0, crossed = 0.0;
+  for (int i = 0; i < degree; i++) {
+    const double want =
+        (i < degree / 2) ? lo_coeffs[i] : hi_coeffs[i - degree / 2];
+    vs_two = std::max(vs_two, std::abs(got_one[i] - got_two[i]));
+    vs_true = std::max(vs_true, std::abs(got_one[i] - want));
+    // The control: had the halves crossed, comparing against the swap would be
+    // no worse than comparing against the truth.
+    const double swapped =
+        (i < degree / 2) ? hi_coeffs[i] : lo_coeffs[i - degree / 2];
+    crossed = std::max(crossed, std::abs(got_one[i] - swapped));
+  }
+  std::cout << "degree " << degree << " -> " << small_degree << ", rank " << rank
+            << ": one pack vs two " << vs_two << ", vs the two payloads "
+            << vs_true << ", vs the swap " << crossed << std::endl;
+  ASSERT_LT(vs_two, 1e-3) << "the merged pack is not the sum of the two packs";
+  ASSERT_LT(vs_true, 1e-3) << "the merged pack does not carry both payloads";
+  ASSERT_GT(crossed, 1e-1) << "the halves are indistinguishable, so neither "
+                              "check above proves anything";
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_40.json"),

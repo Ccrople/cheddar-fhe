@@ -7,6 +7,36 @@ namespace cheddar {
 
 namespace kernel {
 
+// res = lo + Y^(N'/2) * hi, on a module component, in the coefficient domain.
+//
+// Negacyclic in Y, so entry s of the shift reads entry s - N'/2 of `hi` and
+// entry s + N'/2 negated when s is in the lower half. Nothing here assumes the
+// operand halves are empty; that assumption belongs to the caller who is using
+// this to put two payloads in one ciphertext, and stating it here would only
+// hide a violation.
+//
+// grid: (words / block), where words spans limb, module index and coefficient
+// alike, because a shift by N'/2 stays inside the N'-run it started in.
+template <typename word>
+__global__ void ShiftedAdd(word *dst, const word *lo, const word *hi,
+                           const word *primes, int small_degree,
+                           int runs_per_limb, int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int half = small_degree >> 1;
+  const int s = idx & (small_degree - 1);
+  const int limb = idx / (runs_per_limb * small_degree);
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  word shifted;
+  if (s < half) {
+    // Y^(N'/2) sends entry s + N'/2 here, and Y^N' = -1 makes it a negation.
+    shifted = basic::Negate(basic::StreamingLoad(hi + idx + half), prime);
+  } else {
+    shifted = basic::StreamingLoad(hi + idx - half);
+  }
+  dst[idx] = basic::Add(basic::StreamingLoad(lo + idx), shifted, prime);
+}
+
 // b-part: res_i[limb][s] = b[limb][i + k*s], a plain stride-k gather.
 //
 // grid: (small_degree / block, k, num_total_primes)
@@ -429,6 +459,40 @@ void MlweHandler<word>::ModDecomp(std::vector<MlweCiphertext<word>> &res,
       d_dst_b.data(), b_coeffs.data(), rank, small_degree, degree);
   kernel::ModDecompA<word><<<grid_dim, block_dim>>>(
       d_dst_a.data(), a_coeffs.data(), primes, rank, small_degree, degree);
+}
+
+template <typename word>
+void MlweHandler<word>::AddShiftedHalf(MlweCiphertext<word> &res,
+                                       const MlweCiphertext<word> &lo,
+                                       const MlweCiphertext<word> &hi) const {
+  const int rank = lo.rank_;
+  const int small_degree = lo.degree_;
+  AssertTrue(rank > 0 && small_degree >= 2 && IsPowOfTwo(small_degree),
+             "AddShiftedHalf: invalid module component shape");
+  AssertTrue(hi.rank_ == rank && hi.degree_ == small_degree,
+             "AddShiftedHalf: the two components differ in rank or degree");
+  AssertTrue(lo.np_ == hi.np_,
+             "AddShiftedHalf: the two components differ in NP");
+  AssertTrue(lo.scale_ == hi.scale_,
+             "AddShiftedHalf: the two components differ in scale");
+
+  const int num_total_primes = lo.np_.GetNumTotal();
+  res.rank_ = rank;
+  res.degree_ = small_degree;
+  res.np_ = lo.np_;
+  res.scale_ = lo.scale_;
+  res.a_.resize(static_cast<size_t>(num_total_primes) * rank * small_degree);
+  res.b_.resize(static_cast<size_t>(num_total_primes) * small_degree);
+
+  const word *primes = param_.GetPrimesPtr(lo.np_);
+  auto launch = [&](word *dst, const word *a, const word *b, int runs_per_limb) {
+    const int total = num_total_primes * runs_per_limb * small_degree;
+    const int block = Min(small_degree, kernel_block_dim_);
+    kernel::ShiftedAdd<word><<<DivCeil(total, block), block>>>(
+        dst, a, b, primes, small_degree, runs_per_limb, total);
+  };
+  launch(res.a_.data(), lo.a_.data(), hi.a_.data(), rank);
+  launch(res.b_.data(), lo.b_.data(), hi.b_.data(), 1);
 }
 
 template <typename word>

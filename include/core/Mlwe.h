@@ -224,6 +224,31 @@ class MlweHandler {
                const std::vector<const Evk *> &keys) const;
 
   /**
+   * @brief res = lo + Y^(N'/2) * hi, on one module component.
+   *
+   * TWO PAYLOADS, ONE PACK. `ModPack` costs `rank` key switches per output
+   * ciphertext and that is what a projection spends its time on -- measured at
+   * 81% of the block's seven projections, against 6% for the product itself.
+   * Halving the pack count therefore nearly halves the projection, and the way
+   * to halve it is to put two outputs in one ciphertext before packing rather
+   * than after.
+   *
+   * The shift is the module-level image of the ring's own `X^(N/2)`: packing
+   * sends entry `s` of component `n` to big coefficient `n + rank*s`, so
+   * `Y^(N'/2)` on every component is `X^(rank*N'/2)` = `X^(N/2)` on the packed
+   * ciphertext. That is the same merge `BootContext::HalfBootPair` performs on
+   * the big ring, arrived at one pack earlier.
+   *
+   * The arithmetic is unconditional -- `Y^N' = -1`, so the wrap negates, and
+   * nothing here assumes an empty half. What does assume it is the *use*: the
+   * two payloads only stay separable while each occupies coefficients
+   * `0 .. N'/2-1` alone, which is the contract `HalfBootPair` documents and
+   * which the caller owns.
+   */
+  void AddShiftedHalf(MlweCiphertext<word> &res, const MlweCiphertext<word> &lo,
+                      const MlweCiphertext<word> &hi) const;
+
+  /**
    * @brief Inverse-transform a ciphertext component into the coefficient
    * domain and copy it to the host. Exposed because the decomposition is only
    * meaningful against coefficient vectors, so tests need them.

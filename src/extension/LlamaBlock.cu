@@ -534,6 +534,31 @@ void LlamaBlock<word>::Lift(std::vector<Ct> &res, const std::vector<Ct> &x,
 }
 
 template <typename word>
+void LlamaBlock<word>::LiftMerged(std::vector<Ct> &res,
+                                  const std::vector<Ct> &merged,
+                                  double magnitude,
+                                  const EvkMap<word> &evk_map,
+                                  double shift) const {
+  res.resize(merged.size() * 2);
+  const int level = sched_->GetSlotLevel() - 1;
+  Constant<word> shift_const;
+  if (shift != 0.0) {
+    boot_->encoder_.EncodeConstant(shift_const, level,
+                                   boot_->param_.GetScale(level), shift);
+  }
+  for (size_t m = 0; m < merged.size(); m++) {
+    Ct landed_lo, landed_hi;
+    sched_->ToSlotSplit(landed_lo, landed_hi, merged[m], evk_map);
+    sched_->Canonicalise(res[2 * m], landed_lo, magnitude);
+    sched_->Canonicalise(res[2 * m + 1], landed_hi, magnitude);
+    if (shift != 0.0) {
+      boot_->Add(res[2 * m], res[2 * m], shift_const);
+      boot_->Add(res[2 * m + 1], res[2 * m + 1], shift_const);
+    }
+  }
+}
+
+template <typename word>
 void LlamaBlock<word>::Lower(std::vector<Ct> &res, const std::vector<Ct> &x,
                              const EvkMap<word> &evk_map) const {
   res.resize(x.size());
@@ -564,15 +589,21 @@ template <typename word>
 void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
                                    const std::vector<double> &want,
                                    const std::vector<double> &got, int channels,
-                                   double scale,
-                                   const std::vector<int> &order) const {
+                                   double scale, const std::vector<int> &order,
+                                   bool merged) const {
   const int sinks = cfg_.num_sink_tokens;
   if (sinks <= 0) return;
   const size_t expect = static_cast<size_t>(sinks) * channels;
   AssertTrue(want.size() == expect && got.size() == expect,
              "LlamaBlock::InjectSinks: the public sink rows must be "
              "[num_sink_tokens][channels]");
-  AssertTrue(static_cast<int>(cts.size()) == NumCiphertexts(channels),
+  // Merged input holds two output ciphertexts per ciphertext: the even one in
+  // the real coefficients and the odd one in the imaginary ones. That is not a
+  // separate code path here -- `CoeffOfSlot` already takes the real/imaginary
+  // flag, and the flag *is* the half -- so the only change is which one to ask
+  // for.
+  const int per_ct = merged ? 2 : 1;
+  AssertTrue(static_cast<int>(cts.size()) * per_ct == NumCiphertexts(channels),
              "LlamaBlock::InjectSinks: wrong ciphertext count");
 
   // The projection's columns were reordered, so slot position `p` holds the
@@ -595,16 +626,19 @@ void LlamaBlock<word>::InjectSinks(std::vector<Ct> &cts,
                "level 0 before a plaintext can be added to it");
     std::vector<double> coeffs(degree, 0.0);
     bool any = false;
-    for (int t = 0; t < sinks; t++) {
-      for (int c = 0; c < channels_per_ct_; c++) {
-        const int position = static_cast<int>(i) * channels_per_ct_ + c;
-        const int channel = inv.empty() ? position : inv[position];
-        const size_t idx = static_cast<size_t>(t) * channels + channel;
-        const double d = scale * (want[idx] - got[idx]);
-        if (d == 0.0) continue;
-        const int slot = t + cfg_.num_tokens * c;
-        coeffs[AttentionPacking::CoeffOfSlot({slot, false}, degree)] = d;
-        any = true;
+    for (int half = 0; half < per_ct; half++) {
+      const int source = static_cast<int>(i) * per_ct + half;
+      for (int t = 0; t < sinks; t++) {
+        for (int c = 0; c < channels_per_ct_; c++) {
+          const int position = source * channels_per_ct_ + c;
+          const int channel = inv.empty() ? position : inv[position];
+          const size_t idx = static_cast<size_t>(t) * channels + channel;
+          const double d = scale * (want[idx] - got[idx]);
+          if (d == 0.0) continue;
+          const int slot = t + cfg_.num_tokens * c;
+          coeffs[AttentionPacking::CoeffOfSlot({slot, half == 1}, degree)] = d;
+          any = true;
+        }
       }
     }
     if (!any) continue;
@@ -662,27 +696,44 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // the token, three channel bits on the ciphertext axis -- is bought here, in
   // a host-side permutation of a plaintext, rather than with a slot transform
   // and a level on each of Q, K and V.
+  // MERGED WHERE THE MERGE IS FREE TO CARRY. Q, K, V, gate and up go straight
+  // from the projection to a crossing with nothing but plaintext additions in
+  // between, so their pairs can be formed inside `ModPack` and never taken
+  // apart until `LiftMerged` splits them at the far side. O and down cannot:
+  // their outputs meet the residual stream, which is not merged, and no cheap
+  // operation separates the halves of a coefficient ciphertext once they are
+  // together. Those two keep the ordinary route.
+  const bool merge = BootPairEnabled();
+  auto project = [&](std::vector<Ct> &out, const std::vector<Ct> &in, int in_ch,
+                     int out_ch, const std::vector<double> &weight,
+                     double scale, const char *tag) {
+    if (merge) {
+      leg.ProjectMerged(out, in, in_ch, out_ch, weight, scale, tag, *boot_);
+    } else {
+      leg.Project(out, in, in_ch, out_ch, weight, scale, tag);
+    }
+  };
   std::vector<Ct> q, k, v;
   {
     ProfileScope _p("A  project Q");
-    leg.Project(q, coeff, cfg_.num_channels, cfg_.num_channels,
-                Reorder(w.wq, cfg_.num_channels, cfg_.num_channels,
-                        LinearLeg::Tensor::kQuery, false),
-                cal_.size_q, "Q");
+    project(q, coeff, cfg_.num_channels, cfg_.num_channels,
+            Reorder(w.wq, cfg_.num_channels, cfg_.num_channels,
+                    LinearLeg::Tensor::kQuery, false),
+            cal_.size_q, "Q");
   }
   {
     ProfileScope _p("A  project K");
-    leg.Project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-                Reorder(w.wk, cfg_.num_channels, cfg_.num_kv_channels,
-                        LinearLeg::Tensor::kKey, false),
-                cal_.size_k, "K");
+    project(k, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+            Reorder(w.wk, cfg_.num_channels, cfg_.num_kv_channels,
+                    LinearLeg::Tensor::kKey, false),
+            cal_.size_k, "K");
   }
   {
     ProfileScope _p("A  project V");
-    leg.Project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
-                Reorder(w.wv, cfg_.num_channels, cfg_.num_kv_channels,
-                        LinearLeg::Tensor::kValue, false),
-                cal_.size_v, "V");
+    project(v, coeff, cfg_.num_channels, cfg_.num_kv_channels,
+            Reorder(w.wv, cfg_.num_channels, cfg_.num_kv_channels,
+                    LinearLeg::Tensor::kValue, false),
+            cal_.size_v, "V");
   }
 
   // The sink tokens' K and V, put back. Their hidden state never reached the
@@ -695,9 +746,9 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   {
     ProfileScope _p("A  inject sinks");
     InjectSinks(k, sinks.k, sinks.computed_k, cfg_.num_kv_channels, cal_.size_k,
-                k_order_);
+                k_order_, merge);
     InjectSinks(v, sinks.v, sinks.computed_v, cfg_.num_kv_channels, cal_.size_v,
-                v_order_);
+                v_order_, merge);
   }
 
   // ---- turn B: RoPE on Q and K, then the score product ------------------
@@ -709,9 +760,15 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   Announce("B  Q from the projection", q, 0);
   {
     ProfileScope _p("B  lift Q,K,V");
-    Lift(q_slots, q, 1.0, evk_map);
-    Lift(k_slots, k, 1.0, evk_map);
-    Lift(v_slots, v, 1.0, evk_map);
+    if (merge) {
+      LiftMerged(q_slots, q, 1.0, evk_map);
+      LiftMerged(k_slots, k, 1.0, evk_map);
+      LiftMerged(v_slots, v, 1.0, evk_map);
+    } else {
+      Lift(q_slots, q, 1.0, evk_map);
+      Lift(k_slots, k, 1.0, evk_map);
+      Lift(v_slots, v, 1.0, evk_map);
+    }
   }
   q.clear();
   k.clear();
@@ -923,13 +980,13 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // SiLu.h says it belongs, and the crossing constant rides along with it.
   {
     ProfileScope _p("E  project gate");
-    leg.Project(gate, h_coeff, cfg_.num_channels, cfg_.hidden, w.wgate,
-                cal_.size_gate / cal_.silu_range, "gate");
+    project(gate, h_coeff, cfg_.num_channels, cfg_.hidden, w.wgate,
+            cal_.size_gate / cal_.silu_range, "gate");
   }
   {
     ProfileScope _p("E  project up");
-    leg.Project(up, h_coeff, cfg_.num_channels, cfg_.hidden, w.wup, cal_.size_up,
-                "up");
+    project(up, h_coeff, cfg_.num_channels, cfg_.hidden, w.wup, cal_.size_up,
+            "up");
   }
 
   // ---- turn F: SiLU, the elementwise gate, then the down projection -----
@@ -940,8 +997,13 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   Announce("F  gate", gate, 0);
   {
     ProfileScope _p("F  lift gate,up");
-    Lift(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
-    Lift(up_slots, up, 1.0, evk_map);
+    if (merge) {
+      LiftMerged(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
+      LiftMerged(up_slots, up, 1.0, evk_map);
+    } else {
+      Lift(gate_slots, gate, 1.0 / cal_.size_gate, evk_map);
+      Lift(up_slots, up, 1.0, evk_map);
+    }
   }
   const auto &mult_key = evk_map.GetMultiplicationKey();
   std::vector<Ct> gated(gate_slots.size());

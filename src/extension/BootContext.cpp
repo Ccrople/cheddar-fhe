@@ -494,6 +494,28 @@ void BootContext<word>::HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
   Ct merged;
   this->MultImaginaryUnit(merged, hi);
   this->Add(merged, merged, lo);
+  HalfBootSplit(res_lo, res_hi, merged, evk_map, min_ks);
+}
+
+template <typename word>
+void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
+                                      const EvkMap<word> &evk_map,
+                                      bool min_ks) const {
+  AssertTrue(!this->param_.conjugate_invariant_,
+             "HalfBootSplit: the real subring's CtS lands real slots, so there "
+             "is no second axis to split");
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  const int max_num_slots = this->param_.MaxNumSlots();
+  const int input_num_slots = merged.GetNumSlots();
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
+  AssertTrue(num_slots == max_num_slots,
+             "HalfBootSplit: only the full-slot bootstrap separates the axes");
+  if (this->param_.NPToLevel(merged.GetNP()) > 0) {
+    Ct down;
+    this->LevelDown(down, merged, 0);
+    HalfBootSplit(res_lo, res_hi, down, evk_map, min_ks);
+    return;
+  }
 
   // From here it is `HalfBoot`, verbatim, on the merged ciphertext.
   Ct main_ct;

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "common/Assert.h"
 #include "core/Container.h"
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
@@ -399,6 +400,41 @@ class LlamaBlock {
                          const char *name) const = 0;
 
     /**
+     * @brief `Project`, with consecutive output ciphertexts merged in pairs.
+     *
+     * Output ciphertext `2m` lands in coefficients `0 .. N/2-1` of `res[m]` and
+     * `2m+1` in `N/2 .. N-1`. That is the form `BootContext::HalfBootSplit`
+     * consumes, so the block's next step reads it directly.
+     *
+     * WHY THE PROJECTION AND NOT THE BOOTSTRAP DOES THIS. The merge itself is
+     * one multiply and one add wherever it happens; what makes the position
+     * matter is `ModPack`, which costs `rank` key switches per output
+     * ciphertext and is 81% of the block's seven projections against 6% for
+     * the product. Merging before the pack halves the pack. A leg that cannot
+     * do that still answers correctly through the default below -- it projects
+     * as usual and merges on the big ring -- and pays what it would have paid.
+     *
+     * @param res `out_channels / (2 * channels_per_ct)` merged ciphertexts
+     */
+    virtual void ProjectMerged(std::vector<Ct> &res, const std::vector<Ct> &x,
+                               int in_channels, int out_channels,
+                               const std::vector<double> &w, double w_scale,
+                               const char *name,
+                               const Context<word> &context) const {
+      std::vector<Ct> plain;
+      Project(plain, x, in_channels, out_channels, w, w_scale, name);
+      AssertTrue(plain.size() % 2 == 0,
+                 "ProjectMerged: an odd number of output ciphertexts has no "
+                 "pairing");
+      res.resize(plain.size() / 2);
+      for (size_t m = 0; m < res.size(); m++) {
+        Ct shifted;
+        context.MultImaginaryUnit(shifted, plain[2 * m + 1]);
+        context.Add(res[m], shifted, plain[2 * m]);
+      }
+    }
+
+    /**
      * @brief res = magnitude * (Q K^T + shift), per head, with GQA repetition.
      *
      * ## The order is not the obvious one, and it is what makes the bootstrap
@@ -545,6 +581,12 @@ class LlamaBlock {
   // for the one operator whose argument is affine rather than linear.
   void Lift(std::vector<Ct> &res, const std::vector<Ct> &x, double magnitude,
             const EvkMap<word> &evk_map, double shift = 0.0) const;
+  // The same crossing for a producer that already merged its output in pairs
+  // (`LinearLeg::ProjectMerged`): `res` is twice as long as `merged`, and what
+  // it holds is what `Lift` would have handed back.
+  void LiftMerged(std::vector<Ct> &res, const std::vector<Ct> &merged,
+                  double magnitude, const EvkMap<word> &evk_map,
+                  double shift = 0.0) const;
   // The other half: StC every ciphertext back to the coefficient domain.
   void Lower(std::vector<Ct> &res, const std::vector<Ct> &x,
              const EvkMap<word> &evk_map) const;
@@ -606,7 +648,7 @@ class LlamaBlock {
   // cached K of a sink token belongs.
   void InjectSinks(std::vector<Ct> &cts, const std::vector<double> &want,
                    const std::vector<double> &got, int channels, double scale,
-                   const std::vector<int> &order) const;
+                   const std::vector<int> &order, bool merged = false) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   Config cfg_;
