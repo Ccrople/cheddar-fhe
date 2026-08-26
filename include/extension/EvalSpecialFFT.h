@@ -243,4 +243,67 @@ class EvalSpecialFFT {
                           const Ct &input, const EvkMap<word> &evk_map) const;
 };
 
+/**
+ * @brief The one-phase, one-level form of the conjugate-invariant SinC
+ * conversions, for rings that cannot host `EvalSpecialFFT` at all.
+ *
+ * ## Why this exists (Doing.md 1.5bo)
+ *
+ * The CI CC-MM chain needs a PER-PART conversion on the small product ring:
+ * after `SlotToSinC(degree / rank)` on the big ring, the switch's parts land
+ * in slot form, one small-ring conversion short of the Algorithm 4 operand.
+ * The small ring holds two levels above its floor and `EvalSpecialFFT`'s
+ * constructor compiles a full CtS/StC against a BootParameter -- neither fits.
+ *
+ * What makes one phase possible where `PrepareSinC` demands two on R+: the
+ * pair chain exists to carry a complex INTERMEDIATE between phases, and a
+ * single phase has none. For real input x the whole conversion is
+ * `Re(M x) = Re(M) x` -- one plain `LinearTransform` over the real part of
+ * the corrected stage product, one level, ordinary BSGS (a gs = 1 layout is
+ * fine here; there is no fused complex giant step involved).
+ *
+ * The matrices carry the corrections of Doing.md 1.5bn: the forward doubles
+ * every input column outside block 0; the inverse rides 1/d and the complex
+ * per-row lambda (solved on the 4k reference ring, capped at
+ * sub_degree 256), taken real AFTER the lambda multiplication.
+ *
+ * @tparam word uint32_t or uint64_t
+ */
+template <typename word>
+class CiSinCConverter {
+ private:
+  using Ct = Ciphertext<word>;
+
+  int sub_degree_ = 0;
+  // Zero or one entry each; a vector because LinearTransform has no default
+  // constructor and owns device state.
+  std::vector<LinearTransform<word>> forward_;
+  std::vector<LinearTransform<word>> inverse_;
+
+ public:
+  /**
+   * @param context a conjugate-invariant Context
+   * @param sub_degree k
+   * @param forward_level level the slots -> SinC direction is compiled at
+   *        (it returns one below), or -1 to skip building it
+   * @param inverse_level likewise for SinC -> slots; the inverse is only
+   *        buildable for sub_degree <= 256 (the lambda cap)
+   */
+  CiSinCConverter(ConstContextPtr<word> context, int sub_degree,
+                  int forward_level, int inverse_level);
+
+  // disable copying (or moving also)
+  CiSinCConverter(const CiSinCConverter &) = delete;
+  CiSinCConverter &operator=(const CiSinCConverter &) = delete;
+
+  int GetSubDegree() const { return sub_degree_; }
+
+  void AddRequiredRotations(EvkRequest &req) const;
+
+  void SlotToSinC(ConstContextPtr<word> context, Ct &res, const Ct &input,
+                  const EvkMap<word> &evk_map) const;
+  void SinCToSlot(ConstContextPtr<word> context, Ct &res, const Ct &input,
+                  const EvkMap<word> &evk_map) const;
+};
+
 }  // namespace cheddar

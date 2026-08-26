@@ -1166,4 +1166,177 @@ void EvalSpecialFFT<word>::EvaluateSinCToSlot(
 template class EvalSpecialFFT<uint32_t>;
 template class EvalSpecialFFT<uint64_t>;
 
+namespace {
+
+// One composed butterfly stage product as a StripedMatrix, mirroring
+// PopulatePlainMatrices entry for entry -- including the top stage, whose
+// minus diagonal coincides with the plus one at stride n/2 and merges into
+// it, which the (col - row) mod n indexing below does automatically.
+//
+// `stages` lists the stage indices (stride = 2^i) in APPLICATION order:
+// stages[0] is applied first, i.e. multiplied on the right.
+template <typename word>
+StripedMatrix ComposeCiSinCStages(const Parameter<word> &param,
+                                  const Encoder<word> &encoder, int num_slots,
+                                  const std::vector<int> &stage_indices,
+                                  bool inverse_dir) {
+  const int M = param.CyclotomicIndex();
+  StripedMatrix result;
+  bool first = true;
+  for (int i : stage_indices) {
+    const int stride = 1 << i;
+    const int st8 = stride << 3;
+    const int gap = M / st8;
+    StripedMatrix stage(num_slots, num_slots);
+    auto put = [&](int row, int col, Complex v) {
+      const int off = ((col - row) % num_slots + num_slots) % num_slots;
+      stage.try_emplace(off, num_slots, Complex(0));
+      stage[off][row] = v;
+    };
+    for (int base = 0; base < num_slots; base += 2 * stride) {
+      for (int j = 0; j < stride; j++) {
+        const int fwd_idx = (param.GetGaloisFactor(j) % st8) * gap;
+        const int inv_idx = (st8 - param.GetGaloisFactor(j) % st8) * gap;
+        if (!inverse_dir) {
+          const Complex tw = encoder.GetTwiddleFactor(fwd_idx);
+          // (x, y) -> (x + y * tw, x - y * tw)
+          put(base + j, base + j, Complex(1.0, 0.0));
+          put(base + j, base + j + stride, tw);
+          put(base + j + stride, base + j, Complex(1.0, 0.0));
+          put(base + j + stride, base + j + stride, -tw);
+        } else {
+          const Complex tw = encoder.GetTwiddleFactor(inv_idx);
+          // (x, y) -> (x + y, (x - y) * tw)
+          put(base + j, base + j, Complex(1.0, 0.0));
+          put(base + j, base + j + stride, Complex(1.0, 0.0));
+          put(base + j + stride, base + j, tw);
+          put(base + j + stride, base + j + stride, -tw);
+        }
+      }
+    }
+    result = first ? std::move(stage) : StripedMatrix::Mult(stage, result);
+    first = false;
+  }
+  return result;
+}
+
+}  // namespace
+
+template <typename word>
+CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
+                                       int sub_degree, int forward_level,
+                                       int inverse_level)
+    : sub_degree_{sub_degree} {
+  const auto &param = context->param_;
+  AssertTrue(param.conjugate_invariant_,
+             "CiSinCConverter: R+ only -- the ordinary ring has "
+             "EvalSpecialFFT::PrepareSinC");
+  const int degree = param.degree_;
+  const int num_slots = param.MaxNumSlots();
+  AssertTrue(num_slots == degree,
+             "CiSinCConverter: R+ has one real slot per coefficient");
+  AssertTrue(IsPowOfTwo(sub_degree) && sub_degree >= 2 &&
+                 sub_degree < degree && degree % sub_degree == 0,
+             "CiSinCConverter: sub_degree must be a power of two in "
+             "[2, degree)");
+  const int num_stages = Log2Ceil(num_slots);
+  const int d = degree / sub_degree;
+  const int p = Log2Ceil(d);
+  AssertTrue(p >= 1, "CiSinCConverter: nothing to do");
+
+  auto split = [](int nd) {
+    const int bs = 1 << DivCeil(Log2Ceil(nd), 2);
+    return std::pair<int, int>{bs, DivCeil(nd, bs)};
+  };
+
+  if (forward_level >= 0) {
+    AssertTrue(forward_level >= 1,
+               "CiSinCConverter: the conversion spends one level");
+    std::vector<int> stages;
+    for (int i = num_stages - p; i < num_stages; i++) stages.push_back(i);
+    StripedMatrix m =
+        ComposeCiSinCStages(param, context->encoder_, num_slots, stages,
+                            false);
+    for (auto &[idx, diag] : m) {
+      for (int j = 0; j < num_slots; j++) {
+        const int col = ((j + idx) % num_slots + num_slots) % num_slots;
+        double v = diag[j].real();
+        if (col >= sub_degree) v *= 2.0;
+        diag[j] = Complex(v, 0.0);
+      }
+    }
+    auto [bs, gs] = split(m.GetNumDiag());
+    std::cout << "CiSinCConverter forward: " << p << " stages, "
+              << m.GetNumDiag() << " diagonals, level " << forward_level
+              << ", BSGS " << bs << "x" << gs << std::endl;
+    forward_.emplace_back(context, m, forward_level,
+                          param.GetRescalePrimeProd(forward_level), bs, gs, 0,
+                          0);
+  }
+
+  if (inverse_level >= 0) {
+    AssertTrue(inverse_level >= 1,
+               "CiSinCConverter: the conversion spends one level");
+    AssertTrue(sub_degree <= kCiSinCInverseLambdaCap,
+               "CiSinCConverter: the inverse is only built for sub_degree <= "
+               "256 -- see the lambda cap of Doing.md 1.5bn");
+    std::vector<Complex> f1, f2;
+    SolveCiSinCInverseLambda(sub_degree, f1, f2);
+    // The prefix of CtS: the same strides in the opposite order, highest
+    // first, times 1/d.
+    std::vector<int> stages;
+    for (int i = num_stages - 1; i >= num_stages - p; i--) stages.push_back(i);
+    StripedMatrix m =
+        ComposeCiSinCStages(param, context->encoder_, num_slots, stages,
+                            true);
+    m = StripedMatrix::Mult(m, 1.0 / static_cast<double>(d));
+    for (auto &[idx, diag] : m) {
+      for (int j = 0; j < num_slots; j++) {
+        const int block = j / sub_degree;
+        Complex lam(1.0, 0.0);
+        if (block == 1) {
+          lam = f1[j % sub_degree];
+        } else if (block >= 2) {
+          lam = f2[j % sub_degree];
+        }
+        diag[j] = Complex((diag[j] * lam).real(), 0.0);
+      }
+    }
+    auto [bs, gs] = split(m.GetNumDiag());
+    std::cout << "CiSinCConverter inverse: " << p << " stages, "
+              << m.GetNumDiag() << " diagonals, level " << inverse_level
+              << ", BSGS " << bs << "x" << gs << std::endl;
+    inverse_.emplace_back(context, m, inverse_level,
+                          param.GetRescalePrimeProd(inverse_level), bs, gs, 0,
+                          0);
+  }
+}
+
+template <typename word>
+void CiSinCConverter<word>::AddRequiredRotations(EvkRequest &req) const {
+  for (const auto &lt : forward_) lt.AddRequiredRotations(req);
+  for (const auto &lt : inverse_) lt.AddRequiredRotations(req);
+}
+
+template <typename word>
+void CiSinCConverter<word>::SlotToSinC(ConstContextPtr<word> context, Ct &res,
+                                       const Ct &input,
+                                       const EvkMap<word> &evk_map) const {
+  AssertTrue(!forward_.empty(),
+             "CiSinCConverter: the forward direction was not built");
+  forward_.front().Evaluate(context, res, input, evk_map);
+}
+
+template <typename word>
+void CiSinCConverter<word>::SinCToSlot(ConstContextPtr<word> context, Ct &res,
+                                       const Ct &input,
+                                       const EvkMap<word> &evk_map) const {
+  AssertTrue(!inverse_.empty(),
+             "CiSinCConverter: the inverse direction was not built");
+  inverse_.front().Evaluate(context, res, input, evk_map);
+}
+
+template class CiSinCConverter<uint32_t>;
+template class CiSinCConverter<uint64_t>;
+
 }  // namespace cheddar
