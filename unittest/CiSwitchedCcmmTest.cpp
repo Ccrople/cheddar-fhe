@@ -4126,3 +4126,488 @@ TEST(CiBootSet, HalfDensityProjectionsDissolveTheDoorstepTransform) {
   EXPECT_GT(transposed, 3e-2);
   EXPECT_GT(norope, 3e-2);
 }
+
+// The real HalfBoot delivers the banded images (Doing.md 1.5bz).
+//
+// 1.5by measured the transport from the banded ModPack image to the chain
+// with the coefficient -> slot edge STOOD IN by a host encode of the
+// bit-reversed image (legitimate -- 1.5bh measured that edge exactly --
+// but composed, not run). This test runs it: the half-density banded
+// coefficient images are encrypted at level 0, exactly where the PC-MM
+// leaves its output, and cross into slots through ci16_35's own HalfBoot
+// -- ModRaise -> CtS -> EvalMod, landing AT dec 19 (full Boot's StC is
+// what lands lower; 1.5bu) -- before the 1.5by pipeline takes over.
+//
+// THE SCALE CONTRACT AT THE HALFBOOT BOUNDARY. HalfBoot's output decodes
+// to a CONSTANT multiple of the input coefficients -- 1.5bh measured the
+// map as a permutation times one constant, and the constant is the
+// message ratio 2^-log_message_ratio (~1/32) times the rungs' drift. The
+// ordinary leg restores those five bits inside the SinC prefix's folded
+// Canonicalise multiply; here the SAME fold rides RoPE's masks (one
+// plaintext multiply at the landing level, already being spent), so the
+// factor never reaches the products. The constant is measured off ONE
+// decrypted ciphertext, asserted flat across entries (< 2% spread) and
+// within half a bit of 1/32, then folded -- a parameter calibration, not
+// a data-dependent step.
+//
+// Everything downstream is 1.5by verbatim, three levels higher: RoPE +
+// kill @19 (one mask set, duplicates die), merge @18 (one +128
+// rotation), the 63-diagonal exchange @18 (rebuilt at this level, same
+// window convention), K's cross @17, LevelDown to the trio, premapped
+// descent @3, two chain calls, parts against host RoPE'd scores. What
+// this buys: the projection-to-scores path now runs with NO stand-ins
+// between the PC-MM's own output encoding and the product -- and the 16
+// HalfBoots per tensor that half-density costs are timed on the real
+// ladder.
+TEST(CiBootSet, TheRealHalfBootDeliversTheBandedImages) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int land_level = 19;      // dec: HalfBoot's landing (1.5bu)
+  const int exchange_level = 18;  // RoPE spends 19 -> 18
+  const int cross_level = 17;     // the exchange spends 18 -> 17
+  const int conv_level = 3;
+  const int chain_level = 2;
+  const int sub_degree = 32;
+  const int n = boot.Degree();
+
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.dim, 128);
+  ASSERT_EQ(layout.lanes, 32);
+  ASSERT_EQ(layout.num_cts, 8);
+  const int half = layout.contraction;  // 64
+
+  auto rev = [](int v, int bits) {
+    int r = 0;
+    for (int j = 0; j < bits; j++) {
+      r = (r << 1) | (v & 1);
+      v >>= 1;
+    }
+    return r;
+  };
+  auto exch = [](int s) {
+    const int a = (s >> 7) & 31, b = s & 31;
+    return (s & ~((31 << 7) | 31)) | (b << 7) | a;
+  };
+  auto door0 = [&](int t, int c, int i) {
+    return (rev(c % 16, 4) << 12) | (rev(i, 5) << 7) | rev(t, 7);
+  };
+  auto door1 = [&](int t, int c, int i) { return exch(door0(t, c, i)); };
+  auto door1k = [&](int t, int c, int i) {
+    return (door1(t, c, i) & ~(7 << 7)) | (((c / 16) % 4) << 7);
+  };
+
+  // Premaps by enumeration, as in 1.5by.
+  const int num_blocks = n / sub_degree;
+  std::vector<int> pre_q(num_blocks, -1), pre_k(num_blocks, -1);
+  {
+    int bad = 0;
+    for (int t = 0; t < layout.dim; t++) {
+      for (int c = 0; c < layout.dim; c++) {
+        int ct_idx, slot, copy_slot;
+        layout.LocateSlot(t, c, 0, ct_idx, slot, copy_slot);
+        if (ct_idx != c / 16) bad++;
+        int db = door1(t, c, 0) >> 5;
+        if (pre_q[db] == -1) pre_q[db] = slot >> 5;
+        if (pre_q[db] != (slot >> 5)) bad++;
+        layout.LocateSlot(c % half, t, 0, ct_idx, slot, copy_slot);
+        if (ct_idx != t / 16) bad++;
+        db = door1k(t, c, 0) >> 5;
+        if (pre_k[db] == -1) pre_k[db] = slot >> 5;
+        if (pre_k[db] != (slot >> 5)) bad++;
+      }
+    }
+    ASSERT_EQ(bad, 0);
+    std::vector<char> used(num_blocks, 0);
+    for (int b = 0; b < num_blocks; b++) {
+      if (pre_k[b] != -1) used[pre_k[b]] = 1;
+    }
+    std::vector<int> free_out;
+    for (int b = 0; b < num_blocks; b++) {
+      if (!used[b]) free_out.push_back(b);
+    }
+    size_t fo = 0;
+    for (int b = 0; b < num_blocks; b++) {
+      if (pre_k[b] == -1) pre_k[b] = free_out[fo++];
+    }
+    ASSERT_EQ(fo, free_out.size());
+  }
+
+  // ---- keys, converters, the exchange at the landing rungs -------------
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv_q(swtch.context, sub_degree,
+                               /*forward_level=*/conv_level,
+                               /*inverse_level=*/-1, &layout, &pre_q);
+  CiSinCConverter<word> conv_k(swtch.context, sub_degree,
+                               /*forward_level=*/conv_level,
+                               /*inverse_level=*/-1, &layout, &pre_k);
+  EvkRequest req;
+  conv_q.AddRequiredRotations(req);
+  conv_k.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const int window = 31 * 127;
+  cheddar::StripedMatrix em(n, n);
+  for (int r = 0; r < n; r++) {
+    const int in = exch(r);
+    const int off = ((in - r) % n + n) % n;
+    em.try_emplace(off, n, Complex(0.0, 0.0));
+    em[off][r] = Complex(1.0, 0.0);
+  }
+  ASSERT_EQ(em.GetNumDiag(), 63);
+  cheddar::LinearTransform<word> lt_exch(
+      boot.context, em, exchange_level,
+      boot.param->GetRescalePrimeProd(exchange_level), 8, 8,
+      /*pre_rotation=*/-window, /*additional_pt_rot=*/window);
+  const int window_back = n - window;
+  {
+    EvkRequest ereq;
+    lt_exch.AddRequiredRotations(ereq);
+    ereq.AddRequest(window_back, exchange_level - 1);
+    boot.ui->PrepareRotationKey(ereq);
+  }
+  const int merge_idx = n - 128;
+  boot.ui->PrepareRotationKey(merge_idx, exchange_level);
+  {
+    std::set<int> idxs;
+    for (int u = 0; u < 4; u++) {
+      for (int v = 0; v < 8; v++) {
+        const int rot = (v - u) * 128;
+        if (rot != 0) idxs.insert((rot % n + n) % n);
+      }
+    }
+    for (int idx : idxs) boot.ui->PrepareRotationKey(idx, cross_level);
+  }
+
+  // The bootstrap itself, prepared exactly as Bootstrapping.cpp does.
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    EvkRequest boot_req;
+    bctx->AddRequiredRotations(boot_req, num_slots);
+    boot.ui->PrepareRotationKey(boot_req);
+  }
+
+  // ---- data ------------------------------------------------------------
+  const RealBatch q = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.dim, 0.08, 0xB111);
+  const RealBatch kk = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                   layout.dim, 0.08, 0xB112);
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / layout.dim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < layout.lanes; t++) {
+      for (int i = 0; i < layout.dim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), sn = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * sn;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * sn;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  // The banded half-density coefficient image of family fam of channel
+  // group l -- what the PC-MM's ModPack emits -- encrypted at level 0 and
+  // taken through the real HalfBoot.
+  double halfboot_seconds = 0.0;
+  int halfboot_count = 0;
+  auto boot_half = [&](const RealBatch &m, int l, int fam,
+                       Ciphertext<word> &out) {
+    std::vector<std::vector<double>> comp(
+        512, std::vector<double>(layout.dim, 0.0));
+    for (int hh = 0; hh < 16; hh++) {
+      for (int cp = 0; cp < 16; cp++) {
+        for (int p = 0; p < layout.dim; p++) {
+          comp[hh * 16 + cp][p] = m[fam * 16 + hh][p][l * 16 + cp];
+        }
+      }
+    }
+    const auto rec = HostRecompose(comp, 512, layout.dim);
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), rec);
+    Ciphertext<word> enc;
+    boot.ui->Encrypt(enc, pt);
+    enc.SetNumSlots(num_slots);
+    const auto h0 = std::chrono::steady_clock::now();
+    bctx->HalfBoot(out, enc, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    halfboot_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - h0)
+            .count();
+    halfboot_count++;
+    ASSERT_EQ(boot.param->NPToLevel(out.GetNP()), land_level)
+        << "HalfBoot did not land at dec";
+  };
+
+  std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8);
+  for (int l = 0; l < 8; l++) {
+    boot_half(q, l, 0, q_a[l]);
+    boot_half(q, l, 1, q_b[l]);
+    boot_half(kk, l, 0, k_a[l]);
+    boot_half(kk, l, 1, k_b[l]);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // ---- the boundary constant, measured off one ciphertext --------------
+  // Decode-by-declared returns constant * coefficient; the constant is the
+  // message ratio times the rungs' drift, flat across entries.
+  double hb_const = 0.0;
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, k_a[0]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    double rlo = 1e300, rhi = -1e300, rsum = 0.0;
+    int counted = 0;
+    for (int t = 0; t < layout.dim; t++) {
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const double want = kk[hh][t][cp];
+          if (std::abs(want) < 0.02) continue;
+          const double r = slots[door0(t, cp, hh)].real() / want;
+          rlo = std::min(rlo, r);
+          rhi = std::max(rhi, r);
+          rsum += r;
+          counted++;
+        }
+      }
+    }
+    hb_const = rsum / counted;
+    std::cout << "  HalfBoot boundary constant " << hb_const << " (2^"
+              << std::log2(std::abs(hb_const)) << ", want ~2^-5) over "
+              << counted << " entries, spread [" << rlo << ", " << rhi << "]"
+              << std::endl;
+    ASSERT_LT((rhi - rlo) / std::abs(hb_const), 2e-2)
+        << "the landing is not a permutation times one constant";
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5)
+        << "the constant is not the message ratio";
+  }
+
+  // ---- RoPE + kill, with the boundary constant folded into the masks ---
+  const double restore = 1.0 / hb_const;
+  auto rope_and_kill = [&](std::vector<Ciphertext<word>> &a_cts,
+                           std::vector<Ciphertext<word>> &b_cts) {
+    const double pt_scale = boot.param->GetRescalePrimeProd(land_level);
+    for (int lo = 0; lo < 4; lo++) {
+      std::vector<Complex> cm(n, Complex(0.0, 0.0));
+      std::vector<Complex> sm(n, Complex(0.0, 0.0));
+      std::vector<Complex> nm(n, Complex(0.0, 0.0));
+      for (int t = 0; t < layout.dim; t++) {
+        for (int cp = 0; cp < 16; cp++) {
+          const double ang = t * theta[lo * 16 + cp];
+          for (int hh = 0; hh < 16; hh++) {
+            const int slot = door0(t, lo * 16 + cp, hh);
+            cm[slot] = Complex(std::cos(ang) * restore, 0.0);
+            sm[slot] = Complex(std::sin(ang) * restore, 0.0);
+            nm[slot] = Complex(-std::sin(ang) * restore, 0.0);
+          }
+        }
+      }
+      Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+      boot.context->encoder_.Encode(cos_pt, land_level, pt_scale, cm);
+      boot.context->encoder_.Encode(sin_pt, land_level, pt_scale, sm);
+      boot.context->encoder_.Encode(neg_sin_pt, land_level, pt_scale, nm);
+      for (int fam = 0; fam < 2; fam++) {
+        std::vector<Ciphertext<word>> &cts = (fam == 0) ? a_cts : b_cts;
+        Ciphertext<word> &lo_ct = cts[lo];
+        Ciphertext<word> &hi_ct = cts[lo + 4];
+        Ciphertext<word> aa, bb, dd;
+        boot.context->Mult(aa, lo_ct, cos_pt);
+        boot.context->Mult(bb, hi_ct, neg_sin_pt);
+        boot.context->Add(aa, aa, bb);
+        boot.context->Mult(bb, hi_ct, cos_pt);
+        boot.context->Mult(dd, lo_ct, sin_pt);
+        boot.context->Add(bb, bb, dd);
+        boot.context->Rescale(lo_ct, aa);
+        boot.context->Rescale(hi_ct, bb);
+      }
+    }
+  };
+  auto merge = [&](std::vector<Ciphertext<word>> &a_cts,
+                   std::vector<Ciphertext<word>> &b_cts) {
+    for (int l = 0; l < layout.num_cts; l++) {
+      Ciphertext<word> moved;
+      boot.context->HRot(moved, b_cts[l],
+                         boot.ui->GetEvkMap().GetRotationKey(merge_idx),
+                         merge_idx);
+      boot.context->Add(a_cts[l], a_cts[l], moved);
+    }
+  };
+  auto exchange_all = [&](std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      ASSERT_EQ(boot.param->NPToLevel(ct.GetNP()), exchange_level);
+      Ciphertext<word> shifted, swapped;
+      lt_exch.Evaluate(boot.context, shifted, ct, boot.ui->GetEvkMap());
+      boot.context->HRot(swapped, shifted,
+                         boot.ui->GetEvkMap().GetRotationKey(window_back),
+                         window_back);
+      ct = std::move(swapped);
+    }
+  };
+
+  rope_and_kill(q_a, q_b);
+  rope_and_kill(k_a, k_b);
+  merge(q_a, q_b);
+  merge(k_a, k_b);
+  exchange_all(q_a);
+  exchange_all(k_a);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  const double cr_pt_scale = boot.param->GetRescalePrimeProd(cross_level);
+  std::vector<Plaintext<word>> sel(8);
+  for (int v = 0; v < 8; v++) {
+    std::vector<Complex> msg(n, Complex(0.0, 0.0));
+    for (int s = 0; s < n; s++) {
+      if (((s >> 7) & 7) == v) msg[s] = Complex(1.0, 0.0);
+    }
+    boot.context->encoder_.Encode(sel[v], cross_level, cr_pt_scale, msg);
+  }
+  auto cross = [&](int call) {
+    std::vector<Ciphertext<word>> out(layout.num_cts);
+    for (int t_hi = 0; t_hi < layout.num_cts; t_hi++) {
+      const int v = rev(t_hi, 3);
+      Ciphertext<word> acc;
+      bool first = true;
+      for (int l = call * 4; l < call * 4 + 4; l++) {
+        Ciphertext<word> piece;
+        boot.context->Mult(piece, k_a[l], sel[v]);
+        const int rot = (v - l % 4) * 128;
+        if (rot != 0) {
+          const int idx = (rot % n + n) % n;
+          Ciphertext<word> moved;
+          boot.context->HRot(moved, piece,
+                             boot.ui->GetEvkMap().GetRotationKey(idx), idx);
+          piece = std::move(moved);
+        }
+        if (first) {
+          acc = std::move(piece);
+          first = false;
+        } else {
+          boot.context->Add(acc, acc, piece);
+        }
+      }
+      boot.context->Rescale(out[t_hi], acc);
+    }
+    return out;
+  };
+
+  auto convert = [&](CiSinCConverter<word> &conv,
+                     std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      Ciphertext<word> at_level;
+      boot.context->LevelDown(at_level, ct, conv_level);
+      Ciphertext<word> sinc;
+      conv.SlotToSinC(swtch.context, sinc, at_level, swtch.ui->GetEvkMap());
+      ct = std::move(sinc);
+    }
+  };
+  convert(conv_q, q_a);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::vector<Ciphertext<word>> res;
+  for (int call = 0; call < 2; call++) {
+    std::vector<Ciphertext<word>> rhs = cross(call);
+    convert(conv_k, rhs);
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    std::vector<Ciphertext<word>> lhs;
+    for (int i = 0; i < layout.num_cts / 2; i++) {
+      lhs.push_back(std::move(q_a[call * layout.num_cts / 2 + i]));
+    }
+    std::vector<Ciphertext<word>> part;
+    handler.Multiply(part, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                     swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    if (call == 0) {
+      res = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        boot.context->Add(res[bi], res[bi], part[bi]);
+      }
+    }
+  }
+
+  std::vector<std::vector<Complex>> got(layout.dim);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    ASSERT_EQ(boot.param->NPToLevel(res[bi].GetNP()), chain_level - 1);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, res[bi]);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, layout.rank, small.Degree());
+    for (int j = 0; j < layout.rank; j++) {
+      Plaintext<word> bridge;
+      small.context->encoder_.EncodeCoeff(
+          bridge, chain_level - 1,
+          small.param->GetScale(chain_level - 1), comp[j]);
+      small.context->encoder_.DecodeSinC(got[bi * layout.rank + j], bridge,
+                                         sub_degree);
+    }
+  }
+
+  double worst = 0.0, transposed = 0.0, norope = 0.0;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int column = 0; column < layout.dim; column++) {
+        double want = 0.0, want_t = 0.0, want_raw = 0.0;
+        for (int c = 0; c < layout.dim; c++) {
+          want += q_ref[head][row][c] * k_ref[head][column][c];
+          want_t += q_ref[head][column][c] * k_ref[head][row][c];
+          want_raw += q[head][row][c] * kk[head][column][c];
+        }
+        int part, index;
+        layout.LocatePart(row, column, lane, part, index);
+        const double g = got[part][index].real();
+        worst = std::max(worst, std::abs(g - want));
+        transposed = std::max(transposed, std::abs(g - want_t));
+        norope = std::max(norope, std::abs(g - want_raw));
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "the real HalfBoot delivers the banded images (coeffs @0 -> "
+            << "HalfBoot -> @" << land_level << " -> RoPE+restore+kill -> "
+            << "merge -> exchange @" << exchange_level << " -> [K: cross @"
+            << cross_level << "] -> premapped descent @" << conv_level
+            << " -> chain x2): products " << worst << std::endl;
+  std::cout << "  controls: transposed " << transposed << ", un-RoPE'd "
+            << norope << std::endl;
+  std::cout << "  cost: HalfBoot "
+            << halfboot_seconds / std::max(halfboot_count, 1) << " s/ct over "
+            << halfboot_count
+            << " cts (the half-density price, correctness lane)" << std::endl;
+
+  EXPECT_LT(worst, 2e-2)
+      << "the HalfBoot'd operands did not land the scores at the primary "
+         "parts";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(norope, 3e-2);
+}
