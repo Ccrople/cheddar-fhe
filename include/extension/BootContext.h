@@ -72,6 +72,22 @@ class BootContext : public Context<word>,
   void EvaluateModAfterCtS(Ct &res, Ct &main_ct, bool full_slot,
                            const EvkMap<word> &evk_map) const;
 
+  /**
+   * @brief The full-slot separation, stopped before it recombines.
+   *
+   * `EvaluateModAfterCtS`'s full-slot branch splits the complex slot vector
+   * into its two real axes, reduces each, and folds them back together. The
+   * fold is the last two lines and nothing before it depends on them, so a
+   * caller that wants the axes *as two ciphertexts* gets them for the price of
+   * the reduction it was paying anyway -- no extra key switch, no extra level.
+   *
+   * `main_ct` arrives at EvalMod's start scale (the caller sets it, as
+   * `EvaluateModAfterCtS` does); `lo` and `hi` leave carrying the real and
+   * imaginary axes respectively, at EvalMod's end scale.
+   */
+  void SplitAndEvaluateMod(Ct &lo, Ct &hi, const Ct &main_ct,
+                           const EvkMap<word> &evk_map) const;
+
   ContextPtr<word> GetContext();
   ConstContextPtr<word> GetContext() const;
 
@@ -279,6 +295,44 @@ class BootContext : public Context<word>,
    */
   void HalfBoot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
                 bool min_ks = false) const;
+
+  /**
+   * @brief Two real-payload coefficient ciphertexts through ONE HalfBoot.
+   *
+   * THE HALF THAT WAS ALREADY BEING PAID FOR. At full slots the ordinary ring's
+   * CtS folds coefficients `j` and `j + N/2` into the real and imaginary axes of
+   * slot `j`, so `EvaluateModAfterCtS` separates the axes and reduces each --
+   * two EvalMods, always. A pipeline whose payload is real-axis-only in slots
+   * (which is every operator in this layer: `SpreadNormWeight` and every
+   * calibration constant write `Complex(v, 0)`) has StC leave coefficients
+   * `N/2..N-1` **zero**, so the second of those two EvalMods runs on an
+   * identically-zero ciphertext, once per bootstrap.
+   *
+   * Filling that half costs one monomial multiply and one add. `X^{N/2}` is the
+   * imaginary unit's polynomial -- it evaluates to `i` at every slot, because
+   * `5^j = 1 mod 4` -- so `MultImaginaryUnit` *is* the shift by `N/2`, level
+   * free and key free, and `hi`'s own upper half being zero means the shift
+   * never wraps. Splitting the result back out is free by construction: it is
+   * `SplitAndEvaluateMod` stopping one line before the fold.
+   *
+   * So a pair costs one HalfBoot, not two, and the arithmetic each half sees is
+   * the arithmetic it would have seen alone. The one thing the caller owes is
+   * the contract:
+   *
+   * **Both inputs must carry payload in coefficients `0 .. N/2-1` only.** That
+   * is what StC produces from real slots and what the PC-MM preserves (its mix
+   * is entrywise over each module component, so zeros stay zero), but it is not
+   * checked here and cannot be -- a violation silently adds `hi`'s upper half
+   * into `lo`'s payload.
+   *
+   * @param res_lo slots of `lo`, exactly as `HalfBoot(lo)` would have left them
+   * @param res_hi slots of `hi`, likewise
+   * @param lo coefficient-encoded, upper coefficient half zero
+   * @param hi coefficient-encoded, upper coefficient half zero, same level and
+   *        scale as `lo`
+   */
+  void HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo, const Ct &hi,
+                    const EvkMap<word> &evk_map, bool min_ks = false) const;
 
   // Other functions...
 

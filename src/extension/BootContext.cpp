@@ -428,14 +428,10 @@ void BootContext<word>::EvaluateModAfterCtS(Ct &res, Ct &main_ct,
   }
 
   if (full_slot) {
+    // Split the axes, reduce each, fold them back. The first two steps are
+    // `SplitAndEvaluateMod`; `HalfBootPair` is the same call without the fold.
     Ct ct_conj;
-    this->HConj(ct_conj, main_ct, evk_map.GetConjugationKey());
-    // Perform eval mod on real and imag part separately
-    this->Add(res, main_ct, ct_conj);
-    this->Sub(ct_conj, ct_conj, main_ct);
-    this->MultImaginaryUnit(ct_conj, ct_conj);
-    EvaluateMod(res, res, evk_map.GetMultiplicationKey());
-    EvaluateMod(ct_conj, ct_conj, evk_map.GetMultiplicationKey());
+    SplitAndEvaluateMod(res, ct_conj, main_ct, evk_map);
     this->MultImaginaryUnit(ct_conj, ct_conj);
     this->Add(res, res, ct_conj);
   } else {
@@ -443,6 +439,83 @@ void BootContext<word>::EvaluateModAfterCtS(Ct &res, Ct &main_ct,
     this->HConjAdd(res, main_ct, main_ct, evk_map.GetConjugationKey());
     EvaluateMod(res, res, evk_map.GetMultiplicationKey());
   }
+}
+
+template <typename word>
+void BootContext<word>::SplitAndEvaluateMod(Ct &lo, Ct &hi, const Ct &main_ct,
+                                            const EvkMap<word> &evk_map) const {
+  // main = a + i b. Conjugation gives a - i b, and the two combinations are
+  // real: lo = 2a, and hi = i * (conj - main) = i * (-2 i b) = 2b. Whatever
+  // constant CtS folded in rides both identically, which is why the calibration
+  // that makes the real axis right makes the imaginary one right too.
+  this->HConj(hi, main_ct, evk_map.GetConjugationKey());
+  this->Add(lo, main_ct, hi);
+  this->Sub(hi, hi, main_ct);
+  this->MultImaginaryUnit(hi, hi);
+  EvaluateMod(lo, lo, evk_map.GetMultiplicationKey());
+  EvaluateMod(hi, hi, evk_map.GetMultiplicationKey());
+}
+
+template <typename word>
+void BootContext<word>::HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
+                                     const Ct &hi, const EvkMap<word> &evk_map,
+                                     bool min_ks) const {
+  AssertTrue(!this->param_.conjugate_invariant_,
+             "HalfBootPair: the real subring's CtS lands real slots, so there "
+             "is no second axis to fill and no pair to make");
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  const int max_num_slots = this->param_.MaxNumSlots();
+  const int input_num_slots = lo.GetNumSlots();
+  AssertTrue(hi.GetNumSlots() == input_num_slots,
+             "HalfBootPair: the two inputs must carry the same slot count");
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
+  AssertTrue(num_slots == max_num_slots,
+             "HalfBootPair: only the full-slot bootstrap separates the axes; a "
+             "sparse one merges them into spare slots and has no free half");
+
+  const int lo_level = this->param_.NPToLevel(lo.GetNP());
+  const int hi_level = this->param_.NPToLevel(hi.GetNP());
+  AssertTrue(lo_level == hi_level,
+             "HalfBootPair: the two inputs must be at the same level");
+  if (lo_level > 0) {
+    Ct lo_down, hi_down;
+    this->LevelDown(lo_down, lo, 0);
+    this->LevelDown(hi_down, hi, 0);
+    HalfBootPair(res_lo, res_hi, lo_down, hi_down, evk_map, min_ks);
+    return;
+  }
+  AssertTrue(lo.GetScale() == hi.GetScale(),
+             "HalfBootPair: the two inputs must be at the same scale -- they "
+             "share one ModRaise and one EvalMod calibration");
+
+  // THE MERGE. `hi`'s payload is coefficients 0..N/2-1 by contract, and
+  // multiplying by X^{N/2} moves it to N/2..N-1 with nothing wrapping round the
+  // negacyclic sign, so the sum holds both payloads and neither is disturbed.
+  Ct merged;
+  this->MultImaginaryUnit(merged, hi);
+  this->Add(merged, merged, lo);
+
+  // From here it is `HalfBoot`, verbatim, on the merged ciphertext.
+  Ct main_ct;
+  NPInfo min_np = this->param_.LevelToNP(-1);
+  AssertTrue(min_np.IsSubsetOf(merged.GetNP()), "HalfBootPair: Invalid input NP");
+  this->MultUnsafe(main_ct, merged, scaleup_const_, -1);
+  ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel());
+  main_ct.SetNumSlots(max_num_slots);
+  Trace(main_ct, num_slots, (max_num_slots / num_slots), main_ct, evk_map);
+  main_ct.SetNumSlots(num_slots);
+  CoeffToSlot(main_ct, num_slots, main_ct, evk_map, min_ks);
+
+  AssertTrue(boot_variant_.at(num_slots) != BootVariant::kImaginaryRemoving,
+             "HalfBootPair: kImaginaryRemoving folds work into StC, which this "
+             "does not run");
+  main_ct.SetScale(eval_mod_->start_scale_);
+  SplitAndEvaluateMod(res_lo, res_hi, main_ct, evk_map);
+
+  res_lo.SetNumSlots(input_num_slots);
+  res_hi.SetNumSlots(input_num_slots);
+  res_lo.SetScale(eval_mod_->end_scale_);
+  res_hi.SetScale(eval_mod_->end_scale_);
 }
 
 template <typename word>

@@ -225,6 +225,26 @@ class SylphSchedule {
    */
   double ToSlot(Ct &res, const Ct &x, const EvkMap<word> &evk_map,
                 bool min_ks = false) const;
+
+  /**
+   * @brief Two ciphertexts up the same leg, on one HalfBoot.
+   *
+   * `BootContext::HalfBootPair` fills the imaginary axis that this pipeline
+   * leaves empty, so a pair costs what one crossing costs. The contract it
+   * needs -- payload in coefficients `0 .. N/2-1` only -- is exactly what
+   * `ToCoeff` produces from real-axis slots, which is every ciphertext this
+   * schedule ever hands back.
+   *
+   * @param res_lo slots of `lo`; identical to what `ToSlot(lo)` would give
+   * @param res_hi slots of `hi`
+   * @param lo coefficient-encoded, at any level
+   * @param hi coefficient-encoded, at the same level and scale as `lo`
+   * @param evk_map supplies the bootstrapping keys
+   * @param min_ks whether to use minimum key-switching
+   * @return the descent drift, as `ToSlot` returns it; it is common to the pair
+   */
+  double ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo, const Ct &hi,
+                    const EvkMap<word> &evk_map, bool min_ks = false) const;
 };
 
 }  // namespace cheddar

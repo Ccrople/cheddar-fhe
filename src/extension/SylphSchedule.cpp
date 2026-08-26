@@ -298,6 +298,30 @@ double SylphSchedule<word>::ToSlot(Ct &res, const Ct &x,
   return drift;
 }
 
+template <typename word>
+double SylphSchedule<word>::ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
+                                       const Ct &hi,
+                                       const EvkMap<word> &evk_map,
+                                       bool min_ks /*= false*/) const {
+  const int level = boot_->param_.NPToLevel(lo.GetNP());
+  AssertTrue(level == boot_->param_.NPToLevel(hi.GetNP()),
+             "ToSlotPair: the two ciphertexts must be at the same level");
+  double drift = 1.0;
+  if (level > 0) {
+    // The same descent both sides, taken here rather than inside HalfBootPair,
+    // for the reason `ToSlot` takes it: the drift has to be visible.
+    const double before = lo.GetScale();
+    Ct low_lo, low_hi;
+    boot_->LevelDown(low_lo, lo, 0);
+    boot_->LevelDown(low_hi, hi, 0);
+    drift = low_lo.GetScale() / before;
+    boot_->HalfBootPair(res_lo, res_hi, low_lo, low_hi, evk_map, min_ks);
+  } else {
+    boot_->HalfBootPair(res_lo, res_hi, lo, hi, evk_map, min_ks);
+  }
+  return drift;
+}
+
 template class SylphSchedule<uint32_t>;
 template class SylphSchedule<uint64_t>;
 

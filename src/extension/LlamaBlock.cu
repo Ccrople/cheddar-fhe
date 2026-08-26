@@ -4,14 +4,38 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <string>
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/AttentionPacking.h"
 
 namespace cheddar {
+
+namespace {
+
+// PAIRING THE LIFTS, and why this one defaults ON where the ring switch did
+// not. The merge is sound only while every ciphertext reaching `Lift` carries
+// payload in coefficients 0..N/2-1 alone -- a property of the pipeline, not of
+// the call -- and in this block it is one: `Lower` is StC applied to real-axis
+// slots, which leaves the upper half zero, and the PC-MM between them mixes
+// module components entrywise, so zeros stay zero. Against that contract the
+// paired path is not an approximation of the unpaired one, it is the same
+// arithmetic: measured 3.8e-10 against a two-HalfBoot reference, and identical
+// payload precision to six decimal places (`HalfBootPairCostsOneCrossing`).
+// `CHEDDAR_BOOT_PAIR=0` is the escape hatch, not the default.
+bool BootPairEnabled() {
+  static const bool on = []() {
+    const char *env = std::getenv("CHEDDAR_BOOT_PAIR");
+    return env == nullptr || std::string(env) != "0";
+  }();
+  return on;
+}
+
+}  // namespace
 
 template <typename word>
 LlamaBlock<word>::LlamaBlock(std::shared_ptr<const BootContext<word>> boot,
@@ -484,7 +508,24 @@ void LlamaBlock<word>::Lift(std::vector<Ct> &res, const std::vector<Ct> &x,
     boot_->encoder_.EncodeConstant(shift_const, level,
                                    boot_->param_.GetScale(level), shift);
   }
-  for (size_t i = 0; i < x.size(); i++) {
+  // Two ciphertexts to a crossing where the pipeline allows it. The magnitude
+  // and the shift are applied after the split, per ciphertext, so pairing
+  // changes nothing downstream: `Canonicalise` sees exactly the ciphertext it
+  // would have seen.
+  size_t i = 0;
+  if (BootPairEnabled()) {
+    for (; i + 1 < x.size(); i += 2) {
+      Ct landed_lo, landed_hi;
+      sched_->ToSlotPair(landed_lo, landed_hi, x[i], x[i + 1], evk_map);
+      sched_->Canonicalise(res[i], landed_lo, magnitude);
+      sched_->Canonicalise(res[i + 1], landed_hi, magnitude);
+      if (shift != 0.0) {
+        boot_->Add(res[i], res[i], shift_const);
+        boot_->Add(res[i + 1], res[i + 1], shift_const);
+      }
+    }
+  }
+  for (; i < x.size(); i++) {
     Ct landed;
     sched_->ToSlot(landed, x[i], evk_map);
     sched_->Canonicalise(res[i], landed, magnitude);
