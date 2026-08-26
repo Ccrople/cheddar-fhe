@@ -911,3 +911,246 @@ TEST(CiNestedPacking, ASlotCiphertextReachesTheChainThroughTheConverter) {
       << "the raw flat message already matches the products, so the block "
          "sums are not present and this run is not testing the identity";
 }
+
+// ---------------------------------------------------------------------------
+// The folds, and the loop they close (Doing.md 1.5bq).
+//
+// 1.5bp packed the two-term sums on the HOST and read the result back
+// through a HOST block scan; the leg cannot. Both maps live on the same
+// stride-k diagonal lattice as the composed conversion itself, so they FOLD
+// into it -- the copy-add as a column relabelling of the forward matrix
+// (M -> M (I + pi2)), the block scan as a row recombination of the inverse
+// (M -> G M) -- and the diagonal count cannot pass its ceiling degree / k.
+// No extra level, no extra rotations: the converter consumes slots holding
+// each entry ONCE (its primary LocateSlot address, a bijective layout) and
+// returns them the same way.
+//
+// The _l3 trio (one more terminal prime, 38535169) holds the whole loop:
+// encrypt at 3, nested forward -> 2, the chain -> 1, nested inverse -> 0.
+// Slots to slots, every arrow homomorphic.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char *kSwitchL3Param = "ci_ringswitch16_35_l3.json";
+constexpr const char *kSmallL3Param = "ci12_35_l3.json";
+constexpr const char *kLiftedL3Param = "ringdegree13_35_l3.json";
+
+}  // namespace
+
+TEST(CiNestedPacking, TheNestedConverterClosesTheLoop) {
+  Ring big(kSwitchL3Param);
+  Ring small(kSmallL3Param);
+  Ring lifted(kLiftedL3Param,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int top = big.param->max_level_;
+  ASSERT_EQ(top, 3) << "the _l3 chain holds both conversion levels";
+  const int chain_level = top - 1;
+  const int inverse_level = chain_level - 1;
+  const int sub_degree = 128;
+
+  CiSwitchedCcmmHandler<word> handler(big.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.num_cts, 2);
+
+  big.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                               chain_level);
+  big.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                      small.ui->GetSecretCoeffs(),
+                                      chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(big.context, sub_degree, /*forward_level=*/top,
+                             /*inverse_level=*/inverse_level, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  big.ui->PrepareRotationKey(req);
+
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0x1B9C);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0x1B9D);
+
+  // Primary addresses only, by ASSIGNMENT: the nested forward owns the
+  // copy-add now, so the slot layout is bijective -- what a leg would
+  // actually hold.
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(big.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      big.context->encoder_.Encode(pt, top, big.param->GetScale(top),
+                                   slot_msg);
+      Ciphertext<word> enc;
+      big.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(big.context, out[bi], enc, big.ui->GetEvkMap());
+      ASSERT_EQ(big.param->NPToLevel(out[bi].GetNP()), chain_level);
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // Stage 1: the folded forward produced the two-address flat encoding --
+  // the coefficient probe against the host encode of the SUMMED message.
+  double fwd_coeff_err = 0.0;
+  {
+    std::vector<Complex> fmsg(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int i = 0; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          double want = b[r][row][i];
+          if (i != 0 && row + 1 < layout.dim) {
+            want += b[r][row + 1][layout.rank - i];
+          }
+          fmsg[(static_cast<size_t>(row) * layout.rank + i) * layout.lanes +
+               r] = Complex(want, 0.0);
+        }
+      }
+    }
+    Plaintext<word> probe;
+    big.ui->Decrypt(probe, rhs[0]);
+    std::vector<double> got_c, want_c;
+    big.context->encoder_.DecodeCoeff(got_c, probe);
+    Plaintext<word> host_pt;
+    big.context->encoder_.EncodeSinC(host_pt, chain_level,
+                                     big.param->GetScale(top), fmsg,
+                                     sub_degree);
+    big.context->encoder_.DecodeCoeff(want_c, host_pt);
+    for (int t = 0; t < big.Degree(); t++) {
+      fwd_coeff_err =
+          std::max(fwd_coeff_err, std::abs(got_c[t] - want_c[t]));
+    }
+  }
+
+  handler.Multiply(res, lhs, rhs, big.ui->GetRingSwitchKey(layout.rank),
+                   big.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // Stage 2: the folded inverse returns the loop to slots, at level 0.
+  std::vector<std::vector<Complex>> slots(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(big.context, back, res[bi], big.ui->GetEvkMap());
+    ASSERT_EQ(big.param->NPToLevel(back.GetNP()), inverse_level - 1);
+    Plaintext<word> pt;
+    big.ui->Decrypt(pt, back);
+    big.context->encoder_.Decode(slots[bi], pt);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  double worst_loop = 0.0, transposed = 0.0, unsummed = 0.0;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int column = 0; column < layout.dim; column++) {
+        double want = 0.0, want_t = 0.0, want_sum = 0.0;
+        for (int x = 0; x < layout.contraction; x++) {
+          want += a[lane][row][x] * b[lane][x][column];
+          want_t += a[lane][column][x] * b[lane][x][row];
+        }
+        const int cls = column % layout.rank;
+        if (cls != 0 && row + 1 < layout.dim) {
+          const int partner =
+              (column / layout.rank) * layout.rank + (layout.rank - cls);
+          for (int x = 0; x < layout.contraction; x++) {
+            want_sum += a[lane][row + 1][x] * b[lane][x][partner];
+          }
+        }
+        int ct_idx, slot, copy_slot;
+        layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+        const double got = slots[ct_idx][slot].real();
+        worst_loop = std::max(worst_loop, std::abs(got - want));
+        transposed = std::max(transposed, std::abs(got - want_t));
+        // The scan-undone value differs from the raw block sum by the
+        // partner product; if they agree everywhere the fold did nothing.
+        unsummed = std::max(unsummed, std::abs(want_sum));
+      }
+    }
+  }
+
+  // Stage 3: the inverse alone, isolated from the chain -- a freshly
+  // encoded flat ciphertext of KNOWN block sums must come back unsummed.
+  double inv_err = 0.0;
+  {
+    std::mt19937_64 gen(0x1B9E);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    std::vector<std::vector<double>> s(
+        layout.dim * layout.rank, std::vector<double>(layout.lanes));
+    for (auto &blk : s) {
+      for (auto &v : blk) v = dist(gen);
+    }
+    std::vector<Complex> gs(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int i = 0; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          double v = s[row * layout.rank + i][r];
+          if (i != 0 && row + 1 < layout.dim) {
+            v += s[(row + 1) * layout.rank + (layout.rank - i)][r];
+          }
+          gs[(static_cast<size_t>(row) * layout.rank + i) * layout.lanes +
+             r] = Complex(v, 0.0);
+        }
+      }
+    }
+    Plaintext<word> pt;
+    big.context->encoder_.EncodeSinC(pt, inverse_level,
+                                     big.param->GetScale(inverse_level), gs,
+                                     sub_degree);
+    Ciphertext<word> enc, back;
+    big.ui->Encrypt(enc, pt);
+    conv.SinCToSlot(big.context, back, enc, big.ui->GetEvkMap());
+    Plaintext<word> out;
+    big.ui->Decrypt(out, back);
+    std::vector<Complex> got;
+    big.context->encoder_.Decode(got, out);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int i = 0; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, i, r, ct_idx, slot, copy_slot);
+          inv_err = std::max(
+              inv_err,
+              std::abs(got[slot].real() - s[row * layout.rank + i][r]));
+        }
+      }
+    }
+  }
+
+  std::cout << "nested converter loop, sub_degree " << sub_degree
+            << ": forward coeff " << fwd_coeff_err << ", loop products "
+            << worst_loop << ", inverse alone " << inv_err << std::endl;
+  std::cout << "  controls: transposed " << transposed
+            << ", largest partner product the scan removed " << unsummed
+            << std::endl;
+
+  EXPECT_LT(fwd_coeff_err, 2e-3)
+      << "the folded forward does not produce the two-address encoding";
+  EXPECT_LT(worst_loop, 5e-2)
+      << "the homomorphic loop did not return the products to their "
+         "primary slots";
+  EXPECT_LT(inv_err, 2e-2) << "the folded inverse does not undo the sums";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(unsummed, 1e-2)
+      << "no partner product was ever live, so the fold went unexercised";
+}

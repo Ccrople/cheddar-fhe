@@ -3,6 +3,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/CiSwitchedCcmm.h"
 #include "core/Context.h"
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
@@ -288,9 +289,23 @@ class CiSinCConverter {
    *        (it returns one below), or -1 to skip building it
    * @param inverse_level likewise for SinC -> slots; the inverse is only
    *        buildable for sub_degree <= 256 (the lambda cap)
+   * @param chain when non-null, the CC-MM chain layout whose operand the
+   *        conversions serve, and both directions fold the mixed-radix
+   *        identity's block maps in (Doing.md 1.5bq). The FORWARD then
+   *        consumes slots holding each entry at its PRIMARY `LocateSlot`
+   *        address only -- a bijective layout, no host-side sums -- and
+   *        produces the chain operand: the copy-add `y = x + pi2 x` is one
+   *        column relabelling of the composed matrix, and the INVERSE folds
+   *        g's block-level scan in, so it consumes the chain's output and
+   *        returns the true (unsummed) values at their primary addresses.
+   *        Every map here lives on the stride-`sub_degree` diagonal lattice,
+   *        so the fold cannot grow the diagonal count past `degree /
+   *        sub_degree` -- the composed transform's own ceiling: no extra
+   *        level, no extra rotations beyond the BSGS the count implies.
    */
   CiSinCConverter(ConstContextPtr<word> context, int sub_degree,
-                  int forward_level, int inverse_level);
+                  int forward_level, int inverse_level,
+                  const CiSwitchedCcmmLayout *chain = nullptr);
 
   // disable copying (or moving also)
   CiSinCConverter(const CiSinCConverter &) = delete;

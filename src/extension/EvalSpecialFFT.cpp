@@ -1220,12 +1220,123 @@ StripedMatrix ComposeCiSinCStages(const Parameter<word> &param,
   return result;
 }
 
+// Accumulator for the two folds below: the diagonals all live on the
+// stride-k lattice, so they are held densely by `offset / k` and packed
+// into a StripedMatrix at the end -- a map lookup per entry would dominate.
+StripedMatrix PackLattice(std::vector<std::vector<Complex>> &acc, int n,
+                          int k) {
+  StripedMatrix res(n, n);
+  for (size_t i = 0; i < acc.size(); i++) {
+    if (acc[i].empty()) continue;
+    bool any = false;
+    for (const auto &v : acc[i]) {
+      if (v != Complex(0.0, 0.0)) {
+        any = true;
+        break;
+      }
+    }
+    if (any) res.emplace(static_cast<int>(i) * k, std::move(acc[i]));
+  }
+  return res;
+}
+
+// The mixed-radix identity's copy-add (Doing.md 1.5bp/1.5bq), folded on the
+// column side: M -> M (I + P2), where P2 adds each entry's primary block
+// into its partner's address -- so the transform consumes slots holding
+// every entry ONCE and emits the two-address flat message itself. A column
+// relabelling: (M P2)[i, src] = M[i, dst] for every partner pair, and every
+// offset stays on the stride-k lattice, so the diagonal count cannot pass
+// its ceiling degree / k.
+StripedMatrix FoldNestedPack(const StripedMatrix &m,
+                             const CiSwitchedCcmmLayout &chain) {
+  const int n = m.GetHeight();
+  const int k = chain.sub_degree;
+  const int num_blocks = n / k;
+  const int log_blocks = Log2Ceil(num_blocks);
+  // dst2src[A]: the slot block whose value the copy-add lands at block A.
+  std::vector<int> dst2src(num_blocks, -1);
+  for (int row = 0; row + 1 < chain.dim; row++) {
+    for (int cls = 1; cls < chain.rank; cls++) {
+      const int dst = SinCBitRev(row * chain.rank + cls, log_blocks);
+      const int src = SinCBitRev(
+          (row + 1) * chain.rank + (chain.rank - cls), log_blocks);
+      dst2src[dst] = src;
+    }
+  }
+  std::vector<std::vector<Complex>> acc(num_blocks);
+  auto add = [&](int row, int col, Complex v) {
+    const int off = (((col - row) % n) + n) % n;
+    auto &diag = acc[off / k];
+    if (diag.empty()) diag.assign(n, Complex(0.0));
+    diag[row] += v;
+  };
+  for (const auto &[idx, diag] : m) {
+    AssertTrue(idx % k == 0,
+               "FoldNestedPack: a diagonal left the stride-k lattice");
+    for (int j = 0; j < n; j++) {
+      const Complex v = diag[j];
+      if (v == Complex(0.0, 0.0)) continue;
+      const int col = ((j + idx) % n + n) % n;
+      add(j, col, v);
+      const int src = dst2src[col / k];
+      if (src >= 0) add(j, src * k + col % k, v);
+    }
+  }
+  return PackLattice(acc, n, k);
+}
+
+// g's exact inverse -- the alternating suffix scan down the class pairs at
+// BLOCK granularity -- folded on the row side: M -> G M, so the inverse
+// conversion consumes the chain's output (a flat encoding of the block
+// sums) and returns the true values at their primary addresses. Same
+// lattice, same ceiling.
+StripedMatrix FoldNestedUnpack(const StripedMatrix &m,
+                               const CiSwitchedCcmmLayout &chain) {
+  const int n = m.GetHeight();
+  const int k = chain.sub_degree;
+  const int num_blocks = n / k;
+  const int log_blocks = Log2Ceil(num_blocks);
+  // fanout[A]: the (output block, sign) pairs G sends block A's rows to.
+  std::vector<std::vector<std::pair<int, double>>> fanout(num_blocks);
+  for (int c = 0; c < chain.rank; c++) {
+    for (int r = 0; r < chain.dim; r++) {
+      const int out = SinCBitRev(r * chain.rank + c, log_blocks);
+      const int reach = (c == 0) ? 0 : chain.dim - 1 - r;
+      for (int j = 0; j <= reach; j++) {
+        const int cj = (j % 2 == 0) ? c : chain.rank - c;
+        const int in = SinCBitRev((r + j) * chain.rank + cj, log_blocks);
+        fanout[in].emplace_back(out, (j % 2 == 0) ? 1.0 : -1.0);
+      }
+    }
+  }
+  std::vector<std::vector<Complex>> acc(num_blocks);
+  for (const auto &[idx, diag] : m) {
+    AssertTrue(idx % k == 0,
+               "FoldNestedUnpack: a diagonal left the stride-k lattice");
+    for (int j = 0; j < n; j++) {
+      const Complex v = diag[j];
+      if (v == Complex(0.0, 0.0)) continue;
+      const int col = ((j + idx) % n + n) % n;
+      const int lane = j % k;
+      for (const auto &[a_out, sign] : fanout[j / k]) {
+        const int row = a_out * k + lane;
+        const int off = (((col - row) % n) + n) % n;
+        auto &dst = acc[off / k];
+        if (dst.empty()) dst.assign(n, Complex(0.0));
+        dst[row] += sign * v;
+      }
+    }
+  }
+  return PackLattice(acc, n, k);
+}
+
 }  // namespace
 
 template <typename word>
 CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
                                        int sub_degree, int forward_level,
-                                       int inverse_level)
+                                       int inverse_level,
+                                       const CiSwitchedCcmmLayout *chain)
     : sub_degree_{sub_degree} {
   const auto &param = context->param_;
   AssertTrue(param.conjugate_invariant_,
@@ -1239,6 +1350,11 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
                  sub_degree < degree && degree % sub_degree == 0,
              "CiSinCConverter: sub_degree must be a power of two in "
              "[2, degree)");
+  if (chain != nullptr) {
+    AssertTrue(chain->big_degree == degree && chain->sub_degree == sub_degree,
+               "CiSinCConverter: the chain layout does not describe this "
+               "ring and sub_degree");
+  }
   const int num_stages = Log2Ceil(num_slots);
   const int d = degree / sub_degree;
   const int p = Log2Ceil(d);
@@ -1265,10 +1381,15 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
         diag[j] = Complex(v, 0.0);
       }
     }
+    // The copy-add composes AFTER the x2 correction: the correction is a
+    // property of the flat transform's columns, and the fold relabels which
+    // slot feeds a column, not which column it is.
+    if (chain != nullptr) m = FoldNestedPack(m, *chain);
     auto [bs, gs] = split(m.GetNumDiag());
     std::cout << "CiSinCConverter forward: " << p << " stages, "
               << m.GetNumDiag() << " diagonals, level " << forward_level
-              << ", BSGS " << bs << "x" << gs << std::endl;
+              << ", BSGS " << bs << "x" << gs
+              << (chain != nullptr ? ", nested fold" : "") << std::endl;
     forward_.emplace_back(context, m, forward_level,
                           param.GetRescalePrimeProd(forward_level), bs, gs, 0,
                           0);
@@ -1302,10 +1423,15 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
         diag[j] = Complex((diag[j] * lam).real(), 0.0);
       }
     }
+    // The block scan composes AFTER the lambda correction: the corrected
+    // matrix is the one whose output rows hold the flat message, and the
+    // scan is a map on those values.
+    if (chain != nullptr) m = FoldNestedUnpack(m, *chain);
     auto [bs, gs] = split(m.GetNumDiag());
     std::cout << "CiSinCConverter inverse: " << p << " stages, "
               << m.GetNumDiag() << " diagonals, level " << inverse_level
-              << ", BSGS " << bs << "x" << gs << std::endl;
+              << ", BSGS " << bs << "x" << gs
+              << (chain != nullptr ? ", nested fold" : "") << std::endl;
     inverse_.emplace_back(context, m, inverse_level,
                           param.GetRescalePrimeProd(inverse_level), bs, gs, 0,
                           0);
