@@ -32,7 +32,11 @@
 //
 // SEPARATE BINARY: three rings alive at once; see SmallRingNttTest.cpp.
 
-#undef ENABLE_EXTENSION
+// ENABLE_EXTENSION stays DEFINED here, unlike the sibling multi-ring
+// binaries: CiBootSet's consumption test needs ci16_35 to come up as its
+// own BootContext, and RingFixture only builds one when the extension is
+// visible. Every other preset in this file says boot: false and still gets
+// a plain Context, so nothing else in the binary changes.
 
 #include <gtest/gtest.h>
 
@@ -45,9 +49,11 @@
 #include "RingFixture.h"
 #include "core/CiSwitchedCcmm.h"
 #include "core/EvkRequest.h"
+#include "extension/BootContext.h"
 #include "extension/EvalSpecialFFT.h"
 
 using word = uint32_t;
+using cheddar::BootContext;
 using cheddar::Ciphertext;
 using cheddar::CiLiftHandler;
 using cheddar::CiSwitchedCcmmHandler;
@@ -1663,10 +1669,12 @@ TEST(CiNestedPacking, RopeRidesTheHalfContractionSplitWithoutRotations) {
 //
 // with every rung canonical (2^35 within millibits, against the
 // correctness trios' 2^25-ish rungs) -- the first time the scores pipeline
-// runs at the ladder the layer will actually stand on. NOT here: the
-// bootstrap itself (ci16_35's CI boot is measured elsewhere), and any
-// security claim for the trio (Q * P = 2^182+ at degree 4096:
-// correctness-lane, exactly like the _l2/_l3 trios).
+// runs at the ladder the layer will actually stand on. The third test
+// (1.5bu) then hands the level-0 output to ci16_35's own Boot and reads
+// the scores back at dec level. NOT here: any security claim for the trio
+// (Q * P = 2^182+ at degree 4096: correctness-lane, exactly like the
+// _l2/_l3 trios), and any bootstrap performance claim (Boot's timing is
+// measured by Bootstrapping.cpp, warm; here it runs cold, once).
 // ---------------------------------------------------------------------------
 
 constexpr const char *kBootParam = "ci16_35.json";
@@ -2212,4 +2220,215 @@ TEST(CiBootSet, TheRopedScoresReturnToSlotsOnTheRealLadder) {
       << "the scores did not survive the full L4..L0 walk";
   EXPECT_GT(transposed, 3e-2);
   EXPECT_GT(norope, 3e-2);
+}
+
+// The bootstrap consumes the level-0 scores (Doing.md 1.5bu).
+//
+// 1.5bt left the scores in slots at level 0 -- SoftMax's slot addresses,
+// but the wrong level: nothing evaluates at level 0, and the only way out
+// is ci16_35's own bootstrap. This test closes that edge: the sub-128
+// loop's products, landed at their primary addresses at level 0, go
+// through Boot -- the measured CI bootstrap, keys and all, prepared
+// exactly as Bootstrapping.cpp prepares it -- and come out still at their
+// primary addresses, against the same host products, with the transposed
+// read as the control. Boot lands at GetEndLevel() = dec - num_stc = 16,
+// not at dec 19: EvalMod ends at 19 and full Boot's own StC spends three
+// more below it. Landing AT dec is HalfBoot's property, which is one more
+// reason the fused route below is the eventual one. The bootstrap's transforms run at
+// levels 19..31, far above the level-7 hoist-zone ceiling that forces the
+// leg's own conversions onto the trio.
+//
+// THE SCALE CONTRACT AT THE BOOT BOUNDARY. Boot never reads the input's
+// declared scale: it multiplies the DATA by 2^log_scaleup and assumes the
+// data sits at base_scale with the message in (-1, 1) (BootContext's
+// constructor). The chain's output arrives at 2 s^2 / q_rescale(chain) =
+// carried * base_scale -- carried ~ 2^1.15 on these rungs, the 1.5bm
+// factor of two times the rungs' millibit drift -- so what Boot returns
+// is carried * m at the canonical dec scale. The factor rides through
+// EvalMod inside the message (|carried * m| stays far inside (-1, 1)) and
+// is divided out here; the layer will fold it into SoftMax's first
+// plaintext multiply instead.
+//
+// WHAT THIS DOES NOT BUY: the fused route. The ordinary leg feeds
+// HalfBoot with the product's SinC coefficients directly and finishes
+// with the StC prefix at dec level (SinCAttention), spending no bottom
+// level on the return conversion and no StC inside the bootstrap. The CI
+// analogue needs the prefix's nested form -- the composed map from what
+// HalfBoot leaves in slots to the layout's primary addresses -- which
+// does not exist yet. Until it does, the leg pays inverse_level for
+// SinCToSlot and Boot pays its StC; this test is the contract that route
+// has to beat.
+TEST(CiBootSet, TheBootstrapConsumesTheLevelZeroScores) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr)
+      << "ci16_35 did not come up as a BootContext -- RingFixture's boot "
+         "branch is compiled out";
+
+  const int fwd_level = 3;      // (1,5)
+  const int chain_level = 2;    // (4,0)
+  const int inverse_level = 1;  // (2,1)
+  const int sub_degree = 128;
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.num_cts, 2);
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(swtch.context, sub_degree,
+                             /*forward_level=*/fwd_level,
+                             /*inverse_level=*/inverse_level, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  // The bootstrap, prepared on the boot Context. boot.ui's constructor
+  // already made the multiplication, conjugation and sparse-encapsulation
+  // keys; only the CtS/StC rotations are added here.
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest boot_req;
+  bctx->AddRequiredRotations(boot_req, num_slots);
+  boot.ui->PrepareRotationKey(boot_req);
+
+  const double s = boot.param->GetScale(fwd_level);
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0xB010);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0xB011);
+
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(boot.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      boot.context->encoder_.Encode(pt, fwd_level, s, slot_msg);
+      Ciphertext<word> enc;
+      boot.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(swtch.context, out[bi], enc, swtch.ui->GetEvkMap());
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  handler.Multiply(res, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                   swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // What arrives at the boundary: the chain's exact output scale, as a
+  // multiple of the base scale Boot assumes.
+  const double carried_want =
+      2.0 * s * s /
+      (boot.param->GetRescalePrimeProd(chain_level) *
+       boot.param->base_scale_);
+
+  double pre_worst = 0.0, post_worst = 0.0, transposed = 0.0;
+  double carried_seen = 0.0, boot_seconds = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, res[bi], swtch.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(back.GetNP()), 0);
+
+    const double carried = back.GetScale() / boot.param->base_scale_;
+    carried_seen = carried;
+
+    // The pre-boot read, so the bootstrap's own contribution is visible
+    // as the difference of the two numbers printed below.
+    std::vector<Complex> before;
+    {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, back);
+      boot.context->encoder_.Decode(before, pt);
+    }
+
+    back.SetNumSlots(num_slots);
+    Ciphertext<word> dec;
+    const auto b0 = std::chrono::steady_clock::now();
+    bctx->Boot(dec, back, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    boot_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - b0)
+            .count();
+    // Full Boot lands at GetEndLevel() = dec - num_stc (16 here): EvalMod
+    // ends AT dec 19 -- that is HalfBoot's landing, the one the schedule
+    // calls dec -- and Boot's own StC spends its three levels below it.
+    ASSERT_EQ(boot.param->NPToLevel(dec.GetNP()),
+              bctx->GetBootParameter().GetEndLevel())
+        << "the bootstrap did not land where its parameter says";
+
+    std::vector<Complex> after;
+    {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, dec);
+      boot.context->encoder_.Decode(after, pt);
+    }
+
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          double want = 0.0, want_t = 0.0;
+          for (int x = 0; x < layout.contraction; x++) {
+            want += a[lane][row][x] * b[lane][x][column];
+            want_t += a[lane][column][x] * b[lane][x][row];
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          pre_worst =
+              std::max(pre_worst, std::abs(before[slot].real() - want));
+          const double got = after[slot].real() / carried;
+          post_worst = std::max(post_worst, std::abs(got - want));
+          transposed = std::max(transposed, std::abs(got - want_t));
+        }
+      }
+    }
+  }
+
+  std::cout << "the bootstrap consumes the level-0 scores (sub_degree "
+            << sub_degree << "): products before Boot " << pre_worst
+            << ", after Boot at level "
+            << bctx->GetBootParameter().GetEndLevel() << " " << post_worst
+            << std::endl;
+  std::cout << "  carried scale at the boundary " << carried_seen
+            << " x base (want " << carried_want << "), Boot "
+            << boot_seconds / layout.num_cts
+            << " s/ct cold (correctness lane, not a performance claim)"
+            << std::endl;
+  std::cout << "  control: transposed " << transposed << std::endl;
+
+  EXPECT_NEAR(carried_seen / carried_want, 1.0, 1e-6)
+      << "the chain's 2 s^2 / q_rescale law did not arrive at the boot "
+         "boundary intact";
+  EXPECT_LT(post_worst, 1e-2)
+      << "the bootstrap did not return the scores to their primary slots";
+  EXPECT_GT(transposed, 3e-2);
 }
