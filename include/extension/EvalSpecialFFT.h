@@ -302,10 +302,24 @@ class CiSinCConverter {
    *        so the fold cannot grow the diagonal count past `degree /
    *        sub_degree` -- the composed transform's own ceiling: no extra
    *        level, no extra rotations beyond the BSGS the count implies.
+   * @param forward_premap when non-null, a lane-preserving slot permutation
+   *        folded into the FORWARD on its input side (Doing.md 1.5bx), given
+   *        at block granularity: `(*forward_premap)[b]` is the block address
+   *        the forward's own convention (primary `LocateSlot` blocks under
+   *        `chain`, flat SinC blocks without) assigns to the entry the
+   *        caller's layout holds at block `b` of the slot index, lanes -- the
+   *        low `log2(sub_degree)` slot bits -- untouched. This is how a
+   *        transport whose composed map is a block permutation (the Llama
+   *        leg's Q/V transport, and the intra-ciphertext remainder of K's)
+   *        rides the conversion for free: a column relabelling of the
+   *        composed matrix, on the same lattice, same ceiling. Must be a
+   *        bijection over `degree / sub_degree` blocks; ignored when the
+   *        forward is not built.
    */
   CiSinCConverter(ConstContextPtr<word> context, int sub_degree,
                   int forward_level, int inverse_level,
-                  const CiSwitchedCcmmLayout *chain = nullptr);
+                  const CiSwitchedCcmmLayout *chain = nullptr,
+                  const std::vector<int> *forward_premap = nullptr);
 
   // disable copying (or moving also)
   CiSinCConverter(const CiSinCConverter &) = delete;

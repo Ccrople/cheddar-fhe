@@ -1330,13 +1330,42 @@ StripedMatrix FoldNestedUnpack(const StripedMatrix &m,
   return PackLattice(acc, n, k);
 }
 
+// A caller-supplied lane-preserving block permutation, folded on the input
+// (column) side (Doing.md 1.5bx): the composed matrix consumes the caller's
+// layout directly. With `inv` the inverse of the block premap, column
+// `c = B * k + lane` of the composed matrix moves to `inv[B] * k + lane` --
+// M_new[i, s] = M[i, premap(s)] -- and every offset stays on the stride-k
+// lattice because the permutation never touches a lane.
+StripedMatrix FoldColumnPremap(const StripedMatrix &m,
+                               const std::vector<int> &inv, int k) {
+  const int n = m.GetHeight();
+  const int num_blocks = n / k;
+  std::vector<std::vector<Complex>> acc(num_blocks);
+  for (const auto &[idx, diag] : m) {
+    AssertTrue(idx % k == 0,
+               "FoldColumnPremap: a diagonal left the stride-k lattice");
+    for (int j = 0; j < n; j++) {
+      const Complex v = diag[j];
+      if (v == Complex(0.0, 0.0)) continue;
+      const int col = ((j + idx) % n + n) % n;
+      const int nc = inv[col / k] * k + col % k;
+      const int off = (((nc - j) % n) + n) % n;
+      auto &dst = acc[off / k];
+      if (dst.empty()) dst.assign(n, Complex(0.0));
+      dst[j] += v;
+    }
+  }
+  return PackLattice(acc, n, k);
+}
+
 }  // namespace
 
 template <typename word>
 CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
                                        int sub_degree, int forward_level,
                                        int inverse_level,
-                                       const CiSwitchedCcmmLayout *chain)
+                                       const CiSwitchedCcmmLayout *chain,
+                                       const std::vector<int> *forward_premap)
     : sub_degree_{sub_degree} {
   const auto &param = context->param_;
   AssertTrue(param.conjugate_invariant_,
@@ -1385,11 +1414,27 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
     // property of the flat transform's columns, and the fold relabels which
     // slot feeds a column, not which column it is.
     if (chain != nullptr) m = FoldNestedPack(m, *chain);
+    // The caller's premap composes OUTERMOST: it relabels which input slot
+    // feeds each address of whatever convention the folds above fixed.
+    if (forward_premap != nullptr) {
+      const int nb = num_slots / sub_degree;
+      AssertTrue(static_cast<int>(forward_premap->size()) == nb,
+                 "CiSinCConverter: forward_premap must cover every block");
+      std::vector<int> inv(nb, -1);
+      for (int b = 0; b < nb; b++) {
+        const int dst = (*forward_premap)[b];
+        AssertTrue(dst >= 0 && dst < nb && inv[dst] == -1,
+                   "CiSinCConverter: forward_premap is not a bijection");
+        inv[dst] = b;
+      }
+      m = FoldColumnPremap(m, inv, sub_degree);
+    }
     auto [bs, gs] = split(m.GetNumDiag());
     std::cout << "CiSinCConverter forward: " << p << " stages, "
               << m.GetNumDiag() << " diagonals, level " << forward_level
               << ", BSGS " << bs << "x" << gs
-              << (chain != nullptr ? ", nested fold" : "") << std::endl;
+              << (chain != nullptr ? ", nested fold" : "")
+              << (forward_premap != nullptr ? ", premap" : "") << std::endl;
     forward_.emplace_back(context, m, forward_level,
                           param.GetRescalePrimeProd(forward_level), bs, gs, 0,
                           0);
