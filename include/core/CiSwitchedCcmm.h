@@ -44,16 +44,30 @@ namespace cheddar {
  * indices stay full: the result is `num_cts` big ciphertexts carrying the
  * per-lane real products (d x d/2)(d/2 x d).
  *
- * **3. There is no slot-level layout.** The ordinary layout's `Locate` rests
- * on two identities the CI chain does not have: `EvaluateSlotToSinC` has no
- * conjugate-invariant form yet, and the CI ring switch does not redistribute
- * SinC blocks by `i = j + rank * i'` -- its parts are the block-level banded
- * scan of the big blocks (Doing.md 1.5bj). So the layout here is stated at
- * the **part level**: entry (row, column, lane) lives in small ciphertext
- * `column` at CI SinC index `row * k + lane`, and a big operand ciphertext
- * is, in coefficients, the banded two-term recomposition of its `rank`
- * parts -- the exact inverse of what the switch computes, which is how a
- * caller (or the test) assembles one.
+ * **3. The layout is part-level, and the slot address is a two-term sum.**
+ * The CI ring switch does not redistribute SinC blocks by `i = j + rank *
+ * i'` -- its parts are the block-level banded scan of the big blocks
+ * (Doing.md 1.5bj) -- so the layout is stated at the **part level**: entry
+ * (row, column, lane) lives in small ciphertext `column` at CI SinC index
+ * `row * k + lane`, and a big operand ciphertext is, in coefficients, the
+ * banded two-term recomposition of its `rank` parts.
+ *
+ * That recomposition need not be assembled coefficient-wise: the banded
+ * recompose obeys a **mixed-radix identity** (Doing.md 1.5bp),
+ *
+ *     rec_rank( { rec_perpart(pcomp_I) } ) = rec_big( g(pcomp) ),
+ *     g(pcomp)[row * rank + I] = pcomp_I[row] + [I != 0] pcomp_{rank-I}[row+1]
+ *
+ * so the nested operand IS a flat big-ring SinC ciphertext at the same
+ * sub-degree whose message carries each entry **twice**: once at its own
+ * block `row * rank + column % rank`, and once -- for `column % rank != 0`,
+ * `row >= 1` -- at block `(row - 1) * rank + (rank - column % rank)`. A
+ * slot-form ciphertext holding those sums descends through the ordinary CI
+ * `EvaluateSlotToSinC` (1.5bn) or `CiSinCConverter` and the switch then
+ * yields exactly the parts `LocatePart` prescribes; no transform at the
+ * switch boundary, which is what 1.5bo's noise physics demands. `LocateSlot`
+ * states the two slot addresses; producing the second copy homomorphically
+ * is one block-permutation add on clean slot data, upstream of the descent.
  *
  * ## Scale
  *
@@ -98,6 +112,30 @@ struct CiSwitchedCcmmLayout {
   /// The inverse of LocatePart.
   bool PositionPart(int part, int index, int &row, int &column,
                     int &lane) const;
+
+  /**
+   * @brief The slot-level address the mixed-radix identity buys (Doing.md
+   * 1.5bp): where entry `(row, column, lane)` must be ADDED into the big
+   * ciphertext's SLOT message for the flat CI SlotToSinC at this layout's
+   * `sub_degree`, followed by the ring switch, to place it where
+   * `LocatePart` says.
+   *
+   * A slot generally accumulates two entries (its own, and the partner
+   * class's next row), and an entry generally occupies two slots -- so a
+   * message is built by ADDING each entry at both addresses, not by
+   * assignment.
+   *
+   * @param ct receives the big ciphertext index, `column / rank`
+   * @param slot receives the entry's own slot: block
+   *        `BitRev(row * rank + column % rank)` of the slot index, lane
+   *        untouched
+   * @param copy_slot receives the second address -- block
+   *        `BitRev((row - 1) * rank + rank - column % rank)` -- or -1 when
+   *        the entry has none (`column % rank == 0` or `row == 0`)
+   * @return how many slot addresses the entry occupies, 1 or 2
+   */
+  int LocateSlot(int row, int column, int lane, int &ct, int &slot,
+                 int &copy_slot) const;
 };
 
 template <typename word>

@@ -61,6 +61,38 @@ bool CiSwitchedCcmmLayout::PositionPart(int part, int index, int &row,
   return true;
 }
 
+namespace {
+
+int BitReverse(int v, int bits) {
+  int r = 0;
+  for (int i = 0; i < bits; i++) r |= ((v >> i) & 1) << (bits - 1 - i);
+  return r;
+}
+
+}  // namespace
+
+int CiSwitchedCcmmLayout::LocateSlot(int row, int column, int lane, int &ct,
+                                     int &slot, int &copy_slot) const {
+  AssertTrue(row >= 0 && row < dim && column >= 0 && column < dim &&
+                 lane >= 0 && lane < lanes,
+             "CiSwitchedCcmmLayout::LocateSlot: index out of range");
+  ct = column / rank;
+  const int cls = column % rank;
+  // The flat block index runs over ALL of one big ciphertext's blocks at
+  // this sub-degree; its bit reversal is the CI SlotToSinC's own block map
+  // (EvalSpecialFFT: slot group A -> SinC block BitRev(A), lanes untouched).
+  const int num_flat_blocks = big_degree / sub_degree;  // rank * dim
+  const int log_blocks = Log2Ceil(num_flat_blocks);
+  slot = BitReverse(row * rank + cls, log_blocks) * sub_degree + lane;
+  copy_slot = -1;
+  if (cls != 0 && row >= 1) {
+    copy_slot =
+        BitReverse((row - 1) * rank + (rank - cls), log_blocks) * sub_degree +
+        lane;
+  }
+  return copy_slot < 0 ? 1 : 2;
+}
+
 template <typename word>
 CiSwitchedCcmmHandler<word>::CiSwitchedCcmmHandler(
     ConstContextPtr<word> switch_ctx, ConstContextPtr<word> small_ctx,

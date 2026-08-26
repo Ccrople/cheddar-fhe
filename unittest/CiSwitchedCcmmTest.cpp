@@ -532,3 +532,382 @@ TEST(CiSlotChain, TheScanWalksTheSwitchNoiseAndSlotReadsConcentrateIt) {
       << "the slot read came back CLEAN: the noise floor moved, and the "
          "route decision of Doing.md 1.5bo should be revisited";
 }
+
+// ---------------------------------------------------------------------------
+// The mixed-radix identity of the banded recompose, and the packing it buys
+// (Doing.md 1.5bp).
+//
+// 1.5bo closed the transform routes to the nested arrangement: no
+// diagonal-decorated map carries a FLAT big SinC ciphertext to the chain's
+// part-level operand, and no conversion may follow the switch. What remained
+// was "a layer-packing decision" -- and this is it. The banded recompose is
+// mixed-radix associative:
+//
+//     rec_rank( { rec_perpart(pcomp_I) } )  =  rec_big( g(pcomp) ),
+//     g(pcomp)[row * rank + I] = pcomp_I[row] + [I != 0] pcomp_{rank-I}[row+1]
+//
+// so the nested operand IS a flat big-ring SinC ciphertext at the same
+// sub-degree, provided its message carries each entry at two block
+// addresses (LocateSlot). The route to the chain from big-ring slots is
+// then: pack the two-term sums in slot form (clean data, one
+// block-permutation add), run the flat CI SlotToSinC -- here the one-phase
+// CiSinCConverter, in its first big-ring use -- and hand the result to
+// Multiply unchanged. Nothing converts at the switch boundary, which is
+// exactly what 1.5bo's noise physics demands.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char *kLiftedL2Param = "ringdegree13_35_l2.json";
+
+// The block-level scan: g's exact inverse, applied to a flat SinC message
+// read off a result ciphertext to recover the per-part (nested) content.
+// Same recursion as the coefficient scan, at block granularity, vectorised
+// over the lanes.
+std::vector<std::vector<std::vector<double>>> HostBlockScan(
+    const std::vector<Complex> &fm, int rank, int dim, int lanes) {
+  std::vector<std::vector<std::vector<double>>> comp(
+      rank, std::vector<std::vector<double>>(dim,
+                                             std::vector<double>(lanes, 0.0)));
+  auto at = [&](int block, int r) {
+    return fm[static_cast<size_t>(block) * lanes + r].real();
+  };
+  for (int bp = 0; bp < dim; bp++) {
+    for (int r = 0; r < lanes; r++) comp[0][bp][r] = at(bp * rank, r);
+  }
+  for (int i = 1; i <= rank / 2; i++) {
+    const int mi = rank - i;
+    std::vector<double> acc_i(lanes, 0.0), acc_m(lanes, 0.0);
+    for (int bp = dim - 1; bp >= 0; bp--) {
+      for (int r = 0; r < lanes; r++) {
+        const double new_i = at(bp * rank + i, r) - acc_m[r];
+        const double new_m = at(bp * rank + mi, r) - acc_i[r];
+        comp[i][bp][r] = new_i;
+        comp[mi][bp][r] = new_m;  // mi == i rewrites the same value
+        acc_i[r] = new_i;
+        acc_m[r] = new_m;
+      }
+    }
+  }
+  return comp;
+}
+
+}  // namespace
+
+// The identity itself, against the real encoders and exactly: one big
+// ciphertext's worth of per-part SinC messages, encoded nested (per-part
+// EncodeSinC + the switch recompose) and flat (one big EncodeSinC of the
+// two-term block sums), must produce the SAME coefficients -- and
+// LocateSlot's two addresses must build the same flat message.
+TEST(CiNestedPacking, TheFlatEncodingOfTheBlockSumsIsTheNestedOperand) {
+  Ring big(kSwitchParam);
+  Ring small(kSmallParam);
+  const int level = big.param->max_level_;
+  const double scale = big.param->GetScale(level);
+
+  for (const int sub_degree : {32, 128}) {
+    CiSwitchedCcmmLayout layout(big.Degree(), small.Degree(), sub_degree);
+    const int k = layout.lanes;
+    const int ds = layout.dim;
+    const int rank = layout.rank;
+    const int log_blocks = Log2(rank * ds);
+
+    std::mt19937_64 gen(0xB9 + sub_degree);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    std::vector<std::vector<Complex>> part_msg(
+        rank, std::vector<Complex>(small.Degree()));
+    for (auto &m : part_msg) {
+      for (auto &v : m) v = Complex(dist(gen), 0.0);
+    }
+
+    // Nested: per-part encode, then the switch recompose.
+    std::vector<std::vector<double>> part_coeffs(rank);
+    for (int j = 0; j < rank; j++) {
+      Plaintext<word> pt;
+      small.context->encoder_.EncodeSinC(pt, level, scale, part_msg[j],
+                                         sub_degree);
+      small.context->encoder_.DecodeCoeff(part_coeffs[j], pt);
+    }
+    const auto nested = HostRecompose(part_coeffs, rank, small.Degree());
+
+    // Flat: the two-term block sums, one big EncodeSinC.
+    std::vector<Complex> fmsg(big.Degree(), Complex(0.0, 0.0));
+    for (int bp = 0; bp < ds; bp++) {
+      for (int i = 0; i < rank; i++) {
+        for (int r = 0; r < k; r++) {
+          Complex v = part_msg[i][static_cast<size_t>(bp) * k + r];
+          if (i != 0 && bp + 1 < ds) {
+            v += part_msg[rank - i][static_cast<size_t>(bp + 1) * k + r];
+          }
+          fmsg[(static_cast<size_t>(bp) * rank + i) * k + r] = v;
+        }
+      }
+    }
+    Plaintext<word> flat_pt;
+    big.context->encoder_.EncodeSinC(flat_pt, level, scale, fmsg, sub_degree);
+    std::vector<double> flat;
+    big.context->encoder_.DecodeCoeff(flat, flat_pt);
+
+    double worst = 0.0;
+    for (int t = 0; t < big.Degree(); t++) {
+      worst = std::max(worst, std::abs(nested[t] - flat[t]));
+    }
+    std::cout << "mixed-radix identity, sub_degree " << sub_degree
+              << ": max |nested - flat(g)| = " << worst << std::endl;
+    EXPECT_LT(worst, 1e-7) << "the identity must hold to encode rounding";
+
+    // LocateSlot builds the same flat message through the slot map.
+    std::vector<Complex> slot_msg(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < ds; row++) {
+      for (int i = 0; i < rank; i++) {
+        for (int r = 0; r < k; r++) {
+          const Complex v = part_msg[i][static_cast<size_t>(row) * k + r];
+          int ct_idx, slot, copy_slot;
+          const int n = layout.LocateSlot(row, i, r, ct_idx, slot, copy_slot);
+          ASSERT_EQ(ct_idx, 0);
+          slot_msg[slot] += v;
+          if (n == 2) slot_msg[copy_slot] += v;
+        }
+      }
+    }
+    double slot_worst = 0.0;
+    for (int b = 0; b < rank * ds; b++) {
+      for (int r = 0; r < k; r++) {
+        const Complex direct = fmsg[static_cast<size_t>(b) * k + r];
+        const Complex located =
+            slot_msg[static_cast<size_t>(BitRev(b, log_blocks)) * k + r];
+        slot_worst = std::max(slot_worst, std::abs(direct - located));
+      }
+    }
+    EXPECT_LT(slot_worst, 1e-12)
+        << "LocateSlot disagrees with the identity's own construction";
+  }
+}
+
+// The route, end to end on the device: slot-form big ciphertexts carrying
+// the two-term sums, the one-phase converter's first big-ring outing (512
+// diagonals at sub_degree 128), the unchanged chain, and both reads of the
+// result -- the part-level read of 1.5bm and the flat read undone by the
+// block scan. The _l2 trio's third level is exactly this transform's budget.
+TEST(CiNestedPacking, ASlotCiphertextReachesTheChainThroughTheConverter) {
+  Ring big(kSwitchL2Param);
+  Ring small(kSmallL2Param);
+  Ring lifted(kLiftedL2Param,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int top = big.param->max_level_;
+  ASSERT_EQ(top, 2) << "the _l2 chain holds the conversion level";
+  const int chain_level = top - 1;
+  const int sub_degree = 128;
+
+  CiSwitchedCcmmHandler<word> handler(big.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.num_cts, 2);
+
+  big.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                               chain_level);
+  big.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                      small.ui->GetSecretCoeffs(),
+                                      chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(big.context, sub_degree, /*forward_level=*/top,
+                             /*inverse_level=*/-1);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  big.ui->PrepareRotationKey(req);
+
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0x1B9A);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0x1B9B);
+
+  // A big operand from SLOT form: every entry added at both LocateSlot
+  // addresses, encoded on the slots, and descended by the converter.
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(big.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            const double v = m[lane][row][column];
+            if (v == 0.0) continue;
+            int ct_idx, slot, copy_slot;
+            const int n =
+                layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            ASSERT_EQ(ct_idx, bi);
+            slot_msg[slot] += v;
+            if (n == 2) slot_msg[copy_slot] += v;
+          }
+        }
+      }
+      Plaintext<word> pt;
+      big.context->encoder_.Encode(pt, top, big.param->GetScale(top),
+                                   slot_msg);
+      Ciphertext<word> enc;
+      big.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(big.context, out[bi], enc, big.ui->GetEvkMap());
+      ASSERT_EQ(big.param->NPToLevel(out[bi].GetNP()), chain_level);
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // The converter alone, on the big ring, measured in both bases: the
+  // COEFFICIENT error against the host flat encode is the transform's own
+  // noise; the lane read then pays the scan's conditioning on top of it.
+  double conv_err = 0.0;
+  double conv_coeff_err = 0.0;
+  {
+    std::vector<Complex> fmsg(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int i = 0; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          double want = b[r][row][i];
+          if (i != 0 && row + 1 < layout.dim) {
+            want += b[r][row + 1][layout.rank - i];
+          }
+          fmsg[(static_cast<size_t>(row) * layout.rank + i) * layout.lanes +
+               r] = Complex(want, 0.0);
+        }
+      }
+    }
+    Plaintext<word> probe;
+    big.ui->Decrypt(probe, rhs[0]);
+    std::vector<Complex> got;
+    big.context->encoder_.DecodeSinC(got, probe, sub_degree);
+    for (size_t at = 0; at < fmsg.size(); at++) {
+      conv_err = std::max(conv_err, std::abs(got[at].real() - fmsg[at].real()));
+    }
+    std::vector<double> got_c, want_c;
+    big.context->encoder_.DecodeCoeff(got_c, probe);
+    Plaintext<word> host_pt;
+    big.context->encoder_.EncodeSinC(host_pt, chain_level,
+                                     big.param->GetScale(top), fmsg,
+                                     sub_degree);
+    big.context->encoder_.DecodeCoeff(want_c, host_pt);
+    for (int t = 0; t < big.Degree(); t++) {
+      conv_coeff_err =
+          std::max(conv_coeff_err, std::abs(got_c[t] - want_c[t]));
+    }
+  }
+
+  handler.Multiply(res, lhs, rhs, big.ui->GetRingSwitchKey(layout.rank),
+                   big.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(res.size()), layout.num_cts);
+  // The converter preserves its INPUT scale -- GetScale(top), not the
+  // canonical scale of chain_level -- so the chain's exact output scale is
+  // stated from there: Algorithm 4 squares it and rescales by chain_level's
+  // prime product, and the descent doubles it.
+  const double operand_scale = big.param->GetScale(top);
+  const double product_scale = 2.0 * operand_scale * operand_scale /
+                               big.param->GetRescalePrimeProd(chain_level);
+  for (const auto &ct : res) {
+    ASSERT_EQ(big.param->NPToLevel(ct.GetNP()), chain_level - 1);
+    EXPECT_NEAR(ct.GetScale() / product_scale, 1.0, 1e-6);
+  }
+
+  // Read 1, part-level (1.5bm's): the coefficient scan, each part's lanes
+  // through the small ring's encoder.
+  std::vector<std::vector<Complex>> got_parts(layout.dim);
+  // Read 2, flat: DecodeSinC on the big ring, then the block scan undoes g.
+  std::vector<std::vector<std::vector<std::vector<double>>>> got_flat;
+  const double bridge_scale = small.param->GetScale(chain_level);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    big.ui->Decrypt(pt, res[bi]);
+    std::vector<double> coeffs;
+    big.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, layout.rank, small.Degree());
+    for (int j = 0; j < layout.rank; j++) {
+      Plaintext<word> bridge;
+      small.context->encoder_.EncodeCoeff(bridge, chain_level, bridge_scale,
+                                          comp[j]);
+      small.context->encoder_.DecodeSinC(got_parts[bi * layout.rank + j],
+                                         bridge, sub_degree);
+    }
+    std::vector<Complex> fm;
+    big.context->encoder_.DecodeSinC(fm, pt, sub_degree);
+    got_flat.push_back(
+        HostBlockScan(fm, layout.rank, layout.dim, layout.lanes));
+  }
+
+  double worst_part = 0.0, worst_flat = 0.0, transposed = 0.0;
+  double no_unscan = 0.0;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int column = 0; column < layout.dim; column++) {
+        double want = 0.0, want_t = 0.0;
+        for (int x = 0; x < layout.contraction; x++) {
+          want += a[lane][row][x] * b[lane][x][column];
+          want_t += a[lane][column][x] * b[lane][x][row];
+        }
+        int part, index;
+        layout.LocatePart(row, column, lane, part, index);
+        const double got_p = got_parts[part][index].real();
+        worst_part = std::max(worst_part, std::abs(got_p - want));
+        transposed = std::max(transposed, std::abs(got_p - want_t));
+        const int bi = column / layout.rank;
+        const int cls = column % layout.rank;
+        worst_flat = std::max(
+            worst_flat, std::abs(got_flat[bi][cls][row][lane] - want));
+      }
+    }
+  }
+  // The control that pins g as load-bearing on the read side: the flat
+  // message itself, NOT unscanned, is the block sums and must miss the
+  // products wherever a partner is live.
+  {
+    Plaintext<word> pt;
+    big.ui->Decrypt(pt, res[0]);
+    std::vector<Complex> fm;
+    big.context->encoder_.DecodeSinC(fm, pt, sub_degree);
+    for (int row = 0; row + 1 < layout.dim; row++) {
+      for (int i = 1; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          double want = 0.0;
+          for (int x = 0; x < layout.contraction; x++) {
+            want += a[r][row][x] * b[r][x][i];
+          }
+          const size_t at =
+              (static_cast<size_t>(row) * layout.rank + i) * layout.lanes + r;
+          no_unscan = std::max(no_unscan, std::abs(fm[at].real() - want));
+        }
+      }
+    }
+  }
+
+  std::cout << "slot -> converter -> chain, sub_degree " << sub_degree
+            << ": converter coeff " << conv_coeff_err << " / lane read "
+            << conv_err << ", products (part read) " << worst_part
+            << ", (flat read) " << worst_flat << std::endl;
+  std::cout << "  controls: transposed " << transposed << ", flat without "
+            << "the block scan " << no_unscan << std::endl;
+
+  EXPECT_LT(conv_coeff_err, 2e-3)
+      << "the one-phase big-ring transform's own noise moved";
+  EXPECT_LT(conv_err, 4e-2)
+      << "the lane read pays the scan's conditioning over the coefficient "
+         "floor";
+  EXPECT_LT(worst_part, 2e-2)
+      << "the converted operands did not land where LocatePart says";
+  EXPECT_LT(worst_flat, 2e-2)
+      << "the flat read plus the block scan must recover the same products";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(no_unscan, 3e-2)
+      << "the raw flat message already matches the products, so the block "
+         "sums are not present and this run is not testing the identity";
+}
