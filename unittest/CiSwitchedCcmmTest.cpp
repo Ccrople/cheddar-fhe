@@ -50,12 +50,16 @@
 #include "core/CiSwitchedCcmm.h"
 #include "core/EvkRequest.h"
 #include "extension/BootContext.h"
+#include "extension/ChebyshevFit.h"
+#include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 
 using word = uint32_t;
 using cheddar::BootContext;
 using cheddar::Ciphertext;
 using cheddar::CiLiftHandler;
+using cheddar::Constant;
+using cheddar::EvalPoly;
 using cheddar::CiSwitchedCcmmHandler;
 using cheddar::CiSinCConverter;
 using cheddar::CiSwitchedCcmmLayout;
@@ -2431,4 +2435,367 @@ TEST(CiBootSet, TheBootstrapConsumesTheLevelZeroScores) {
   EXPECT_LT(post_worst, 1e-2)
       << "the bootstrap did not return the scores to their primary slots";
   EXPECT_GT(transposed, 3e-2);
+}
+
+// SoftMax normalizes the booted scores (Doing.md 1.5bv).
+//
+// 1.5bs settled the placement without running the arithmetic; this runs it,
+// on the layout's own slot fields, at the levels the layer will have.
+// [SYLPH] section 2.3 / Cho et al., k = 1: y = exp, then one Euclidean
+// normalisation (y / ||y||_2)^2 whose square already sums to one -- exactly
+// SoftMaxHandler's algorithm, but that handler is compiled to the ordinary
+// ring (num_slots = degree / 2) and to a key axis on the top slot field.
+//
+// THE BIT REVERSAL PUTS THE CLS FIELD ON TOP, AND THE REDUCTION IS FREE.
+// LocateSlot's primary address is block BitRev(row * rank + cls), lane in
+// the low bits -- so cls, the LOW four bits of the block index, lands on
+// the TOP four bits of the slot index, at stride num_slots / rank. The
+// rotate-and-add tree over a top field wraps modulo the field exactly
+// (the carry falls off the vector's end), so
+//
+//   1 ct add  (the ciphertext half of the key axis)
+//   4 rotate-adds by (num_slots / rank) * 2^t
+//
+// leaves the full row norm at EVERY slot: no mask, no mirror broadcast,
+// every slot exact, the same shape as the handler's own convention with
+// the keys merely visited in bit-reversed order -- which a sum cannot
+// see. 1.5bs's "broadcast the mirror" turns out to be unnecessary.
+//
+// SHARPNESS LIVES IN THE POLYNOMIAL, NOT THE CIPHERTEXT. The bootstrap
+// carries u = 2 (S - c) / M + 1 in [-1, 1]; the effective score span
+// M_eff is baked into exp's Chebyshev fit (exp(M_eff (u - 1) / 4) for
+// k = 1), exactly as the layer folds 1 / sqrt(d_head) and the calibrated
+// shift upstream of HalfBoot. So a chain whose raw products span ~0.3 can
+// still exercise a sharp softmax -- M_eff = 8 here -- and the affine's
+// plaintext multiply is also where 1.5bu's carried factor divides out, as
+// promised there. NOT here: the causal mask (one more plaintext multiply,
+// mechanically identical to the merged mask above; which norm interval it
+// leaves per row is a calibration question for real data), and any claim
+// about calibrated ranges -- lo/hi are read off this test's own data, as
+// [SYLPH] reads them off the real layer's.
+TEST(CiBootSet, SoftMaxNormalizesTheBootedScores) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int fwd_level = 3, chain_level = 2, inverse_level = 1;
+  const int sub_degree = 128;
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.dim, 32);
+  ASSERT_EQ(layout.rank, 16);
+  ASSERT_EQ(layout.lanes, 128);
+  ASSERT_EQ(layout.num_cts, 2);
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(swtch.context, sub_degree, fwd_level,
+                             inverse_level, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest boot_req;
+  bctx->AddRequiredRotations(boot_req, num_slots);
+  boot.ui->PrepareRotationKey(boot_req);
+
+  // ---- the scores, through the measured pipeline to level 16 ------------
+  const double s = boot.param->GetScale(fwd_level);
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0xB020);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0xB021);
+
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(boot.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      boot.context->encoder_.Encode(pt, fwd_level, s, slot_msg);
+      Ciphertext<word> enc;
+      boot.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(swtch.context, out[bi], enc, swtch.ui->GetEvkMap());
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  handler.Multiply(res, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                   swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+
+  double carried = 0.0;
+  std::vector<Ciphertext<word>> scores(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, res[bi], swtch.ui->GetEvkMap());
+    carried = back.GetScale() / boot.param->base_scale_;
+    back.SetNumSlots(num_slots);
+    bctx->Boot(scores[bi], back, boot.ui->GetEvkMap());
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const int top = boot.param->NPToLevel(scores[0].GetNP());
+  ASSERT_EQ(top, bctx->GetBootParameter().GetEndLevel());
+
+  // ---- host calibration, public exactly as the layer's is ---------------
+  // S[lane][row][col], the true products; c and M off the data; u in [-1,1].
+  const double m_eff = 8.0;
+  std::vector<std::vector<std::vector<double>>> S(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  double smin = 1e300, smax = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int col = 0; col < layout.dim; col++) {
+        double v = 0.0;
+        for (int x = 0; x < layout.contraction; x++) {
+          v += a[lane][row][x] * b[lane][x][col];
+        }
+        S[lane][row][col] = v;
+        smin = std::min(smin, v);
+        smax = std::max(smax, v);
+      }
+    }
+  }
+  const double span = smax - smin;
+  auto u_of = [&](double v) { return 2.0 * (v - smax) / span + 1.0; };
+
+  // ---- the polynomials, SoftMax.cu's own construction -------------------
+  const double half = m_eff / 4.0;  // k = 1: exp on [-M_eff / 2, 0]
+  auto exp_coeffs = cheddar::chebfit::Interpolate(
+      [half](double v) { return std::exp(half * (v - 1.0)); }, 9);
+  const int exp_in = top - 1;
+  auto log2ceil = [](int n) {
+    int r = 0;
+    while ((1 << r) < n) r++;
+    return r;
+  };
+  const int exp_used =
+      EvalPoly<word>(exp_coeffs, exp_in, boot.param->GetScale(exp_in),
+                     boot.param->GetScale(exp_in), true)
+          .GetPolyDegree();
+  const int exp_out = exp_in - log2ceil(exp_used + 1);
+  EvalPoly<word> exp_poly(exp_coeffs, exp_in, boot.param->GetScale(exp_in),
+                          boot.param->GetScale(exp_out), true);
+  exp_poly.Compile(boot.context);
+
+  // The norm interval, read off this data with a margin -- rows are
+  // (row, lane) pairs, keys are the column axis across both ciphertexts.
+  double lo = 1e300, hi = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      double sq = 0.0;
+      for (int col = 0; col < layout.dim; col++) {
+        const double y = std::exp(half * (u_of(S[lane][row][col]) - 1.0));
+        sq += y * y;
+      }
+      lo = std::min(lo, sq);
+      hi = std::max(hi, sq);
+    }
+  }
+  lo *= 0.9;
+  hi *= 1.1;
+  const double aff_a = 0.5 * (hi - lo);
+  const double aff_b = 0.5 * (hi + lo);
+  auto inv_coeffs = cheddar::chebfit::Interpolate(
+      [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+      15);
+  const int sq_level = exp_out - 1;    // HMult(y, y)
+  const int poly_in = sq_level - 1;    // the merged mask / affine multiply
+  const int inv_used =
+      EvalPoly<word>(inv_coeffs, poly_in, boot.param->GetScale(poly_in),
+                     boot.param->GetScale(poly_in), true)
+          .GetPolyDegree();
+  const int inv_out = poly_in - log2ceil(inv_used + 1);
+  ASSERT_GE(inv_out - 2, 0) << "the softmax does not fit below the boot";
+  EvalPoly<word> inv_poly(inv_coeffs, poly_in,
+                          boot.param->GetScale(poly_in),
+                          boot.param->GetScale(inv_out), true);
+  inv_poly.Compile(boot.context);
+
+  // ---- rotation keys for the reduce tree --------------------------------
+  // cls sits on the TOP four slot bits (see the header comment), so the
+  // stride is num_slots / rank and the tree is exact at every slot.
+  std::vector<int> reduce_dist;
+  for (int t = 0; t < 4; t++) {
+    reduce_dist.push_back((num_slots / layout.rank) << t);
+  }
+  {
+    EvkRequest rot_req;
+    for (int d : reduce_dist) rot_req.AddRequest(d, sq_level);
+    boot.ui->PrepareRotationKey(rot_req);
+  }
+  const auto &evk = boot.ui->GetEvkMap();
+  const auto &mult_key = evk.GetMultiplicationKey();
+
+  // ---- the circuit ------------------------------------------------------
+  // Affine at `top`: u = a1 * (carried * S) + a0, carried dividing out in
+  // a1 exactly as 1.5bu promised.
+  const double a1 = 2.0 / (span * carried);
+  const double a0 = 1.0 - 2.0 * smax / span;
+  std::vector<Ciphertext<word>> y(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Constant<word> c1;
+    boot.context->encoder_.EncodeConstant(c1, top,
+                                          boot.param->GetScale(top), a1);
+    Ciphertext<word> t1, u_ct;
+    boot.context->Mult(t1, scores[bi], c1);
+    boot.context->Rescale(u_ct, t1);
+    Constant<word> c0;
+    boot.context->encoder_.EncodeConstant(c0, exp_in, u_ct.GetScale(), a0);
+    boot.context->Add(u_ct, u_ct, c0);
+    // y = exp(M_eff (u - 1) / 4)
+    exp_poly.Evaluate(boot.context, y[bi], u_ct, mult_key);
+  }
+
+  // The Euclidean norm over the split key axis: one ct add, then the
+  // top-field reduce tree -- exact at every slot, no mask, no broadcast.
+  Ciphertext<word> sq, term, rotated;
+  boot.context->HMult(sq, y[0], y[0], mult_key);
+  boot.context->HMult(term, y[1], y[1], mult_key);
+  boot.context->Add(sq, sq, term);
+  for (int d : reduce_dist) {
+    boot.context->HRotAdd(rotated, sq, sq, evk.GetRotationKey(d), d);
+    boot.context->Copy(sq, rotated);
+  }
+  // The affine map onto the polynomial's domain, SoftMax.cu's own pattern.
+  {
+    Constant<word> inv_a;
+    boot.context->encoder_.EncodeConstant(
+        inv_a, sq_level, boot.param->GetScale(sq_level), 1.0 / aff_a);
+    Ciphertext<word> scaled;
+    boot.context->Mult(scaled, sq, inv_a);
+    boot.context->Rescale(sq, scaled);
+    Constant<word> shift;
+    boot.context->encoder_.EncodeConstant(shift, poly_in, sq.GetScale(),
+                                          -aff_b / aff_a);
+    boot.context->Add(sq, sq, shift);
+  }
+
+  // r = 1 / ||y||_2, then P = (y r)^2 -- which already sums to one.
+  Ciphertext<word> r;
+  inv_poly.Evaluate(boot.context, r, sq, mult_key);
+  const int meet = boot.param->NPToLevel(r.GetNP());
+  std::vector<Ciphertext<word>> P(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> levelled, prod;
+    boot.context->LevelDown(levelled, y[bi], meet);
+    boot.context->HMult(prod, levelled, r, mult_key);
+    boot.context->HMult(P[bi], prod, prod, mult_key);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const int out_level = boot.param->NPToLevel(P[0].GetNP());
+
+  // ---- the reads --------------------------------------------------------
+  // True softmax; the same circuit in the clear (separating fit error from
+  // crypto error, SoftMaxHandler::PlainSoftMax's pattern); the transposed
+  // control; and the row sums P * V depends on.
+  double worst_true = 0.0, worst_plain = 0.0, transposed = 0.0;
+  double worst_rowsum = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, P[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int lane = 0; lane < layout.lanes; lane++) {
+      for (int row = 0; row < layout.dim; row++) {
+        // Host references for this (row, lane) row.
+        std::vector<double> yp(layout.dim);
+        double zsum = 0.0, ysq = 0.0;
+        for (int col = 0; col < layout.dim; col++) {
+          zsum += std::exp(m_eff * (u_of(S[lane][row][col]) - 1.0) / 2.0);
+          yp[col] = exp_poly.PlainEvaluate(u_of(S[lane][row][col]));
+          ysq += yp[col] * yp[col];
+        }
+        const double rp = inv_poly.PlainEvaluate((ysq - aff_b) / aff_a);
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          const double want_true =
+              std::exp(m_eff * (u_of(S[lane][row][column]) - 1.0) / 2.0) /
+              zsum;
+          const double want_plain =
+              (yp[column] * rp) * (yp[column] * rp);
+          const double want_t =
+              std::exp(m_eff * (u_of(S[lane][column][row]) - 1.0) / 2.0);
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          worst_true = std::max(worst_true, std::abs(got - want_true));
+          worst_plain = std::max(worst_plain, std::abs(got - want_plain));
+          transposed =
+              std::max(transposed, std::abs(got - want_t / zsum));
+        }
+      }
+    }
+  }
+  // Row sums need both ciphertexts together.
+  {
+    std::vector<std::vector<Complex>> all(layout.num_cts);
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, P[bi]);
+      boot.context->encoder_.Decode(all[bi], pt);
+    }
+    for (int lane = 0; lane < layout.lanes; lane++) {
+      for (int row = 0; row < layout.dim; row++) {
+        double rowsum = 0.0;
+        for (int col = 0; col < layout.dim; col++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, col, lane, ct_idx, slot, copy_slot);
+          rowsum += all[col / layout.rank][slot].real();
+        }
+        worst_rowsum = std::max(worst_rowsum, std::abs(rowsum - 1.0));
+      }
+    }
+  }
+
+  std::cout << "softmax on the booted scores (M_eff " << m_eff
+            << ", exp deg " << exp_used << " @" << exp_in << ".." << exp_out
+            << ", invsqrt deg " << inv_used << " @" << poly_in << ".."
+            << inv_out << ", P @" << out_level << "): vs true softmax "
+            << worst_true << ", vs the same circuit in the clear "
+            << worst_plain << std::endl;
+  std::cout << "  row sums off one by " << worst_rowsum
+            << ", norm interval [" << lo << ", " << hi
+            << "] read off the data" << std::endl;
+  std::cout << "  control: transposed " << transposed << std::endl;
+
+  EXPECT_LT(worst_true, 3e-2)
+      << "the softmax did not land on the true row distribution";
+  EXPECT_LT(worst_plain, 1e-2)
+      << "the encrypted circuit disagrees with its own plaintext twin, so "
+         "the error is crypto, not fit";
+  EXPECT_LT(worst_rowsum, 5e-2)
+      << "the rows do not sum to one, which is the property P V consumes";
+  EXPECT_GT(transposed, 5e-2);
 }
