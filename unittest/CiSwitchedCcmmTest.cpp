@@ -5969,3 +5969,472 @@ TEST(CiBootSet, TheAttentionLegClosesEndToEnd) {
   EXPECT_GT(half_sum, 5e-3)
       << "one call alone matches, so the two-call sum never happened";
 }
+
+// The causal mask folds into the softmax walk (Doing.md 1.5cc).
+//
+// 1.5bv left two data questions open: the causal mask, and which norm
+// interval each row then lands in (a row with few live keys has a small
+// norm). Both close together, and the mechanism is one plaintext the
+// walk does not have plus one it already does:
+//
+// 1. THE MASK IS ONE 0/1 PLAINTEXT MULTIPLY ON y = exp(...), and the
+//    level it needs comes out of exp's own fit: deg 9 -> deg 7 is a
+//    log2ceil of 4 -> 3, and the deg-7 Chebyshev truncation of
+//    exp(2(u - 1)) on [-1, 1] is ~7e-6 -- two orders below the 4e-4
+//    boot-floor the softmax already carries. Every level downstream is
+//    UNCHANGED (sq at 10, invsqrt at 9..5), so the causal walk lands P
+//    at fwd_level exactly like the plain one. Masking y rather than P
+//    is load-bearing: the Euclidean norm then sums live keys only,
+//    which is what makes the masked softmax causal instead of clipped.
+//
+// 2. THE AFFINE'S SHIFT GOES PER-ROW, AND THAT IS THE INTERVAL ANSWER.
+//    a0 was the global constant 1 - 2 smax / span; softmax is
+//    shift-invariant within a row, so a0 -- already one Add -- can be a
+//    plaintext carrying each (lane, row)'s own live-key max instead
+//    (masked slots keep the global shift so their u stays inside the
+//    fit domain; the mask kills their y anyway). Then every row's
+//    largest live y is exactly 1 and the norm interval is [1, live
+//    row sum] BY CONSTRUCTION, against the global shift under which a
+//    row whose live keys sit far below smax collapses toward
+//    e^-m_eff and the interval spans orders of magnitude (both
+//    intervals printed below; the global one is what 1.5bv warned
+//    about). What remains data-dependent is exactly what span already
+//    was: rowmax and span are calibrated estimates with margins, not
+//    exact reads -- here, as in 1.5bv, they are read off this test's
+//    own data.
+//
+// Measured at sub_degree 128 through the real pipeline (encrypt @3 ->
+// chain -> slots @0 -> Boot -> @16 -> causal softmax -> P @3 -> chain
+// x2 -> slots @0), against the causal softmax times V in the clear.
+// Controls: the UN-masked softmax reference must fail, the transposed
+// read must fail, P at masked addresses must be numerically zero, and
+// live row sums must be one.
+TEST(CiBootSet, TheCausalMaskFoldsIntoTheSoftmaxWalk) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int fwd_level = 3, chain_level = 2, inverse_level = 1;
+  const int sub_degree = 128;
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.num_cts, 2);
+  const int half_keys = layout.contraction;  // 16
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(swtch.context, sub_degree, fwd_level,
+                             inverse_level, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest boot_req;
+  bctx->AddRequiredRotations(boot_req, num_slots);
+  boot.ui->PrepareRotationKey(boot_req);
+
+  // ---- scores through the pipeline: 1.5bw's front half, verbatim -------
+  const double s = boot.param->GetScale(fwd_level);
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0xCA05);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0xCA06);
+  const RealBatch v = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.dim, 0.08, 0xCA07);
+
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(boot.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      boot.context->encoder_.Encode(pt, fwd_level, s, slot_msg);
+      Ciphertext<word> enc;
+      boot.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(swtch.context, out[bi], enc, swtch.ui->GetEvkMap());
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  handler.Multiply(res, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                   swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+
+  double carried = 0.0;
+  std::vector<Ciphertext<word>> scores(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, res[bi], swtch.ui->GetEvkMap());
+    carried = back.GetScale() / boot.param->base_scale_;
+    back.SetNumSlots(num_slots);
+    bctx->Boot(scores[bi], back, boot.ui->GetEvkMap());
+  }
+  const int top = boot.param->NPToLevel(scores[0].GetNP());
+
+  // ---- host calibration: per-row live maxima, both norm intervals ------
+  const double m_eff = 8.0;
+  std::vector<std::vector<std::vector<double>>> S(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  double smin = 1e300, smax = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int col = 0; col < layout.dim; col++) {
+        double val = 0.0;
+        for (int x = 0; x < layout.contraction; x++) {
+          val += a[lane][row][x] * b[lane][x][col];
+        }
+        S[lane][row][col] = val;
+        smin = std::min(smin, val);
+        smax = std::max(smax, val);
+      }
+    }
+  }
+  const double span = smax - smin;
+  auto u_of = [&](double val) { return 2.0 * (val - smax) / span + 1.0; };
+
+  std::vector<std::vector<double>> rowmax(
+      layout.lanes, std::vector<double>(layout.dim, -1e300));
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int k = 0; k <= row; k++) {
+        rowmax[lane][row] = std::max(rowmax[lane][row], S[lane][row][k]);
+      }
+    }
+  }
+  double raw_lo = 1e300, raw_hi = -1e300, glo = 1e300, ghi = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      double sqv = 0.0, gsqv = 0.0;
+      for (int k = 0; k <= row; k++) {
+        sqv += std::exp(m_eff * (S[lane][row][k] - rowmax[lane][row]) / span);
+        gsqv += std::exp(m_eff * (S[lane][row][k] - smax) / span);
+      }
+      raw_lo = std::min(raw_lo, sqv);
+      raw_hi = std::max(raw_hi, sqv);
+      glo = std::min(glo, gsqv);
+      ghi = std::max(ghi, gsqv);
+    }
+  }
+  const double lo = raw_lo * 0.9, hi = raw_hi * 1.1;
+
+  const double hb = m_eff / 4.0;
+  auto exp_coeffs = cheddar::chebfit::Interpolate(
+      [hb](double val) { return std::exp(hb * (val - 1.0)); }, 7);
+  const int exp_in = top - 1;
+  auto log2ceil = [](int n) {
+    int r = 0;
+    while ((1 << r) < n) r++;
+    return r;
+  };
+  const int exp_used =
+      EvalPoly<word>(exp_coeffs, exp_in, boot.param->GetScale(exp_in),
+                     boot.param->GetScale(exp_in), true)
+          .GetPolyDegree();
+  const int exp_out = exp_in - log2ceil(exp_used + 1);
+  EvalPoly<word> exp_poly(exp_coeffs, exp_in, boot.param->GetScale(exp_in),
+                          boot.param->GetScale(exp_out), true);
+  exp_poly.Compile(boot.context);
+
+  const int mask_level = exp_out - 1;
+  const int sq_level = mask_level - 1;
+  const int poly_in = sq_level - 1;
+  const double aff_a = 0.5 * (hi - lo);
+  const double aff_b = 0.5 * (hi + lo);
+  auto inv_coeffs = cheddar::chebfit::Interpolate(
+      [aff_a, aff_b](double val) {
+        return 1.0 / std::sqrt(aff_a * val + aff_b);
+      },
+      15);
+  const int inv_used =
+      EvalPoly<word>(inv_coeffs, poly_in, boot.param->GetScale(poly_in),
+                     boot.param->GetScale(poly_in), true)
+          .GetPolyDegree();
+  const int inv_out = poly_in - log2ceil(inv_used + 1);
+  EvalPoly<word> inv_poly(inv_coeffs, poly_in,
+                          boot.param->GetScale(poly_in),
+                          boot.param->GetScale(inv_out), true);
+  inv_poly.Compile(boot.context);
+
+  std::vector<int> reduce_dist;
+  for (int t = 0; t < 4; t++) {
+    reduce_dist.push_back((num_slots / layout.rank) << t);
+  }
+  {
+    EvkRequest rot_req;
+    for (int d : reduce_dist) rot_req.AddRequest(d, sq_level);
+    boot.ui->PrepareRotationKey(rot_req);
+  }
+  const auto &evk = boot.ui->GetEvkMap();
+  const auto &mult_key = evk.GetMultiplicationKey();
+
+  // ---- the affine with per-row shifts, exp, THE MASK -------------------
+  const double a1 = 2.0 / (span * carried);
+  std::vector<Ciphertext<word>> y(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Constant<word> c1;
+    boot.context->encoder_.EncodeConstant(c1, top,
+                                          boot.param->GetScale(top), a1);
+    Ciphertext<word> t1, u_ct;
+    boot.context->Mult(t1, scores[bi], c1);
+    boot.context->Rescale(u_ct, t1);
+    std::vector<Complex> a0_msg(boot.Degree(), Complex(0.0, 0.0));
+    std::vector<Complex> mask_msg(boot.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const bool live = column <= row;
+          const double shift = live ? rowmax[lane][row] : smax;
+          a0_msg[slot] = Complex(1.0 - 2.0 * shift / span, 0.0);
+          mask_msg[slot] = Complex(live ? 1.0 : 0.0, 0.0);
+        }
+      }
+    }
+    Plaintext<word> a0_pt;
+    boot.context->encoder_.Encode(a0_pt, exp_in, u_ct.GetScale(), a0_msg);
+    boot.context->Add(u_ct, u_ct, a0_pt);
+    Ciphertext<word> y_full;
+    exp_poly.Evaluate(boot.context, y_full, u_ct, mult_key);
+    Plaintext<word> mask_pt;
+    boot.context->encoder_.Encode(mask_pt, exp_out,
+                                  boot.param->GetScale(exp_out), mask_msg);
+    Ciphertext<word> t2;
+    boot.context->Mult(t2, y_full, mask_pt);
+    boot.context->Rescale(y[bi], t2);
+  }
+  // The norm now sums live keys only; the tree is 1.5bv's, untouched.
+  Ciphertext<word> sq, term, rotated;
+  boot.context->HMult(sq, y[0], y[0], mult_key);
+  boot.context->HMult(term, y[1], y[1], mult_key);
+  boot.context->Add(sq, sq, term);
+  for (int d : reduce_dist) {
+    boot.context->HRotAdd(rotated, sq, sq, evk.GetRotationKey(d), d);
+    boot.context->Copy(sq, rotated);
+  }
+  {
+    Constant<word> inv_a;
+    boot.context->encoder_.EncodeConstant(
+        inv_a, sq_level, boot.param->GetScale(sq_level), 1.0 / aff_a);
+    Ciphertext<word> scaled;
+    boot.context->Mult(scaled, sq, inv_a);
+    boot.context->Rescale(sq, scaled);
+    Constant<word> shift;
+    boot.context->encoder_.EncodeConstant(shift, poly_in, sq.GetScale(),
+                                          -aff_b / aff_a);
+    boot.context->Add(sq, sq, shift);
+  }
+  Ciphertext<word> r;
+  inv_poly.Evaluate(boot.context, r, sq, mult_key);
+  const int meet = boot.param->NPToLevel(r.GetNP());
+  std::vector<Ciphertext<word>> P(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> levelled, prod;
+    boot.context->LevelDown(levelled, y[bi], meet);
+    boot.context->HMult(prod, levelled, r, mult_key);
+    boot.context->HMult(P[bi], prod, prod, mult_key);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const int p_level = boot.param->NPToLevel(P[0].GetNP());
+  ASSERT_GE(p_level, fwd_level)
+      << "the masked walk overspent its levels; P fell below fwd_level";
+  if (p_level > fwd_level) {
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      Ciphertext<word> down;
+      boot.context->LevelDown(down, P[bi], fwd_level);
+      P[bi] = std::move(down);
+    }
+  }
+  ASSERT_EQ(boot.param->NPToLevel(P[0].GetNP()), fwd_level);
+
+  // What P arrived as: the causal shape is checked HERE, before V.
+  std::vector<std::vector<std::vector<double>>> P_dec(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, P[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          P_dec[lane][row][column] = slots[slot].real();
+        }
+      }
+    }
+  }
+  double masked_resid = 0.0, rowsum_dev = 0.0;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    for (int row = 0; row < layout.dim; row++) {
+      double rs = 0.0;
+      for (int k = 0; k < layout.dim; k++) {
+        if (k <= row) {
+          rs += P_dec[lane][row][k];
+        } else {
+          masked_resid =
+              std::max(masked_resid, std::abs(P_dec[lane][row][k]));
+        }
+      }
+      rowsum_dev = std::max(rowsum_dev, std::abs(rs - 1.0));
+    }
+  }
+
+  // ---- P x V, exactly 1.5bw's second contraction -----------------------
+  std::vector<Ciphertext<word>> p_sinc(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    conv.SlotToSinC(swtch.context, p_sinc[bi], P[bi],
+                    swtch.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(p_sinc[bi].GetNP()), chain_level);
+  }
+  std::vector<Ciphertext<word>> out;
+  for (int call = 0; call < 2; call++) {
+    RealBatch h(layout.lanes,
+                std::vector<std::vector<double>>(
+                    layout.dim, std::vector<double>(layout.dim, 0.0)));
+    for (int lane = 0; lane < layout.lanes; lane++) {
+      for (int x = 0; x < half_keys; x++) {
+        for (int col = 0; col < layout.dim; col++) {
+          h[lane][x][col] = v[lane][call * half_keys + x][col];
+        }
+      }
+    }
+    std::vector<Ciphertext<word>> v_rhs, p_lhs, part;
+    build(h, layout.num_cts, v_rhs);
+    p_lhs.push_back(std::move(p_sinc[call]));
+    handler.Multiply(part, p_lhs, v_rhs,
+                     swtch.ui->GetRingSwitchKey(layout.rank),
+                     swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    if (call == 0) {
+      out = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        boot.context->Add(out[bi], out[bi], part[bi]);
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // ---- back to slots, against the causal leg in the clear --------------
+  double worst_true = 0.0, worst_incoming = 0.0, worst_plain = 0.0;
+  double transposed = 0.0, half_sum = 0.0, biggest = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, out[bi], swtch.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(back.GetNP()), 0);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, back);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int lane = 0; lane < layout.lanes; lane++) {
+      for (int row = 0; row < layout.dim; row++) {
+        std::vector<double> p_true(layout.dim, 0.0);
+        std::vector<double> p_plain(layout.dim, 0.0);
+        double zsum = 0.0, gzsum = 0.0;
+        for (int k = 0; k < layout.dim; k++) {
+          p_plain[k] = std::exp(m_eff * (u_of(S[lane][row][k]) - 1.0) / 2.0);
+          gzsum += p_plain[k];
+          if (k <= row) {
+            p_true[k] = std::exp(
+                m_eff * (S[lane][row][k] - rowmax[lane][row]) / span);
+            zsum += p_true[k];
+          }
+        }
+        for (double &pv : p_true) pv /= zsum;
+        for (double &pv : p_plain) pv /= gzsum;
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          double want = 0.0, want_in = 0.0, want_plain = 0.0;
+          double want_t = 0.0, want_half = 0.0;
+          for (int k = 0; k < layout.dim; k++) {
+            want += p_true[k] * v[lane][k][column];
+            want_in += P_dec[lane][row][k] * v[lane][k][column];
+            want_plain += p_plain[k] * v[lane][k][column];
+            want_t += P_dec[lane][column][k] * v[lane][k][row];
+            if (k < half_keys) {
+              want_half += P_dec[lane][row][k] * v[lane][k][column];
+            }
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          biggest = std::max(biggest, std::abs(want));
+          worst_true = std::max(worst_true, std::abs(got - want));
+          worst_incoming =
+              std::max(worst_incoming, std::abs(got - want_in));
+          worst_plain = std::max(worst_plain, std::abs(got - want_plain));
+          transposed = std::max(transposed, std::abs(got - want_t));
+          half_sum = std::max(half_sum, std::abs(got - want_half));
+        }
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "the causal softmax through the walk (exp deg " << exp_used
+            << " @" << exp_in << ".." << exp_out << ", mask @" << mask_level
+            << ", invsqrt deg " << inv_used << " @" << poly_in << ".."
+            << inv_out << "): vs causal softmax x V " << worst_true
+            << ", vs decrypted P x V " << worst_incoming
+            << " (|output| up to " << biggest << ")" << std::endl;
+  std::cout << "  norm interval: per-row shifts [" << raw_lo << ", "
+            << raw_hi << "]; the global shift would need [" << glo << ", "
+            << ghi << "]" << std::endl;
+  std::cout << "  P at masked addresses <= " << masked_resid
+            << ", live row sums off one by " << rowsum_dev << std::endl;
+  std::cout << "  controls: un-masked softmax " << worst_plain
+            << ", transposed " << transposed << ", single-call half sum "
+            << half_sum << std::endl;
+
+  EXPECT_LT(worst_true, 2e-3)
+      << "the causal attention output did not land at the primary "
+         "addresses";
+  EXPECT_LT(worst_incoming, 1e-3)
+      << "the second contraction added more than its own floor";
+  EXPECT_LT(masked_resid, 1e-3) << "the mask leaked into P";
+  EXPECT_LT(rowsum_dev, 1e-2)
+      << "the live rows are not stochastic, so the norm summed the wrong "
+         "keys";
+  EXPECT_GT(worst_plain, 5e-3)
+      << "the causal and plain softmax agree, so the mask did nothing";
+  EXPECT_GT(transposed, 1e-2);
+  EXPECT_GT(half_sum, 1e-2)
+      << "one call alone matches, so the two-call sum never happened";
+}
