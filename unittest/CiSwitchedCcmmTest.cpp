@@ -6898,3 +6898,553 @@ TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
       << "the causal and plain softmax agree, so the mask did nothing";
   EXPECT_GT(transposed, 5e-3);
 }
+
+// The projections run at full width (Doing.md 1.5ce).
+//
+// 1.5ca emitted the half-density images from a toy 512-channel X -- one
+// ciphertext, one ModDecomp, a 512 x 512 weight slice. The layer's real
+// residual is 4096 channels = EIGHT such ciphertexts, and the promised
+// "same machinery summed over eight input cts" turns out to need no sum
+// at all: `PcmmHandler::Multiply` computes res[i] = sum_j u[i][j] cts[j]
+// over however many columns U has, so the eight ciphertexts' ModDecomp
+// parts CONCATENATE into one 4096-part vector and U widens to 512 x 4096
+// -- the cross-ciphertext accumulation lives inside the PP-MM's own inner
+// sum, zero new mechanism, zero library code.
+//
+// What changes against 1.5ca, exactly:
+//   - X is 4096 channels over eight ciphertexts, each holding channels
+//     [512 l, 512 l + 512) as the banded recomposition of its components;
+//     eight ModDecomps run ONCE and all 32 emissions mix the same parts.
+//   - The weight slice per half-image is 512 x 4096 (rows I >= 256 still
+//     zero), encoded at the same rp(1) scale.
+//   - ModPack, Rescale, HalfBoot, the transport and the chain are
+//     untouched -- width never reaches them.
+//
+// Measured to the scores through the real transport (HalfBoot @19 ->
+// RoPE + restore + kill -> merge -> exchange -> [K: cross] -> premapped
+// descents @3 -> chain x2), against the full-width projections in the
+// clear, with the transposed and un-RoPE'd controls. The weights scale as
+// 1/sqrt(width), so |S| stays put and the noise datum is directly
+// comparable with 1.5ca's 1.42e-04.
+TEST(CiBootSet, TheProjectionsRunAtFullWidth) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int pcmm_level = 1;
+  const int land_level = 19;
+  const int exchange_level = 18;
+  const int cross_level = 17;
+  const int conv_level = 3;
+  const int chain_level = 2;
+  const int sub_degree = 32;
+  const int n = boot.Degree();
+  const int proj_rank = 512;
+  const int proj_small = n / proj_rank;  // 128 = T
+  const int num_x = 8;                   // eight X ciphertexts
+  const int in_ch = num_x * proj_rank;   // 4096: the layer's real width
+
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  const int half = layout.contraction;  // 64
+
+  auto rev = [](int v, int bits) {
+    int r = 0;
+    for (int j = 0; j < bits; j++) {
+      r = (r << 1) | (v & 1);
+      v >>= 1;
+    }
+    return r;
+  };
+  auto exch = [](int s) {
+    const int a = (s >> 7) & 31, b = s & 31;
+    return (s & ~((31 << 7) | 31)) | (b << 7) | a;
+  };
+  auto door0 = [&](int t, int c, int i) {
+    return (rev(c % 16, 4) << 12) | (rev(i, 5) << 7) | rev(t, 7);
+  };
+  auto door1 = [&](int t, int c, int i) { return exch(door0(t, c, i)); };
+  auto door1k = [&](int t, int c, int i) {
+    return (door1(t, c, i) & ~(7 << 7)) | (((c / 16) % 4) << 7);
+  };
+
+  const int num_blocks = n / sub_degree;
+  std::vector<int> pre_q(num_blocks, -1), pre_k(num_blocks, -1);
+  {
+    int bad = 0;
+    for (int t = 0; t < layout.dim; t++) {
+      for (int c = 0; c < layout.dim; c++) {
+        int ct_idx, slot, copy_slot;
+        layout.LocateSlot(t, c, 0, ct_idx, slot, copy_slot);
+        if (ct_idx != c / 16) bad++;
+        int db = door1(t, c, 0) >> 5;
+        if (pre_q[db] == -1) pre_q[db] = slot >> 5;
+        if (pre_q[db] != (slot >> 5)) bad++;
+        layout.LocateSlot(c % half, t, 0, ct_idx, slot, copy_slot);
+        if (ct_idx != t / 16) bad++;
+        db = door1k(t, c, 0) >> 5;
+        if (pre_k[db] == -1) pre_k[db] = slot >> 5;
+        if (pre_k[db] != (slot >> 5)) bad++;
+      }
+    }
+    ASSERT_EQ(bad, 0);
+    std::vector<char> used(num_blocks, 0);
+    for (int b = 0; b < num_blocks; b++) {
+      if (pre_k[b] != -1) used[pre_k[b]] = 1;
+    }
+    std::vector<int> free_out;
+    for (int b = 0; b < num_blocks; b++) {
+      if (!used[b]) free_out.push_back(b);
+    }
+    size_t fo = 0;
+    for (int b = 0; b < num_blocks; b++) {
+      if (pre_k[b] == -1) pre_k[b] = free_out[fo++];
+    }
+    ASSERT_EQ(fo, free_out.size());
+  }
+
+  // ---- keys, converters, the exchange --------------------------------
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv_q(swtch.context, sub_degree,
+                               /*forward_level=*/conv_level,
+                               /*inverse_level=*/-1, &layout, &pre_q);
+  CiSinCConverter<word> conv_k(swtch.context, sub_degree,
+                               /*forward_level=*/conv_level,
+                               /*inverse_level=*/-1, &layout, &pre_k);
+  EvkRequest req;
+  conv_q.AddRequiredRotations(req);
+  conv_k.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const int window = 31 * 127;
+  cheddar::StripedMatrix em(n, n);
+  for (int r = 0; r < n; r++) {
+    const int in = exch(r);
+    const int off = ((in - r) % n + n) % n;
+    em.try_emplace(off, n, Complex(0.0, 0.0));
+    em[off][r] = Complex(1.0, 0.0);
+  }
+  cheddar::LinearTransform<word> lt_exch(
+      boot.context, em, exchange_level,
+      boot.param->GetRescalePrimeProd(exchange_level), 8, 8,
+      /*pre_rotation=*/-window, /*additional_pt_rot=*/window);
+  const int window_back = n - window;
+  {
+    EvkRequest ereq;
+    lt_exch.AddRequiredRotations(ereq);
+    ereq.AddRequest(window_back, exchange_level - 1);
+    boot.ui->PrepareRotationKey(ereq);
+  }
+  const int merge_idx = n - 128;
+  boot.ui->PrepareRotationKey(merge_idx, exchange_level);
+  {
+    std::set<int> idxs;
+    for (int u = 0; u < 4; u++) {
+      for (int v = 0; v < 8; v++) {
+        const int rot = (v - u) * 128;
+        if (rot != 0) idxs.insert((rot % n + n) % n);
+      }
+    }
+    for (int idx : idxs) boot.ui->PrepareRotationKey(idx, cross_level);
+  }
+
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    EvkRequest boot_req;
+    bctx->AddRequiredRotations(boot_req, num_slots);
+    boot.ui->PrepareRotationKey(boot_req);
+  }
+
+  // ---- the projections: eight X ciphertexts, one part vector ----------
+  cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
+  cheddar::PcmmHandler<word> pcmm(*boot.param);
+  boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
+  for (int j = 0; j < proj_rank; j++) {
+    pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
+  }
+
+  std::mt19937_64 gen(0xB151);
+  std::uniform_real_distribution<double> xd(-1.0, 1.0);
+  std::vector<std::vector<double>> x_comp(
+      in_ch, std::vector<double>(proj_small, 0.0));
+  for (auto &ch : x_comp) {
+    for (auto &v : ch) v = xd(gen);
+  }
+  const double wa = 0.24 / std::sqrt(static_cast<double>(in_ch));
+  std::uniform_real_distribution<double> wd(-wa, wa);
+  std::vector<std::vector<std::vector<double>>> wq(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(in_ch, 0.0)));
+  auto wk = wq;
+  for (int i = 0; i < layout.lanes; i++) {
+    for (int c = 0; c < layout.dim; c++) {
+      for (int o = 0; o < in_ch; o++) {
+        wq[i][c][o] = wd(gen);
+        wk[i][c][o] = wd(gen);
+      }
+    }
+  }
+  auto project = [&](const std::vector<std::vector<std::vector<double>>> &w) {
+    RealBatch r(layout.lanes,
+                std::vector<std::vector<double>>(
+                    layout.dim, std::vector<double>(layout.dim, 0.0)));
+    for (int i = 0; i < layout.lanes; i++) {
+      for (int t = 0; t < layout.dim; t++) {
+        for (int c = 0; c < layout.dim; c++) {
+          double s = 0.0;
+          for (int o = 0; o < in_ch; o++) s += w[i][c][o] * x_comp[o][t];
+          r[i][t][c] = s;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q = project(wq);
+  const RealBatch kk = project(wk);
+
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / layout.dim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < layout.lanes; t++) {
+      for (int i = 0; i < layout.dim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), sn = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * sn;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * sn;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  // Eight encryptions, eight ModDecomps, ONE concatenated part vector:
+  // parts [512 l, 512 l + 512) come from the ciphertext holding channels
+  // [512 l, 512 l + 512), so part index == input-channel index and the
+  // wider U below reads it directly.
+  std::vector<cheddar::MlweCiphertext<word>> x_parts;
+  double decomp_seconds = 0.0;
+  {
+    const auto d0 = std::chrono::steady_clock::now();
+    for (int l = 0; l < num_x; l++) {
+      std::vector<std::vector<double>> slice(
+          x_comp.begin() + l * proj_rank,
+          x_comp.begin() + (l + 1) * proj_rank);
+      const auto x_rec = HostRecompose(slice, proj_rank, proj_small);
+      Plaintext<word> pt;
+      boot.context->encoder_.EncodeCoeff(pt, pcmm_level,
+                                         boot.param->GetScale(pcmm_level),
+                                         x_rec);
+      Ciphertext<word> x_ct;
+      boot.ui->Encrypt(x_ct, pt);
+      std::vector<cheddar::MlweCiphertext<word>> parts;
+      mlwe.ModDecomp(parts, x_ct, proj_small);
+      ASSERT_EQ(static_cast<int>(parts.size()), proj_rank);
+      for (auto &p : parts) x_parts.push_back(std::move(p));
+    }
+    cudaDeviceSynchronize();
+    decomp_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - d0)
+            .count();
+  }
+  ASSERT_EQ(static_cast<int>(x_parts.size()), in_ch);
+
+  const double w_scale = boot.param->GetRescalePrimeProd(pcmm_level);
+  double pcmm_seconds = 0.0, halfboot_seconds = 0.0;
+  int emit_count = 0;
+  auto emit_half = [&](const std::vector<std::vector<std::vector<double>>> &w,
+                       int l, int fam, Ciphertext<word> &out) {
+    std::vector<double> vals(static_cast<size_t>(proj_rank) * in_ch, 0.0);
+    for (int hh = 0; hh < 16; hh++) {
+      for (int cp = 0; cp < 16; cp++) {
+        const int row = hh * 16 + cp;
+        for (int o = 0; o < in_ch; o++) {
+          vals[static_cast<size_t>(row) * in_ch + o] =
+              w[fam * 16 + hh][l * 16 + cp][o];
+        }
+      }
+    }
+    const auto p0 = std::chrono::steady_clock::now();
+    cheddar::PlainMatrix<word> u;
+    pcmm.EncodeMatrix(u, pcmm_level, w_scale, vals, proj_rank, in_ch);
+    std::vector<cheddar::MlweCiphertext<word>> mixed;
+    pcmm.Multiply(mixed, u, x_parts);
+    ASSERT_EQ(static_cast<int>(mixed.size()), proj_rank);
+    Ciphertext<word> packed, dropped;
+    mlwe.ModPack(boot.context, packed, mixed, pack_keys);
+    boot.context->Rescale(dropped, packed);
+    ASSERT_EQ(boot.param->NPToLevel(dropped.GetNP()), 0);
+    cudaDeviceSynchronize();
+    pcmm_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - p0)
+            .count();
+    dropped.SetNumSlots(num_slots);
+    const auto h0 = std::chrono::steady_clock::now();
+    bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    halfboot_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - h0)
+            .count();
+    emit_count++;
+    ASSERT_EQ(boot.param->NPToLevel(out.GetNP()), land_level);
+  };
+
+  std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8);
+  for (int l = 0; l < 8; l++) {
+    emit_half(wq, l, 0, q_a[l]);
+    emit_half(wq, l, 1, q_b[l]);
+    emit_half(wk, l, 0, k_a[l]);
+    emit_half(wk, l, 1, k_b[l]);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  double hb_const = 0.0;
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, k_a[0]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    double rlo = 1e300, rhi = -1e300, rsum = 0.0;
+    int counted = 0;
+    for (int t = 0; t < layout.dim; t++) {
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const double want = kk[hh][t][cp];
+          if (std::abs(want) < 0.02) continue;
+          const double r = slots[door0(t, cp, hh)].real() / want;
+          rlo = std::min(rlo, r);
+          rhi = std::max(rhi, r);
+          rsum += r;
+          counted++;
+        }
+      }
+    }
+    hb_const = rsum / counted;
+    std::cout << "  boundary constant at full width " << hb_const << " (2^"
+              << std::log2(std::abs(hb_const)) << "), spread [" << rlo
+              << ", " << rhi << "] over " << counted << std::endl;
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+  }
+
+  const double restore = 1.0 / hb_const;
+  auto rope_and_kill = [&](std::vector<Ciphertext<word>> &a_cts,
+                           std::vector<Ciphertext<word>> &b_cts) {
+    const double pt_scale = boot.param->GetRescalePrimeProd(land_level);
+    for (int lo = 0; lo < 4; lo++) {
+      std::vector<Complex> cm(n, Complex(0.0, 0.0));
+      std::vector<Complex> sm(n, Complex(0.0, 0.0));
+      std::vector<Complex> nm(n, Complex(0.0, 0.0));
+      for (int t = 0; t < layout.dim; t++) {
+        for (int cp = 0; cp < 16; cp++) {
+          const double ang = t * theta[lo * 16 + cp];
+          for (int hh = 0; hh < 16; hh++) {
+            const int slot = door0(t, lo * 16 + cp, hh);
+            cm[slot] = Complex(std::cos(ang) * restore, 0.0);
+            sm[slot] = Complex(std::sin(ang) * restore, 0.0);
+            nm[slot] = Complex(-std::sin(ang) * restore, 0.0);
+          }
+        }
+      }
+      Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+      boot.context->encoder_.Encode(cos_pt, land_level, pt_scale, cm);
+      boot.context->encoder_.Encode(sin_pt, land_level, pt_scale, sm);
+      boot.context->encoder_.Encode(neg_sin_pt, land_level, pt_scale, nm);
+      for (int fam = 0; fam < 2; fam++) {
+        std::vector<Ciphertext<word>> &cts = (fam == 0) ? a_cts : b_cts;
+        Ciphertext<word> &lo_ct = cts[lo];
+        Ciphertext<word> &hi_ct = cts[lo + 4];
+        Ciphertext<word> aa, bb, dd;
+        boot.context->Mult(aa, lo_ct, cos_pt);
+        boot.context->Mult(bb, hi_ct, neg_sin_pt);
+        boot.context->Add(aa, aa, bb);
+        boot.context->Mult(bb, hi_ct, cos_pt);
+        boot.context->Mult(dd, lo_ct, sin_pt);
+        boot.context->Add(bb, bb, dd);
+        boot.context->Rescale(lo_ct, aa);
+        boot.context->Rescale(hi_ct, bb);
+      }
+    }
+  };
+  auto merge = [&](std::vector<Ciphertext<word>> &a_cts,
+                   std::vector<Ciphertext<word>> &b_cts) {
+    for (int l = 0; l < layout.num_cts; l++) {
+      Ciphertext<word> moved;
+      boot.context->HRot(moved, b_cts[l],
+                         boot.ui->GetEvkMap().GetRotationKey(merge_idx),
+                         merge_idx);
+      boot.context->Add(a_cts[l], a_cts[l], moved);
+    }
+  };
+  auto exchange_all = [&](std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      Ciphertext<word> shifted, swapped;
+      lt_exch.Evaluate(boot.context, shifted, ct, boot.ui->GetEvkMap());
+      boot.context->HRot(swapped, shifted,
+                         boot.ui->GetEvkMap().GetRotationKey(window_back),
+                         window_back);
+      ct = std::move(swapped);
+    }
+  };
+
+  rope_and_kill(q_a, q_b);
+  rope_and_kill(k_a, k_b);
+  merge(q_a, q_b);
+  merge(k_a, k_b);
+  exchange_all(q_a);
+  exchange_all(k_a);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  const double cr_pt_scale = boot.param->GetRescalePrimeProd(cross_level);
+  std::vector<Plaintext<word>> sel(8);
+  for (int v = 0; v < 8; v++) {
+    std::vector<Complex> msg(n, Complex(0.0, 0.0));
+    for (int s = 0; s < n; s++) {
+      if (((s >> 7) & 7) == v) msg[s] = Complex(1.0, 0.0);
+    }
+    boot.context->encoder_.Encode(sel[v], cross_level, cr_pt_scale, msg);
+  }
+  auto cross = [&](int call) {
+    std::vector<Ciphertext<word>> out(layout.num_cts);
+    for (int t_hi = 0; t_hi < layout.num_cts; t_hi++) {
+      const int v = rev(t_hi, 3);
+      Ciphertext<word> acc;
+      bool first = true;
+      for (int l = call * 4; l < call * 4 + 4; l++) {
+        Ciphertext<word> piece;
+        boot.context->Mult(piece, k_a[l], sel[v]);
+        const int rot = (v - l % 4) * 128;
+        if (rot != 0) {
+          const int idx = (rot % n + n) % n;
+          Ciphertext<word> moved;
+          boot.context->HRot(moved, piece,
+                             boot.ui->GetEvkMap().GetRotationKey(idx), idx);
+          piece = std::move(moved);
+        }
+        if (first) {
+          acc = std::move(piece);
+          first = false;
+        } else {
+          boot.context->Add(acc, acc, piece);
+        }
+      }
+      boot.context->Rescale(out[t_hi], acc);
+    }
+    return out;
+  };
+
+  auto convert = [&](CiSinCConverter<word> &conv,
+                     std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      Ciphertext<word> at_level;
+      boot.context->LevelDown(at_level, ct, conv_level);
+      Ciphertext<word> sinc;
+      conv.SlotToSinC(swtch.context, sinc, at_level, swtch.ui->GetEvkMap());
+      ct = std::move(sinc);
+    }
+  };
+  convert(conv_q, q_a);
+
+  std::vector<Ciphertext<word>> res;
+  for (int call = 0; call < 2; call++) {
+    std::vector<Ciphertext<word>> rhs = cross(call);
+    convert(conv_k, rhs);
+    std::vector<Ciphertext<word>> lhs;
+    for (int i = 0; i < layout.num_cts / 2; i++) {
+      lhs.push_back(std::move(q_a[call * layout.num_cts / 2 + i]));
+    }
+    std::vector<Ciphertext<word>> part;
+    handler.Multiply(part, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                     swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    if (call == 0) {
+      res = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        boot.context->Add(res[bi], res[bi], part[bi]);
+      }
+    }
+  }
+
+  std::vector<std::vector<Complex>> got(layout.dim);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    ASSERT_EQ(boot.param->NPToLevel(res[bi].GetNP()), chain_level - 1);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, res[bi]);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, layout.rank, small.Degree());
+    for (int j = 0; j < layout.rank; j++) {
+      Plaintext<word> bridge;
+      small.context->encoder_.EncodeCoeff(
+          bridge, chain_level - 1,
+          small.param->GetScale(chain_level - 1), comp[j]);
+      small.context->encoder_.DecodeSinC(got[bi * layout.rank + j], bridge,
+                                         sub_degree);
+    }
+  }
+
+  double worst = 0.0, transposed = 0.0, norope = 0.0, biggest = 0.0;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int column = 0; column < layout.dim; column++) {
+        double want = 0.0, want_t = 0.0, want_raw = 0.0;
+        for (int c = 0; c < layout.dim; c++) {
+          want += q_ref[head][row][c] * k_ref[head][column][c];
+          want_t += q_ref[head][column][c] * k_ref[head][row][c];
+          want_raw += q[head][row][c] * kk[head][column][c];
+        }
+        biggest = std::max(biggest, std::abs(want));
+        int part, index;
+        layout.LocatePart(row, column, lane, part, index);
+        const double g = got[part][index].real();
+        worst = std::max(worst, std::abs(g - want));
+        transposed = std::max(transposed, std::abs(g - want_t));
+        norope = std::max(norope, std::abs(g - want_raw));
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "full width (" << in_ch << " channels over " << num_x
+            << " X cts, one " << proj_rank << " x " << in_ch
+            << " U per half-image): products " << worst << " (|scores| <= "
+            << biggest << ")" << std::endl;
+  std::cout << "  controls: transposed " << transposed << ", un-RoPE'd "
+            << norope << std::endl;
+  std::cout << "  cost: ModDecomp x" << num_x << " " << decomp_seconds
+            << " s once, PC-MM emit "
+            << pcmm_seconds / std::max(emit_count, 1) << " s/ct, HalfBoot "
+            << halfboot_seconds / std::max(emit_count, 1) << " s/ct over "
+            << emit_count << " cts" << std::endl;
+
+  EXPECT_LT(worst, 2e-2)
+      << "the full-width projections did not land the scores at the "
+         "primary parts";
+  EXPECT_GT(transposed, 1e-2);
+  EXPECT_GT(norope, 1e-2);
+}
