@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdlib>
 
 #include "common/Assert.h"
 #include "common/Basic.cuh"
@@ -50,7 +51,130 @@ __global__ void PcmmAccum(word *const *dst_ptrs, const word *const *src_ptrs,
   dst_ptrs[row][limb_offset] = acc;
 }
 
+// The same product with `TILE` output rows per thread.
+//
+// The kernel above reads the ciphertext operand once per OUTPUT ROW: at the
+// layer's shape that is 512 passes over the same `cols * degree` words, and
+// the product is memory-bound long before it is arithmetic-bound. Holding
+// `TILE` accumulators in registers makes one src load serve `TILE`
+// multiply-adds, which is the only thing that changes here -- the
+// arithmetic, the Montgomery form and the accumulation order within a row
+// are identical, so the result is bit-identical to `PcmmAccum`.
+//
+// `u` is the small operand (rows * cols per limb) and is read `TILE` times
+// per src load, which is what L2 is for. The zero test survives the tiling
+// and gets stronger: the src load is skipped only when EVERY row of the
+// tile has a zero coefficient, which is exactly the case the half-density
+// weight slices produce in bulk (rows >= 256 are entirely zero, Doing.md
+// 1.5by), so a tile either does full work or none.
+template <typename word, int TILE>
+__global__ void PcmmAccumTiled(word *const *dst_ptrs,
+                               const word *const *src_ptrs, const word *u,
+                               const word *primes,
+                               const make_signed_t<word> *inv_primes, int rows,
+                               int cols, int degree) {
+  using signed_word = make_signed_t<word>;
+
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row0 = blockIdx.y * TILE;
+  const int prime_index = blockIdx.z;
+
+  const word prime = basic::StreamingLoadConst(primes + prime_index);
+  const signed_word inv_prime =
+      basic::StreamingLoadConst(inv_primes + prime_index);
+
+  const word *u_base =
+      u + (static_cast<size_t>(prime_index) * rows + row0) * cols;
+  const int limb_offset = prime_index * degree + x;
+
+  word acc[TILE];
+#pragma unroll
+  for (int t = 0; t < TILE; t++) acc[t] = 0;
+
+  for (int j = 0; j < cols; j++) {
+    word u_value[TILE];
+    word any = 0;
+#pragma unroll
+    for (int t = 0; t < TILE; t++) {
+      u_value[t] = basic::StreamingLoadConst(u_base + t * cols + j);
+      any |= u_value[t];
+    }
+    if (any == 0) continue;
+    const word src_value = basic::StreamingLoad(src_ptrs[j] + limb_offset);
+#pragma unroll
+    for (int t = 0; t < TILE; t++) {
+      if (u_value[t] == 0) continue;
+      const word product =
+          basic::MultMontgomery(u_value[t], src_value, prime, inv_prime);
+      acc[t] = basic::Add(acc[t], product, prime);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < TILE; t++) {
+    dst_ptrs[row0 + t][limb_offset] = acc[t];
+  }
+}
+
 }  // namespace kernel
+
+namespace {
+
+// How many output rows one thread carries. 8 by default; the environment
+// override exists so the tile can be swept without a rebuild, the way the
+// layer's other performance switches are.
+int RowTile() {
+  static const int tile = [] {
+    const char *env = std::getenv("CHEDDAR_PCMM_ROW_TILE");
+    const int t = (env != nullptr) ? std::atoi(env) : 8;
+    switch (t) {
+      case 1:
+      case 2:
+      case 4:
+      case 8:
+      case 16:
+        return t;
+      default:
+        return 8;
+    }
+  }();
+  return tile;
+}
+
+// One product launch, tiled as far as the row count divides.
+template <typename word>
+void LaunchAccum(word *const *dst, const word *const *src, const word *u,
+                 const word *primes, const make_signed_t<word> *inv_primes,
+                 int rows, int cols, int degree, int num_primes,
+                 int block_dim) {
+  int tile = RowTile();
+  while (tile > 1 && rows % tile != 0) tile /= 2;
+  const dim3 grid(degree / block_dim, rows / tile, num_primes);
+  switch (tile) {
+    case 16:
+      kernel::PcmmAccumTiled<word, 16><<<grid, block_dim>>>(
+          dst, src, u, primes, inv_primes, rows, cols, degree);
+      break;
+    case 8:
+      kernel::PcmmAccumTiled<word, 8><<<grid, block_dim>>>(
+          dst, src, u, primes, inv_primes, rows, cols, degree);
+      break;
+    case 4:
+      kernel::PcmmAccumTiled<word, 4><<<grid, block_dim>>>(
+          dst, src, u, primes, inv_primes, rows, cols, degree);
+      break;
+    case 2:
+      kernel::PcmmAccumTiled<word, 2><<<grid, block_dim>>>(
+          dst, src, u, primes, inv_primes, rows, cols, degree);
+      break;
+    default:
+      kernel::PcmmAccum<word><<<grid, block_dim>>>(
+          dst, src, u, primes, inv_primes, rows, cols, degree);
+      break;
+  }
+}
+
+}  // namespace
 
 template <typename word>
 int PlainMatrix<word>::GetRows() const {
@@ -185,15 +309,13 @@ void PcmmHandler<word>::Multiply(std::vector<Ct> &res,
   const word *primes = param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = param_.GetInvPrimesPtr(np);
 
-  const dim3 grid_dim(degree / kernel_block_dim_, rows, num_total_primes);
-
   // b and a are two independent products against the same U.
-  kernel::PcmmAccum<word><<<grid_dim, kernel_block_dim_>>>(
-      d_dst_bx.data(), d_src_bx.data(), u.data_.data(), primes, inv_primes,
-      rows, cols, degree);
-  kernel::PcmmAccum<word><<<grid_dim, kernel_block_dim_>>>(
-      d_dst_ax.data(), d_src_ax.data(), u.data_.data(), primes, inv_primes,
-      rows, cols, degree);
+  LaunchAccum<word>(d_dst_bx.data(), d_src_bx.data(), u.data_.data(), primes,
+                    inv_primes, rows, cols, degree, num_total_primes,
+                    kernel_block_dim_);
+  LaunchAccum<word>(d_dst_ax.data(), d_src_ax.data(), u.data_.data(), primes,
+                    inv_primes, rows, cols, degree, num_total_primes,
+                    kernel_block_dim_);
 }
 
 template <typename word>
@@ -268,16 +390,14 @@ void PcmmHandler<word>::Multiply(
   // the 256-thread block: shrink the block rather than refuse the shape.
   // Both lengths are powers of two, so the smaller divides the other.
   const int block_b = Min(small_degree, kernel_block_dim_);
-  const dim3 grid_b(small_degree / block_b, rows, num_total_primes);
-  kernel::PcmmAccum<word><<<grid_b, block_b>>>(
-      d_dst_b.data(), d_src_b.data(), u.data_.data(), primes, inv_primes, rows,
-      cols, small_degree);
+  LaunchAccum<word>(d_dst_b.data(), d_src_b.data(), u.data_.data(), primes,
+                    inv_primes, rows, cols, small_degree, num_total_primes,
+                    block_b);
 
   const int block_a = Min(a_stride, kernel_block_dim_);
-  const dim3 grid_a(a_stride / block_a, rows, num_total_primes);
-  kernel::PcmmAccum<word><<<grid_a, block_a>>>(
-      d_dst_a.data(), d_src_a.data(), u.data_.data(), primes, inv_primes, rows,
-      cols, a_stride);
+  LaunchAccum<word>(d_dst_a.data(), d_src_a.data(), u.data_.data(), primes,
+                    inv_primes, rows, cols, a_stride, num_total_primes,
+                    block_a);
 }
 
 template class PlainMatrix<uint32_t>;

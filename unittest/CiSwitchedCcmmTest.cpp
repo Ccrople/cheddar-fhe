@@ -8415,3 +8415,131 @@ TEST(CiBootSet, TheModPackBasisIsAChoice) {
            "exceeds the digit";
   }
 }
+
+// What the PC-MM's row tile buys (Doing.md 1.5cl).
+//
+// 1.5ch put the layer's cost where it actually is: 48 projections at
+// 751 ms of ONLINE work each -- ~36 s against ~2 s for all of the
+// attention arithmetic -- and inside a projection ModPack is 22 ms, so
+// what a projection costs is the PP-MM. `PcmmAccum` gave one thread one
+// output row, which means the ciphertext operand is read once PER OUTPUT
+// ROW: 512 passes over the same cols * degree words at the layer's shape,
+// on a product that is memory-bound long before it is arithmetic-bound.
+// `PcmmAccumTiled` carries TILE rows per thread, so one src load serves
+// TILE multiply-adds; the arithmetic and the accumulation order within a
+// row are untouched, so it is bit-identical, and the zero test survives
+// (a tile skips the load only when every row of it has a zero, which is
+// what the half-density weight slices produce in bulk).
+//
+// The tile is `CHEDDAR_PCMM_ROW_TILE`, read once per process, so this
+// test measures ONE tile per run and the sweep is a loop over processes.
+// Correctness is checked every run against the host product, not against
+// another tile, so a run stands on its own.
+TEST(CiBootSet, ThePcmmRowTileIsAMeasurement) {
+  Ring boot(kBootParam);
+  const int pcmm_level = 1;
+  const int n = boot.Degree();
+  const int proj_rank = 512;
+  const int proj_small = n / proj_rank;  // 128
+  const int num_x = 8;
+  const int in_ch = num_x * proj_rank;   // 4096, the layer's real width
+
+  cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
+  cheddar::PcmmHandler<word> pcmm(*boot.param);
+
+  std::mt19937_64 gen(0xB171);
+  std::uniform_real_distribution<double> xd(-1.0, 1.0);
+  std::vector<std::vector<double>> x_comp(
+      in_ch, std::vector<double>(proj_small, 0.0));
+  for (auto &ch : x_comp) {
+    for (auto &v : ch) v = xd(gen);
+  }
+  const double wa = 0.24 / std::sqrt(static_cast<double>(in_ch));
+  std::uniform_real_distribution<double> wd(-wa, wa);
+  std::vector<double> vals(static_cast<size_t>(proj_rank) * in_ch, 0.0);
+  for (int row = 0; row < 256; row++) {  // the half-density contract
+    for (int o = 0; o < in_ch; o++) {
+      vals[static_cast<size_t>(row) * in_ch + o] = wd(gen);
+    }
+  }
+  std::vector<std::vector<double>> pref(proj_rank,
+                                        std::vector<double>(proj_small, 0.0));
+  for (int row = 0; row < proj_rank; row++) {
+    for (int t = 0; t < proj_small; t++) {
+      double s = 0.0;
+      for (int o = 0; o < in_ch; o++) {
+        s += vals[static_cast<size_t>(row) * in_ch + o] * x_comp[o][t];
+      }
+      pref[row][t] = s;
+    }
+  }
+  const auto want = HostRecompose(pref, proj_rank, proj_small);
+
+  std::vector<cheddar::MlweCiphertext<word>> x_parts;
+  for (int l = 0; l < num_x; l++) {
+    std::vector<std::vector<double>> slice(
+        x_comp.begin() + l * proj_rank, x_comp.begin() + (l + 1) * proj_rank);
+    const auto x_rec = HostRecompose(slice, proj_rank, proj_small);
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, pcmm_level,
+                                       boot.param->GetScale(pcmm_level),
+                                       x_rec);
+    Ciphertext<word> x_ct;
+    boot.ui->Encrypt(x_ct, pt);
+    std::vector<cheddar::MlweCiphertext<word>> parts;
+    mlwe.ModDecomp(parts, x_ct, proj_small);
+    for (auto &p : parts) x_parts.push_back(std::move(p));
+  }
+  ASSERT_EQ(static_cast<int>(x_parts.size()), in_ch);
+
+  cheddar::PlainMatrix<word> u;
+  pcmm.EncodeMatrix(u, pcmm_level,
+                    boot.param->GetRescalePrimeProd(pcmm_level), vals,
+                    proj_rank, in_ch);
+
+  std::vector<cheddar::MlweCiphertext<word>> mixed;
+  pcmm.Multiply(mixed, u, x_parts);  // warm-up
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  const int reps = 3;
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int r = 0; r < reps; r++) {
+    std::vector<cheddar::MlweCiphertext<word>> tmp;
+    pcmm.Multiply(tmp, u, x_parts);
+  }
+  cudaDeviceSynchronize();
+  const auto t1 = std::chrono::steady_clock::now();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // Correctness on its own terms: pack and read against the host product.
+  boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
+  for (int j = 0; j < proj_rank; j++) {
+    pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
+  }
+  Ciphertext<word> packed, dropped;
+  mlwe.ModPack(boot.context, packed, mixed, pack_keys);
+  boot.context->Rescale(dropped, packed);
+  Plaintext<word> back;
+  boot.ui->Decrypt(back, dropped);
+  std::vector<double> got;
+  boot.context->encoder_.DecodeCoeff(got, back);
+  double worst = 0.0, biggest = 0.0;
+  for (size_t i = 0; i < want.size(); i++) {
+    worst = std::max(worst, std::abs(got[i] - want[i]));
+    biggest = std::max(biggest, std::abs(want[i]));
+  }
+
+  const char *env = std::getenv("CHEDDAR_PCMM_ROW_TILE");
+  std::cout << "PC-MM at the layer's shape (" << proj_rank << " x " << in_ch
+            << " U over " << in_ch << " MLWE parts, rank " << proj_rank
+            << "), CHEDDAR_PCMM_ROW_TILE=" << (env ? env : "unset (8)")
+            << ": Multiply "
+            << std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                   reps
+            << " ms, emission error " << worst << " (|value| <= " << biggest
+            << ")" << std::endl;
+  EXPECT_LT(worst, 1e-2 * std::max(biggest, 1.0))
+      << "the tiled product does not agree with the host";
+}
