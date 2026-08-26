@@ -89,6 +89,7 @@ if(ENABLE_EXTENSION)
   list(APPEND CKKS_GPU_SOURCES
     src/extension/AttentionPacking.cpp
     src/extension/BootContext.cpp
+    src/extension/CiSinCAttention.cu
     src/extension/BootParameter.cpp
     src/extension/ComplexLinearTransform.cpp
     src/extension/EvalMod.cpp

@@ -54,6 +54,7 @@
 #include "core/Pcmm.h"
 #include "extension/BootContext.h"
 #include "extension/ChebyshevFit.h"
+#include "extension/CiSinCAttention.h"
 #include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
@@ -6437,4 +6438,463 @@ TEST(CiBootSet, TheCausalMaskFoldsIntoTheSoftmaxWalk) {
   EXPECT_GT(transposed, 1e-2);
   EXPECT_GT(half_sum, 1e-2)
       << "one call alone matches, so the two-call sum never happened";
+}
+
+// The library leg reproduces the reference (Doing.md 1.5cd).
+//
+// TheAttentionLegClosesEndToEnd is the reference implementation;
+// `CiSinCAttention` is its promotion into the library, and this test is the
+// promotion's proof: the SAME projections (real PC-MM emissions, real
+// HalfBoots, as 1.5ca/1.5cb), driven through the handler's Scores ->
+// caller's Boot -> PrepareSoftMax/SoftMax -> Values, against the SAME
+// host reference. Two things differ from the reference on purpose:
+//
+// 1. THE SOFTMAX RUNS CAUSAL -- 1.5cc's mechanism at the Llama alignment,
+//    which the reference has not run: exp deg 7 paying for the mask, the
+//    per-row shifts carried by `SoftMaxCalibration::row_shift` (indexed by
+//    LAYOUT lane), and -- new against 1.5cc, forced by the 128-key rows --
+//    the per-row norm estimates folded into the mask as est^-1/2
+//    (`row_norm`): at 128 live keys the raw interval is wide enough that
+//    invsqrt deg 15 costs ~1.4e-2 on the row sums (this test's first run
+//    measured it), and the fold collapses the interval to the actual /
+//    estimate ratio at zero levels, est cancelling identically in
+//    P = (y r)^2. The un-masked softmax reference must FAIL as a control,
+//    and P at masked addresses must be numerically zero.
+//
+// 2. V'S RESTORE IS ONE MASK MULTIPLY per ciphertext instead of the
+//    reference's zero-angle RoPE pair arithmetic -- the same values (the
+//    sin terms were exact plaintext zeros), a quarter of the multiplies.
+//
+// Everything else -- premaps, gamma's split fold, the exchange, K's cross,
+// V riding Q's converter, the chain calls, the walk's levels -- is the
+// reference transcribed, and the layout constants are asserted inside the
+// handler at construction.
+TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int pcmm_level = 1;
+  const int chain_level = 2;
+  const int n = boot.Degree();
+  const int proj_rank = 512;
+  const int proj_small = n / proj_rank;
+  const int in_ch = proj_rank;
+  const int num_slots = boot.param->MaxNumSlots();
+
+  auto rev = [](int v, int bits) {
+    int r = 0;
+    for (int j = 0; j < bits; j++) {
+      r = (r << 1) | (v & 1);
+      v >>= 1;
+    }
+    return r;
+  };
+  auto door0 = [&](int t, int c, int i) {
+    return (rev(c % 16, 4) << 12) | (rev(i, 5) << 7) | rev(t, 7);
+  };
+
+  // The boot set first: the handler's constructor reads GetStCInputScale.
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    EvkRequest boot_req;
+    bctx->AddRequiredRotations(boot_req, num_slots);
+    boot.ui->PrepareRotationKey(boot_req);
+  }
+
+  // ---- the projections: real PC-MM emissions, as in 1.5ca/1.5cb ---------
+  cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
+  cheddar::PcmmHandler<word> pcmm(*boot.param);
+  boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
+  for (int j = 0; j < proj_rank; j++) {
+    pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
+  }
+
+  std::mt19937_64 gen(0xB141);
+  std::uniform_real_distribution<double> xd(-1.0, 1.0);
+  std::vector<std::vector<double>> x_comp(
+      in_ch, std::vector<double>(proj_small, 0.0));
+  for (auto &ch : x_comp) {
+    for (auto &v : ch) v = xd(gen);
+  }
+  const int kDim = 128, kLanes = 32;
+  const double wa = 0.24 / std::sqrt(static_cast<double>(in_ch));
+  std::uniform_real_distribution<double> wd(-wa, wa);
+  using W = std::vector<std::vector<std::vector<double>>>;
+  W wq(kLanes, std::vector<std::vector<double>>(
+                   kDim, std::vector<double>(in_ch, 0.0)));
+  W wk = wq, wv = wq;
+  for (int i = 0; i < kLanes; i++) {
+    for (int c = 0; c < kDim; c++) {
+      for (int o = 0; o < in_ch; o++) {
+        wq[i][c][o] = wd(gen);
+        wk[i][c][o] = wd(gen);
+        wv[i][c][o] = wd(gen);
+      }
+    }
+  }
+  auto project = [&](const W &w) {
+    RealBatch r(kLanes, std::vector<std::vector<double>>(
+                            kDim, std::vector<double>(kDim, 0.0)));
+    for (int i = 0; i < kLanes; i++) {
+      for (int t = 0; t < kDim; t++) {
+        for (int c = 0; c < kDim; c++) {
+          double s = 0.0;
+          for (int o = 0; o < in_ch; o++) s += w[i][c][o] * x_comp[o][t];
+          r[i][t][c] = s;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q = project(wq);
+  const RealBatch kk = project(wk);
+  const RealBatch vv = project(wv);
+
+  const int half = kDim / 2;
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / kDim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < kLanes; t++) {
+      for (int i = 0; i < kDim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), sn = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * sn;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * sn;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  std::vector<cheddar::MlweCiphertext<word>> x_parts;
+  {
+    const auto x_rec = HostRecompose(x_comp, proj_rank, proj_small);
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, pcmm_level,
+                                       boot.param->GetScale(pcmm_level),
+                                       x_rec);
+    Ciphertext<word> x_ct;
+    boot.ui->Encrypt(x_ct, pt);
+    mlwe.ModDecomp(x_parts, x_ct, proj_small);
+  }
+
+  const double w_scale = boot.param->GetRescalePrimeProd(pcmm_level);
+  auto emit_half = [&](const W &w, int l, int fam, Ciphertext<word> &out) {
+    std::vector<double> vals(static_cast<size_t>(proj_rank) * in_ch, 0.0);
+    for (int hh = 0; hh < 16; hh++) {
+      for (int cp = 0; cp < 16; cp++) {
+        const int row = hh * 16 + cp;
+        for (int o = 0; o < in_ch; o++) {
+          vals[static_cast<size_t>(row) * in_ch + o] =
+              w[fam * 16 + hh][l * 16 + cp][o];
+        }
+      }
+    }
+    cheddar::PlainMatrix<word> u;
+    pcmm.EncodeMatrix(u, pcmm_level, w_scale, vals, proj_rank, in_ch);
+    std::vector<cheddar::MlweCiphertext<word>> mixed;
+    pcmm.Multiply(mixed, u, x_parts);
+    Ciphertext<word> packed, dropped;
+    mlwe.ModPack(boot.context, packed, mixed, pack_keys);
+    boot.context->Rescale(dropped, packed);
+    dropped.SetNumSlots(num_slots);
+    bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap());
+  };
+
+  std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8),
+      v_b(8);
+  for (int l = 0; l < 8; l++) {
+    emit_half(wq, l, 0, q_a[l]);
+    emit_half(wq, l, 1, q_b[l]);
+    emit_half(wk, l, 0, k_a[l]);
+    emit_half(wk, l, 1, k_b[l]);
+    emit_half(wv, l, 0, v_a[l]);
+    emit_half(wv, l, 1, v_b[l]);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  EXPECT_NEAR(q_a[0].GetScale() / bctx->GetStCInputScale(), 1.0, 1e-9);
+
+  double hb_const = 0.0;
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, k_a[0]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    double rsum = 0.0;
+    int counted = 0;
+    for (int t = 0; t < kDim; t++) {
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const double want = kk[hh][t][cp];
+          if (std::abs(want) < 0.02) continue;
+          rsum += slots[door0(t, cp, hh)].real() / want;
+          counted++;
+        }
+      }
+    }
+    hb_const = rsum / counted;
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+  }
+
+  // ---- the handler, its keys ------------------------------------------
+  typename cheddar::CiSinCAttention<word>::Config acfg;
+  acfg.restore = 1.0 / hb_const;
+  const auto t0 = std::chrono::steady_clock::now();
+  cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
+                                      lifted.context, acfg);
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto &layout = attn.GetLayout();
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    EvkRequest req;
+    attn.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  typename cheddar::CiSinCAttention<word>::Keys keys;
+  keys.boot = &boot.ui->GetEvkMap();
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(layout.rank);
+  keys.inverse_ring_switch = &swtch.ui->GetInverseRingSwitchKey(layout.rank);
+
+  // ---- host calibration off the clear twin ----------------------------
+  const double m_eff = 8.0;
+  std::vector<std::vector<std::vector<double>>> S(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  double smin = 1e300, smax = -1e300;
+  for (int head = 0; head < layout.lanes; head++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int col = 0; col < layout.dim; col++) {
+        double v = 0.0;
+        for (int c = 0; c < layout.dim; c++) {
+          v += q_ref[head][row][c] * k_ref[head][col][c];
+        }
+        S[head][row][col] = v;
+        smin = std::min(smin, v);
+        smax = std::max(smax, v);
+      }
+    }
+  }
+  const double span = smax - smin;
+  // row_shift is indexed by the LAYOUT lane; the physical head there is
+  // rev5(lane), exactly as every slot read in this suite.
+  std::vector<std::vector<double>> row_shift(
+      layout.lanes, std::vector<double>(layout.dim, -1e300));
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int k = 0; k <= row; k++) {
+        row_shift[lane][row] =
+            std::max(row_shift[lane][row], S[head][row][k]);
+      }
+    }
+  }
+  // The live-norm estimates, folded into the mask as est^-1/2. At 128
+  // live keys the raw interval is wide enough that invsqrt deg 15 costs
+  // ~1.4e-2 on the row sums (the first run of this test measured it);
+  // with the fold the interval is the actual / estimate ratio, here 1 by
+  // construction, and only the margins remain.
+  std::vector<std::vector<double>> row_norm(
+      layout.lanes, std::vector<double>(layout.dim, 0.0));
+  double raw_lo = 1e300, raw_hi = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      double sqv = 0.0;
+      for (int k = 0; k <= row; k++) {
+        sqv += std::exp(m_eff * (S[head][row][k] - row_shift[lane][row]) /
+                        span);
+      }
+      row_norm[lane][row] = sqv;
+      raw_lo = std::min(raw_lo, sqv);
+      raw_hi = std::max(raw_hi, sqv);
+    }
+  }
+
+  typename cheddar::CiSinCAttention<word>::SoftMaxCalibration calib;
+  calib.m_eff = m_eff;
+  calib.span = span;
+  calib.shift = smax;
+  calib.norm_lo = 0.9;
+  calib.norm_hi = 1.1;
+  calib.causal = true;
+  calib.row_shift = row_shift;
+  calib.row_norm = row_norm;
+  attn.PrepareSoftMax(calib);
+
+  // ---- the leg through the handler ------------------------------------
+  const auto t2 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> s0;
+  attn.Scores(s0, q_a, q_b, k_a, k_b, keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t3 = std::chrono::steady_clock::now();
+  const double carried = s0[0].GetScale() / boot.param->base_scale_;
+  ASSERT_LT(carried * std::max(std::abs(smax), std::abs(smin)), 0.95)
+      << "the handler's canonicalising fold did not land carried in "
+         "EvalMod's range";
+
+  std::vector<Ciphertext<word>> scores(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    s0[bi].SetNumSlots(num_slots);
+    bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
+  }
+  ASSERT_EQ(boot.param->NPToLevel(scores[0].GetNP()), attn.GetTopLevel());
+
+  const auto t4 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> P;
+  attn.SoftMax(P, scores, carried, boot.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t5 = std::chrono::steady_clock::now();
+
+  // What P arrived as: the causal shape checked before V.
+  std::vector<std::vector<std::vector<double>>> P_dec(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, P[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          P_dec[rev(lane, 5)][row][column] = slots[slot].real();
+        }
+      }
+    }
+  }
+  double masked_resid = 0.0, rowsum_dev = 0.0;
+  for (int head = 0; head < layout.lanes; head++) {
+    for (int row = 0; row < layout.dim; row++) {
+      double rs = 0.0;
+      for (int k = 0; k < layout.dim; k++) {
+        if (k <= row) {
+          rs += P_dec[head][row][k];
+        } else {
+          masked_resid =
+              std::max(masked_resid, std::abs(P_dec[head][row][k]));
+        }
+      }
+      rowsum_dev = std::max(rowsum_dev, std::abs(rs - 1.0));
+    }
+  }
+
+  const auto t6 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> out;
+  attn.Values(out, P, v_a, v_b, keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t7 = std::chrono::steady_clock::now();
+
+  // ---- against the causal leg in the clear ----------------------------
+  double worst_true = 0.0, worst_incoming = 0.0, worst_plain = 0.0;
+  double transposed = 0.0, biggest = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    ASSERT_EQ(boot.param->NPToLevel(out[bi].GetNP()), 0);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, out[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int lane = 0; lane < layout.lanes; lane++) {
+      const int head = rev(lane, 5);
+      for (int row = 0; row < layout.dim; row++) {
+        std::vector<double> p_true(layout.dim, 0.0);
+        std::vector<double> p_plain(layout.dim, 0.0);
+        double zsum = 0.0, gzsum = 0.0;
+        for (int k = 0; k < layout.dim; k++) {
+          p_plain[k] =
+              std::exp(m_eff * (S[head][row][k] - smax) / span);
+          gzsum += p_plain[k];
+          if (k <= row) {
+            p_true[k] = std::exp(
+                m_eff * (S[head][row][k] - row_shift[lane][row]) / span);
+            zsum += p_true[k];
+          }
+        }
+        for (double &pv : p_true) pv /= zsum;
+        for (double &pv : p_plain) pv /= gzsum;
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          double want = 0.0, want_in = 0.0, want_plain = 0.0, want_t = 0.0;
+          for (int k = 0; k < layout.dim; k++) {
+            want += p_true[k] * vv[head][k][column];
+            want_in += P_dec[head][row][k] * vv[head][k][column];
+            want_plain += p_plain[k] * vv[head][k][column];
+            want_t += P_dec[head][column][k] * vv[head][k][row];
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          biggest = std::max(biggest, std::abs(want));
+          worst_true = std::max(worst_true, std::abs(got - want));
+          worst_incoming =
+              std::max(worst_incoming, std::abs(got - want_in));
+          worst_plain = std::max(worst_plain, std::abs(got - want_plain));
+          transposed = std::max(transposed, std::abs(got - want_t));
+        }
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  auto secs = [](auto a, auto b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+  std::cout << "the library leg (CiSinCAttention, causal): vs the causal "
+            << "leg in the clear " << worst_true << ", vs decrypted P x V "
+            << worst_incoming << " (|output| <= " << biggest << ", carried "
+            << carried << ")" << std::endl;
+  std::cout << "  P at masked addresses <= " << masked_resid
+            << ", live row sums off one by " << rowsum_dev << std::endl;
+  std::cout << "  raw live-norm interval [" << raw_lo << ", " << raw_hi
+            << "] folded to [0.9, 1.1] by the row_norm mask" << std::endl;
+  std::cout << "  controls: un-masked softmax " << worst_plain
+            << ", transposed " << transposed << std::endl;
+  std::cout << "  cost: construct " << secs(t0, t1) << " s, Scores "
+            << secs(t2, t3) << " s, SoftMax " << secs(t4, t5)
+            << " s, Values " << secs(t6, t7) << " s" << std::endl;
+
+  EXPECT_LT(worst_true, 2e-2)
+      << "the handler did not land the attention output at the primary "
+         "addresses";
+  EXPECT_LT(worst_incoming, 1e-2)
+      << "the second contraction added more than its own floor";
+  EXPECT_LT(masked_resid, 1e-3) << "the causal mask leaked into P";
+  EXPECT_LT(rowsum_dev, 1e-2);
+  EXPECT_GT(worst_plain, 5e-3)
+      << "the causal and plain softmax agree, so the mask did nothing";
+  EXPECT_GT(transposed, 5e-3);
 }
