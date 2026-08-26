@@ -1619,3 +1619,597 @@ TEST(CiNestedPacking, RopeRidesTheHalfContractionSplitWithoutRotations) {
       << "the RoPE'd and raw products agree, so the rotation never "
          "happened";
 }
+
+// ---------------------------------------------------------------------------
+// The real bootstrap set (Doing.md 1.5bt).
+//
+// 1.5bs closed with "these want the real bootstrap set -- a ci16 with the
+// switch pair's bottom primes -- not the correctness trio". Backwards: the
+// boot parameter already owns a chain-shaped bottom. ci16_35's levels
+//
+//   L0 (0,2) {29884417, 37224449}   q0 = 2^49.98
+//   L1 (2,1) {m0, m1, t0}           rescale m0 m1 / t1 = 2^35.008
+//   L2 (4,0) {m0 .. m3}             rescale m2 m3 / t0 = 2^35.002
+//   L3 (1,5) {m0, t0 .. t4}         rescale 2^35.149 (the graft exchange)
+//   L4 (3,4) {m0..m2, t0..t3}       rescale m1 m2 / t4 = 2^34.91
+//
+// are a valid switch-trio ladder in themselves, so the trio COMES TO THE
+// BOOT PARAMETER: ci_ringswitch16_35_boot / ci12_35_boot /
+// ringdegree13_35_boot carry those five configs and their primes verbatim
+// -- the first trio with MAIN primes -- plus two synthetic top levels
+// (3,5) and (4,5) that only satisfy Parameter's all-primes-at-the-last-
+// level rule (split in two because a rescale may drop mains or terminals,
+// not both) and hold no ciphertext. A ciphertext of ci16_35 at level <= 4
+// IS a ciphertext of
+// the switching Context, limb for limb: no transport, no new bootstrap
+// parameter, and ci16_35's measured bootstrap is untouched. The switching
+// Context holds the block's secret (RingFixture's adopted-secret
+// constructor, the [SYLPH] ladder pattern).
+//
+// WHY THE CONVERSIONS RUN ON THE TRIO AND NOT ON ci16_35. On ci16_35's
+// twelve-prime aux basis (alpha 12, max_num_ter 5), every level with
+// num_main + 5 <= 12 -- levels 0..6 -- sits in 1.5x's num_accum == 1
+// hoisted-accumulation zone, and a hoisted LinearTransform there returns
+// uniform mod-Q noise. Measured here, and pinned below as a regression:
+// the same converter that is exact on the trio is mod-Q garbage at
+// ci16_35's level 3. The narrow trio has no zone at all (alpha 2 <
+// max_num_ter), which lands the leg exactly where [SYLPH] wanted its
+// switch keys anyway. Plain ops (RoPE's plaintext multiplies, Rescale,
+// encrypt/decrypt) are zone-free and stay on the boot Context.
+//
+// The two tests walk the layer's own bottom,
+//
+//   L4 --RoPE--> L3 --SlotToSinC--> L2 --chain--> L1 --SinCToSlot--> L0
+//
+// with every rung canonical (2^35 within millibits, against the
+// correctness trios' 2^25-ish rungs) -- the first time the scores pipeline
+// runs at the ladder the layer will actually stand on. NOT here: the
+// bootstrap itself (ci16_35's CI boot is measured elsewhere), and any
+// security claim for the trio (Q * P = 2^182+ at degree 4096:
+// correctness-lane, exactly like the _l2/_l3 trios).
+// ---------------------------------------------------------------------------
+
+constexpr const char *kBootParam = "ci16_35.json";
+constexpr const char *kBootSwitchParam = "ci_ringswitch16_35_boot.json";
+constexpr const char *kBootSmallParam = "ci12_35_boot.json";
+constexpr const char *kBootLiftedParam = "ringdegree13_35_boot.json";
+
+TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int fwd_level = 3;      // (1,5), on ci16_35 and on the trio alike
+  const int chain_level = 2;    // (4,0)
+  const int inverse_level = 1;  // (2,1)
+  ASSERT_EQ(swtch.param->max_level_, 6) << "L0..L4 plus the synthetic tops";
+
+  // The matched-set precondition, in numbers: the rescale ladders agree at
+  // every shared level because the primes do. Editing either file alone
+  // breaks this first.
+  for (int l = 1; l <= 4; l++) {
+    ASSERT_NEAR(boot.param->GetRescalePrimeProd(l) /
+                    swtch.param->GetRescalePrimeProd(l),
+                1.0, 1e-12)
+        << "ci16_35 and the _boot trio disagree at level " << l;
+  }
+
+  const int sub_degree = 128;
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.num_cts, 2);
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(swtch.context, sub_degree,
+                             /*forward_level=*/fwd_level,
+                             /*inverse_level=*/inverse_level, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const double s = boot.param->GetScale(fwd_level);
+
+  // Zone-free plain ops on the boot Context: the ct x pt ladder at the
+  // very levels whose HOISTED transforms die below.
+  {
+    std::mt19937_64 gen(0xB009);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (int level = fwd_level; level >= 1; level--) {
+      std::vector<Complex> av(boot.Degree()), bv(boot.Degree());
+      for (int i = 0; i < boot.Degree(); i++) {
+        av[i] = Complex(dist(gen), 0.0);
+        bv[i] = Complex(dist(gen), 0.0);
+      }
+      Plaintext<word> pa, pb;
+      boot.context->encoder_.Encode(pa, level, boot.param->GetScale(level),
+                                    av);
+      boot.context->encoder_.Encode(
+          pb, level, boot.param->GetRescalePrimeProd(level), bv);
+      Ciphertext<word> ct, prod, resc;
+      boot.ui->Encrypt(ct, pa);
+      boot.context->Mult(prod, ct, pb);
+      boot.context->Rescale(resc, prod);
+      Plaintext<word> back;
+      boot.ui->Decrypt(back, resc);
+      std::vector<Complex> got;
+      boot.context->encoder_.Decode(got, back);
+      double err = 0.0;
+      for (int i = 0; i < boot.Degree(); i++) {
+        err = std::max(
+            err, std::abs(got[i].real() - av[i].real() * bv[i].real()));
+      }
+      EXPECT_LT(err, 1e-2)
+          << "plain ct x pt + rescale broke at ci16_35 level " << level
+          << " -- the graft exchange itself, not the hoist zone";
+    }
+  }
+
+  // The zone, pinned as a regression: the SAME conversion, hoisted on
+  // ci16_35's alpha-12 basis at level 3 (num_main 1 + max_num_ter 5 <=
+  // alpha 12, 1.5x's num_accum == 1 criterion), returns mod-Q noise. If
+  // this assertion ever fails -- the boot-side conversion coming back
+  // clean -- the underlying Hoist defect got fixed and the leg's
+  // conversions may move onto the boot Context; revisit 1.5bt.
+  {
+    CiSinCConverter<word> zone(boot.context, sub_degree,
+                               /*forward_level=*/fwd_level,
+                               /*inverse_level=*/-1, &layout);
+    EvkRequest zone_req;
+    zone.AddRequiredRotations(zone_req);
+    boot.ui->PrepareRotationKey(zone_req);
+    std::vector<Complex> msg(boot.Degree(), Complex(0.0, 0.0));
+    for (int i = 0; i < boot.Degree(); i++) {
+      msg[i] = Complex(((i * 2654435761ULL) % 1000) / 1000.0 - 0.5, 0.0);
+    }
+    Plaintext<word> pt;
+    boot.context->encoder_.Encode(pt, fwd_level, s, msg);
+    Ciphertext<word> enc, sinc;
+    boot.ui->Encrypt(enc, pt);
+    zone.SlotToSinC(boot.context, sinc, enc, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    Plaintext<word> out;
+    boot.ui->Decrypt(out, sinc);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, out);
+    double magnitude = 0.0;
+    for (double c : coeffs) magnitude = std::max(magnitude, std::abs(c));
+    std::cout << "  the hoist zone on ci16_35 at level 3: |output| "
+              << magnitude << " (mod-Q noise; clean would be O(1))"
+              << std::endl;
+    EXPECT_GT(magnitude, 1e3)
+        << "the hoisted conversion on ci16_35's alpha-12 basis came back "
+           "clean -- the 1.5x zone moved; revisit where the conversions "
+           "live";
+  }
+
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.contraction, 0.08, 0xB007);
+  const RealBatch b = SampleBatch(layout.lanes, layout.dim,
+                                  layout.contraction, layout.dim, 0.08,
+                                  0xB008);
+
+  // Primary addresses by assignment; the nested forward owns the copy-add.
+  auto build = [&](const RealBatch &m, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int bi = 0; bi < num_big; bi++) {
+      std::vector<Complex> slot_msg(boot.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      boot.context->encoder_.Encode(pt, fwd_level, s, slot_msg);
+      Ciphertext<word> enc;
+      boot.ui->Encrypt(enc, pt);
+      conv.SlotToSinC(swtch.context, out[bi], enc, swtch.ui->GetEvkMap());
+      ASSERT_EQ(boot.param->NPToLevel(out[bi].GetNP()), chain_level);
+      ASSERT_EQ(swtch.param->NPToLevel(out[bi].GetNP()), chain_level);
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  build(a, layout.num_cts / 2, lhs);
+  build(b, layout.num_cts, rhs);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // The crossing, measured as an identity: the same ciphertext decrypts to
+  // the same coefficients through either Context.
+  double crossing = 0.0;
+  {
+    Plaintext<word> pb, ps;
+    boot.ui->Decrypt(pb, rhs[0]);
+    swtch.ui->Decrypt(ps, rhs[0]);
+    std::vector<double> cb, cs;
+    boot.context->encoder_.DecodeCoeff(cb, pb);
+    swtch.context->encoder_.DecodeCoeff(cs, ps);
+    for (int t = 0; t < boot.Degree(); t++) {
+      crossing = std::max(crossing, std::abs(cb[t] - cs[t]));
+    }
+  }
+
+  // The folded forward's coefficient probe, against the host encode of the
+  // two-address summed message -- on the boot ladder this time.
+  double fwd_coeff_err = 0.0;
+  {
+    std::vector<Complex> fmsg(boot.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int i = 0; i < layout.rank; i++) {
+        for (int r = 0; r < layout.lanes; r++) {
+          double want = b[r][row][i];
+          if (i != 0 && row + 1 < layout.dim) {
+            want += b[r][row + 1][layout.rank - i];
+          }
+          fmsg[(static_cast<size_t>(row) * layout.rank + i) * layout.lanes +
+               r] = Complex(want, 0.0);
+        }
+      }
+    }
+    Plaintext<word> probe;
+    boot.ui->Decrypt(probe, rhs[0]);
+    std::vector<double> got_c, want_c;
+    boot.context->encoder_.DecodeCoeff(got_c, probe);
+    Plaintext<word> host_pt;
+    boot.context->encoder_.EncodeSinC(host_pt, chain_level, s, fmsg,
+                                      sub_degree);
+    boot.context->encoder_.DecodeCoeff(want_c, host_pt);
+    for (int t = 0; t < boot.Degree(); t++) {
+      fwd_coeff_err =
+          std::max(fwd_coeff_err, std::abs(got_c[t] - want_c[t]));
+    }
+  }
+
+  handler.Multiply(res, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                   swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                   lifted.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // On the canonical ladder the 1.5bm factor-of-two law holds in its exact
+  // form: 2 s^2 over the chain level's rescale product.
+  const double product_scale =
+      2.0 * s * s / boot.param->GetRescalePrimeProd(chain_level);
+  for (const auto &ct : res) {
+    ASSERT_EQ(boot.param->NPToLevel(ct.GetNP()), inverse_level);
+    EXPECT_NEAR(ct.GetScale() / product_scale, 1.0, 1e-6)
+        << "the chain's scale law does not close on the boot ladder";
+  }
+
+  // Back to slots at level 0 through the trio, decrypted through the boot
+  // Context -- the crossing in the other direction.
+  double worst_loop = 0.0, transposed = 0.0, unsummed = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, res[bi], swtch.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(back.GetNP()), inverse_level - 1);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, back);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          double want = 0.0, want_t = 0.0, want_sum = 0.0;
+          for (int x = 0; x < layout.contraction; x++) {
+            want += a[lane][row][x] * b[lane][x][column];
+            want_t += a[lane][column][x] * b[lane][x][row];
+          }
+          const int cls = column % layout.rank;
+          if (cls != 0 && row + 1 < layout.dim) {
+            const int partner =
+                bi * layout.rank + (layout.rank - cls);
+            for (int x = 0; x < layout.contraction; x++) {
+              want_sum += a[lane][row + 1][x] * b[lane][x][partner];
+            }
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          worst_loop = std::max(worst_loop, std::abs(got - want));
+          transposed = std::max(transposed, std::abs(got - want_t));
+          unsummed = std::max(unsummed, std::abs(want_sum));
+        }
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "the loop on the real bootstrap ladder (ci16_35 L3..L0), "
+            << "sub_degree " << sub_degree << ": crossing " << crossing
+            << ", forward coeff " << fwd_coeff_err << ", loop products "
+            << worst_loop << std::endl;
+  std::cout << "  controls: transposed " << transposed
+            << ", largest partner product the scan removed " << unsummed
+            << std::endl;
+
+  EXPECT_LT(crossing, 1e-9)
+      << "a level-2 ciphertext of ci16_35 is not a ciphertext of the "
+         "switching Context -- the limb layouts diverged";
+  EXPECT_LT(fwd_coeff_err, 2e-3);
+  EXPECT_LT(worst_loop, 5e-2)
+      << "the loop did not return the products to their primary slots on "
+         "the boot ladder";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(unsummed, 1e-2);
+}
+
+// The Llama scores pipeline on the same rungs: RoPE at L4 (rotation-free,
+// 1.5bs), the sub-32 nested descent at L3, the two-call contraction sum
+// through the chain at L2, and -- what the _l3 trio never had the levels
+// for -- the RoPE'd scores RETURNED TO SLOTS at L0, primary addresses,
+// ready for SoftMax's four slot-field rotations. Four levels of the
+// nineteen below dec.
+TEST(CiBootSet, TheRopedScoresReturnToSlotsOnTheRealLadder) {
+  Ring boot(kBootParam);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int rope_level = 4;     // (3,4): RoPE's plaintext-multiply level
+  const int conv_level = 3;     // the nested descent, on the trio
+  const int chain_level = 2;    // (4,0)
+  const int inverse_level = 1;  // the return to slots
+  const int sub_degree = 32;
+  ASSERT_EQ(swtch.param->max_level_, 6);
+
+  CiSwitchedCcmmHandler<word> handler(swtch.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.dim, 128);
+  ASSERT_EQ(layout.lanes, 32);
+  ASSERT_EQ(layout.num_cts, 8);
+  const int half = layout.contraction;  // 64
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> conv(swtch.context, sub_degree,
+                             /*forward_level=*/conv_level,
+                             /*inverse_level=*/inverse_level, &layout);
+  const auto t1 = std::chrono::steady_clock::now();
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  const RealBatch q = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.dim, 0.08, 0xB0E1);
+  const RealBatch kk = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                   layout.dim, 0.08, 0xB0E2);
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / layout.dim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < layout.lanes; t++) {
+      for (int i = 0; i < layout.dim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), sn = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * sn;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * sn;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  const double pt_scale = boot.param->GetRescalePrimeProd(rope_level);
+  auto encrypt_slots = [&](const RealBatch &m, int bi, Ciphertext<word> &out) {
+    std::vector<Complex> slot_msg(boot.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, bi * layout.rank + j, lane, ct_idx, slot,
+                            copy_slot);
+          slot_msg[slot] = Complex(m[lane][row][bi * layout.rank + j], 0.0);
+        }
+      }
+    }
+    Plaintext<word> pt;
+    boot.context->encoder_.Encode(pt, rope_level,
+                                  boot.param->GetScale(rope_level), slot_msg);
+    boot.ui->Encrypt(out, pt);
+  };
+  auto mask = [&](int bi, auto value, Plaintext<word> &pt) {
+    std::vector<Complex> msg(boot.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, bi * layout.rank + j, lane, ct_idx, slot,
+                            copy_slot);
+          msg[slot] = Complex(value(row, j), 0.0);
+        }
+      }
+    }
+    boot.context->encoder_.Encode(pt, rope_level, pt_scale, msg);
+  };
+  auto rope_pair = [&](Ciphertext<word> &lo, Ciphertext<word> &hi,
+                       const Plaintext<word> &cos_pt,
+                       const Plaintext<word> &sin_pt,
+                       const Plaintext<word> &neg_sin_pt) {
+    Ciphertext<word> a, b;
+    boot.context->Mult(a, lo, cos_pt);
+    boot.context->Mult(b, hi, neg_sin_pt);
+    boot.context->Add(a, a, b);
+    boot.context->Mult(b, hi, cos_pt);
+    Ciphertext<word> d;
+    boot.context->Mult(d, lo, sin_pt);
+    boot.context->Add(b, b, d);
+    boot.context->Rescale(lo, a);
+    boot.context->Rescale(hi, b);
+  };
+
+  std::vector<Ciphertext<word>> q_cts(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) encrypt_slots(q, bi, q_cts[bi]);
+  for (int k = 0; k < layout.num_cts / 2; k++) {
+    Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+    auto ang = [&](int row, int cls) {
+      return static_cast<double>(row) * theta[k * layout.rank + cls];
+    };
+    mask(k, [&](int r, int c) { return std::cos(ang(r, c)); }, cos_pt);
+    mask(k, [&](int r, int c) { return std::sin(ang(r, c)); }, sin_pt);
+    mask(k, [&](int r, int c) { return -std::sin(ang(r, c)); }, neg_sin_pt);
+    rope_pair(q_cts[k], q_cts[k + layout.num_cts / 2], cos_pt, sin_pt,
+              neg_sin_pt);
+  }
+
+  std::vector<Ciphertext<word>> k_lo(layout.num_cts), k_hi(layout.num_cts);
+  {
+    auto half_batch = [&](int call) {
+      RealBatch h(layout.lanes,
+                  std::vector<std::vector<double>>(
+                      layout.dim, std::vector<double>(layout.dim, 0.0)));
+      for (int t = 0; t < layout.lanes; t++) {
+        for (int x = 0; x < half; x++) {
+          for (int j = 0; j < layout.dim; j++) {
+            h[t][x][j] = kk[t][j][call * half + x];
+          }
+        }
+      }
+      return h;
+    };
+    const RealBatch b1 = half_batch(0), b2 = half_batch(1);
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      encrypt_slots(b1, bi, k_lo[bi]);
+      encrypt_slots(b2, bi, k_hi[bi]);
+      Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+      auto ang = [&](int row, int cls) {
+        return static_cast<double>(bi * layout.rank + cls) *
+               theta[row % half];
+      };
+      mask(bi, [&](int r, int c) { return std::cos(ang(r, c)); }, cos_pt);
+      mask(bi, [&](int r, int c) { return std::sin(ang(r, c)); }, sin_pt);
+      mask(bi, [&](int r, int c) { return -std::sin(ang(r, c)); },
+           neg_sin_pt);
+      rope_pair(k_lo[bi], k_hi[bi], cos_pt, sin_pt, neg_sin_pt);
+    }
+  }
+
+  double fwd_seconds = 0.0;
+  int fwd_count = 0;
+  auto convert = [&](std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      ASSERT_EQ(boot.param->NPToLevel(ct.GetNP()), conv_level);
+      Ciphertext<word> sinc;
+      const auto f0 = std::chrono::steady_clock::now();
+      conv.SlotToSinC(swtch.context, sinc, ct, swtch.ui->GetEvkMap());
+      cudaDeviceSynchronize();
+      fwd_seconds += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - f0)
+                         .count();
+      fwd_count++;
+      ct = std::move(sinc);
+    }
+  };
+  convert(q_cts);
+  convert(k_lo);
+  convert(k_hi);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::vector<Ciphertext<word>> res;
+  double mult_seconds = 0.0;
+  for (int call = 0; call < 2; call++) {
+    std::vector<Ciphertext<word>> lhs;
+    for (int i = 0; i < layout.num_cts / 2; i++) {
+      lhs.push_back(std::move(q_cts[call * layout.num_cts / 2 + i]));
+    }
+    std::vector<Ciphertext<word>> &rhs = (call == 0) ? k_lo : k_hi;
+    std::vector<Ciphertext<word>> part;
+    const auto m0 = std::chrono::steady_clock::now();
+    handler.Multiply(part, lhs, rhs, swtch.ui->GetRingSwitchKey(layout.rank),
+                     swtch.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    mult_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - m0)
+            .count();
+    if (call == 0) {
+      res = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        boot.context->Add(res[bi], res[bi], part[bi]);
+      }
+    }
+  }
+
+  // The return to slots the _l3 trio never had the levels for.
+  double worst = 0.0, transposed = 0.0, norope = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(swtch.context, back, res[bi], swtch.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(back.GetNP()), inverse_level - 1);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, back);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          double want = 0.0, want_t = 0.0, want_raw = 0.0;
+          for (int c = 0; c < layout.dim; c++) {
+            want += q_ref[lane][row][c] * k_ref[lane][column][c];
+            want_t += q_ref[lane][column][c] * k_ref[lane][row][c];
+            want_raw += q[lane][row][c] * kk[lane][column][c];
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          worst = std::max(worst, std::abs(got - want));
+          transposed = std::max(transposed, std::abs(got - want_t));
+          norope = std::max(norope, std::abs(got - want_raw));
+        }
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "RoPE'd scores, returned to slots on the real ladder "
+            << "(L4 RoPE, L3 descent, L2 chain x2, L1 return): products "
+            << worst << std::endl;
+  std::cout << "  controls: transposed " << transposed << ", un-RoPE'd "
+            << norope << std::endl;
+  std::cout << "  cost at the boot levels: converter build "
+            << std::chrono::duration<double>(t1 - t0).count()
+            << " s, forward " << fwd_seconds / std::max(fwd_count, 1)
+            << " s/ct over " << fwd_count << " cts, one chain call "
+            << mult_seconds / 2.0 << " s" << std::endl;
+
+  EXPECT_LT(worst, 5e-2)
+      << "the scores did not survive the full L4..L0 walk";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(norope, 3e-2);
+}
