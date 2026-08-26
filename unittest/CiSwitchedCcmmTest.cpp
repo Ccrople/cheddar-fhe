@@ -1343,3 +1343,279 @@ TEST(CiNestedPacking, TheTwoCallSumClosesTheLlamaContraction) {
       << "the upper half of the contraction never mattered, so this run "
          "is not testing the sum";
 }
+
+// ---------------------------------------------------------------------------
+// RoPE in the operand layouts, rotation-free (Doing.md 1.5bs).
+//
+// Llama's rotate_half pairs channel m with channel m + 64 -- and the
+// half-contraction split of 1.5br cuts the CONTRACTION axis at exactly 64,
+// which for the scores product is the channel axis on BOTH operands. So the
+// pairing never crosses a ciphertext's own slots:
+//
+//   * Q (lhs): channel = column; channels m and m + 64 are big ciphertexts
+//     k and k + 4 of the one nested packing, same slot. RoPE is plaintext
+//     multiplies and ciphertext adds ACROSS the ct pair -- zero rotations,
+//     and the cos/sin masks of ct k serve ct k + 4 unchanged.
+//   * K (rhs): channel = row, and the per-call packing puts channels m and
+//     m + 64 at the SAME block of the two calls' bundles. RoPE is the same
+//     ct-pair arithmetic across the bundles -- zero rotations, and the two
+//     calls share their masks.
+//
+// One plaintext-multiply level each, nothing else. The angles ride the
+// masks: theta depends on (channel pair, token) = (a slot field, a slot
+// field), so a per-ciphertext plaintext encodes them exactly.
+//
+// The scores also settle SoftMax's placement without running it: the output
+// lands at (row = query, column = key, lane = head) primary addresses, so
+// the key axis SoftMax reduces over is the column axis -- four slot-field
+// rotations plus ciphertext adds -- and P then IS the next product's lhs
+// with its contraction split already on the big-ciphertext boundary.
+// ---------------------------------------------------------------------------
+
+TEST(CiNestedPacking, RopeRidesTheHalfContractionSplitWithoutRotations) {
+  Ring big(kSwitchL3Param);
+  Ring small(kSmallL3Param);
+  Ring lifted(kLiftedL3Param,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int top = big.param->max_level_;
+  ASSERT_EQ(top, 3);
+  const int conv_level = top - 1;      // RoPE spends the top level
+  const int chain_level = conv_level - 1;
+  const int sub_degree = 32;
+
+  CiSwitchedCcmmHandler<word> handler(big.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.dim, 128);
+  ASSERT_EQ(layout.num_cts, 8);
+  const int half = layout.contraction;  // 64: the split, and RoPE's pair gap
+
+  big.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                               chain_level);
+  big.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                      small.ui->GetSecretCoeffs(),
+                                      chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  CiSinCConverter<word> conv(big.context, sub_degree,
+                             /*forward_level=*/conv_level,
+                             /*inverse_level=*/-1, &layout);
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  big.ui->PrepareRotationKey(req);
+
+  // Q[lane][token][channel], K[lane][token][channel]; theta_m = base^(-2m/d).
+  const RealBatch q = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.dim, 0.08, 0x40E1);
+  const RealBatch kk = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                   layout.dim, 0.08, 0x40E2);
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / layout.dim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < layout.lanes; t++) {
+      for (int i = 0; i < layout.dim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), s = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * s;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * s;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  const double pt_scale = big.param->GetRescalePrimeProd(top);
+  // One slot-form ciphertext of an operand packing, entries at primary
+  // addresses, NOT yet converted.
+  auto encrypt_slots = [&](const RealBatch &m, int bi, Ciphertext<word> &out) {
+    std::vector<Complex> slot_msg(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, bi * layout.rank + j, lane, ct_idx, slot,
+                            copy_slot);
+          slot_msg[slot] = Complex(m[lane][row][bi * layout.rank + j], 0.0);
+        }
+      }
+    }
+    Plaintext<word> pt;
+    big.context->encoder_.Encode(pt, top, big.param->GetScale(top), slot_msg);
+    big.ui->Encrypt(out, pt);
+  };
+  // A mask over one ciphertext's slots, from (row, cls, lane) -> value.
+  auto mask = [&](int bi, auto value, Plaintext<word> &pt) {
+    std::vector<Complex> msg(big.Degree(), Complex(0.0, 0.0));
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, bi * layout.rank + j, lane, ct_idx, slot,
+                            copy_slot);
+          msg[slot] = Complex(value(row, j), 0.0);
+        }
+      }
+    }
+    big.context->encoder_.Encode(pt, top, pt_scale, msg);
+  };
+  // The rotation-free RoPE pair: lo' = lo cos - hi sin, hi' = hi cos +
+  // lo sin, rescaled back to conv_level.
+  auto rope_pair = [&](Ciphertext<word> &lo, Ciphertext<word> &hi,
+                       const Plaintext<word> &cos_pt,
+                       const Plaintext<word> &sin_pt,
+                       const Plaintext<word> &neg_sin_pt) {
+    Ciphertext<word> a, b;
+    big.context->Mult(a, lo, cos_pt);
+    big.context->Mult(b, hi, neg_sin_pt);
+    big.context->Add(a, a, b);
+    big.context->Mult(b, hi, cos_pt);
+    Ciphertext<word> d;
+    big.context->Mult(d, lo, sin_pt);
+    big.context->Add(b, b, d);
+    big.context->Rescale(lo, a);
+    big.context->Rescale(hi, b);
+  };
+
+  // Q: one packing of eight; RoPE pairs ct k with ct k + 4, masks indexed by
+  // the pair's shared m = k * rank + cls, angle by the QUERY token = row.
+  std::vector<Ciphertext<word>> q_cts(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) encrypt_slots(q, bi, q_cts[bi]);
+  for (int k = 0; k < layout.num_cts / 2; k++) {
+    Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+    auto ang = [&](int row, int cls) {
+      return static_cast<double>(row) * theta[k * layout.rank + cls];
+    };
+    mask(k, [&](int r, int c) { return std::cos(ang(r, c)); }, cos_pt);
+    mask(k, [&](int r, int c) { return std::sin(ang(r, c)); }, sin_pt);
+    mask(k, [&](int r, int c) { return -std::sin(ang(r, c)); }, neg_sin_pt);
+    rope_pair(q_cts[k], q_cts[k + layout.num_cts / 2], cos_pt, sin_pt,
+              neg_sin_pt);
+  }
+
+  // K: the two calls' bundles, channels m and m + 64 at the same block;
+  // RoPE pairs bundle 1 with bundle 2 ciphertext by ciphertext, masks
+  // indexed by the channel = row block, angle by the KEY token = column.
+  std::vector<Ciphertext<word>> k_lo(layout.num_cts), k_hi(layout.num_cts);
+  {
+    auto half_batch = [&](int call) {
+      RealBatch h(layout.lanes,
+                  std::vector<std::vector<double>>(
+                      layout.dim, std::vector<double>(layout.dim, 0.0)));
+      for (int t = 0; t < layout.lanes; t++) {
+        for (int x = 0; x < half; x++) {
+          for (int j = 0; j < layout.dim; j++) {
+            h[t][x][j] = kk[t][j][call * half + x];
+          }
+        }
+      }
+      return h;
+    };
+    const RealBatch b1 = half_batch(0), b2 = half_batch(1);
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      encrypt_slots(b1, bi, k_lo[bi]);
+      encrypt_slots(b2, bi, k_hi[bi]);
+      Plaintext<word> cos_pt, sin_pt, neg_sin_pt;
+      auto ang = [&](int row, int cls) {
+        return static_cast<double>(bi * layout.rank + cls) *
+               theta[row % half];
+      };
+      mask(bi, [&](int r, int c) { return std::cos(ang(r, c)); }, cos_pt);
+      mask(bi, [&](int r, int c) { return std::sin(ang(r, c)); }, sin_pt);
+      mask(bi, [&](int r, int c) { return -std::sin(ang(r, c)); },
+           neg_sin_pt);
+      rope_pair(k_lo[bi], k_hi[bi], cos_pt, sin_pt, neg_sin_pt);
+    }
+  }
+
+  // Descend everything and run the two calls.
+  auto convert = [&](std::vector<Ciphertext<word>> &cts) {
+    for (auto &ct : cts) {
+      ASSERT_EQ(big.param->NPToLevel(ct.GetNP()), conv_level);
+      Ciphertext<word> sinc;
+      conv.SlotToSinC(big.context, sinc, ct, big.ui->GetEvkMap());
+      ct = std::move(sinc);
+    }
+  };
+  convert(q_cts);
+  convert(k_lo);
+  convert(k_hi);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::vector<Ciphertext<word>> res;
+  for (int call = 0; call < 2; call++) {
+    std::vector<Ciphertext<word>> lhs;
+    for (int i = 0; i < layout.num_cts / 2; i++) {
+      lhs.push_back(std::move(q_cts[call * layout.num_cts / 2 + i]));
+    }
+    std::vector<Ciphertext<word>> &rhs = (call == 0) ? k_lo : k_hi;
+    std::vector<Ciphertext<word>> part;
+    handler.Multiply(part, lhs, rhs, big.ui->GetRingSwitchKey(layout.rank),
+                     big.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    if (call == 0) {
+      res = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        big.context->Add(res[bi], res[bi], part[bi]);
+      }
+    }
+  }
+
+  // The part-level read, against the RoPE'd host product; the un-RoPE'd
+  // product is the control that has to fail.
+  double worst = 0.0, transposed = 0.0, norope = 0.0;
+  const double bridge_scale = small.param->GetScale(chain_level);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    big.ui->Decrypt(pt, res[bi]);
+    std::vector<double> coeffs;
+    big.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, layout.rank, small.Degree());
+    for (int j = 0; j < layout.rank; j++) {
+      Plaintext<word> bridge;
+      small.context->encoder_.EncodeCoeff(bridge, chain_level, bridge_scale,
+                                          comp[j]);
+      std::vector<Complex> got;
+      small.context->encoder_.DecodeSinC(got, bridge, sub_degree);
+      const int column = bi * layout.rank + j;
+      for (int row = 0; row < layout.dim; row++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          double want = 0.0, want_t = 0.0, want_raw = 0.0;
+          for (int c = 0; c < layout.dim; c++) {
+            want += q_ref[lane][row][c] * k_ref[lane][column][c];
+            want_t += q_ref[lane][column][c] * k_ref[lane][row][c];
+            want_raw += q[lane][row][c] * kk[lane][column][c];
+          }
+          int part_idx, index;
+          layout.LocatePart(row, column, lane, part_idx, index);
+          const double g = got[index].real();
+          worst = std::max(worst, std::abs(g - want));
+          transposed = std::max(transposed, std::abs(g - want_t));
+          norope = std::max(norope, std::abs(g - want_raw));
+        }
+      }
+    }
+  }
+
+  std::cout << "RoPE'd scores at the Llama alignment: products " << worst
+            << std::endl;
+  std::cout << "  controls: transposed " << transposed << ", un-RoPE'd "
+            << norope << std::endl;
+
+  EXPECT_LT(worst, 5e-2)
+      << "RoPE across the ct pairs did not land the rotated scores";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(norope, 3e-2)
+      << "the RoPE'd and raw products agree, so the rotation never "
+         "happened";
+}
