@@ -85,12 +85,33 @@ class CiSinCAttention {
  public:
   struct Config {
     int sub_degree = 32;      //!< k; fixes the Llama alignment below
-    int land_level = 19;      //!< where HalfBoot lands the half-images
-    int exchange_level = 18;  //!< the merge and the 63-diagonal exchange
-    int cross_level = 17;     //!< K's cross and V's call alignment
+    int land_level = 19;  //!< where HalfBoot lands the half-images
+    //! The merge and the 63-diagonal exchange. This is a DIAL, not the
+    //! landing: `Merge` drops the halves onto it, and a key switch pays
+    //! for the limbs it carries -- measured on an A100 at 4.51 ms per
+    //! exchange at level 18 against 2.65 at level 7, the same 41% on the
+    //! merge and the cross (Doing.md 1.5ci). The floor is 7: the exchange
+    //! is a hoisted transform and levels 0..6 are ci16_35's num_accum == 1
+    //! zone (1.5bt).
+    int exchange_level = 8;
+    //! K's cross and V's call alignment. The exchange rescales onto this
+    //! level, so it is `exchange_level - 1` and the constructor checks it.
+    int cross_level = 7;
     int forward_level = 3;    //!< the nested descents (SlotToSinC)
     int chain_level = 2;      //!< the chain multiplies here
     int inverse_level = 1;    //!< the return conversions (SinCToSlot)
+    //! Baby steps for the three converters' BSGS. The conversions are the
+    //! leg's dominant online cost -- 48 forwards and 16 inverses a cycle --
+    //! and their 2048-diagonal transform is NOT fastest at the balanced
+    //! split: measured at this shape on an A100 (Doing.md 1.5cj), 64 x 32
+    //! costs 28.36 ms/ct, 128 x 16 26.75, **256 x 8 14.47**, 512 x 4 17.02
+    //! and 1024 x 2 23.04 -- a U with a sharp floor at 256, twice as fast
+    //! as the balanced split while doing MORE key switches. The price is
+    //! rotation keys, 262 against 94, shared across all three converters
+    //! (same diagonal lattice). The mechanism is not identified and the
+    //! number is measured at one shape; a different sub_degree should be
+    //! re-swept rather than assumed.
+    int converter_baby_steps = 256;
     double rope_base = 10000.0;  //!< theta[m] = rope_base^(-2m / dim)
     //! 1 / the measured HalfBoot boundary constant (Doing.md 1.5bz); folded
     //! into the RoPE/restore masks. 1.0 leaves the images as HalfBoot

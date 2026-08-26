@@ -61,6 +61,21 @@ CiSinCAttention<word>::CiSinCAttention(
              "CiSinCAttention: the transport (doorstep, premaps, exchange, "
              "cross) is stated at the Llama alignment -- sub_degree 32, "
              "dim 128, 32 lanes, 8 ciphertexts");
+  // The transport's height is a DIAL, not a fact: RoPE leaves the halves
+  // at land_level - 1, but nothing between there and the descent needs
+  // that height, and every key switch pays for the limbs it carries.
+  // `exchange_level` may sit anywhere between the descent and the
+  // landing; `Merge` drops the halves onto it. The two hard constraints
+  // are that the exchange's OUTPUT is the cross's input (its selector
+  // plaintexts are encoded at cross_level), and that a hoisted transform
+  // must stay above the alpha-12 num_accum == 1 zone -- levels 0..6 on
+  // ci16_35 (Doing.md 1.5bt), which the exchange's own BSGS is.
+  AssertTrue(cfg_.exchange_level >= 7,
+             "CiSinCAttention: the exchange is a hoisted transform and "
+             "levels 0..6 are ci16_35's num_accum == 1 zone");
+  AssertTrue(cfg_.cross_level == cfg_.exchange_level - 1,
+             "CiSinCAttention: the exchange rescales onto the cross's "
+             "level, so cross_level must be exchange_level - 1");
   AssertTrue(cfg_.land_level > cfg_.exchange_level &&
                  cfg_.exchange_level > cfg_.cross_level &&
                  cfg_.cross_level > cfg_.forward_level &&
@@ -83,13 +98,13 @@ CiSinCAttention<word>::CiSinCAttention(
 
   conv_q_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, cfg_.forward_level,
-      /*inverse_level=*/-1, &layout, &pre_q_);
+      /*inverse_level=*/-1, &layout, &pre_q_, cfg_.converter_baby_steps);
   conv_k_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, cfg_.forward_level,
-      /*inverse_level=*/-1, &layout, &pre_k_);
+      /*inverse_level=*/-1, &layout, &pre_k_, cfg_.converter_baby_steps);
   conv_pv_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, cfg_.forward_level, cfg_.inverse_level,
-      &layout);
+      &layout, /*forward_premap=*/nullptr, cfg_.converter_baby_steps);
 
   // The 63-diagonal token/head exchange (1.5by), window convention: the
   // negative offsets 127 * [-31, 31] pass DetermineStride's wrap wall as
@@ -252,11 +267,15 @@ void CiSinCAttention<word>::AddRequiredRotations(EvkRequest &req) const {
   }
   idxs.insert(128);  // V's odd-call alignment
   for (int idx : idxs) req.AddRequest(idx, cfg_.cross_level);
-  // The softmax reduction tree; the bootstrap's own FFT keys already hold
-  // these indices, so this is usually a no-op.
+  // The softmax reduction tree. It runs on the BOOTED scores, a few levels
+  // below GetTopLevel() and far above the transport -- a rotation key
+  // serves the levels below the one it was made at, so these must be asked
+  // for at the top, NOT at the transport's level (which is a dial and may
+  // sit at 8). The bootstrap's own CtS/StC keys already hold these
+  // indices, so this is usually a no-op.
   const auto &layout = ccmm_.GetLayout();
   for (int t = 0; t < 4; t++) {
-    req.AddRequest((num_slots_ / layout.rank) << t, cfg_.exchange_level);
+    req.AddRequest((num_slots_ / layout.rank) << t, GetTopLevel());
   }
 }
 
@@ -307,6 +326,19 @@ void CiSinCAttention<word>::Merge(std::vector<Ct> &a_cts,
                                   const EvkMap<word> &evk) const {
   const int merge_idx = degree_ - 128;
   for (size_t l = 0; l < a_cts.size(); l++) {
+    // Onto the dial's level first (see the constructor): the drop is free
+    // and everything after it -- this rotation, the exchange's whole
+    // BSGS, K's cross -- is a key switch that no longer carries the
+    // landing's limbs. The scale is untouched by LevelDown, and gamma's
+    // fold is stated against cross_level, so the arithmetic is unchanged.
+    const int here = boot_->param_.NPToLevel(a_cts[l].GetNP());
+    if (here > cfg_.exchange_level) {
+      Ct da, db;
+      boot_->LevelDown(da, a_cts[l], cfg_.exchange_level);
+      boot_->LevelDown(db, b_cts[l], cfg_.exchange_level);
+      a_cts[l] = std::move(da);
+      b_cts[l] = std::move(db);
+    }
     Ct moved;
     boot_->HRot(moved, b_cts[l], evk.GetRotationKey(merge_idx), merge_idx);
     boot_->Add(a_cts[l], a_cts[l], moved);

@@ -315,11 +315,28 @@ class CiSinCConverter {
    *        composed matrix, on the same lattice, same ceiling. Must be a
    *        bijection over `degree / sub_degree` blocks; ignored when the
    *        forward is not built.
+   * @param baby_steps when positive, the BSGS baby-step count to compile
+   *        both directions with, overriding the default split.
+   *
+   *        The default is `sqrt(num_diag)`, which balances a baby step
+   *        against a giant step -- and on R+ those do NOT cost the same.
+   *        1.5be measured the ratio at ~7 (a baby step rides the shared
+   *        ModUp as one fused key multiply; a giant step pays its own
+   *        ModDown + ModUp), so the balanced split is `sqrt(7 num_diag)`,
+   *        and `BSGSSplit` already uses it for the bootstrap's CI phases.
+   *        It caps those at 16 baby steps for `GSFusedComplexKernel`'s
+   *        registers -- a cap that does NOT apply here, since these are
+   *        single-ciphertext `LinearTransform`s and the fused complex
+   *        giant step lives in `ComplexLinearTransform`. The default is
+   *        left on the balanced split until the ratio is measured at the
+   *        converter's own level and shape; this parameter is how it gets
+   *        measured.
    */
   CiSinCConverter(ConstContextPtr<word> context, int sub_degree,
                   int forward_level, int inverse_level,
                   const CiSwitchedCcmmLayout *chain = nullptr,
-                  const std::vector<int> *forward_premap = nullptr);
+                  const std::vector<int> *forward_premap = nullptr,
+                  int baby_steps = 0);
 
   // disable copying (or moving also)
   CiSinCConverter(const CiSinCConverter &) = delete;

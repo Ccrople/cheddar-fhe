@@ -1365,7 +1365,8 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
                                        int sub_degree, int forward_level,
                                        int inverse_level,
                                        const CiSwitchedCcmmLayout *chain,
-                                       const std::vector<int> *forward_premap)
+                                       const std::vector<int> *forward_premap,
+                                       int baby_steps)
     : sub_degree_{sub_degree} {
   const auto &param = context->param_;
   AssertTrue(param.conjugate_invariant_,
@@ -1389,8 +1390,16 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
   const int p = Log2Ceil(d);
   AssertTrue(p >= 1, "CiSinCConverter: nothing to do");
 
-  auto split = [](int nd) {
-    const int bs = 1 << DivCeil(Log2Ceil(nd), 2);
+  // The balanced split, plus the measurement knob. These transforms are
+  // single-ciphertext LinearTransforms, so ComplexLinearTransform's fused
+  // giant step -- and the bs <= 16 register cap BSGSSplit imposes for it --
+  // is not in this path; what IS in it is 1.5be's cost ratio, and whether
+  // sqrt(nd) or sqrt(7 nd) wins at the converter's own level is a
+  // measurement, not a derivation.
+  auto split = [baby_steps](int nd) {
+    int bs = (baby_steps > 0) ? baby_steps : (1 << DivCeil(Log2Ceil(nd), 2));
+    if (bs > nd) bs = 1 << Log2Ceil(nd);
+    if (bs < 1) bs = 1;
     return std::pair<int, int>{bs, DivCeil(nd, bs)};
   };
 
