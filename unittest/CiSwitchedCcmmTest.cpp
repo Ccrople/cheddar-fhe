@@ -36,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -1153,4 +1154,192 @@ TEST(CiNestedPacking, TheNestedConverterClosesTheLoop) {
   EXPECT_GT(transposed, 3e-2);
   EXPECT_GT(unsummed, 1e-2)
       << "no partner product was ever live, so the fold went unexercised";
+}
+
+// ---------------------------------------------------------------------------
+// The Llama alignment, and the two-call contraction sum (Doing.md 1.5br).
+//
+// sub_degree 32 is the layer's own shape: d = 128 = T = head_dim, 32 real
+// lanes = 32 heads, one 128 x 128 product per lane. The half-contraction
+// contract caps one call at depth d/2 = 64, so the full 128-deep product is
+// TWO calls summed -- and the packing makes the split nearly free on the
+// lhs: its 128 columns are big ciphertexts 0..3 and 4..7 of ONE packing
+// (the copy-add mixes only within a big ciphertext), so call 2 simply hands
+// the upper four over as its bundle. Only the rhs is packed per call, its
+// contraction rows placed into blocks 0..63 both times.
+//
+// This is also the sub-32 nested converter's first outing -- 2048 diagonals
+// against the lift shape's 512 -- and the timings printed here are the cost
+// side of the route question 1.5bq left open (one-phase converter vs the
+// multi-phase transform with the folds in its boundary phases).
+// ---------------------------------------------------------------------------
+
+TEST(CiNestedPacking, TheTwoCallSumClosesTheLlamaContraction) {
+  Ring big(kSwitchL3Param);
+  Ring small(kSmallL3Param);
+  Ring lifted(kLiftedL3Param,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  const int top = big.param->max_level_;
+  ASSERT_EQ(top, 3);
+  const int chain_level = top - 1;
+  const int inverse_level = chain_level - 1;
+  const int sub_degree = 32;
+
+  CiSwitchedCcmmHandler<word> handler(big.context, small.context,
+                                      lifted.context, sub_degree);
+  const CiSwitchedCcmmLayout &layout = handler.GetLayout();
+  ASSERT_EQ(layout.dim, 128);
+  ASSERT_EQ(layout.lanes, 32);
+  ASSERT_EQ(layout.num_cts, 8);
+  ASSERT_EQ(layout.contraction, 64);
+
+  big.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                               chain_level);
+  big.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                      small.ui->GetSecretCoeffs(),
+                                      chain_level);
+  for (int idx : handler.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> conv(big.context, sub_degree, /*forward_level=*/top,
+                             /*inverse_level=*/inverse_level, &layout);
+  const auto t1 = std::chrono::steady_clock::now();
+  EvkRequest req;
+  conv.AddRequiredRotations(req);
+  big.ui->PrepareRotationKey(req);
+
+  // A full 128 x 128 per lane on both sides: the contraction is 128 deep
+  // and no single call may take it.
+  const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                  layout.dim, 0.08, 0x11A3);
+  const RealBatch full_b = SampleBatch(layout.lanes, layout.dim, layout.dim,
+                                       layout.dim, 0.08, 0x11A4);
+  // The rhs of call c holds rows 64c .. 64c+63 of B in blocks 0..63.
+  auto rhs_half = [&](int call) {
+    RealBatch h(layout.lanes,
+                std::vector<std::vector<double>>(
+                    layout.dim, std::vector<double>(layout.dim, 0.0)));
+    for (int t = 0; t < layout.lanes; t++) {
+      for (int x = 0; x < layout.contraction; x++) {
+        h[t][x] = full_b[t][call * layout.contraction + x];
+      }
+    }
+    return h;
+  };
+
+  // `first_ct` picks which big ciphertexts of the operand's own packing are
+  // built: the lhs of call 2 is big ciphertexts 4..7 of A's single packing.
+  double fwd_seconds = 0.0;
+  int fwd_count = 0;
+  auto build = [&](const RealBatch &m, int first_ct, int num_big,
+                   std::vector<Ciphertext<word>> &out) {
+    out.resize(num_big);
+    for (int i = 0; i < num_big; i++) {
+      const int bi = first_ct + i;
+      std::vector<Complex> slot_msg(big.Degree(), Complex(0.0, 0.0));
+      for (int row = 0; row < layout.dim; row++) {
+        for (int j = 0; j < layout.rank; j++) {
+          const int column = bi * layout.rank + j;
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            int ct_idx, slot, copy_slot;
+            layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+            ASSERT_EQ(ct_idx, bi);
+            slot_msg[slot] = Complex(m[lane][row][column], 0.0);
+          }
+        }
+      }
+      Plaintext<word> pt;
+      big.context->encoder_.Encode(pt, top, big.param->GetScale(top),
+                                   slot_msg);
+      Ciphertext<word> enc;
+      big.ui->Encrypt(enc, pt);
+      const auto f0 = std::chrono::steady_clock::now();
+      conv.SlotToSinC(big.context, out[i], enc, big.ui->GetEvkMap());
+      cudaDeviceSynchronize();
+      fwd_seconds += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - f0)
+                         .count();
+      fwd_count++;
+    }
+  };
+
+  std::vector<Ciphertext<word>> res;
+  double mult_seconds = 0.0;
+  for (int call = 0; call < 2; call++) {
+    std::vector<Ciphertext<word>> lhs, rhs, part;
+    build(a, call * layout.num_cts / 2, layout.num_cts / 2, lhs);
+    build(rhs_half(call), 0, layout.num_cts, rhs);
+    const auto m0 = std::chrono::steady_clock::now();
+    handler.Multiply(part, lhs, rhs, big.ui->GetRingSwitchKey(layout.rank),
+                     big.ui->GetInverseRingSwitchKey(layout.rank),
+                     lifted.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    mult_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - m0)
+            .count();
+    if (call == 0) {
+      res = std::move(part);
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        big.context->Add(res[bi], res[bi], part[bi]);
+      }
+    }
+  }
+
+  // The loop back to slots, and the full-depth reference.
+  double worst = 0.0, transposed = 0.0, deepest_upper = 0.0;
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> back;
+    conv.SinCToSlot(big.context, back, res[bi], big.ui->GetEvkMap());
+    Plaintext<word> pt;
+    big.ui->Decrypt(pt, back);
+    std::vector<Complex> slots;
+    big.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          double want = 0.0, want_t = 0.0, upper = 0.0;
+          for (int x = 0; x < layout.dim; x++) {
+            want += a[lane][row][x] * full_b[lane][x][column];
+            want_t += a[lane][column][x] * full_b[lane][x][row];
+          }
+          for (int x = layout.contraction; x < layout.dim; x++) {
+            upper += a[lane][row][x] * full_b[lane][x][column];
+          }
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          const double got = slots[slot].real();
+          worst = std::max(worst, std::abs(got - want));
+          transposed = std::max(transposed, std::abs(got - want_t));
+          deepest_upper = std::max(deepest_upper, std::abs(upper));
+        }
+      }
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "two-call sum at the Llama alignment (128x128, depth 64+64, "
+            << layout.lanes << " lanes): products " << worst << std::endl;
+  std::cout << "  controls: transposed " << transposed
+            << ", largest upper-half contribution " << deepest_upper
+            << std::endl;
+  std::cout << "  cost of the sub-32 nested converter: build "
+            << std::chrono::duration<double>(t1 - t0).count()
+            << " s, forward "
+            << fwd_seconds / std::max(fwd_count, 1) << " s/ct over "
+            << fwd_count << " cts, one chain call "
+            << mult_seconds / 2.0 << " s" << std::endl;
+
+  EXPECT_LT(worst, 5e-2)
+      << "the two half-contractions do not sum to the 128-deep product";
+  EXPECT_GT(transposed, 3e-2);
+  EXPECT_GT(deepest_upper, 3e-2)
+      << "the upper half of the contraction never mattered, so this run "
+         "is not testing the sum";
 }
