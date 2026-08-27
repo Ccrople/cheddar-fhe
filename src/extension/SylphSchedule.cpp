@@ -12,7 +12,13 @@ SylphSchedule<word>::SylphSchedule(
     std::shared_ptr<const BootContext<word>> boot, int num_slots)
     : boot_{std::move(boot)}, num_slots_{num_slots} {
   AssertTrue(boot_ != nullptr, "SylphSchedule: no BootContext");
-  AssertTrue(num_slots_ > 0 && num_slots_ <= boot_->param_.degree_ / 2,
+  // MaxNumSlots(), not degree/2: the same number on the ordinary ring and
+  // `degree` on the conjugate-invariant one, where a full-slot cycle is
+  // 65536 real slots. Nothing else in this class reads the ring -- `ToSlot`
+  // and `ToCoeff` pass `num_slots_` straight to HalfBoot and SlotToCoeff,
+  // which take it as an argument -- so this assertion was the whole of what
+  // kept the cycle off R+.
+  AssertTrue(num_slots_ > 0 && num_slots_ <= boot_->param_.MaxNumSlots(),
              "SylphSchedule: invalid slot count");
   // Without slack, StC starts exactly where EvalMod ends and the non-linear
   // leg has nowhere to go. That is the shipped presets' configuration and it
