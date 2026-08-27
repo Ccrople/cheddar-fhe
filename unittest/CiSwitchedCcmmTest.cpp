@@ -8773,120 +8773,21 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     n_emit++;
   };
 
-  // ---- the same 48 emissions as ONE `CoeffLinearLeg` call ----------------
-  //
-  // `PcmmHandler` is the raw-kernel product, and 1.5cq measured the SAME shape
-  // through `CoeffLinearLeg`'s cuBLAS int8 path at 7.7x: "1.5ch's 751 ms/ct
-  // projection was the kernel, not the algorithm". These 48 emissions are 48%
-  // of the online layer, so this is the largest lever there is here.
-  //
-  // And they are ONE call, not 48. `Project` returns `out_channels / rank`
-  // ciphertexts and shares the descent across them, so asking for 48 groups
-  // ModDecomps X once instead of once per emission -- which at ~17 ms each
-  // would have eaten most of the win.
-  //
-  // The weight has to be reindexed for it. `emit_half` builds
-  // `vals[out_component][in_component]` directly, while `BuildOperands` reads
-  // `w[in_index * out_channels + out_index]` with both indices BIT-REVERSED
-  // (`Component()` is the identity on R+), so
-  // `wbig[a * cols + g * rank + b] = vals_g[rev9(b)][rev9(a)]`.
-  const int qkv_groups = 48;
-  const int qkv_cols = qkv_groups * proj_rank;
   std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8),
       v_b(8);
-  // One emission down the old path, kept as the reference the batched one is
-  // checked against. Its timings are then discarded.
-  Ciphertext<word> ref00;
-  emit_half(wq, 0, 0, ref00);
-  std::cout << "  [time] one raw-kernel emission: ONE-TIME weight encode "
-            << t_encode << " ms, ONLINE mix+pack+rescale " << t_mix
-            << " ms, ONLINE HalfBoot " << t_hb << " ms (48 of these was "
-            << "3218 / 1825 ms online)" << std::endl;
-  t_encode = 0.0;
-  t_mix = 0.0;
-  t_hb = 0.0;
-  n_emit = 0;
-  {
-    const auto b0 = tick();
-    std::vector<double> wbig(static_cast<size_t>(in_ch) * qkv_cols, 0.0);
-    auto put = [&](const W &w, int l, int fam, int g) {
-      for (int hh = 0; hh < 16; hh++) {
-        for (int cp = 0; cp < 16; cp++) {
-          const int r = hh * 16 + cp;  // the output module component
-          const int b = rev(r, 9);
-          for (int o = 0; o < in_ch; o++) {  // the input module component
-            const int a = rev(o, 9);
-            wbig[static_cast<size_t>(a) * qkv_cols + g * proj_rank + b] =
-                w[fam * 16 + hh][l * 16 + cp][o];
-          }
-        }
-      }
-    };
-    for (int l = 0; l < 8; l++) {
-      put(wq, l, 0, l * 6 + 0);
-      put(wq, l, 1, l * 6 + 1);
-      put(wk, l, 0, l * 6 + 2);
-      put(wk, l, 1, l * 6 + 3);
-      put(wv, l, 0, l * 6 + 4);
-      put(wv, l, 1, l * 6 + 5);
-    }
-    typename cheddar::CoeffLinearLeg<word>::Config qcfg;
-    qcfg.num_tokens = proj_small;
-    qcfg.product_level = pcmm_level;
-    qcfg.parents_per_tile = 0;
-    ProjectOnlyLegCi qkv(boot.context, qcfg, pack_keys);
-    std::vector<Ciphertext<word>> parents(1), emitted;
-    {
-      const auto x_rec = HostRecompose(x_comp, proj_rank, proj_small);
-      Plaintext<word> xp;
-      boot.context->encoder_.EncodeCoeff(xp, pcmm_level,
-                                         boot.param->GetScale(pcmm_level),
-                                         x_rec);
-      boot.ui->Encrypt(parents[0], xp);
-    }
-    const auto b1 = tick();
-    qkv.Project(emitted, parents, in_ch, qkv_cols, wbig, w_scale, "qkv");
-    const auto b2 = tick();
-    ASSERT_EQ(static_cast<int>(emitted.size()), qkv_groups);
-    std::vector<Ciphertext<word>> crossed(qkv_groups);
-    for (int g = 0; g < qkv_groups; g++) {
-      emitted[g].SetNumSlots(num_slots);
-      bctx->HalfBoot(crossed[g], emitted[g], boot.ui->GetEvkMap());
-    }
-    const auto b3 = tick();
-    std::cout << "  [time] Q/K/V as ONE CoeffLinearLeg call over " << qkv_groups
-              << " groups: ONE-TIME reindex, leg and encrypt " << span_ms(b0, b1)
-              << " ms, product+pack+rescale " << span_ms(b1, b2)
-              << " ms (weight encode inside), ONLINE HalfBoot "
-              << span_ms(b2, b3) << " ms" << std::endl;
-    for (int l = 0; l < 8; l++) {
-      q_a[l] = std::move(crossed[l * 6 + 0]);
-      q_b[l] = std::move(crossed[l * 6 + 1]);
-      k_a[l] = std::move(crossed[l * 6 + 2]);
-      k_b[l] = std::move(crossed[l * 6 + 3]);
-      v_a[l] = std::move(crossed[l * 6 + 4]);
-      v_b[l] = std::move(crossed[l * 6 + 5]);
-    }
+  for (int l = 0; l < 8; l++) {
+    emit_half(wq, l, 0, q_a[l]);
+    emit_half(wq, l, 1, q_b[l]);
+    emit_half(wk, l, 0, k_a[l]);
+    emit_half(wk, l, 1, k_b[l]);
+    emit_half(wv, l, 0, v_a[l]);
+    emit_half(wv, l, 1, v_b[l]);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  {  // the batched path against the raw-kernel one, on the same emission
-    Plaintext<word> pa, pb;
-    boot.ui->Decrypt(pa, ref00);
-    boot.ui->Decrypt(pb, q_a[0]);
-    std::vector<Complex> sa, sb;
-    boot.context->encoder_.Decode(sa, pa);
-    boot.context->encoder_.Decode(sb, pb);
-    double d = 0.0, m = 0.0;
-    for (int i = 0; i < num_slots; i++) {
-      m = std::max(m, std::abs(sa[i].real()));
-      d = std::max(d, std::abs(sa[i].real() - sb[i].real()));
-    }
-    std::cout << "  the batched emission against the raw-kernel one: " << d
-              << " (|v| <= " << m << ")" << std::endl;
-    EXPECT_LT(d, 1e-3 * m)
-        << "the CoeffLinearLeg emission is not the PcmmHandler one: the "
-           "weight reindex or the descent's channel order is wrong";
-  }
+  std::cout << "  [time] Q/K/V over " << n_emit
+            << " emissions: ONE-TIME weight encode " << t_encode
+            << " ms, ONLINE mix+pack+rescale " << t_mix
+            << " ms, ONLINE HalfBoot " << t_hb << " ms" << std::endl;
   EXPECT_NEAR(q_a[0].GetScale() / bctx->GetStCInputScale(), 1.0, 1e-9);
 
   double hb_const = 0.0;
