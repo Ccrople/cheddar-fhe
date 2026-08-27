@@ -8980,6 +8980,21 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
               << " MiB back, " << (after >> 20) << " MiB free" << std::endl;
   }
 
+  // A MEMORY LEDGER, because three runs died of memory and each guess about
+  // which item was to blame cost seventeen minutes. `cudaMemGetInfo` cannot
+  // see inside RMM's pool -- that is why the release above reads 0 MiB back --
+  // but it does see the pool RESERVE, and reservation growth is what actually
+  // runs the card out. Printing it at every stage boundary says which stage
+  // grows it.
+  auto ledger = [](const char *tag) {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    std::cout << "  [mem] " << tag << ": " << ((total_b - free_b) >> 20)
+              << " MiB reserved, " << (free_b >> 20) << " MiB free"
+              << std::endl;
+  };
+  ledger("leg released");
+
   // The attention output, decrypted once and laid out the way the O
   // projection reads it. The seam sends chain entry (row, col, lane) to
   // block channel `chan_of(col, lane % 16)` of half ciphertext
@@ -9034,6 +9049,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
                 /*boot_slack_levels=*/12);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
   ASSERT_NE(fctx, nullptr);
+ledger("before the FFN context");
   fctx->PrepareEvalMod();
   fctx->PrepareEvalSpecialFFT(num_slots);
   {
@@ -9041,6 +9057,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     fctx->AddRequiredRotations(req, num_slots);
     boot.ui->PrepareRotationKey(req);
   }
+
+  ledger("FFN context up");
 
   // ---- the seam: chain layout -> the block's banded half-density image --
   const int t1_level = 10, t2_level = 9;
@@ -9165,6 +9183,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   for (int bi = 0; bi < layout.num_cts; bi++) {
     bctx->Boot(booted[bi], out[bi], boot.ui->GetEvkMap());
   }
+  ledger("the eight Boots done");
   out.clear();
   out.shrink_to_fit();
   std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
@@ -9208,6 +9227,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // are 486 + 486 + 129 plaintext diagonals -- 6.7 GB -- and the run that
   // reached here died in the O projection with all of them still resident.
   seam_t2.reset();
+  ledger("seam done and released");
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  the seam gave " << h_cts.size()
@@ -9247,7 +9267,9 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   lcfg.num_tokens = proj_small;
   lcfg.product_level = pcmm_level;
   lcfg.parents_per_tile = 0;
+  ledger("before the leg object");
   ProjectOnlyLegCi leg(boot_ffn.context, lcfg, pack_keys);
+  ledger("leg object built");
 
   auto host_mm2 = [&](const std::vector<double> &in, int in_w,
                      const std::vector<double> &w, int out_w) {
@@ -9302,6 +9324,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
+  ledger("O projection done");
 
   std::vector<double> o_host(o_unit.size(), 0.0);
   for (size_t i = 0; i < o_unit.size(); i++) o_host[i] = o_unit[i] * res_scale;
