@@ -9321,9 +9321,13 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       static_cast<size_t>(proj_small) * model_declared, 0.0);
   for (int c = 0; c < model_declared; c += 2) {
     for (int t = 0; t < proj_small; t++) {
+      // The ciphertext carries `o_fit * (x + O)`: the stream was encrypted
+      // with o_fit folded in and the O output already carries it. So the
+      // host residual is `x + O`, and the factor rides through to the
+      // boundary constant the next crossing measures.
       h_host[static_cast<size_t>(t) * model_declared + c] =
           x_comp[rev(c, 9)][rev(t, 7)] +
-          o_host[static_cast<size_t>(t) * model_declared + c] / o_fit;
+          o_host[static_cast<size_t>(t) * model_declared + c];
     }
   }
 
