@@ -1663,3 +1663,150 @@ TEST(CiFfn, TheStagedSeamCarriesTheSameMapAsTheOneShot) {
     EXPECT_LT(outside, 1e-3 * mx) << "the staged T1 put something outside";
   }
 }
+
+// ---------------------------------------------------------------------------
+// SIXTEEN PARENTS, WHICH IS THE LAYER'S O PROJECTION AND NOTHING ELSE.
+//
+// Every conjugate-invariant projection measured so far has had ONE parent or
+// TWO. `parents_per_tile` is clamped to `parents` when the setting is larger,
+// so setting it to 4 in those tests tiled nothing -- the "R+ runs clean at
+// tile 4" measurement that cleared this path proved only that a single tile
+// still works. And the flat channel index the leg contracts over,
+// `parent * rank + rev9(component)`, has never been checked across more than
+// two parents either.
+//
+// The layer's O projection is the first stage to do both at once, and it is
+// where the layer fails while the seam that feeds it passes. So run it alone,
+// off host-built banded images with no seam, no bootstrap and no crossing in
+// front of it -- a minute instead of seventeen -- and run it BOTH ways in the
+// same process, because one tile against four is the whole question.
+TEST(CiFfn, TheProjectionReadsSixteenHalfDensityParents) {
+  Ring boot(Param());
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  ASSERT_EQ(degree / kTokens, kRank);
+
+  constexpr int kParents = 16;
+  const int in_declared = kParents * kRank;  // 8192 declared, 4096 live
+  const int out_declared = kRank;            // 512 declared, 256 live
+  const int product_level = 1;
+
+  // ---- the model, in double ---------------------------------------------
+  std::mt19937_64 gen(0xB16E);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.02);
+  std::vector<double> in(static_cast<size_t>(kTokens) * in_declared, 0.0);
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < in_declared; c += 2) {
+      in[static_cast<size_t>(t) * in_declared + c] = xd(gen);
+    }
+  }
+  std::vector<double> w(static_cast<size_t>(in_declared) * out_declared, 0.0);
+  for (int i = 0; i < in_declared; i += 2) {
+    for (int o = 0; o < out_declared; o += 2) {
+      w[static_cast<size_t>(i) * out_declared + o] = wd(gen);
+    }
+  }
+  std::vector<double> want(static_cast<size_t>(kTokens) * out_declared, 0.0);
+  double want_absmax = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int o = 0; o < out_declared; o += 2) {
+      double acc = 0.0;
+      for (int i = 0; i < in_declared; i += 2) {
+        acc += in[static_cast<size_t>(t) * in_declared + i] *
+               w[static_cast<size_t>(i) * out_declared + o];
+      }
+      want[static_cast<size_t>(t) * out_declared + o] = acc;
+      want_absmax = std::max(want_absmax, std::abs(acc));
+    }
+  }
+
+  // ---- the sixteen parents, each a banded half-density image -------------
+  //
+  // Parent `k` carries declared channels `k * rank + c`; live at even `c`,
+  // which is component `rev9(c) < 256`. `CiRecompose` puts the shifted
+  // duplicates in, which is what makes the vector banded as well as clean --
+  // exactly what the seam builds and what ModDecomp inverts.
+  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+
+  double coeff_max = 0.0;
+  std::vector<std::vector<double>> parent_coeffs(kParents);
+  for (int k = 0; k < kParents; k++) {
+    std::vector<std::vector<double>> comp(kRank,
+                                          std::vector<double>(kTokens, 0.0));
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < kRank; c += 2) {
+        comp[Rev(c, 9)][Rev(t, 7)] =
+            in[static_cast<size_t>(t) * in_declared + k * kRank + c];
+      }
+    }
+    parent_coeffs[k] = CiRecompose(comp, kRank, kTokens);
+    for (double v : parent_coeffs[k]) coeff_max = std::max(coeff_max, std::abs(v));
+  }
+  const double beta = 0.4 / coeff_max;
+  std::vector<Ciphertext<word>> ins(kParents);
+  for (int k = 0; k < kParents; k++) {
+    for (double &v : parent_coeffs[k]) v *= beta;
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, product_level,
+                                       boot.param->GetScale(product_level),
+                                       parent_coeffs[k]);
+    boot.ui->Encrypt(ins[k], pt);
+    ins[k].SetNumSlots(num_slots);
+  }
+
+  // ---- the same product both ways ---------------------------------------
+  auto run = [&](int tile, const char *name) {
+    typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+    lcfg.num_tokens = kTokens;
+    lcfg.product_level = product_level;
+    lcfg.parents_per_tile = tile;
+    ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, ins, in_declared, out_declared, w, 1.0, name);
+    cudaDeviceSynchronize();
+    EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+    EXPECT_EQ(res.size(), 1u);
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, res[0]);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto got = CiComponentsFfn(coeffs, kRank, kTokens);
+    double num = 0.0, den = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < out_declared; c += 2) {
+        const double v = got[Rev(c, 9)][Rev(t, 7)];
+        const double q = want[static_cast<size_t>(t) * out_declared + c];
+        num += v * q;
+        den += q * q;
+      }
+    }
+    const double carried = num / den;
+    double err = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < out_declared; c += 2) {
+        const double v = got[Rev(c, 9)][Rev(t, 7)] / carried;
+        err = std::max(err, std::abs(v - want[static_cast<size_t>(t) *
+                                              out_declared + c]));
+      }
+    }
+    std::cout << "  " << kParents << " parents, parents_per_tile " << tile
+              << ": relative " << (err / want_absmax) << " (|y| <= "
+              << want_absmax << ", carried " << carried << ")" << std::endl;
+    return err / want_absmax;
+  };
+
+  const double flat = run(0, "o16_flat");
+  const double tiled = run(4, "o16_tiled");
+  EXPECT_LT(flat, 0.02)
+      << "the projection cannot read sixteen half-density parents at all";
+  EXPECT_LT(tiled, 0.02)
+      << "the projection reads sixteen half-density parents in one tile but "
+         "not in four: the tiled accumulation is what the layer's O "
+         "projection newly exercises";
+}
