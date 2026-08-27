@@ -9342,6 +9342,7 @@ ledger("before the FFN context");
   std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
   for (int half = 0; half < 2; half++) {
     make_t1(half);
+    stage("ONE-TIME one half's T1 stage plaintexts and their keys");
     for (int bi = 0; bi < layout.num_cts; bi++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
       boot_ffn.context->LevelDown(low, booted[bi], t1_top);
@@ -9393,6 +9394,7 @@ ledger("before the FFN context");
       boot_ffn.context->Add(sum, live, dup);
       sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
     }
+    stage("the seam over one half's eight ciphertexts");
     seam_t1_cur.clear();
   }
   booted.clear();
@@ -9511,9 +9513,22 @@ ledger("before the FFN context");
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
   ledger("O projection done");
-  // The weight ENCODE is inside `Project` and CLAUDE.md separates it at
-  // 0.366 s/ct one-time against 0.751 s/ct online; this row is both.
-  stage("the O projection, weight encode included");
+  // The weight ENCODE is inside the first `Project` under a given name -- the
+  // 8192 x 512 conversion the log reports as 60 MiB -- and a layer pays it
+  // once for all 32. So the first call is timed with it and a second,
+  // identical call is timed against the cache: that difference IS the online
+  // cost, and the 7 s target is a budget of online costs.
+  stage("the O projection, ONE-TIME weight encode included");
+  {
+    std::vector<Ciphertext<word>> ins(h_cts.size()), again;
+    for (size_t k = 0; k < h_cts.size(); k++) {
+      boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
+    }
+    leg.Project(again, ins, attn_channels, model_declared, wo, res_scale, "o");
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    stage("the O projection again, off the weight cache: ONLINE");
+  }
 
   std::vector<double> o_host(o_unit.size(), 0.0);
   for (size_t i = 0; i < o_unit.size(); i++) o_host[i] = o_unit[i] * res_scale;
