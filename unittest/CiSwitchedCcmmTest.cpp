@@ -8950,6 +8950,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   attn_p->Values(out, P, v_a, v_b, keys);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t7 = std::chrono::steady_clock::now();
 
   // =====================================================================
   // THE REST OF THE LAYER. Everything above is the attention leg, verbatim
@@ -8994,6 +8995,33 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
               << std::endl;
   };
   ledger("leg released");
+
+  // A TIME LEDGER BESIDE THE MEMORY ONE, and for the same reason: the target
+  // is 7 s a layer and there is no way to aim at it without knowing which
+  // rows are the seconds. Everything one-time -- key generation, the
+  // converters, the seam's plaintext diagonals -- is reported apart from the
+  // online work, because a layer pays those once for all 32 of them.
+  auto tmark = std::chrono::steady_clock::now();
+  auto stage = [&tmark](const char *tag) {
+    cudaDeviceSynchronize();
+    const auto now = std::chrono::steady_clock::now();
+    std::cout << "  [time] " << tag << ": "
+              << std::chrono::duration<double, std::milli>(now - tmark).count()
+              << " ms" << std::endl;
+    tmark = now;
+  };
+  {
+    auto ms = [](const std::chrono::steady_clock::time_point &a,
+                 const std::chrono::steady_clock::time_point &b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::cout << "  [time] ONE-TIME leg handler (three converters): "
+              << ms(t0, t1) << " ms" << std::endl;
+    std::cout << "  [time] leg scores: " << ms(t2, t3) << " ms, 8 Boots: "
+              << ms(t3, t4) << " ms, softmax: " << ms(t4, t5)
+              << " ms, values: " << ms(t6, t7) << " ms" << std::endl;
+    // t5 -> t6 is the host's decryption of P and its reference, not circuit.
+  }
 
   // The attention output, decrypted once and laid out the way the O
   // projection reads it. The seam sends chain entry (row, col, lane) to
@@ -9059,6 +9087,7 @@ ledger("before the FFN context");
   }
 
   ledger("FFN context up");
+  stage("ONE-TIME the FFN BootContext and its keys");
 
   // ---- the seam: chain layout -> the block's banded half-density image --
   // T1 IS A BIT PERMUTATION OF THE SLOT INDEX, and running it as one
@@ -9280,12 +9309,15 @@ ledger("before the FFN context");
     boot.ui->PrepareRotationKey(req);
   }
 
+  stage("ONE-TIME the seam's T2, its token map and their keys");
+
   // Boot the attention output, run the seam, come back to coefficients.
   std::vector<Ciphertext<word>> booted(layout.num_cts);
   for (int bi = 0; bi < layout.num_cts; bi++) {
     bctx->Boot(booted[bi], out[bi], boot.ui->GetEvkMap());
   }
   ledger("the eight Boots done");
+  stage("the 8 Boots before the seam");
   out.clear();
   out.shrink_to_fit();
   std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
@@ -9351,6 +9383,9 @@ ledger("before the FFN context");
   // reached here died in the O projection with all of them still resident.
   seam_t2.reset();
   ledger("seam done and released");
+  // The T1 stages are rebuilt inside the half loop, so this row carries one
+  // one-time cost per half that a real layer would hoist out.
+  stage("the seam: T1 x 3 stages, token map, T2, ToCoeff, over 16 halves");
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  the seam gave " << h_cts.size()
@@ -9401,6 +9436,7 @@ ledger("before the FFN context");
   ledger("before the leg object");
   ProjectOnlyLegCi leg(boot_ffn.context, lcfg, pack_keys);
   ledger("leg object built");
+  stage("ONE-TIME the projection leg object");
 
   auto host_mm2 = [&](const std::vector<double> &in, int in_w,
                      const std::vector<double> &w, int out_w) {
@@ -9456,6 +9492,9 @@ ledger("before the FFN context");
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
   ledger("O projection done");
+  // The weight ENCODE is inside `Project` and CLAUDE.md separates it at
+  // 0.366 s/ct one-time against 0.751 s/ct online; this row is both.
+  stage("the O projection, weight encode included");
 
   std::vector<double> o_host(o_unit.size(), 0.0);
   for (size_t i = 0; i < o_unit.size(); i++) o_host[i] = o_unit[i] * res_scale;
@@ -9545,6 +9584,7 @@ ledger("before the FFN context");
   boot_ffn.context->Add(h_ct, stream, o_out);
   std::cout << "  residual added at level "
             << boot_ffn.param->NPToLevel(h_ct.GetNP()) << std::endl;
+  stage("the attention residual");
 
   // The host's residual stream, in the same units.
   std::vector<double> h_host(
@@ -9648,6 +9688,10 @@ ledger("before the FFN context");
   }
   std::cout << "  RMSNorm(ffn) done, coefficients at level "
             << boot_ffn.param->NPToLevel(normed.GetNP()) << std::endl;
+  // This row carries a host decryption -- the boundary constant is measured
+  // in-pipeline rather than assumed -- so it is an upper bound on the
+  // circuit's own time, not the circuit's time.
+  stage("HalfBoot, RMSNorm and back to coefficients (+ one host decrypt)");
 
   std::vector<double> n_host(h_host.size(), 0.0);
   for (int t = 0; t < proj_small; t++) {
@@ -9678,6 +9722,7 @@ ledger("before the FFN context");
                 "up");
   }
   ASSERT_EQ(gate.size(), 2u);
+  stage("the gate and up projections");
 
   std::vector<Ciphertext<word>> prod(2);
   {
@@ -9697,6 +9742,7 @@ ledger("before the FFN context");
   }
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  stage("HalfBoot x4, SiLU, the gate multiply");
 
   std::vector<double> gu(g_host.size(), 0.0);
   for (size_t i = 0; i < gu.size(); i++) {
@@ -9719,6 +9765,7 @@ ledger("before the FFN context");
   }
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  stage("ToCoeff x2 and the down projection");
 
   // ---- the layer's output, against the same layer in double -------------
   {

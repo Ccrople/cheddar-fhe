@@ -1064,17 +1064,13 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   };
 
   const int half = 0;  // heads 0..15; the other half is the same map shifted
-  const bool flip = std::getenv("CHEDDAR_SEAM_NOFLIP") == nullptr;
-  std::cout << "offset convention: " << (flip ? "out[j+i] = in[j]"
-                                              : "out[j] = in[j+i]")
-            << std::endl;
   // ABOVE THE ZONE. CLAUDE.md: "ci16_35's alpha-12 basis puts every hoisted
   // transform at levels 0..6 in 1.5x's num_accum == 1 zone (mod-Q noise,
   // measured 1.8e+25 and pinned as a regression)". A `LinearTransform` IS a
   // hoisted transform, and run at levels 5 and 4 these two returned 1e38 --
   // the same failure, one decade worse. The leg's own exchange sits at 8 for
   // exactly this reason and its floor is 7 (`Config::exchange_level`).
-  const int t1_level = 10, t2_level = 9;
+  const int t1_level = 11, tok_level = 10, t2_level = 9;
   ASSERT_LE(t1_level, boot.param->max_level_);
 
   // ---- T1: chain layout -> the block's live addresses -------------------
@@ -1087,35 +1083,57 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
       for (int row = 0; row < kRows; row++) {
         const int dst = slot_block(row, c);
         const int src = slot_chain(row, col, lane);
-        // `StripedMatrix` key `i` with `diag[j]`: the exchange 1.5by ships is
-        // an INVOLUTION, so it cannot tell `out[j] = in[j + i]` from
-        // `out[j + i] = in[j]`. CHEDDAR_SEAM_FLIP picks the other reading;
-        // one run of this test settles it for every map that follows.
-        const int off = flip ? ((dst - src) % degree + degree) % degree
-                             : ((src - dst) % degree + degree) % degree;
+        // The convention is pinned by
+        // `TheStripedMatrixOffsetConventionIsPinned`: key `i` means
+        // `out[j] = in[j + i]`, indexed at the DESTINATION. It had to be
+        // pinned by its own test because 1.5by's exchange is an INVOLUTION
+        // and so cannot tell the two readings apart.
+        const int off = ((src - dst) % degree + degree) % degree;
         m1.try_emplace(off, degree, Complex(0.0, 0.0));
-        m1[off][flip ? src : dst] = Complex(1.0, 0.0);
+        m1[off][dst] = Complex(1.0, 0.0);
       }
     }
   }
   std::cout << "T1 (chain -> block live): " << m1.GetNumDiag() << " diagonals"
             << std::endl;
 
-  // ---- T2: the shifted duplicates, as a channel permutation -----------
+  // ---- the shifted duplicates ------------------------------------------
   //
-  // Live component `I = rev9(c)` at position `row`; its duplicate belongs at
-  // component `rank - I` and position `row - 1`, i.e. block channel
-  // `rev9(512 - I)` and token `row - 1`.
+  // Live component `I = rev9(c)` at banded POSITION `p`; its duplicate belongs
+  // at component `rank - I`, position `p - 1`.
   //
-  // AS ONE TRANSFORM that is 131 diagonals and still too dear: the token's
-  // `-1` makes every offset odd, `DetermineStride`'s gcd collapses to 1,
-  // `max_rot` is 65024 and the BSGS split has to cover the whole ring at
-  // 256 x 256 = 512 key switches a ciphertext. Splitting the token shift off
-  // as a plain rotation leaves a pure CHANNEL permutation whose offsets are
-  // all multiples of 128, gcd 128, so 32 x 32 covers it in 64. The wrapped
-  // slots -- token 0 rotating in from the next channel -- are excluded by the
-  // transform's own plaintexts rather than by a separate mask, so T2 is one
-  // rotation, one transform and one add.
+  // AND THE POSITION IS NOT THE TOKEN. On R+ the slot-to-coefficient map sends
+  // slot `t + 128 c` to coefficient `rev7(t) * 512 + rev9(c)`, so `p = rev7(t)`
+  // and stepping one position DOWN is a bit-reversed decrement of the token --
+  // a carry, never a rotation. This test shipped with `row - 1` and passed,
+  // because it checked its own formula against itself; the layer's O
+  // projection read the very same image at err/mx 14.48. The read at the end
+  // of this test is now the CONSUMER'S, so the formula can no longer mark its
+  // own work.
+  //
+  // The two maps stay separate. As one transform they are 903 diagonals,
+  // because the carry makes offsets odd and `DetermineStride`'s gcd collapses
+  // to 1. Apart, the token map is 7 diagonals -- a bit-reversed decrement only
+  // ever touches a prefix of the bits -- and the channel permutation's offsets
+  // are all multiples of 128, gcd 128.
+  cheddar::StripedMatrix mtok(degree, degree);
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      const int c = chan_of(col, lh);
+      for (int row = 0; row < kRows; row++) {
+        const int pos = Rev(row, 7);
+        if (pos == 0) continue;  // nothing sits one position below it
+        const int td = Rev(pos - 1, 7);
+        const int dst = slot_block(td, c);
+        const int off = ((slot_block(row, c) - dst) % degree + degree) % degree;
+        mtok.try_emplace(off, degree, Complex(0.0, 0.0));
+        mtok[off][dst] = Complex(1.0, 0.0);
+      }
+    }
+  }
+  std::cout << "token map (position p -> p - 1): " << mtok.GetNumDiag()
+            << " diagonals" << std::endl;
+
   cheddar::StripedMatrix m2(degree, degree);
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
@@ -1136,24 +1154,26 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
       if (I == 0) continue;
       const int cd = Rev(kRank - I, 9);
       ASSERT_EQ(cd % 2, 1) << "a partner channel must be odd, i.e. dead";
-      const int step = kRows * (c - cd);
-      const int off = ((flip ? -step : step) % degree + degree) % degree;
+      const int off = ((kRows * (c - cd)) % degree + degree) % degree;
       m2.try_emplace(off, degree, Complex(0.0, 0.0));
-      for (int row = 1; row < kRows; row++) {
-        m2[off][flip ? slot_block(row - 1, c) : slot_block(row - 1, cd)] =
-            Complex(1.0, 0.0);
+      for (int td = 0; td < kRows; td++) {
+        // The token map left this one empty: position 127 has nothing above
+        // it to come down from.
+        if (Rev(td, 7) == kRows - 1) continue;
+        m2[off][slot_block(td, cd)] = Complex(1.0, 0.0);
       }
     }
   }
-  std::cout << "T2 (channel permutation after the -1 rotation): "
+  std::cout << "T2 (channel permutation after the token map): "
             << m2.GetNumDiag() << " diagonals" << std::endl;
 
   // The windows are `DetermineStride`'s wrap wall, handled the way 1.5by's
   // exchange handles it, but chosen rather than guessed: `BestWindow` tries
   // every offset as the origin and reports the smallest `bs * gs` that will
   // be accepted.
-  int need1 = 0, need2 = 0;
+  int need1 = 0, needt = 0, need2 = 0;
   const int w1 = BestWindow(m1, degree, &need1);
+  const int wt = BestWindow(mtok, degree, &needt);
   const int w2 = BestWindow(m2, degree, &need2);
   auto split = [](int need) {
     int bs = 1;
@@ -1163,11 +1183,13 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     return std::make_pair(bs, gs);
   };
   const auto s1 = split(need1);
+  const auto st = split(needt);
   const auto s2 = split(need2);
   std::cout << "  T1 window " << w1 << ", needs bs*gs >= " << need1 << " -> "
-            << s1.first << "x" << s1.second << "; T2 window " << w2
-            << ", needs " << need2 << " -> " << s2.first << "x" << s2.second
-            << std::endl;
+            << s1.first << "x" << s1.second << "; token window " << wt
+            << ", needs " << needt << " -> " << st.first << "x" << st.second
+            << "; T2 window " << w2 << ", needs " << need2 << " -> "
+            << s2.first << "x" << s2.second << std::endl;
 
   // The plaintext scale that leaves the output canonical one level down:
   // Mult multiplies the scales and Rescale divides by the level's actual
@@ -1179,19 +1201,22 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   cheddar::LinearTransform<word> t1(
       boot.context, m1, t1_level, pt_scale(t1_level), s1.first, s1.second,
       /*pre_rotation=*/w1, /*additional_pt_rot=*/-w1);
+  cheddar::LinearTransform<word> ttok(
+      boot.context, mtok, tok_level, pt_scale(tok_level), st.first, st.second,
+      /*pre_rotation=*/wt, /*additional_pt_rot=*/-wt);
   cheddar::LinearTransform<word> t2(
       boot.context, m2, t2_level, pt_scale(t2_level), s2.first, s2.second,
       /*pre_rotation=*/w2, /*additional_pt_rot=*/-w2);
   {
     cheddar::EvkRequest req;
     t1.AddRequiredRotations(req);
+    ttok.AddRequiredRotations(req);
     t2.AddRequiredRotations(req);
-    req.AddRequest(1, t2_level);           // the token shift
-    req.AddRequest(degree - 1, t2_level);  // and the other direction
     // The window convention leaves the result rotated: `additional_pt_rot`
     // shifts every plaintext, so the caller pays one closing rotation, as
     // `CiSinCAttention::ExchangeAll` does (1.5by).
     req.AddRequest(((w1 % degree) + degree) % degree, t1_level - 1);
+    req.AddRequest(((wt % degree) + degree) % degree, tok_level - 1);
     req.AddRequest(((w2 % degree) + degree) % degree, t2_level - 1);
     boot.ui->PrepareRotationKey(req);
   }
@@ -1226,32 +1251,34 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     x = std::move(y);
   };
   const int back1 = ((w1 % degree) + degree) % degree;
+  const int backt = ((wt % degree) + degree) % degree;
   const int back2 = ((w2 % degree) + degree) % degree;
 
   Ciphertext<word> a, shifted, dup, live, b;
   t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
   close(a, back1);
-  // The token shift's direction is the last 50/50 in the seam, and it costs
-  // one key switch to settle, so both are run and both are reported rather
-  // than guessed and re-run.
-  const int shift = std::getenv("CHEDDAR_SEAM_SHIFT_BACK") ? degree - 1 : 1;
-  std::cout << "  token shift by " << shift << std::endl;
   std::cout << "  after T1: level " << boot.param->NPToLevel(a.GetNP())
             << ", scale / canonical "
             << (a.GetScale() /
                 boot.param->GetScale(boot.param->NPToLevel(a.GetNP())))
             << std::endl;
-  // The token shift, then the channel permutation, then the sum with the
-  // live image itself. HRot by 1 brings slot s + 1 down to slot s.
-  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(shift),
-                     shift);
+  // The token map, then the channel permutation, then the sum with the live
+  // image itself.
+  ttok.Evaluate(boot.context, shifted, a, boot.ui->GetEvkMap());
+  close(shifted, backt);
   t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
   close(dup, back2);
   // The live image has to meet `dup` at the same level AND the same scale,
   // and LevelDown leaves a drift, so it comes down by the same multiply the
-  // transform used: a constant one at the scale that lands canonical.
+  // transform used: a constant one at the scale that lands canonical. It is
+  // now two levels above, so one plain LevelDown goes first.
   {
     const int dl = boot.param->NPToLevel(dup.GetNP());
+    if (boot.param->NPToLevel(a.GetNP()) != dl + 1) {
+      Ciphertext<word> d;
+      boot.context->LevelDown(d, a, dl + 1);
+      a = std::move(d);
+    }
     cheddar::Constant<word> one;
     boot.context->encoder_.EncodeConstant(
         one, dl + 1,
@@ -1305,41 +1332,54 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   std::vector<Complex> got;
   boot.context->encoder_.Decode(got, out_pt);
 
-  // ---- what the O projection needs to be there --------------------------
-  double live_err = 0.0, dup_err = 0.0, absmax = 0.0, elsewhere = 0.0;
-  std::vector<char> touched(num_slots, 0);
+  // ---- THE CONSUMER'S READ ----------------------------------------------
+  //
+  // NOT "is every duplicate where I said it would be". That is the formula
+  // marking its own work, and it is exactly how `row - 1` survived here for
+  // a whole increment while the layer's O projection read the same image at
+  // err/mx 14.48. What follows is the read the projection performs: slots to
+  // coefficients by R+'s own map, then the banded scan `ModDecomp` inverts.
+  // If the duplicates are misplaced by even one position the scan walks the
+  // error the length of the ring and this comes back enormous.
+  std::vector<double> coeffs(degree, 0.0);
+  for (int t = 0; t < kRows; t++) {
+    for (int c = 0; c < kRank; c++) {
+      coeffs[static_cast<size_t>(Rev(t, 7)) * kRank + Rev(c, 9)] =
+          got[slot_block(t, c)].real();
+    }
+  }
+  const auto comp = CiComponentsFfn(coeffs, kRank, kRows);
+  double live_err = 0.0, absmax = 0.0;
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
       const int lane = half * 16 + lh;
-      const int c = chan_of(col, lh);
-      const int Ic = Rev(c, 9);
-      const int cd = (Ic == 0) ? -1 : Rev(kRank - Ic, 9);
+      const int I = Rev(chan_of(col, lh), 9);
       for (int row = 0; row < kRows; row++) {
         const double want = v[row][col][lane];
         absmax = std::max(absmax, std::abs(want));
-        const int ls = slot_block(row, c);
-        live_err = std::max(live_err, std::abs(got[ls].real() - want));
-        touched[ls] = 1;
-        if (row >= 1 && cd >= 0) {
-          const int ds = slot_block(row - 1, cd);
-          dup_err = std::max(dup_err, std::abs(got[ds].real() - want));
-          touched[ds] = 1;
-        }
+        live_err =
+            std::max(live_err, std::abs(comp[I][Rev(row, 7)] - want));
       }
     }
   }
-  for (int s = 0; s < num_slots; s++) {
-    if (!touched[s]) elsewhere = std::max(elsewhere, std::abs(got[s].real()));
+  // And the dead components have to come out of the scan at zero: that is
+  // what "half density" means to everything downstream.
+  double dead_err = 0.0;
+  for (int I = kLive; I < kRank; I++) {
+    for (int p = 0; p < kRows; p++) {
+      dead_err = std::max(dead_err, std::abs(comp[I][p]));
+    }
   }
-  std::cout << "THE SEAM: live " << live_err << ", duplicates " << dup_err
-            << ", everywhere else " << elsewhere << " (|v| <= " << absmax
-            << ")" << std::endl;
+  std::cout << "THE SEAM, read as components: live " << live_err
+            << ", dead " << dead_err << " (|v| <= " << absmax << ")"
+            << std::endl;
   // THE SEAM CLOSES. T1 (486 diagonals) carries the chain's layout to the
-  // block's live half-density addresses, one rotation shifts the token, T2
-  // (130 diagonals) permutes the channel onto the partner, and the sum is
-  // the banded image a coefficient-domain projection on R+ reads.
+  // block's live half-density addresses, a 7-diagonal token map steps every
+  // entry one banded POSITION down, T2 (129 diagonals) permutes the channel
+  // onto the partner, and the sum is the banded image a coefficient-domain
+  // projection on R+ reads.
   //
-  // Four things had to be right at once and each was found the hard way:
+  // Five things had to be right at once and each was found the hard way:
   //
   //   - THE LEVEL. A LinearTransform is a hoisted transform and ci16_35's
   //     levels 0..6 are the num_accum == 1 zone; at 5 and 4 both returned
@@ -1354,17 +1394,19 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   //     whose channel is 0 -- even, and therefore live -- so taking the
   //     banded formula literally wrote a duplicate on top of a live value.
   //     That alone held the live half at 2.54 while T1 was exact.
+  //   - AND THE STEP IS IN THE BANDED POSITION, NOT THE TOKEN. `p = rev7(t)`,
+  //     so `p - 1` is a bit-reversed decrement. The first version of this
+  //     test rotated by one slot and passed, because it then looked for the
+  //     duplicates where it had put them. Read as components -- which is what
+  //     the O projection does -- that image is off by 38.56 against |v| 4.16.
   //
-  // The token shift's direction is checked by its own control: the other way
-  // leaves the duplicates at 6.20.
+  // The two errors below are the CONSUMER'S, taken through the banded scan.
+  // Nothing here compares the seam against the seam.
   EXPECT_LT(live_err, 1e-3 * absmax)
-      << "the seam did not carry the chain's entries to the block's live "
-         "addresses";
-  EXPECT_LT(dup_err, 1e-3 * absmax)
-      << "the seam did not put the shifted duplicates where the banded "
-         "convention needs them";
-  EXPECT_LT(elsewhere, 1e-3 * absmax)
-      << "something landed outside the half-density image";
+      << "the banded scan did not return the chain's entries as components";
+  EXPECT_LT(dead_err, 1e-3 * absmax)
+      << "the scan left mass in the dead components: the shifted duplicates "
+         "are not where the banded convention needs them";
 }
 
 // ---------------------------------------------------------------------------
