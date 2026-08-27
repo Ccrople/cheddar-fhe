@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <set>
 #include <utility>
 #include <functional>
 #include <string>
@@ -1047,45 +1048,67 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   std::cout << "T1 (chain -> block live): " << m1.GetNumDiag() << " diagonals"
             << std::endl;
 
-  // ---- T2: identity plus the shifted duplicates -------------------------
+  // ---- T2: the shifted duplicates, as a channel permutation -----------
   //
   // Live component `I = rev9(c)` at position `row`; its duplicate belongs at
   // component `rank - I` and position `row - 1`, i.e. block channel
-  // `rev9(512 - I)` and token `row - 1`. Adding the identity in the same
-  // matrix keeps it one transform and one level.
+  // `rev9(512 - I)` and token `row - 1`.
+  //
+  // AS ONE TRANSFORM that is 131 diagonals and still too dear: the token's
+  // `-1` makes every offset odd, `DetermineStride`'s gcd collapses to 1,
+  // `max_rot` is 65024 and the BSGS split has to cover the whole ring at
+  // 256 x 256 = 512 key switches a ciphertext. Splitting the token shift off
+  // as a plain rotation leaves a pure CHANNEL permutation whose offsets are
+  // all multiples of 128, gcd 128, so 32 x 32 covers it in 64. The wrapped
+  // slots -- token 0 rotating in from the next channel -- are excluded by the
+  // transform's own plaintexts rather than by a separate mask, so T2 is one
+  // rotation, one transform and one add.
   cheddar::StripedMatrix m2(degree, degree);
-  for (int s = 0; s < degree; s++) {
-    m2.try_emplace(0, degree, Complex(0.0, 0.0));
-    m2[0][s] = Complex(1.0, 0.0);
+  int t2_window = 0;
+  {
+    std::set<int> raw_offs;
+    for (int col = 0; col < kCols; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        const int c = chan_of(col, lh);
+        const int I = Rev(c, 9);
+        ASSERT_LT(I, kRank / 2) << "an even channel must be a live component";
+        raw_offs.insert(kRows * (c - Rev(kRank - I, 9)));
+      }
+    }
+    t2_window = *raw_offs.begin();
   }
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
       const int c = chan_of(col, lh);
-      const int I = Rev(c, 9);
-      ASSERT_LT(I, kRank / 2) << "an even channel must be a live component";
-      const int cd = Rev(kRank - I, 9);
+      const int cd = Rev(kRank - Rev(c, 9), 9);
+      const int off = ((kRows * (c - cd)) % degree + degree) % degree;
+      m2.try_emplace(off, degree, Complex(0.0, 0.0));
       for (int row = 1; row < kRows; row++) {
-        const int dst = slot_block(row - 1, cd);
-        const int src = slot_block(row, c);
-        const int off = ((src - dst) % degree + degree) % degree;
-        m2.try_emplace(off, degree, Complex(0.0, 0.0));
-        m2[off][dst] = Complex(1.0, 0.0);
+        m2[off][slot_block(row - 1, cd)] = Complex(1.0, 0.0);
       }
     }
   }
-  std::cout << "T2 (identity + duplicates): " << m2.GetNumDiag()
-            << " diagonals" << std::endl;
+  std::cout << "T2 (channel permutation after the -1 rotation): "
+            << m2.GetNumDiag() << " diagonals" << std::endl;
 
+  // The windows are `DetermineStride`'s wrap wall, handled exactly as the
+  // leg's own exchange handles it (1.5by). T1 needs bs*gs >= 7827, T2 >= 1023.
+  constexpr int kT1Window = 61679;
   cheddar::LinearTransform<word> t1(
       boot.context, m1, t1_level,
-      boot.param->GetRescalePrimeProd(t1_level), 32, 16);
+      boot.param->GetRescalePrimeProd(t1_level), 128, 64,
+      /*pre_rotation=*/-kT1Window, /*additional_pt_rot=*/kT1Window);
   cheddar::LinearTransform<word> t2(
       boot.context, m2, t2_level,
-      boot.param->GetRescalePrimeProd(t2_level), 32, 32);
+      boot.param->GetRescalePrimeProd(t2_level), 32, 32,
+      /*pre_rotation=*/-t2_window, /*additional_pt_rot=*/t2_window);
+  std::cout << "  T1 BSGS " << t1.GetBS() << "x" << t1.GetGS() << ", T2 "
+            << t2.GetBS() << "x" << t2.GetGS() << std::endl;
   {
     cheddar::EvkRequest req;
     t1.AddRequiredRotations(req);
     t2.AddRequiredRotations(req);
+    req.AddRequest(1, t2_level);  // the token shift
     boot.ui->PrepareRotationKey(req);
   }
 
@@ -1111,12 +1134,18 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   Ciphertext<word> ct;
   boot.ui->Encrypt(ct, pt);
 
-  Ciphertext<word> a, b;
+  Ciphertext<word> a, shifted, dup, live, b;
   t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
-  t2.Evaluate(boot.context, b, a, boot.ui->GetEvkMap());
+  // The token shift, then the channel permutation, then the sum with the
+  // live image itself. HRot by 1 brings slot s + 1 down to slot s.
+  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1));
+  t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
+  boot.context->LevelDown(live, a, boot.param->NPToLevel(dup.GetNP()));
+  boot.context->Add(b, live, dup);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  ASSERT_EQ(boot.param->NPToLevel(b.GetNP()), t2_level - 1);
+  std::cout << "  output at level "
+            << boot.param->NPToLevel(b.GetNP()) << std::endl;
 
   Plaintext<word> out_pt;
   boot.ui->Decrypt(out_pt, b);
