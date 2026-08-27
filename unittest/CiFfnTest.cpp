@@ -1138,7 +1138,8 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
   // The token shift, then the channel permutation, then the sum with the
   // live image itself. HRot by 1 brings slot s + 1 down to slot s.
-  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1));
+  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1),
+                     1);
   t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
   boot.context->LevelDown(live, a, boot.param->NPToLevel(dup.GetNP()));
   boot.context->Add(b, live, dup);
