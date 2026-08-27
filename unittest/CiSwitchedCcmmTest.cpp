@@ -6824,6 +6824,8 @@ TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
   // ---- against the causal leg in the clear ----------------------------
   double worst_true = 0.0, worst_incoming = 0.0, worst_plain = 0.0;
   double transposed = 0.0, biggest = 0.0;
+  double copy_gap = 0.0;
+  long long copy_seen = 0;
   for (int bi = 0; bi < layout.num_cts; bi++) {
     ASSERT_EQ(boot.param->NPToLevel(out[bi].GetNP()), 0);
     Plaintext<word> pt;
@@ -6860,6 +6862,19 @@ TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
           int ct_idx, slot, copy_slot;
           layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
           const double got = slots[slot].real();
+          // THE SEAM TO THE O PROJECTION, asked here because this is the
+          // only place the leg's output is already in hand. A
+          // coefficient-domain projection on R+ needs the BANDED
+          // convention -- each entry at its own address AND at its
+          // partner's (Doing.md 1.5cs) -- which is the pair LocateSlot
+          // names. If the OUTPUT carries it, Boot + StC hands the O
+          // projection what it wants with no transform and the CI block's
+          // last seam is free.
+          if (copy_slot >= 0) {
+            copy_gap = std::max(copy_gap,
+                                std::abs(slots[copy_slot].real() - got));
+            copy_seen++;
+          }
           biggest = std::max(biggest, std::abs(want));
           worst_true = std::max(worst_true, std::abs(got - want));
           worst_incoming =
@@ -6886,6 +6901,11 @@ TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
             << "] folded to [0.9, 1.1] by the row_norm mask" << std::endl;
   std::cout << "  controls: un-masked softmax " << worst_plain
             << ", transposed " << transposed << std::endl;
+  std::cout << "  THE SEAM: the output's copy addresses differ from their "
+            << "primaries by at most " << copy_gap << " over " << copy_seen
+            << " pairs (|output| <= " << biggest << "). Below the leg's own "
+            << "floor means the banded convention is already there and the "
+            << "O projection needs no transform." << std::endl;
   std::cout << "  cost: construct " << secs(t0, t1) << " s, Scores "
             << secs(t2, t3) << " s, SoftMax " << secs(t4, t5)
             << " s, Values " << secs(t6, t7) << " s" << std::endl;
