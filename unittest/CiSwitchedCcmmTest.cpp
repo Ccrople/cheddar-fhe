@@ -8591,10 +8591,20 @@ class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
 
 TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   Ring boot(kBootParam);
-  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
-  Ring small(kBootSmallParam);
-  Ring lifted(kBootLiftedParam,
-              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+  // HELD BY POINTER SO THEY CAN BE RELEASED. A whole layer needs two
+  // bootstrap key sets alive -- the leg's, at slack zero, and the FFN's, at
+  // slack nine -- and two of them plus the leg's three converters, its 512
+  // big-ring ModPack keys and the lifted ring's automorphisms do not fit in
+  // 80 GB: the run dies with cudaErrorMemoryAllocation right after the seam's
+  // transforms are built. Nothing after `Values` needs the switching, product
+  // or lifted rings, or the converters, so they go before the second
+  // BootContext is made.
+  auto swtch = std::make_unique<Ring>(kBootSwitchParam,
+                                      boot.ui->GetSecretCoeffs());
+  auto small = std::make_unique<Ring>(kBootSmallParam);
+  auto lifted = std::make_unique<Ring>(
+      kBootLiftedParam,
+      CiLiftHandler<word>::LiftSecret(small->ui->GetSecretCoeffs()));
 
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   ASSERT_NE(bctx, nullptr);
@@ -8777,35 +8787,36 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   typename cheddar::CiSinCAttention<word>::Config acfg;
   acfg.restore = 1.0 / hb_const;
   const auto t0 = std::chrono::steady_clock::now();
-  cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
-                                      lifted.context, acfg);
+  auto attn_p = std::make_unique<cheddar::CiSinCAttention<word>>(
+      bctx, swtch->context, small->context,
+                                      lifted->context, acfg));
   const auto t1 = std::chrono::steady_clock::now();
-  const auto &layout = attn.GetLayout();
+  const auto layout = attn_p->GetLayout();  // by value: attn_p dies below
 
-  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+  swtch->ui->PrepareRingSwitchKey(small->Degree(), small->ui->GetSecretCoeffs(),
                                  chain_level);
-  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
-                                        small.ui->GetSecretCoeffs(),
+  swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
+                                        small->ui->GetSecretCoeffs(),
                                         chain_level);
-  for (int idx : attn.LiftedRotationIndices()) {
-    lifted.ui->PrepareRotationKey(idx, chain_level);
+  for (int idx : attn_p->LiftedRotationIndices()) {
+    lifted->ui->PrepareRotationKey(idx, chain_level);
   }
   {
     EvkRequest req;
-    attn.AddSwitchRotations(req);
-    swtch.ui->PrepareRotationKey(req);
+    attn_p->AddSwitchRotations(req);
+    swtch->ui->PrepareRotationKey(req);
   }
   {
     EvkRequest req;
-    attn.AddRequiredRotations(req);
+    attn_p->AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
-  keys.swtch = &swtch.ui->GetEvkMap();
-  keys.lifted = &lifted.ui->GetEvkMap();
-  keys.ring_switch = &swtch.ui->GetRingSwitchKey(layout.rank);
-  keys.inverse_ring_switch = &swtch.ui->GetInverseRingSwitchKey(layout.rank);
+  keys.swtch = &swtch->ui->GetEvkMap();
+  keys.lifted = &lifted->ui->GetEvkMap();
+  keys.ring_switch = &swtch->ui->GetRingSwitchKey(layout.rank);
+  keys.inverse_ring_switch = &swtch->ui->GetInverseRingSwitchKey(layout.rank);
 
   // ---- host calibration off the clear twin ----------------------------
   const double m_eff = 8.0;
@@ -8871,12 +8882,12 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   calib.causal = true;
   calib.row_shift = row_shift;
   calib.row_norm = row_norm;
-  attn.PrepareSoftMax(calib);
+  attn_p->PrepareSoftMax(calib);
 
   // ---- the leg through the handler ------------------------------------
   const auto t2 = std::chrono::steady_clock::now();
   std::vector<Ciphertext<word>> s0;
-  attn.Scores(s0, q_a, q_b, k_a, k_b, keys);
+  attn_p->Scores(s0, q_a, q_b, k_a, k_b, keys);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const auto t3 = std::chrono::steady_clock::now();
@@ -8890,11 +8901,11 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     s0[bi].SetNumSlots(num_slots);
     bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
   }
-  ASSERT_EQ(boot.param->NPToLevel(scores[0].GetNP()), attn.GetTopLevel());
+  ASSERT_EQ(boot.param->NPToLevel(scores[0].GetNP()), attn_p->GetTopLevel());
 
   const auto t4 = std::chrono::steady_clock::now();
   std::vector<Ciphertext<word>> P;
-  attn.SoftMax(P, scores, carried, boot.ui->GetEvkMap());
+  attn_p->SoftMax(P, scores, carried, boot.ui->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const auto t5 = std::chrono::steady_clock::now();
@@ -8937,7 +8948,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
 
   const auto t6 = std::chrono::steady_clock::now();
   std::vector<Ciphertext<word>> out;
-  attn.Values(out, P, v_a, v_b, keys);
+  attn_p->Values(out, P, v_a, v_b, keys);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
@@ -8952,6 +8963,24 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // of the layer exactly, and the attention half is measured by the
   // assertions the leg test already carries and which are kept above.
   // =====================================================================
+  // ---- release the leg -------------------------------------------------
+  //
+  // Everything after this point needs `boot`, `out` and the layout, and
+  // nothing else the leg built: not the three converters, not the switching,
+  // product or lifted rings, not their keys. Freeing them here is what makes
+  // room for the second BootContext.
+  {
+    size_t before = 0, total = 0, after = 0;
+    cudaMemGetInfo(&before, &total);
+    attn_p.reset();
+    lifted.reset();
+    small.reset();
+    swtch.reset();
+    cudaMemGetInfo(&after, &total);
+    std::cout << "  released the leg: " << ((after - before) >> 20)
+              << " MiB back, " << (after >> 20) << " MiB free" << std::endl;
+  }
+
   // The attention output, decrypted once and laid out the way the O
   // projection reads it. The seam sends chain entry (row, col, lane) to
   // block channel `chan_of(col, lane % 16)` of half ciphertext
