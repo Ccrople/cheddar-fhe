@@ -8788,8 +8788,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   acfg.restore = 1.0 / hb_const;
   const auto t0 = std::chrono::steady_clock::now();
   auto attn_p = std::make_unique<cheddar::CiSinCAttention<word>>(
-      bctx, swtch->context, small->context,
-                                      lifted->context, acfg));
+      bctx, swtch->context, small->context, lifted->context, acfg);
   const auto t1 = std::chrono::steady_clock::now();
   const auto layout = attn_p->GetLayout();  // by value: attn_p dies below
 
