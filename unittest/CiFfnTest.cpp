@@ -1341,3 +1341,96 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   std::cout << "  neither transform is settled; see the comment above."
             << std::endl;
 }
+
+// ---------------------------------------------------------------------------
+// What does a StripedMatrix key MEAN? Settled once, here, so no map after this
+// one has to guess.
+//
+// The tree's own transforms cannot answer it. `CiSinCAttention`'s exchange is
+// an INVOLUTION with a symmetric window, so it reads identically whether the
+// key `i` means `out[j] = in[j + i]` or `out[j + i] = in[j]`; the bootstrap's
+// FFT diagonals are generated from the transform they implement rather than
+// from an index map. Both readings were tried on the seam above and neither
+// came out exact, which is what makes this worth its own test rather than
+// another 50/50.
+//
+// Two diagonals, at offsets 128 and 256, carrying DISJOINT row masks. The two
+// readings then put the answer in different slots and one decode separates
+// them:
+//
+//   out[j] = in[j + i]   ->  out[0..128)   = in[128..256)
+//                            out[128..256) = in[384..512)
+//   out[j + i] = in[j]   ->  out[128..256) = in[0..128)
+//                            out[384..512) = in[128..256)
+//
+// Above ci16_35's level-7 hoisted zone, because a LinearTransform is a
+// hoisted transform and below it this returns 1e38 rather than an answer.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, TheStripedMatrixOffsetConventionIsPinned) {
+  Ring boot(Param());
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  const int level = 10;
+
+  cheddar::StripedMatrix m(degree, degree);
+  m.try_emplace(128, degree, Complex(0.0, 0.0));
+  m.try_emplace(256, degree, Complex(0.0, 0.0));
+  for (int j = 0; j < 128; j++) m[128][j] = Complex(1.0, 0.0);
+  for (int j = 128; j < 256; j++) m[256][j] = Complex(1.0, 0.0);
+
+  cheddar::LinearTransform<word> t(
+      boot.context, m, level,
+      boot.param->GetScale(level - 1) *
+          boot.param->GetRescalePrimeProd(level) / boot.param->GetScale(level),
+      2, 2);
+  {
+    cheddar::EvkRequest req;
+    t.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // A message whose value names its own slot, so the answer reads directly.
+  std::vector<Complex> msg(num_slots, Complex(0.0, 0.0));
+  for (int s = 0; s < num_slots; s++) {
+    msg[s] = Complex(1.0 + static_cast<double>(s) / num_slots, 0.0);
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, level, boot.param->GetScale(level), msg);
+  Ciphertext<word> ct, out;
+  boot.ui->Encrypt(ct, pt);
+  t.Evaluate(boot.context, out, ct, boot.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  Plaintext<word> out_pt;
+  boot.ui->Decrypt(out_pt, out);
+  std::vector<Complex> got;
+  boot.context->encoder_.Decode(got, out_pt);
+
+  auto slot_of = [&](double v) {
+    return static_cast<int>(std::llround((v - 1.0) * num_slots));
+  };
+  double a_err = 0.0, b_err = 0.0;
+  for (int j = 0; j < 128; j++) {
+    a_err = std::max(a_err, std::abs(got[j].real() - msg[j + 128].real()));
+    b_err = std::max(b_err,
+                     std::abs(got[j + 128].real() - msg[j].real()));
+  }
+  std::cout << "reading A (out[j] = in[j + i]): residual " << a_err
+            << std::endl;
+  std::cout << "reading B (out[j + i] = in[j]): residual " << b_err
+            << std::endl;
+  std::cout << "  the first eight non-zero slots and the slot each value "
+            << "names:" << std::endl;
+  int shown = 0;
+  for (int s = 0; s < num_slots && shown < 8; s++) {
+    if (std::abs(got[s].real()) > 0.5) {
+      std::cout << "    slot " << s << " carries slot " << slot_of(
+          got[s].real()) << std::endl;
+      shown++;
+    }
+  }
+  EXPECT_TRUE(a_err < 1e-3 || b_err < 1e-3)
+      << "neither reading of the StripedMatrix key describes what Evaluate "
+         "did, so the offset is not the whole story";
+}
