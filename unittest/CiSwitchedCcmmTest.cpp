@@ -8952,29 +8952,31 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // of the layer exactly, and the attention half is measured by the
   // assertions the leg test already carries and which are kept above.
   // =====================================================================
-  std::vector<std::vector<double>> attn_out(   // [channel][row]
-      layout.num_cts * layout.rank * layout.lanes,
-      std::vector<double>(layout.dim, 0.0));
-  {
-    for (int bi = 0; bi < layout.num_cts; bi++) {
-      Plaintext<word> pt;
-      boot.ui->Decrypt(pt, out[bi]);
-      std::vector<Complex> slots;
-      boot.context->encoder_.Decode(slots, pt);
-      for (int col = 0; col < layout.rank; col++) {
-        for (int lane = 0; lane < layout.lanes; lane++) {
-          // The block channel this entry becomes, by the orders the seam
-          // was built on: `channel = rev4(col) * 32 + rev5(lane)` within the
-          // big ciphertext, and the ciphertext index above it.
-          const int c_in_ct =
-              rev(col, 4) * layout.lanes + rev(lane % 16, 5);
-          const int chan = bi * (layout.rank * layout.lanes) +
-                           (lane >= 16 ? layout.rank * 16 : 0) + c_in_ct;
-          for (int row = 0; row < layout.dim; row++) {
-            int ci, sl, cs;
-            layout.LocateSlot(row, bi * layout.rank + col, lane, ci, sl, cs);
-            attn_out[chan][row] = slots[sl].real();
-          }
+  // The attention output, decrypted once and laid out the way the O
+  // projection reads it. The seam sends chain entry (row, col, lane) to
+  // block channel `chan_of(col, lane % 16)` of half ciphertext
+  // `2 * bi + lane / 16`, and `CoeffLinearLeg` numbers a parent's channels
+  // `parent * rank + channel`, so that is the flat index. Reading it as
+  // "live channel 2j" instead -- the obvious guess -- puts every entry under
+  // the wrong weight column.
+  const int attn_channels = 2 * layout.num_cts * proj_rank;
+  std::vector<double> attn_flat(
+      static_cast<size_t>(layout.dim) * attn_channels, 0.0);
+  auto chan_of0 = [&](int col, int lh) { return rev(col, 4) * 32 + rev(lh, 5); };
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, out[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lane = 0; lane < layout.lanes; lane++) {
+        const int k = 2 * bi + lane / 16;
+        const int c = chan_of0(col, lane % 16);
+        for (int row = 0; row < layout.dim; row++) {
+          int ci, sl, cs;
+          layout.LocateSlot(row, bi * layout.rank + col, lane, ci, sl, cs);
+          attn_flat[static_cast<size_t>(row) * attn_channels +
+                    k * proj_rank + c] = slots[sl].real();
         }
       }
     }
@@ -9169,8 +9171,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // inner dimension is twice that.
   const int model_declared = proj_rank;            // 512, 256 live
   const int hidden_declared = 2 * proj_rank;       // 1024, 512 live
-  const int attn_declared = 2 * layout.num_cts * layout.rank * layout.lanes;
-  ASSERT_EQ(static_cast<int>(h_cts.size()) * proj_rank, attn_declared);
+  ASSERT_EQ(static_cast<int>(h_cts.size()) * proj_rank, attn_channels);
 
   std::normal_distribution<double> lw(0.0, 0.02);
   auto half_weight = [&](int in_dec, int out_dec) {
@@ -9182,7 +9183,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
     return w;
   };
-  const auto wo = half_weight(attn_declared, model_declared);
+  const auto wo = half_weight(attn_channels, model_declared);
   const auto wgate = half_weight(model_declared, hidden_declared);
   const auto wup = half_weight(model_declared, hidden_declared);
   const auto wdown = half_weight(hidden_declared, model_declared);
@@ -9197,19 +9198,6 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   lcfg.parents_per_tile = 0;
   ProjectOnlyLegCi leg(boot_ffn.context, lcfg, pack_keys);
 
-  // The attention output's live channels, laid out as the projection reads
-  // them: half ciphertext `k` holds live channels `2 * j` for j < 256.
-  std::vector<double> attn_flat(
-      static_cast<size_t>(layout.dim) * attn_declared, 0.0);
-  for (size_t k = 0; k < h_cts.size(); k++) {
-    for (int j = 0; j < proj_rank / 2; j++) {
-      const int chan = static_cast<int>(k) * (proj_rank / 2) + j;
-      for (int row = 0; row < layout.dim; row++) {
-        attn_flat[static_cast<size_t>(row) * attn_declared +
-                  k * proj_rank + 2 * j] = attn_out[chan][row];
-      }
-    }
-  }
   auto host_mm2 = [&](const std::vector<double> &in, int in_w,
                      const std::vector<double> &w, int out_w) {
     std::vector<double> r(static_cast<size_t>(layout.dim) * out_w, 0.0);
@@ -9233,7 +9221,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, ins, attn_declared, model_declared, wo, 1.0, "o");
+    leg.Project(res, ins, attn_channels, model_declared, wo, 1.0, "o");
     ASSERT_EQ(res.size(), 1u);
     o_out = std::move(res[0]);
   }
@@ -9242,7 +9230,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
 
-  const auto o_host = host_mm2(attn_flat, attn_declared, wo, model_declared);
+  const auto o_host = host_mm2(attn_flat, attn_channels, wo, model_declared);
   std::cout << "THE CI LAYER RAN: attention -> seam -> O projection, all "
             << "encrypted, " << h_cts.size() << " half ciphertexts through "
             << "the seam" << std::endl;
