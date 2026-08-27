@@ -8995,7 +8995,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   };
   auto slot_block = [&](int token, int chan) { return token + 128 * chan; };
   auto chan_of = [&](int col, int lh) { return rev(col, 4) * 32 + rev(lh, 5); };
-  auto best_window = [&](const StripedMatrix &m, int *need) {
+  auto best_window = [&](const cheddar::StripedMatrix &m, int *need) {
     std::vector<int> offs;
     for (const auto &kv : m) offs.push_back(kv.first);
     int bw = 0;
@@ -9028,12 +9028,12 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
            boot.param->GetScale(l);
   };
 
-  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> t1(2);
-  std::unique_ptr<cheddar::LinearTransform<word>> t2;
+  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> seam_t1(2);
+  std::unique_ptr<cheddar::LinearTransform<word>> seam_t2;
   std::vector<int> back1(2, 0);
   int back2 = 0;
   for (int half = 0; half < 2; half++) {
-    StripedMatrix m1(n, n);
+    cheddar::StripedMatrix m1(n, n);
     for (int col = 0; col < layout.rank; col++) {
       for (int lh = 0; lh < 16; lh++) {
         const int lane = half * 16 + lh;
@@ -9050,7 +9050,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     int need = 0;
     const int w = best_window(m1, &need);
     const auto sp = split(need);
-    t1[half] = std::make_unique<cheddar::LinearTransform<word>>(
+    seam_t1[half] = std::make_unique<cheddar::LinearTransform<word>>(
         boot.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
         w, -w);
     back1[half] = ((w % n) + n) % n;
@@ -9058,7 +9058,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
               << " diagonals, " << sp.first << "x" << sp.second << std::endl;
   }
   {
-    StripedMatrix m2(n, n);
+    cheddar::StripedMatrix m2(n, n);
     for (int col = 0; col < layout.rank; col++) {
       for (int lh = 0; lh < 16; lh++) {
         const int c = chan_of(col, lh);
@@ -9075,7 +9075,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     int need = 0;
     const int w = best_window(m2, &need);
     const auto sp = split(need);
-    t2 = std::make_unique<cheddar::LinearTransform<word>>(
+    seam_t2 = std::make_unique<cheddar::LinearTransform<word>>(
         boot.context, m2, t2_level, pt_scale(t2_level), sp.first, sp.second,
         w, -w);
     back2 = ((w % n) + n) % n;
@@ -9085,10 +9085,10 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   {
     EvkRequest req;
     for (int h = 0; h < 2; h++) {
-      t1[h]->AddRequiredRotations(req);
+      seam_t1[h]->AddRequiredRotations(req);
       req.AddRequest(back1[h], t1_level - 1);
     }
-    t2->AddRequiredRotations(req);
+    seam_t2->AddRequiredRotations(req);
     req.AddRequest(back2, t2_level - 1);
     req.AddRequest(1, t2_level);
     boot.ui->PrepareRotationKey(req);
@@ -9102,7 +9102,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     for (int half = 0; half < 2; half++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
       boot.context->LevelDown(low, booted, t1_level);
-      t1[half]->Evaluate(boot.context, a2, low, boot.ui->GetEvkMap());
+      seam_t1[half]->Evaluate(boot.context, a2, low, boot.ui->GetEvkMap());
       if (back1[half]) {
         Ciphertext<word> r;
         boot.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
@@ -9110,7 +9110,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
         a2 = std::move(r);
       }
       boot.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
-      t2->Evaluate(boot.context, dup, sh, boot.ui->GetEvkMap());
+      seam_t2->Evaluate(boot.context, dup, sh, boot.ui->GetEvkMap());
       if (back2) {
         Ciphertext<word> r;
         boot.context->HRot(r, dup, boot.ui->GetEvkMap().GetRotationKey(back2),
