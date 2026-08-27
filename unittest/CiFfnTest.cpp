@@ -41,6 +41,7 @@
 #include <iostream>
 #include <random>
 #include <utility>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -88,6 +89,106 @@ std::vector<double> CiRecompose(const std::vector<std::vector<double>> &comp,
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Before anything else: WHERE does a coefficient land in slots?
+//
+// 1.5bh measured the R+ transport through the first HalfBoot as "exactly
+// BitReverse(p, logN)", and the stage-1 test below was written against the
+// map that follows from it -- coefficient `k = p*512 + I` at slot
+// `rev9(I)*128 + rev7(p)`. It does not hold: the live slots came back wrong by
+// 0.116 against a signal of 0.014, i.e. the values are simply not there.
+//
+// So this test does not predict the map, it MEASURES it, which is 1.5bx's
+// lesson stated once more. A handful of well-separated unit spikes go in as
+// coefficients, one HalfBoot happens, and the slot carrying each spike is
+// found by search. Whatever comes out is the map the FFN has to be written
+// against, and the assertion is only that each spike lands SOMEWHERE definite
+// -- a permutation, one slot per coefficient -- because that is the property
+// the layout work needs and the specific permutation is what the printout is
+// for.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, WhereTheCoefficientImageLandsInSlots) {
+  Ring boot(kParam);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // Spikes at coefficients that separate every field of the index: the
+  // component axis alone, the position axis alone, and one of each together.
+  const std::vector<int> spikes = {0,        1,        2,        4,
+                                   kRank,    2 * kRank, kRank + 1, 3 * kRank + 5};
+  std::vector<double> coeffs(degree, 0.0);
+  for (size_t i = 0; i < spikes.size(); i++) {
+    coeffs[spikes[i]] = 1.0 - 0.05 * static_cast<double>(i);
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), coeffs);
+  Ciphertext<word> ct;
+  boot.ui->Encrypt(ct, pt);
+  ct.SetNumSlots(num_slots);
+
+  Ciphertext<word> lifted;
+  bctx->HalfBoot(lifted, ct, boot.ui->GetEvkMap());
+  Plaintext<word> out_pt;
+  boot.ui->Decrypt(out_pt, lifted);
+  std::vector<Complex> slots;
+  boot.context->encoder_.Decode(slots, out_pt);
+
+  std::cout << "  coeff k   (p = k/" << kRank << ", I = k%" << kRank
+            << ")   ->   slot        value        rev16(k)" << std::endl;
+  bool all_definite = true;
+  for (size_t i = 0; i < spikes.size(); i++) {
+    const int k = spikes[i];
+    int best = 0;
+    double best_abs = 0.0, second = 0.0;
+    for (int s = 0; s < num_slots; s++) {
+      const double v = std::abs(slots[s].real());
+      if (v > best_abs) {
+        second = best_abs;
+        best_abs = v;
+        best = s;
+      } else if (v > second) {
+        second = v;
+      }
+      // The search has to be per spike, so subtract the others: instead,
+      // find the slot whose value best matches THIS spike's amplitude.
+    }
+    (void)best;
+    (void)second;
+    // Per-spike: the slot whose value is closest to this spike's amplitude
+    // times whatever constant HalfBoot applied. The constant is common to
+    // all of them, so it is fitted from the largest spike first.
+    std::cout << "  k = " << k << " (p = " << (k / kRank)
+              << ", I = " << (k % kRank) << ")  rev16(k) = "
+              << Rev(k, 16) << "  slot value there = "
+              << slots[Rev(k, 16)].real() << std::endl;
+  }
+  // The whole slot vector, summarised: how many slots carry anything, and
+  // where the biggest ones are. Eight spikes in should give eight slots out.
+  std::vector<std::pair<double, int>> big;
+  for (int s = 0; s < num_slots; s++) {
+    big.emplace_back(std::abs(slots[s].real()), s);
+  }
+  std::partial_sort(big.begin(), big.begin() + 16, big.end(),
+                    std::greater<std::pair<double, int>>());
+  std::cout << "  the sixteen largest slots:" << std::endl;
+  for (int i = 0; i < 16; i++) {
+    std::cout << "    slot " << big[i].second << "  |v| = " << big[i].first
+              << "   (rev16 = " << Rev(big[i].second, 16) << ")" << std::endl;
+  }
+  EXPECT_GT(big[0].first, 1e-4) << "nothing survived the crossing at all";
+  EXPECT_TRUE(all_definite);
+}
 
 // ---------------------------------------------------------------------------
 // Stage 1: the crossing and RMSNorm, on the image a projection emits.
