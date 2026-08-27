@@ -1116,7 +1116,16 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
       const int c = chan_of(col, lh);
-      const int cd = Rev(kRank - Rev(c, 9), 9);
+      const int I = Rev(c, 9);
+      // COMPONENT ZERO HAS NO PARTNER. The banded recomposition is
+      // `comp_I[p] + [I != 0] comp_{rank-I}[p+1]`, and `rank - 0` is out of
+      // range: taken literally it wraps to component 0, whose channel is 0 --
+      // an EVEN, LIVE address -- so the duplicate lands on top of a live
+      // value. That is the whole of why T2 polluted the live half while T1
+      // alone was exact to 2.9e-05.
+      if (I == 0) continue;
+      const int cd = Rev(kRank - I, 9);
+      ASSERT_EQ(cd % 2, 1) << "a partner channel must be odd, i.e. dead";
       const int step = kRows * (c - cd);
       const int off = ((flip ? -step : step) % degree + degree) % degree;
       m2.try_emplace(off, degree, Complex(0.0, 0.0));
@@ -1293,14 +1302,15 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     for (int lh = 0; lh < 16; lh++) {
       const int lane = half * 16 + lh;
       const int c = chan_of(col, lh);
-      const int cd = Rev(kRank - Rev(c, 9), 9);
+      const int Ic = Rev(c, 9);
+      const int cd = (Ic == 0) ? -1 : Rev(kRank - Ic, 9);
       for (int row = 0; row < kRows; row++) {
         const double want = v[row][col][lane];
         absmax = std::max(absmax, std::abs(want));
         const int ls = slot_block(row, c);
         live_err = std::max(live_err, std::abs(got[ls].real() - want));
         touched[ls] = 1;
-        if (row >= 1) {
+        if (row >= 1 && cd >= 0) {
           const int ds = slot_block(row - 1, cd);
           dup_err = std::max(dup_err, std::abs(got[ds].real() - want));
           touched[ds] = 1;
