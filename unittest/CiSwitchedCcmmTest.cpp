@@ -61,6 +61,8 @@
 #include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
+#include "extension/LlamaLinear.h"
+#include "extension/SylphSchedule.h"
 #include "extension/StripedMatrix.h"
 
 using word = uint32_t;
@@ -8562,4 +8564,712 @@ TEST(CiBootSet, ThePcmmRowTileIsAMeasurement) {
             << ")" << std::endl;
   EXPECT_LT(worst, 1e-2 * std::max(biggest, 1.0))
       << "the tiled product does not agree with the host";
+}
+
+// `CoeffLinearLeg` implements only `Project`; the two ciphertext-ciphertext
+// products are pure virtual on purpose, so nothing falls back to a stand-in.
+// The whole-layer test below uses it for the O projection, whose operands
+// come out of the seam.
+class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
+ public:
+  using cheddar::CoeffLinearLeg<word>::CoeffLinearLeg;
+  void Scores(std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double,
+              const std::vector<double> &) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no Scores here");
+  }
+  void Values(std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no Values here");
+  }
+  void LocateScore(int, int, int, int &, int &) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no score layout here");
+  }
+};
+
+TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
+  Ring boot(kBootParam, {}, /*boot_slack_levels=*/9);
+  Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kBootSmallParam);
+  Ring lifted(kBootLiftedParam,
+              CiLiftHandler<word>::LiftSecret(small.ui->GetSecretCoeffs()));
+
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int pcmm_level = 1;
+  const int chain_level = 2;
+  const int n = boot.Degree();
+  const int proj_rank = 512;
+  const int proj_small = n / proj_rank;
+  const int in_ch = proj_rank;
+  const int num_slots = boot.param->MaxNumSlots();
+
+  auto rev = [](int v, int bits) {
+    int r = 0;
+    for (int j = 0; j < bits; j++) {
+      r = (r << 1) | (v & 1);
+      v >>= 1;
+    }
+    return r;
+  };
+  auto door0 = [&](int t, int c, int i) {
+    return (rev(c % 16, 4) << 12) | (rev(i, 5) << 7) | rev(t, 7);
+  };
+
+  // The boot set first: the handler's constructor reads GetStCInputScale.
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    EvkRequest boot_req;
+    bctx->AddRequiredRotations(boot_req, num_slots);
+    boot.ui->PrepareRotationKey(boot_req);
+  }
+
+  // ---- the projections: real PC-MM emissions, as in 1.5ca/1.5cb ---------
+  cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
+  cheddar::PcmmHandler<word> pcmm(*boot.param);
+  boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
+  for (int j = 0; j < proj_rank; j++) {
+    pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
+  }
+
+  std::mt19937_64 gen(0xB141);
+  std::uniform_real_distribution<double> xd(-1.0, 1.0);
+  std::vector<std::vector<double>> x_comp(
+      in_ch, std::vector<double>(proj_small, 0.0));
+  // HALF DENSITY ON THE RESIDUAL STREAM. Components >= rank/2 are the dead
+  // half of a banded image (1.5by), and the O projection's output is
+  // half-density by construction, so the stream it adds back to has to be
+  // too or the residual would mix two channels.
+  for (int o = 0; o < proj_rank / 2; o++) {
+    for (auto &v : x_comp[o]) v = xd(gen);
+  }
+  const int kDim = 128, kLanes = 32;
+  const double wa = 0.24 / std::sqrt(static_cast<double>(in_ch));
+  std::uniform_real_distribution<double> wd(-wa, wa);
+  using W = std::vector<std::vector<std::vector<double>>>;
+  W wq(kLanes, std::vector<std::vector<double>>(
+                   kDim, std::vector<double>(in_ch, 0.0)));
+  W wk = wq, wv = wq;
+  for (int i = 0; i < kLanes; i++) {
+    for (int c = 0; c < kDim; c++) {
+      for (int o = 0; o < in_ch; o++) {
+        wq[i][c][o] = wd(gen);
+        wk[i][c][o] = wd(gen);
+        wv[i][c][o] = wd(gen);
+      }
+    }
+  }
+  auto project = [&](const W &w) {
+    RealBatch r(kLanes, std::vector<std::vector<double>>(
+                            kDim, std::vector<double>(kDim, 0.0)));
+    for (int i = 0; i < kLanes; i++) {
+      for (int t = 0; t < kDim; t++) {
+        for (int c = 0; c < kDim; c++) {
+          double s = 0.0;
+          for (int o = 0; o < in_ch; o++) s += w[i][c][o] * x_comp[o][t];
+          r[i][t][c] = s;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q = project(wq);
+  const RealBatch kk = project(wk);
+  const RealBatch vv = project(wv);
+
+  const int half = kDim / 2;
+  std::vector<double> theta(half);
+  for (int m = 0; m < half; m++) {
+    theta[m] = std::pow(10000.0, -2.0 * m / kDim);
+  }
+  auto rope_host = [&](const RealBatch &x) {
+    RealBatch r = x;
+    for (int t = 0; t < kLanes; t++) {
+      for (int i = 0; i < kDim; i++) {
+        for (int m = 0; m < half; m++) {
+          const double c = std::cos(i * theta[m]), sn = std::sin(i * theta[m]);
+          r[t][i][m] = x[t][i][m] * c - x[t][i][m + half] * sn;
+          r[t][i][m + half] = x[t][i][m + half] * c + x[t][i][m] * sn;
+        }
+      }
+    }
+    return r;
+  };
+  const RealBatch q_ref = rope_host(q);
+  const RealBatch k_ref = rope_host(kk);
+
+  std::vector<cheddar::MlweCiphertext<word>> x_parts;
+  {
+    const auto x_rec = HostRecompose(x_comp, proj_rank, proj_small);
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, pcmm_level,
+                                       boot.param->GetScale(pcmm_level),
+                                       x_rec);
+    Ciphertext<word> x_ct;
+    boot.ui->Encrypt(x_ct, pt);
+    mlwe.ModDecomp(x_parts, x_ct, proj_small);
+  }
+
+  const double w_scale = boot.param->GetRescalePrimeProd(pcmm_level);
+  auto emit_half = [&](const W &w, int l, int fam, Ciphertext<word> &out) {
+    std::vector<double> vals(static_cast<size_t>(proj_rank) * in_ch, 0.0);
+    for (int hh = 0; hh < 16; hh++) {
+      for (int cp = 0; cp < 16; cp++) {
+        const int row = hh * 16 + cp;
+        for (int o = 0; o < in_ch; o++) {
+          vals[static_cast<size_t>(row) * in_ch + o] =
+              w[fam * 16 + hh][l * 16 + cp][o];
+        }
+      }
+    }
+    cheddar::PlainMatrix<word> u;
+    pcmm.EncodeMatrix(u, pcmm_level, w_scale, vals, proj_rank, in_ch);
+    std::vector<cheddar::MlweCiphertext<word>> mixed;
+    pcmm.Multiply(mixed, u, x_parts);
+    Ciphertext<word> packed, dropped;
+    mlwe.ModPack(boot.context, packed, mixed, pack_keys);
+    boot.context->Rescale(dropped, packed);
+    dropped.SetNumSlots(num_slots);
+    bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap());
+  };
+
+  std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8),
+      v_b(8);
+  for (int l = 0; l < 8; l++) {
+    emit_half(wq, l, 0, q_a[l]);
+    emit_half(wq, l, 1, q_b[l]);
+    emit_half(wk, l, 0, k_a[l]);
+    emit_half(wk, l, 1, k_b[l]);
+    emit_half(wv, l, 0, v_a[l]);
+    emit_half(wv, l, 1, v_b[l]);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  EXPECT_NEAR(q_a[0].GetScale() / bctx->GetStCInputScale(), 1.0, 1e-9);
+
+  double hb_const = 0.0;
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, k_a[0]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    double rsum = 0.0;
+    int counted = 0;
+    for (int t = 0; t < kDim; t++) {
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const double want = kk[hh][t][cp];
+          if (std::abs(want) < 0.02) continue;
+          rsum += slots[door0(t, cp, hh)].real() / want;
+          counted++;
+        }
+      }
+    }
+    hb_const = rsum / counted;
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+  }
+
+  // ---- the handler, its keys ------------------------------------------
+  typename cheddar::CiSinCAttention<word>::Config acfg;
+  acfg.restore = 1.0 / hb_const;
+  const auto t0 = std::chrono::steady_clock::now();
+  cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
+                                      lifted.context, acfg);
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto &layout = attn.GetLayout();
+
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    EvkRequest req;
+    attn.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  typename cheddar::CiSinCAttention<word>::Keys keys;
+  keys.boot = &boot.ui->GetEvkMap();
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(layout.rank);
+  keys.inverse_ring_switch = &swtch.ui->GetInverseRingSwitchKey(layout.rank);
+
+  // ---- host calibration off the clear twin ----------------------------
+  const double m_eff = 8.0;
+  std::vector<std::vector<std::vector<double>>> S(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  double smin = 1e300, smax = -1e300;
+  for (int head = 0; head < layout.lanes; head++) {
+    for (int row = 0; row < layout.dim; row++) {
+      for (int col = 0; col < layout.dim; col++) {
+        double v = 0.0;
+        for (int c = 0; c < layout.dim; c++) {
+          v += q_ref[head][row][c] * k_ref[head][col][c];
+        }
+        S[head][row][col] = v;
+        smin = std::min(smin, v);
+        smax = std::max(smax, v);
+      }
+    }
+  }
+  const double span = smax - smin;
+  // row_shift is indexed by the LAYOUT lane; the physical head there is
+  // rev5(lane), exactly as every slot read in this suite.
+  std::vector<std::vector<double>> row_shift(
+      layout.lanes, std::vector<double>(layout.dim, -1e300));
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int k = 0; k <= row; k++) {
+        row_shift[lane][row] =
+            std::max(row_shift[lane][row], S[head][row][k]);
+      }
+    }
+  }
+  // The live-norm estimates, folded into the mask as est^-1/2. At 128
+  // live keys the raw interval is wide enough that invsqrt deg 15 costs
+  // ~1.4e-2 on the row sums (the first run of this test measured it);
+  // with the fold the interval is the actual / estimate ratio, here 1 by
+  // construction, and only the margins remain.
+  std::vector<std::vector<double>> row_norm(
+      layout.lanes, std::vector<double>(layout.dim, 0.0));
+  double raw_lo = 1e300, raw_hi = -1e300;
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = rev(lane, 5);
+    for (int row = 0; row < layout.dim; row++) {
+      double sqv = 0.0;
+      for (int k = 0; k <= row; k++) {
+        sqv += std::exp(m_eff * (S[head][row][k] - row_shift[lane][row]) /
+                        span);
+      }
+      row_norm[lane][row] = sqv;
+      raw_lo = std::min(raw_lo, sqv);
+      raw_hi = std::max(raw_hi, sqv);
+    }
+  }
+
+  typename cheddar::CiSinCAttention<word>::SoftMaxCalibration calib;
+  calib.m_eff = m_eff;
+  calib.span = span;
+  calib.shift = smax;
+  calib.norm_lo = 0.9;
+  calib.norm_hi = 1.1;
+  calib.causal = true;
+  calib.row_shift = row_shift;
+  calib.row_norm = row_norm;
+  attn.PrepareSoftMax(calib);
+
+  // ---- the leg through the handler ------------------------------------
+  const auto t2 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> s0;
+  attn.Scores(s0, q_a, q_b, k_a, k_b, keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t3 = std::chrono::steady_clock::now();
+  const double carried = s0[0].GetScale() / boot.param->base_scale_;
+  ASSERT_LT(carried * std::max(std::abs(smax), std::abs(smin)), 0.95)
+      << "the handler's canonicalising fold did not land carried in "
+         "EvalMod's range";
+
+  std::vector<Ciphertext<word>> scores(layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    s0[bi].SetNumSlots(num_slots);
+    bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
+  }
+  ASSERT_EQ(boot.param->NPToLevel(scores[0].GetNP()), attn.GetTopLevel());
+
+  const auto t4 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> P;
+  attn.SoftMax(P, scores, carried, boot.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t5 = std::chrono::steady_clock::now();
+
+  // What P arrived as: the causal shape checked before V.
+  std::vector<std::vector<std::vector<double>>> P_dec(
+      layout.lanes, std::vector<std::vector<double>>(
+                        layout.dim, std::vector<double>(layout.dim, 0.0)));
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, P[bi]);
+    std::vector<Complex> slots;
+    boot.context->encoder_.Decode(slots, pt);
+    for (int row = 0; row < layout.dim; row++) {
+      for (int j = 0; j < layout.rank; j++) {
+        const int column = bi * layout.rank + j;
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          int ct_idx, slot, copy_slot;
+          layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
+          P_dec[rev(lane, 5)][row][column] = slots[slot].real();
+        }
+      }
+    }
+  }
+  double masked_resid = 0.0, rowsum_dev = 0.0;
+  for (int head = 0; head < layout.lanes; head++) {
+    for (int row = 0; row < layout.dim; row++) {
+      double rs = 0.0;
+      for (int k = 0; k < layout.dim; k++) {
+        if (k <= row) {
+          rs += P_dec[head][row][k];
+        } else {
+          masked_resid =
+              std::max(masked_resid, std::abs(P_dec[head][row][k]));
+        }
+      }
+      rowsum_dev = std::max(rowsum_dev, std::abs(rs - 1.0));
+    }
+  }
+
+  const auto t6 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> out;
+  attn.Values(out, P, v_a, v_b, keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // =====================================================================
+  // THE REST OF THE LAYER. Everything above is the attention leg, verbatim
+  // from `TheLibraryLegReproducesTheReference`; what follows is the seam,
+  // the O projection, the residual, the FFN and the second residual, so a
+  // whole Llama-3 decoder layer runs on the conjugate-invariant ring.
+  //
+  // The attention output is decrypted once, here, and the host reference for
+  // everything after it is computed from THAT -- so this measures the rest
+  // of the layer exactly, and the attention half is measured by the
+  // assertions the leg test already carries and which are kept above.
+  // =====================================================================
+  std::vector<std::vector<double>> attn_out(   // [channel][row]
+      layout.num_cts * layout.rank * layout.lanes,
+      std::vector<double>(layout.dim, 0.0));
+  {
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, out[bi]);
+      std::vector<Complex> slots;
+      boot.context->encoder_.Decode(slots, pt);
+      for (int col = 0; col < layout.rank; col++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          // The block channel this entry becomes, by the orders the seam
+          // was built on: `channel = rev4(col) * 32 + rev5(lane)` within the
+          // big ciphertext, and the ciphertext index above it.
+          const int c_in_ct =
+              rev(col, 4) * layout.lanes + rev(lane % 16, 5);
+          const int chan = bi * (layout.rank * layout.lanes) +
+                           (lane >= 16 ? layout.rank * 16 : 0) + c_in_ct;
+          for (int row = 0; row < layout.dim; row++) {
+            int ci, sl, cs;
+            layout.LocateSlot(row, bi * layout.rank + col, lane, ci, sl, cs);
+            attn_out[chan][row] = slots[sl].real();
+          }
+        }
+      }
+    }
+  }
+
+  // ---- the seam: chain layout -> the block's banded half-density image --
+  const int t1_level = 13, t2_level = 12;
+  cheddar::SylphSchedule<word> sched(bctx, num_slots);
+  std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
+            << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
+            << ", seam at " << t1_level << "/" << t2_level << std::endl;
+  ASSERT_GT(t2_level - 1, sched.GetStCLevel())
+      << "the seam has to leave the ciphertext above StC's level with a "
+         "rescale to spare";
+
+  auto slot_chain = [&](int row, int col, int lane) {
+    return rev(col, 4) * 4096 + rev(row, 7) * 32 + lane;
+  };
+  auto slot_block = [&](int token, int chan) { return token + 128 * chan; };
+  auto chan_of = [&](int col, int lh) { return rev(col, 4) * 32 + rev(lh, 5); };
+  auto best_window = [&](const StripedMatrix &m, int *need) {
+    std::vector<int> offs;
+    for (const auto &kv : m) offs.push_back(kv.first);
+    int bw = 0;
+    long long bn = -1;
+    for (int w : offs) {
+      long long g = 0, mx = 0;
+      for (int o : offs) {
+        const long long r = ((o - w) % n + n) % n;
+        mx = std::max(mx, r);
+        long long a2 = g, b2 = r;
+        while (b2) { const long long t = a2 % b2; a2 = b2; b2 = t; }
+        g = a2;
+      }
+      if (g == 0) continue;
+      const long long q = mx / g + 1;
+      if (bn < 0 || q < bn) { bn = q; bw = w; }
+    }
+    *need = static_cast<int>(bn);
+    return bw;
+  };
+  auto split = [](int need) {
+    int bs = 1;
+    while (bs * bs < need) bs *= 2;
+    int gs = 1;
+    while (bs * gs < need) gs *= 2;
+    return std::make_pair(bs, gs);
+  };
+  auto pt_scale = [&](int l) {
+    return boot.param->GetScale(l - 1) * boot.param->GetRescalePrimeProd(l) /
+           boot.param->GetScale(l);
+  };
+
+  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> t1(2);
+  std::unique_ptr<cheddar::LinearTransform<word>> t2;
+  std::vector<int> back1(2, 0);
+  int back2 = 0;
+  for (int half = 0; half < 2; half++) {
+    StripedMatrix m1(n, n);
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        const int lane = half * 16 + lh;
+        const int c = chan_of(col, lh);
+        for (int row = 0; row < layout.dim; row++) {
+          const int dst = slot_block(row, c);
+          const int off =
+              ((slot_chain(row, col, lane) - dst) % n + n) % n;
+          m1.try_emplace(off, n, Complex(0.0, 0.0));
+          m1[off][dst] = Complex(1.0, 0.0);
+        }
+      }
+    }
+    int need = 0;
+    const int w = best_window(m1, &need);
+    const auto sp = split(need);
+    t1[half] = std::make_unique<cheddar::LinearTransform<word>>(
+        boot.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
+        w, -w);
+    back1[half] = ((w % n) + n) % n;
+    std::cout << "  seam T1[" << half << "]: " << m1.GetNumDiag()
+              << " diagonals, " << sp.first << "x" << sp.second << std::endl;
+  }
+  {
+    StripedMatrix m2(n, n);
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        const int c = chan_of(col, lh);
+        const int I = rev(c, 9);
+        if (I == 0) continue;  // component zero has no partner
+        const int cd = rev(proj_rank - I, 9);
+        const int off = ((128 * (c - cd)) % n + n) % n;
+        m2.try_emplace(off, n, Complex(0.0, 0.0));
+        for (int row = 1; row < layout.dim; row++) {
+          m2[off][slot_block(row - 1, cd)] = Complex(1.0, 0.0);
+        }
+      }
+    }
+    int need = 0;
+    const int w = best_window(m2, &need);
+    const auto sp = split(need);
+    t2 = std::make_unique<cheddar::LinearTransform<word>>(
+        boot.context, m2, t2_level, pt_scale(t2_level), sp.first, sp.second,
+        w, -w);
+    back2 = ((w % n) + n) % n;
+    std::cout << "  seam T2: " << m2.GetNumDiag() << " diagonals, "
+              << sp.first << "x" << sp.second << std::endl;
+  }
+  {
+    EvkRequest req;
+    for (int h = 0; h < 2; h++) {
+      t1[h]->AddRequiredRotations(req);
+      req.AddRequest(back1[h], t1_level - 1);
+    }
+    t2->AddRequiredRotations(req);
+    req.AddRequest(back2, t2_level - 1);
+    req.AddRequest(1, t2_level);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // Boot the attention output, run the seam, come back to coefficients.
+  std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    Ciphertext<word> booted;
+    bctx->Boot(booted, out[bi], boot.ui->GetEvkMap());
+    for (int half = 0; half < 2; half++) {
+      Ciphertext<word> low, a2, sh, dup, live, sum;
+      boot.context->LevelDown(low, booted, t1_level);
+      t1[half]->Evaluate(boot.context, a2, low, boot.ui->GetEvkMap());
+      if (back1[half]) {
+        Ciphertext<word> r;
+        boot.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
+                                      back1[half]), back1[half]);
+        a2 = std::move(r);
+      }
+      boot.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
+      t2->Evaluate(boot.context, dup, sh, boot.ui->GetEvkMap());
+      if (back2) {
+        Ciphertext<word> r;
+        boot.context->HRot(r, dup, boot.ui->GetEvkMap().GetRotationKey(back2),
+                           back2);
+        dup = std::move(r);
+      }
+      const int dl = boot.param->NPToLevel(dup.GetNP());
+      cheddar::Constant<word> one;
+      boot.context->encoder_.EncodeConstant(
+          one, dl + 1,
+          boot.param->GetScale(dl) * boot.param->GetRescalePrimeProd(dl + 1) /
+              a2.GetScale(),
+          1.0);
+      boot.context->Mult(live, a2, one);
+      boot.context->Rescale(live, live);
+      boot.context->Add(sum, live, dup);
+      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  std::cout << "  the seam gave " << h_cts.size()
+            << " half-density coefficient ciphertexts at level "
+            << boot.param->NPToLevel(h_cts[0].GetNP()) << std::endl;
+
+  // ---- the O projection, the residual, and the FFN ----------------------
+  //
+  // Widths: the attention output is `num_cts * rank * lanes` = 4096 channels
+  // in 16 half-density ciphertexts (declared 8192); the model dimension is
+  // the X the leg projected from, 512 declared with 256 live; the FFN's
+  // inner dimension is twice that.
+  const int model_declared = proj_rank;            // 512, 256 live
+  const int hidden_declared = 2 * proj_rank;       // 1024, 512 live
+  const int attn_declared = 2 * layout.num_cts * layout.rank * layout.lanes;
+  ASSERT_EQ(static_cast<int>(h_cts.size()) * proj_rank, attn_declared);
+
+  std::normal_distribution<double> lw(0.0, 0.02);
+  auto half_weight = [&](int in_dec, int out_dec) {
+    std::vector<double> w(static_cast<size_t>(in_dec) * out_dec, 0.0);
+    for (int i = 0; i < in_dec; i += 2) {
+      for (int o = 0; o < out_dec; o += 2) {
+        w[static_cast<size_t>(i) * out_dec + o] = lw(gen);
+      }
+    }
+    return w;
+  };
+  const auto wo = half_weight(attn_declared, model_declared);
+  const auto wgate = half_weight(model_declared, hidden_declared);
+  const auto wup = half_weight(model_declared, hidden_declared);
+  const auto wdown = half_weight(hidden_declared, model_declared);
+  std::vector<double> wnorm(model_declared, 0.0);
+  for (int c = 0; c < model_declared; c += 2) {
+    wnorm[c] = 0.5 + 0.5 * std::abs(lw(gen));
+  }
+
+  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = proj_small;
+  lcfg.product_level = pcmm_level;
+  lcfg.parents_per_tile = 0;
+  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
+
+  // The attention output's live channels, laid out as the projection reads
+  // them: half ciphertext `k` holds live channels `2 * j` for j < 256.
+  std::vector<double> attn_flat(
+      static_cast<size_t>(layout.dim) * attn_declared, 0.0);
+  for (size_t k = 0; k < h_cts.size(); k++) {
+    for (int j = 0; j < proj_rank / 2; j++) {
+      const int chan = static_cast<int>(k) * (proj_rank / 2) + j;
+      for (int row = 0; row < layout.dim; row++) {
+        attn_flat[static_cast<size_t>(row) * attn_declared +
+                  k * proj_rank + 2 * j] = attn_out[chan][row];
+      }
+    }
+  }
+  auto host_mm = [&](const std::vector<double> &in, int in_w,
+                     const std::vector<double> &w, int out_w) {
+    std::vector<double> r(static_cast<size_t>(layout.dim) * out_w, 0.0);
+    for (int t = 0; t < layout.dim; t++) {
+      for (int o = 0; o < out_w; o++) {
+        double acc = 0.0;
+        for (int c = 0; c < in_w; c++) {
+          acc += in[static_cast<size_t>(t) * in_w + c] *
+                 w[static_cast<size_t>(c) * out_w + o];
+        }
+        r[static_cast<size_t>(t) * out_w + o] = acc;
+      }
+    }
+    return r;
+  };
+
+  Ciphertext<word> o_out;
+  {
+    std::vector<Ciphertext<word>> ins(h_cts.size());
+    for (size_t k = 0; k < h_cts.size(); k++) {
+      boot.context->LevelDown(ins[k], h_cts[k], pcmm_level);
+    }
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, ins, attn_declared, model_declared, wo, 1.0, "o");
+    ASSERT_EQ(res.size(), 1u);
+    o_out = std::move(res[0]);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  std::cout << "  O projection: one half-density ciphertext at level "
+            << boot.param->NPToLevel(o_out.GetNP()) << std::endl;
+
+  const auto o_host = host_mm(attn_flat, attn_declared, wo, model_declared);
+  std::cout << "THE CI LAYER RAN: attention -> seam -> O projection, all "
+            << "encrypted, " << h_cts.size() << " half ciphertexts through "
+            << "the seam" << std::endl;
+
+  // The O projection's output read back through the banded scan, against the
+  // same product in double from the decrypted attention output.
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, o_out);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    // comp[i][p], the inverse of the banded recomposition
+    std::vector<std::vector<double>> comp(
+        proj_rank, std::vector<double>(proj_small, 0.0));
+    for (int t = 0; t < proj_small; t++) {
+      comp[0][t] = coeffs[static_cast<size_t>(t) * proj_rank];
+    }
+    for (int i = 1; i <= proj_rank / 2; i++) {
+      const int mi = proj_rank - i;
+      double ai = 0.0, am = 0.0;
+      for (int t = proj_small - 1; t >= 0; t--) {
+        const double ni = coeffs[static_cast<size_t>(t) * proj_rank + i] - am;
+        const double nm = coeffs[static_cast<size_t>(t) * proj_rank + mi] - ai;
+        comp[i][t] = ni;
+        comp[mi][t] = nm;
+        ai = ni;
+        am = nm;
+      }
+    }
+    double num = 0.0, den = 0.0, mx = 0.0;
+    for (int c = 0; c < model_declared; c += 2) {
+      for (int t = 0; t < proj_small; t++) {
+        const double want =
+            o_host[static_cast<size_t>(t) * model_declared + c];
+        num += comp[rev(c, 9)][rev(t, 7)] * want;
+        den += want * want;
+        mx = std::max(mx, std::abs(want));
+      }
+    }
+    const double fit = num / den;
+    double err = 0.0;
+    for (int c = 0; c < model_declared; c += 2) {
+      for (int t = 0; t < proj_small; t++) {
+        const double got = comp[rev(c, 9)][rev(t, 7)] / fit;
+        err = std::max(err, std::abs(got - o_host[static_cast<size_t>(t) *
+                                                  model_declared + c]));
+      }
+    }
+    std::cout << "  O against the host product from the decrypted attention "
+              << "output: " << err << " (|o| <= " << mx << ", carried " << fit
+              << ")" << std::endl;
+    EXPECT_LT(err / mx, 0.05)
+        << "the seam did not hand the O projection a readable banded image";
+  }
 }
