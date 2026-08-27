@@ -122,6 +122,12 @@ const int kSlack = SlackFromEnv();
 // level: 2^75.1 against 2^31 per auxiliary prime, which makes 3 the smallest
 // legal choice and 4 the smallest comfortable one. Nothing checks it but the
 // accuracy line at the end of the test, which is the right thing to check it.
+// The block's own switch, read here so the test hands it the form it expects.
+bool BootPairFromEnv() {
+  const char *env = std::getenv("CHEDDAR_BOOT_PAIR");
+  return env == nullptr || std::string(env) != "0";
+}
+
 int ModPackAuxFromEnv() {
   const char *env = std::getenv("CHEDDAR_MODPACK_AUX");
   return env ? std::atoi(env) : 0;
@@ -1431,7 +1437,13 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
       sw_ring->ui->PrepareInverseRingSwitchKey(
           small_ring->Degree(), small_ring->ui->GetSecretCoeffs(),
           kProductLevel);
-      small_ring->ui->PrepareModPackKeys(small_degree, kProductLevel);
+      // -1: the narrowest auxiliary basis that keeps beta at 1. ModPack is
+      // 81% of what the seven projections cost (Doing.md 1.5cn's nsys pass),
+      // and every one of its key switches carries this basis.
+      small_ring->ui->PrepareModPackKeys(small_degree, kProductLevel,
+                                         ModPackAuxFromEnv() > 0
+                                             ? ModPackAuxFromEnv()
+                                             : -1);
       descent.switch_context = sw_ring->context;
       descent.small_context = small_ring->context;
       descent.forward = &sw_ring->ui->GetRingSwitchKey(ring_rank);
@@ -1615,14 +1627,24 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
   // The input, coefficient encoded at level 0 -- where the previous block's
   // down projection would have left it.
   const int num_ct = kChannels / pack.channels_per_ct();
-  std::vector<Ciphertext<word>> state(num_ct);
-  for (int i = 0; i < num_ct; i++) {
+  // MERGED AT BOTH ENDS, when the block is running that way. Two of the block's
+  // ciphertexts share one: the even one in the real coefficients and the odd
+  // one in the imaginary ones, which is precisely `CoeffOfSlot`'s flag. The
+  // block reads the form off the count and returns what it was given, so this
+  // is the whole of the change on this side.
+  const int per_ct = BootPairFromEnv() ? 2 : 1;
+  std::vector<Ciphertext<word>> state(num_ct / per_ct);
+  for (int i = 0; i < num_ct / per_ct; i++) {
     std::vector<double> coeffs(pack.degree, 0.0);
-    for (int s = 0; s < num_slots; s++) {
-      const int t = s % kTokens;
-      const int c = i * pack.channels_per_ct() + s / kTokens;
-      coeffs[pack.coeff(s)] =
-          cal.residual * x_fill[static_cast<size_t>(t) * kChannels + c];
+    for (int half = 0; half < per_ct; half++) {
+      const int src = i * per_ct + half;
+      for (int s = 0; s < num_slots; s++) {
+        const int t = s % kTokens;
+        const int c = src * pack.channels_per_ct() + s / kTokens;
+        coeffs[cheddar::AttentionPacking::CoeffOfSlot({s, half == 1},
+                                                      pack.degree)] =
+            cal.residual * x_fill[static_cast<size_t>(t) * kChannels + c];
+      }
     }
     Plaintext<word> ptxt;
     context_->encoder_.EncodeCoeff(ptxt, 0, param_->GetScale(0), coeffs);
@@ -1757,19 +1779,26 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
   // is being run for. The sink rows are skipped because their hidden state was
   // never in the ciphertext; their K and V were, and every query used them.
   double worst = 0.0, absmax = 0.0;
-  for (int i = 0; i < num_ct; i++) {
+  ASSERT_EQ(static_cast<int>(out.size()), num_ct / per_ct);
+  for (int i = 0; i < num_ct / per_ct; i++) {
     Plaintext<word> ptxt;
     interface_->Decrypt(ptxt, out[i]);
     std::vector<double> coeffs;
     context_->encoder_.DecodeCoeff(coeffs, ptxt);
-    for (int s = 0; s < num_slots; s++) {
-      const int t = s % kTokens;
-      if (t < kSinkTokens) continue;
-      const int c = i * pack.channels_per_ct() + s / kTokens;
-      const double want = truth.out[static_cast<size_t>(t) * kChannels + c];
-      const double got = coeffs[pack.coeff(s)] / cal.residual;
-      worst = std::max(worst, std::abs(got - want));
-      absmax = std::max(absmax, std::abs(want));
+    for (int half = 0; half < per_ct; half++) {
+      const int dst = i * per_ct + half;
+      for (int s = 0; s < num_slots; s++) {
+        const int t = s % kTokens;
+        if (t < kSinkTokens) continue;
+        const int c = dst * pack.channels_per_ct() + s / kTokens;
+        const double want = truth.out[static_cast<size_t>(t) * kChannels + c];
+        const double got =
+            coeffs[cheddar::AttentionPacking::CoeffOfSlot({s, half == 1},
+                                                          pack.degree)] /
+            cal.residual;
+        worst = std::max(worst, std::abs(got - want));
+        absmax = std::max(absmax, std::abs(want));
+      }
     }
   }
   std::cout << "one whole Llama-3-8B layer-2 block, tokens " << kSinkTokens

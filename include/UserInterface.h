@@ -156,6 +156,12 @@ class UserInterface {
    * is sized for the deepest switch in the set, so a narrower basis is most of
    * what ModPack costs -- see `Context::PrepareNarrowKeySwitch`, which this
    * calls for you, for the condition P must satisfy.
+   *
+   * **-1 asks for the narrowest basis that keeps `beta` at 1**, which is the
+   * measured floor: below it ModPack drops off the grouped mod-up and nearly
+   * doubles (22.36 ms at 12 aux primes, 18.29 at 7, 42.48 at 6 -- Doing.md
+   * 1.5ck). The number that decides it is this KEY's `num_q`, not the pack
+   * level's, so it is computed here rather than asked of the caller.
    */
   void PrepareModPackKeys(int small_degree, int max_level = -1,
                           int num_aux = 0);

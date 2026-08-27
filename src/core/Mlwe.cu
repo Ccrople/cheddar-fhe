@@ -477,12 +477,22 @@ void MlweHandler<word>::AddShiftedHalf(MlweCiphertext<word> &res,
              "AddShiftedHalf: the two components differ in scale");
 
   const int num_total_primes = lo.np_.GetNumTotal();
-  res.rank_ = rank;
-  res.degree_ = small_degree;
-  res.np_ = lo.np_;
-  res.scale_ = lo.scale_;
-  res.a_.resize(static_cast<size_t>(num_total_primes) * rank * small_degree);
-  res.b_.resize(static_cast<size_t>(num_total_primes) * small_degree);
+  // IN PLACE WHEN THE CALLER ASKS FOR IT. Each merge otherwise allocates two
+  // fresh device buffers per module component, and a projection merges `rank`
+  // of them per output group -- 7168 allocations for gate alone. The kernel is
+  // safe aliased on `lo`: a thread reads only `lo[idx]` and writes only
+  // `dst[idx]`, so there is no cross-thread dependency to break.
+  if (&res != &lo) {
+    res.rank_ = rank;
+    res.degree_ = small_degree;
+    res.np_ = lo.np_;
+    res.scale_ = lo.scale_;
+    res.a_.resize(static_cast<size_t>(num_total_primes) * rank * small_degree);
+    res.b_.resize(static_cast<size_t>(num_total_primes) * small_degree);
+  }
+  AssertTrue(&res != &hi,
+             "AddShiftedHalf: the shifted operand cannot be the destination -- "
+             "a thread reads hi at a different index than it writes");
 
   const word *primes = param_.GetPrimesPtr(lo.np_);
   auto launch = [&](word *dst, const word *a, const word *b, int runs_per_limb) {

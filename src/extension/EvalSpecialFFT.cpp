@@ -15,20 +15,32 @@ namespace {
 
 // How far to push the ordinary path's baby-step count above the heuristic's
 // choice, as a power of two. Read once. `BSGSSplit` documents why the dial
-// exists; **1 is the measured optimum** and 0 restores the split every earlier
-// baseline was taken with.
+// exists.
 //
-//   HalfBoot, bootparam_35, one A100, one process per point:
+// **DEFAULT 0, AND 1 IS NOT SAFE TO DEFAULT TO YET.** It is faster where it
+// works -- HalfBoot on `bootparam_35`, one process per point:
+//
 //     shift 0  28.52 ms     shift 2  26.65 ms
 //     shift 1  26.59 ms     shift 3  26.75 ms
 //
-// A U with a floor one doubling up and a flat, slightly worse tail above it --
-// which is what a 7:1 giant-to-baby cost ratio predicts, and is the first
-// direct confirmation of that ratio on the ordinary path.
+// a U with a floor one doubling up, which is what a 7:1 giant-to-baby cost
+// ratio predicts and is the first direct confirmation of that ratio on this
+// path. It is worth 235 ms of the Llama block on `sylphflow16_35`.
+//
+// But widening the baby step changes which (index, level) pairs
+// `AddRequiredRotations` asks for, and on `bootparam_35` that leaves a rotation
+// key built for a smaller `beta` than the transform then needs:
+// `MultKeyNoModDown`'s `key.GetBeta() >= beta` fires as "Beta mismatch", and
+// `LlamaBlockFixture.TheBlockRunsEndToEnd` dies where it passes at shift 0.
+// `sylphflow16_35` has a different level configuration and does not trip it,
+// which is exactly why a filtered run showed nothing (Doing.md 1.5co).
+//
+// So the dial stays and the default goes back. Whoever raises it again owes
+// the key request, not the split.
 int BabyStepShift() {
   static const int shift = []() {
     const char *env = std::getenv("CHEDDAR_BSGS_BABY_SHIFT");
-    if (env == nullptr) return 1;
+    if (env == nullptr) return 0;
     const int v = std::atoi(env);
     return (v < 0) ? 0 : ((v > 5) ? 5 : v);
   }();

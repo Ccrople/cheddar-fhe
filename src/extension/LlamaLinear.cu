@@ -502,11 +502,12 @@ void CoeffLinearLeg<word>::RunProjection(
         NvtxScope _n("pcmm: MergeHalves");
         std::vector<MlweCiphertext<word>> upper;
         mix(upper, lo_group + 1);
-        std::vector<MlweCiphertext<word>> both(product.size());
+        // In place, because otherwise this allocates two fresh device buffers
+        // per module component and a projection merges `rank` of them per
+        // output group -- 7168 allocations for gate alone.
         for (size_t j = 0; j < product.size(); j++) {
-          product_mlwe_->AddShiftedHalf(both[j], product[j], upper[j]);
+          product_mlwe_->AddShiftedHalf(product[j], product[j], upper[j]);
         }
-        product = std::move(both);
       }
 
       // ModPack takes the components of ONE ciphertext of the product ring,

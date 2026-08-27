@@ -400,6 +400,20 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
 
   const int rank = degree / small_degree;
   NPInfo np = GetNPForEvk(max_level);
+
+  // AS NARROW AS BETA PERMITS, computed here because this is where the number
+  // that decides it lives (Doing.md 1.5ck). `alpha_` is one figure for the
+  // whole parameter set, sized for the deepest key switch in it; ModPack runs
+  // `rank` switches at one low level and does not need that width. What it
+  // cannot go below is `beta = ceil(num_q / num_aux) == 1`, and the `num_q`
+  // that binds is **this key's**, not the level's -- `GetNPForEvk` takes the
+  // largest main count over levels 0..max_level and adds `GetMaxNumTer()`,
+  // which at the layer's setting is 7 where `LevelToNP(pack_level)` says 3.
+  // Below it ModPack drops off the grouped mod-up and the time nearly doubles:
+  // measured 22.36 ms at 12, 18.29 at 7, 42.48 at 6.
+  if (num_aux < 0) {
+    num_aux = Min(context_->param_.alpha_, np.GetNumQ());
+  }
   if (num_aux > 0 && num_aux != context_->param_.alpha_) {
     // A narrower extended basis for these keys alone. The evaluation side
     // needs a mod-switch handler and a P product to match, and neither exists

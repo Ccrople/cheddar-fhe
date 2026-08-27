@@ -656,10 +656,22 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
                            const EvkMap<word> &evk_map) const {
   std::string why;
   AssertTrue(Fits(&why), "LlamaBlock: the plan does not close -- " + why);
-  AssertTrue(static_cast<int>(x.size()) == NumCiphertexts(cfg_.num_channels),
+  const int full_cts = NumCiphertexts(cfg_.num_channels);
+  // THE RESIDUAL STREAM, MERGED AT BOTH ENDS. Half as many ciphertexts for the
+  // same width is the merged form and nothing else is, so the contract is read
+  // off rather than configured -- and a block that takes it also returns it,
+  // which is what lets 32 of them chain without a form change anywhere.
+  const bool merged_io = static_cast<int>(x.size()) * 2 == full_cts;
+  AssertTrue(static_cast<int>(x.size()) == full_cts || merged_io,
              "LlamaBlock: wrong number of input ciphertexts");
 
   const LinearLeg &leg = *leg_;
+  // MERGED THROUGHOUT THE COEFFICIENT DOMAIN. Every ciphertext this block
+  // sends across the coefficient/slot boundary carries payload in half its
+  // coefficients, so the four StC rows, the seven ModPacks and the four
+  // HalfBoot rows each do twice the work they need to. One flag turns all of
+  // it off: `CHEDDAR_BOOT_PAIR=0`.
+  const bool merge = BootPairEnabled();
   const double r = cal_.residual;
 
   // ---- turn A: RMSNorm(attn), then the QKV projection -------------------
@@ -672,7 +684,11 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   Announce("A  input", x, 0);
   {
     ProfileScope _p("A  lift x");
-    Lift(slots, x, 1.0, evk_map);
+    if (merged_io) {
+      LiftMerged(slots, x, 1.0, evk_map);
+    } else {
+      Lift(slots, x, 1.0, evk_map);
+    }
   }
   Announce("A  lifted", slots, sched_->GetSlotLevel() - 1);
   std::vector<std::vector<Complex>> attn_w;
@@ -699,11 +715,9 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   // MERGED WHERE THE MERGE IS FREE TO CARRY. Q, K, V, gate and up go straight
   // from the projection to a crossing with nothing but plaintext additions in
   // between, so their pairs can be formed inside `ModPack` and never taken
-  // apart until `LiftMerged` splits them at the far side. O and down cannot:
-  // their outputs meet the residual stream, which is not merged, and no cheap
-  // operation separates the halves of a coefficient ciphertext once they are
-  // together. Those two keep the ordinary route.
-  const bool merge = BootPairEnabled();
+  // apart until `LiftMerged` splits them at the far side. O and down meet the
+  // residual stream instead, so they merge exactly when it does -- which is
+  // what `merged_io` decides, once, for both ends of the block.
   auto project = [&](std::vector<Ct> &out, const std::vector<Ct> &in, int in_ch,
                      int out_ch, const std::vector<double> &weight,
                      double scale, const char *tag) {
@@ -940,10 +954,17 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   attn.clear();
   {
     ProfileScope _p("D  project O");
-    leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
-                Reorder(w.wo, cfg_.num_channels, cfg_.num_channels,
-                        LinearLeg::Tensor::kAttnOut, true),
-                r / cal_.size_attn, "O");
+    // O and down emit whichever form the residual stream is in, because their
+    // outputs are added to it.
+    const auto wo = Reorder(w.wo, cfg_.num_channels, cfg_.num_channels,
+                            LinearLeg::Tensor::kAttnOut, true);
+    if (merged_io) {
+      project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels, wo,
+              r / cal_.size_attn, "O");
+    } else {
+      leg.Project(attn_out, attn_coeff, cfg_.num_channels, cfg_.num_channels,
+                  wo, r / cal_.size_attn, "O");
+    }
   }
 
   std::vector<Ct> h(x.size());
@@ -958,7 +979,11 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   std::vector<Ct> h_slots, h_normed, h_coeff;
   {
     ProfileScope _p("E  lift");
-    Lift(h_slots, h, 1.0, evk_map);
+    if (merged_io) {
+      LiftMerged(h_slots, h, 1.0, evk_map);
+    } else {
+      Lift(h_slots, h, 1.0, evk_map);
+    }
   }
   std::vector<std::vector<Complex>> ffn_w;
   {
@@ -1031,14 +1056,19 @@ void LlamaBlock<word>::Run(std::vector<Ct> &res, const std::vector<Ct> &x,
   }
   {
     ProfileScope _p("F  project down");
-    leg.Project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,
-                r / cal_.size_up, "down");
+    if (merged_io) {
+      project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,
+              r / cal_.size_up, "down");
+    } else {
+      leg.Project(ffn_out, gated_coeff, cfg_.hidden, cfg_.num_channels, w.wdown,
+                  r / cal_.size_up, "down");
+    }
   }
 
   res.resize(x.size());
   {
     ProfileScope _p("F  residual + ffn");
-    for (size_t i = 0; i < x.size(); i++) {
+    for (size_t i = 0; i < h.size(); i++) {
       boot_->Add(res[i], h[i], ffn_out[i]);
     }
   }
