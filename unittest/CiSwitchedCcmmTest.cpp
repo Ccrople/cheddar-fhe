@@ -9039,7 +9039,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   {
     EvkRequest req;
     fctx->AddRequiredRotations(req, num_slots);
-    boot_ffn.ui->PrepareRotationKey(req);
+    boot.ui->PrepareRotationKey(req);
   }
 
   // ---- the seam: chain layout -> the block's banded half-density image --
@@ -9153,7 +9153,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     seam_t2->AddRequiredRotations(req);
     req.AddRequest(back2, t2_level - 1);
     req.AddRequest(1, t2_level);
-    boot_ffn.ui->PrepareRotationKey(req);
+    boot.ui->PrepareRotationKey(req);
   }
 
   // Boot the attention output, run the seam, come back to coefficients.
@@ -9164,18 +9164,18 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     for (int half = 0; half < 2; half++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
       boot_ffn.context->LevelDown(low, booted, t1_level);
-      seam_t1[half]->Evaluate(boot_ffn.context, a2, low, boot_ffn.ui->GetEvkMap());
+      seam_t1[half]->Evaluate(boot_ffn.context, a2, low, boot.ui->GetEvkMap());
       if (back1[half]) {
         Ciphertext<word> r;
-        boot_ffn.context->HRot(r, a2, boot_ffn.ui->GetEvkMap().GetRotationKey(
+        boot_ffn.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
                                       back1[half]), back1[half]);
         a2 = std::move(r);
       }
-      boot_ffn.context->HRot(sh, a2, boot_ffn.ui->GetEvkMap().GetRotationKey(1), 1);
-      seam_t2->Evaluate(boot_ffn.context, dup, sh, boot_ffn.ui->GetEvkMap());
+      boot_ffn.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
+      seam_t2->Evaluate(boot_ffn.context, dup, sh, boot.ui->GetEvkMap());
       if (back2) {
         Ciphertext<word> r;
-        boot_ffn.context->HRot(r, dup, boot_ffn.ui->GetEvkMap().GetRotationKey(back2),
+        boot_ffn.context->HRot(r, dup, boot.ui->GetEvkMap().GetRotationKey(back2),
                            back2);
         dup = std::move(r);
       }
@@ -9189,7 +9189,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       boot_ffn.context->Mult(live, a2, one);
       boot_ffn.context->Rescale(live, live);
       boot_ffn.context->Add(sum, live, dup);
-      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot_ffn.ui->GetEvkMap());
+      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
     }
   }
   cudaDeviceSynchronize();
@@ -9432,7 +9432,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   Ciphertext<word> normed;
   {
     Ciphertext<word> up;
-    sched.ToSlot(up, h_ct, boot_ffn.ui->GetEvkMap());
+    sched.ToSlot(up, h_ct, boot.ui->GetEvkMap());
     {
       Plaintext<word> rp;
       boot.ui->Decrypt(rp, up);
@@ -9457,7 +9457,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
                                       6.0, 9, /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
-      boot_ffn.ui->PrepareRotationKey(d, op_level);
+      boot.ui->PrepareRotationKey(d, op_level);
     }
     const double root_alpha = std::sqrt(alpha);
     std::vector<std::vector<Complex>> wts(1);
@@ -9471,10 +9471,10 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
     std::vector<Ciphertext<word>> in(1), outv;
     in[0] = std::move(up);
-    rms.Apply(outv, in, wts, boot_ffn.ui->GetEvkMap());
+    rms.Apply(outv, in, wts, boot.ui->GetEvkMap());
     cudaDeviceSynchronize();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    sched.ToCoeff(normed, outv[0], boot_ffn.ui->GetEvkMap());
+    sched.ToCoeff(normed, outv[0], boot.ui->GetEvkMap());
   }
   std::cout << "  RMSNorm(ffn) done, coefficients at level "
             << boot_ffn.param->NPToLevel(normed.GetNP()) << std::endl;
@@ -9514,15 +9514,15 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     cheddar::SiLuHandler<word> silu(boot_ffn.context, silu_range, op_level, 31);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> g_up, u_up, sv, u_low;
-      sched.ToSlot(g_up, gate[i], boot_ffn.ui->GetEvkMap());
-      sched.ToSlot(u_up, upv[i], boot_ffn.ui->GetEvkMap());
+      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
+      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
       canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
       canonicalise(u_up, 1.0 / (boundary * proj_size));
-      silu.Apply(sv, g_up, boot_ffn.ui->GetEvkMap());
+      silu.Apply(sv, g_up, boot.ui->GetEvkMap());
       boot_ffn.context->LevelDown(u_low, u_up,
                               boot_ffn.param->NPToLevel(sv.GetNP()));
       boot_ffn.context->HMult(prod[i], sv, u_low,
-                          boot_ffn.ui->GetEvkMap().GetMultiplicationKey());
+                          boot.ui->GetEvkMap().GetMultiplicationKey());
     }
   }
   cudaDeviceSynchronize();
@@ -9539,7 +9539,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     std::vector<Ciphertext<word>> ins(2);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> c2;
-      sched.ToCoeff(c2, prod[i], boot_ffn.ui->GetEvkMap());
+      sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap());
       boot_ffn.context->LevelDown(ins[i], c2, pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
