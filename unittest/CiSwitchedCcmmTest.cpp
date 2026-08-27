@@ -9214,6 +9214,27 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     return r;
   };
 
+  // SIZE THE RESIDUAL FOR THE CROSSING. The FFN's first stage HalfBoots the
+  // residual stream, and ModRaise cannot carry a message much past 0.4
+  // (1.5ca's "pre-RoPE |projection| <= 0.45", and the FFN's own first run
+  // came back as garbage that still decrypted). |x| is order one and the O
+  // product is its own size, so the bound is bought where it is free: in the
+  // O projection's weight scale, with the same factor folded into the
+  // stream's encode so the residual still adds.
+  const auto o_unit = host_mm2(attn_flat, attn_channels, wo, model_declared);
+  double res_max = 0.0;
+  for (int t = 0; t < proj_small; t++) {
+    for (int c = 0; c < model_declared; c += 2) {
+      res_max = std::max(res_max,
+                         std::abs(x_comp[rev(c, 9)][rev(t, 7)]) +
+                             std::abs(o_unit[static_cast<size_t>(t) *
+                                             model_declared + c]));
+    }
+  }
+  const double res_scale = 0.35 / std::max(res_max, 1e-12);
+  std::cout << "  residual would reach " << res_max << ", so the O weight "
+            << "carries " << res_scale << std::endl;
+
   Ciphertext<word> o_out;
   {
     std::vector<Ciphertext<word>> ins(h_cts.size());
@@ -9221,7 +9242,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, ins, attn_channels, model_declared, wo, 1.0, "o");
+    leg.Project(res, ins, attn_channels, model_declared, wo, res_scale,
+                "o");
     ASSERT_EQ(res.size(), 1u);
     o_out = std::move(res[0]);
   }
@@ -9230,7 +9252,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
 
-  const auto o_host = host_mm2(attn_flat, attn_channels, wo, model_declared);
+  std::vector<double> o_host(o_unit.size(), 0.0);
+  for (size_t i = 0; i < o_unit.size(); i++) o_host[i] = o_unit[i] * res_scale;
   std::cout << "THE CI LAYER RAN: attention -> seam -> O projection, all "
             << "encrypted, " << h_cts.size() << " half ciphertexts through "
             << "the seam" << std::endl;
@@ -9302,7 +9325,9 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     std::vector<std::vector<double>> scaled(x_comp.size(),
                                             std::vector<double>(proj_small));
     for (size_t i = 0; i < x_comp.size(); i++) {
-      for (int t = 0; t < proj_small; t++) scaled[i][t] = x_comp[i][t] * o_fit;
+      for (int t = 0; t < proj_small; t++) {
+        scaled[i][t] = x_comp[i][t] * o_fit * res_scale;
+      }
     }
     Plaintext<word> pt;
     boot_ffn.context->encoder_.EncodeCoeff(pt, 0, boot_ffn.param->GetScale(0),
@@ -9326,7 +9351,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       // host residual is `x + O`, and the factor rides through to the
       // boundary constant the next crossing measures.
       h_host[static_cast<size_t>(t) * model_declared + c] =
-          x_comp[rev(c, 9)][rev(t, 7)] +
+          x_comp[rev(c, 9)][rev(t, 7)] * res_scale +
           o_host[static_cast<size_t>(t) * model_declared + c];
     }
   }
