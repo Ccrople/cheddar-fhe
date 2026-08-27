@@ -139,6 +139,8 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
   const int ring_rank = degree / mid_degree;       // 16, the ring-switch rank
   const int sub_rank = mid_degree / kSmallDegree;  // 16, the ModDecomp rank
   const int num_parents = kInChannels / rank;
+  // Fixed here; only the conjugate-invariant test below takes a width knob.
+  const int in_channels = kInChannels;
 
   ASSERT_EQ(rank, 256);
   ASSERT_EQ(ring_rank * sub_rank, rank)
