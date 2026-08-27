@@ -9842,6 +9842,7 @@ ledger("before the FFN context");
             << std::endl;
 
   double boundary = 0.0;
+  double crossing = 0.0;  // the BootParameter's own, see below
   Ciphertext<word> normed;
   {
     Ciphertext<word> up;
@@ -9863,6 +9864,30 @@ ledger("before the FFN context");
       std::cout << "  HalfBoot boundary constant " << boundary << std::endl;
       ASSERT_GT(std::abs(boundary), 0.0);
     }
+    // THE FIT IS NOT THE CROSSING'S CONSTANT. It is that constant TIMES
+    // whatever this particular ciphertext happened to carry, because the fit
+    // is against `h_host` while the residual stream carries `o_fit * h_host`
+    // -- the O projection's own factor, folded in at both ends. Dividing by
+    // the fit is right HERE, and it is what made this invisible: RMSNorm is
+    // scale invariant, so its output is clean either way.
+    //
+    // It is wrong at the next crossing. The gate and the up carry no `o_fit`,
+    // and dividing them by it hands SiLU an argument 2.185x too small -- which
+    // is not noise, it is a different function, and no fit can absorb it.
+    // Measured before the split: the gate's own crossing constant 0.0312449
+    // against this one's 0.0689854, `SiLU(gate)` carrying 0.444 (= 1/2.185)
+    // at 2^-2.76, and the SwiGLU product 2^-2.97 with the gate itself clean at
+    // 2^-10.35.
+    //
+    // The crossing constant is a property of the BootParameter (1.5bz), so
+    // dividing the data's factor back out recovers it:
+    // 0.0689854 / 2.185 / 0.988 = 0.031624 = 2^-4.9829, which is what
+    // `CiFfn`'s own crossings measure to five digits.
+    crossing = boundary / o_fit;
+    std::cout << "  the crossing's OWN constant " << crossing << " (2^"
+              << std::log2(std::abs(crossing)) << "), the residual's fit "
+              << boundary << " = that times the O projection's carried "
+              << o_fit << std::endl;
     canonicalise(up, 1.0 / boundary);
 
     cheddar::RmsNormHandler<word> rms(boot_ffn.context, proj_small,
@@ -10004,8 +10029,9 @@ ledger("before the FFN context");
                   << (res / (std::abs(gb) * wmx)) << " = 2^"
                   << std::log2(res / (std::abs(gb) * wmx)) << std::endl;
       }
-      canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
-      canonicalise(u_up, 1.0 / (boundary * proj_size));
+      // `crossing`, NOT `boundary`: these ciphertexts carry no `o_fit`.
+      canonicalise(g_up, 1.0 / (crossing * proj_size * silu_range));
+      canonicalise(u_up, 1.0 / (crossing * proj_size));
       silu.Apply(sv, g_up, boot.ui->GetEvkMap());
       if (i == 0) {  // SiLU's own output, in slots, before the multiply
         Plaintext<word> sp;
