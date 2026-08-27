@@ -1151,6 +1151,11 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     t1.AddRequiredRotations(req);
     t2.AddRequiredRotations(req);
     req.AddRequest(1, t2_level);  // the token shift
+    // The window convention leaves the result rotated: `additional_pt_rot`
+    // shifts every plaintext, so the caller pays one closing rotation, as
+    // `CiSinCAttention::ExchangeAll` does (1.5by).
+    req.AddRequest(((w1 % degree) + degree) % degree, t1_level - 1);
+    req.AddRequest(((w2 % degree) + degree) % degree, t2_level - 1);
     boot.ui->PrepareRotationKey(req);
   }
 
@@ -1176,13 +1181,30 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   Ciphertext<word> ct;
   boot.ui->Encrypt(ct, pt);
 
+  auto close = [&](Ciphertext<word> &x, int window_back) {
+    if (window_back == 0) return;
+    Ciphertext<word> y;
+    boot.context->HRot(y, x, boot.ui->GetEvkMap().GetRotationKey(window_back),
+                       window_back);
+    x = std::move(y);
+  };
+  const int back1 = ((w1 % degree) + degree) % degree;
+  const int back2 = ((w2 % degree) + degree) % degree;
+
   Ciphertext<word> a, shifted, dup, live, b;
   t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
+  close(a, back1);
+  std::cout << "  after T1: level " << boot.param->NPToLevel(a.GetNP())
+            << ", scale / canonical "
+            << (a.GetScale() /
+                boot.param->GetScale(boot.param->NPToLevel(a.GetNP())))
+            << std::endl;
   // The token shift, then the channel permutation, then the sum with the
   // live image itself. HRot by 1 brings slot s + 1 down to slot s.
   boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1),
                      1);
   t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
+  close(dup, back2);
   // The live image has to meet `dup` at the same level AND the same scale,
   // and LevelDown leaves a drift, so it comes down by the same multiply the
   // transform used: a constant one at the scale that lands canonical.
