@@ -55,6 +55,8 @@
 #include "extension/LlamaLinear.h"
 #include "extension/RmsNorm.h"
 #include "extension/SiLu.h"
+#include "extension/LinearTransform.h"
+#include "extension/StripedMatrix.h"
 #include "extension/SylphSchedule.h"
 
 using word = uint32_t;
@@ -962,4 +964,198 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   EXPECT_LT(rel, 0.05) << "the conjugate-invariant FFN disagrees with the "
                           "host reference by more than the circuit can "
                           "explain";
+}
+
+// ---------------------------------------------------------------------------
+// THE SEAM: the attention output's layout to the block's banded image.
+//
+// `CiSinCAttention::Values` hands its output back in the CHAIN's layout --
+// `CiSwitchedCcmmLayout::LocateSlot`, entry (row, column, lane) at slot
+// `rev4(col) * 4096 + rev7(row) * 32 + lane` for the sub-32 alignment -- and
+// the O projection wants the BLOCK's half-density banded image: live channels
+// at `token + 128 * channel` with `channel` even, and each live value's
+// shifted duplicate at its partner address (Doing.md 1.5cs).
+//
+// Measured on the device (`TheLibraryLegReproducesTheReference`), the chain's
+// output does NOT already carry the duplicates: the copy addresses differ
+// from their primaries by 0.36 against an output of 0.29. So the seam is two
+// maps, and the question is what they cost. COUNTED on the host, which is
+// where it should have been asked:
+//
+//     chain layout -> block packing, live half only      486 diagonals
+//     creating the duplicates, on block-packed data      910
+//     the two composed into one                        11732
+//
+// against the leg's own converters at 2048 running 14-28 ms/ct. Both pieces
+// are smaller than what the leg already pays and the composite is worse than
+// the sequence, so they stay two transforms.
+//
+// THE ORDERS ARE FREE AND THEY BUY THE 486. Every stage after attention is
+// per token, so the block may adopt any token order as long as the residual
+// stream is read the same way at both ends; and `ChannelOrder` absorbs any
+// channel permutation into the O projection's weight, offline. Searching the
+// two freedoms gives 729 at best and 63555 at worst for the same data, and
+// `token = row, channel = rev4(col) * 32 + rev5(lane)` is the winner -- which
+// also makes the half-density split fall out, because that channel is EVEN
+// exactly when `lane < 16`. The two halves are heads 0..15 and 16..31:
+// 1.5by's own two families, arrived at from the other end.
+//
+// This test builds both transforms and checks them on one ciphertext, with no
+// bootstrap and no converter anywhere near it, so it runs in two minutes and
+// says which of the two is wrong when one is.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
+  Ring boot(Param());
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  ASSERT_EQ(num_slots, degree);
+
+  // The chain's shape at the Llama alignment (sub_degree 32).
+  constexpr int kCols = 16;    // layout.rank: columns per big ciphertext
+  constexpr int kRows = 128;   // layout.dim = T = head_dim
+  constexpr int kLanes = 32;   // layout.lanes = the heads
+  auto slot_chain = [&](int row, int col, int lane) {
+    return Rev(col, 4) * 4096 + Rev(row, 7) * 32 + lane;
+  };
+  auto slot_block = [&](int token, int chan) { return token + kRows * chan; };
+  // The winning orders. `chan` is even exactly when `lane_in_half < 16`.
+  auto chan_of = [&](int col, int lane_in_half) {
+    return Rev(col, 4) * 32 + Rev(lane_in_half, 5);
+  };
+
+  const int half = 0;  // heads 0..15; the other half is the same map shifted
+  const int t1_level = 5, t2_level = 4;
+  ASSERT_LE(t1_level, boot.param->max_level_);
+
+  // ---- T1: chain layout -> the block's live addresses -------------------
+  cheddar::StripedMatrix m1(degree, degree);
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      const int lane = half * 16 + lh;
+      const int c = chan_of(col, lh);
+      ASSERT_EQ(c % 2, 0);
+      for (int row = 0; row < kRows; row++) {
+        const int dst = slot_block(row, c);
+        const int src = slot_chain(row, col, lane);
+        const int off = ((src - dst) % degree + degree) % degree;
+        m1.try_emplace(off, degree, Complex(0.0, 0.0));
+        m1[off][dst] = Complex(1.0, 0.0);
+      }
+    }
+  }
+  std::cout << "T1 (chain -> block live): " << m1.GetNumDiag() << " diagonals"
+            << std::endl;
+
+  // ---- T2: identity plus the shifted duplicates -------------------------
+  //
+  // Live component `I = rev9(c)` at position `row`; its duplicate belongs at
+  // component `rank - I` and position `row - 1`, i.e. block channel
+  // `rev9(512 - I)` and token `row - 1`. Adding the identity in the same
+  // matrix keeps it one transform and one level.
+  cheddar::StripedMatrix m2(degree, degree);
+  for (int s = 0; s < degree; s++) {
+    m2.try_emplace(0, degree, Complex(0.0, 0.0));
+    m2[0][s] = Complex(1.0, 0.0);
+  }
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      const int c = chan_of(col, lh);
+      const int I = Rev(c, 9);
+      ASSERT_LT(I, kRank / 2) << "an even channel must be a live component";
+      const int cd = Rev(kRank - I, 9);
+      for (int row = 1; row < kRows; row++) {
+        const int dst = slot_block(row - 1, cd);
+        const int src = slot_block(row, c);
+        const int off = ((src - dst) % degree + degree) % degree;
+        m2.try_emplace(off, degree, Complex(0.0, 0.0));
+        m2[off][dst] = Complex(1.0, 0.0);
+      }
+    }
+  }
+  std::cout << "T2 (identity + duplicates): " << m2.GetNumDiag()
+            << " diagonals" << std::endl;
+
+  cheddar::LinearTransform<word> t1(
+      boot.context, m1, t1_level,
+      boot.param->GetRescalePrimeProd(t1_level), 32, 16);
+  cheddar::LinearTransform<word> t2(
+      boot.context, m2, t2_level,
+      boot.param->GetRescalePrimeProd(t2_level), 32, 32);
+  {
+    cheddar::EvkRequest req;
+    t1.AddRequiredRotations(req);
+    t2.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // ---- one ciphertext in the chain's layout -----------------------------
+  std::mt19937_64 gen(0x5EA3);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::vector<Complex> msg(num_slots, Complex(0.0, 0.0));
+  // [row][col][lane] -> the attention output entry
+  std::vector<std::vector<std::vector<double>>> v(
+      kRows, std::vector<std::vector<double>>(
+                 kCols, std::vector<double>(kLanes, 0.0)));
+  for (int row = 0; row < kRows; row++) {
+    for (int col = 0; col < kCols; col++) {
+      for (int lane = 0; lane < kLanes; lane++) {
+        v[row][col][lane] = xd(gen);
+        msg[slot_chain(row, col, lane)] = Complex(v[row][col][lane], 0.0);
+      }
+    }
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, t1_level, boot.param->GetScale(t1_level),
+                                msg);
+  Ciphertext<word> ct;
+  boot.ui->Encrypt(ct, pt);
+
+  Ciphertext<word> a, b;
+  t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
+  t2.Evaluate(boot.context, b, a, boot.ui->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(boot.param->NPToLevel(b.GetNP()), t2_level - 1);
+
+  Plaintext<word> out_pt;
+  boot.ui->Decrypt(out_pt, b);
+  std::vector<Complex> got;
+  boot.context->encoder_.Decode(got, out_pt);
+
+  // ---- what the O projection needs to be there --------------------------
+  double live_err = 0.0, dup_err = 0.0, absmax = 0.0, elsewhere = 0.0;
+  std::vector<char> touched(num_slots, 0);
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      const int lane = half * 16 + lh;
+      const int c = chan_of(col, lh);
+      const int cd = Rev(kRank - Rev(c, 9), 9);
+      for (int row = 0; row < kRows; row++) {
+        const double want = v[row][col][lane];
+        absmax = std::max(absmax, std::abs(want));
+        const int ls = slot_block(row, c);
+        live_err = std::max(live_err, std::abs(got[ls].real() - want));
+        touched[ls] = 1;
+        if (row >= 1) {
+          const int ds = slot_block(row - 1, cd);
+          dup_err = std::max(dup_err, std::abs(got[ds].real() - want));
+          touched[ds] = 1;
+        }
+      }
+    }
+  }
+  for (int s = 0; s < num_slots; s++) {
+    if (!touched[s]) elsewhere = std::max(elsewhere, std::abs(got[s].real()));
+  }
+  std::cout << "THE SEAM: live " << live_err << ", duplicates " << dup_err
+            << ", everywhere else " << elsewhere << " (|v| <= " << absmax
+            << ")" << std::endl;
+  EXPECT_LT(live_err, 1e-3 * absmax)
+      << "T1 did not carry the chain's entries to the block's live addresses";
+  EXPECT_LT(dup_err, 1e-3 * absmax)
+      << "T2 did not put the shifted duplicates where the banded convention "
+         "needs them";
+  EXPECT_LT(elsewhere, 1e-3 * absmax)
+      << "something landed outside the half-density image";
 }
