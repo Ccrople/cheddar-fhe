@@ -1054,6 +1054,10 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   };
 
   const int half = 0;  // heads 0..15; the other half is the same map shifted
+  const bool flip = std::getenv("CHEDDAR_SEAM_FLIP") != nullptr;
+  std::cout << "offset convention: " << (flip ? "out[j+i] = in[j]"
+                                              : "out[j] = in[j+i]")
+            << std::endl;
   // ABOVE THE ZONE. CLAUDE.md: "ci16_35's alpha-12 basis puts every hoisted
   // transform at levels 0..6 in 1.5x's num_accum == 1 zone (mod-Q noise,
   // measured 1.8e+25 and pinned as a regression)". A `LinearTransform` IS a
@@ -1073,9 +1077,14 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
       for (int row = 0; row < kRows; row++) {
         const int dst = slot_block(row, c);
         const int src = slot_chain(row, col, lane);
-        const int off = ((src - dst) % degree + degree) % degree;
+        // `StripedMatrix` key `i` with `diag[j]`: the exchange 1.5by ships is
+        // an INVOLUTION, so it cannot tell `out[j] = in[j + i]` from
+        // `out[j + i] = in[j]`. CHEDDAR_SEAM_FLIP picks the other reading;
+        // one run of this test settles it for every map that follows.
+        const int off = flip ? ((dst - src) % degree + degree) % degree
+                             : ((src - dst) % degree + degree) % degree;
         m1.try_emplace(off, degree, Complex(0.0, 0.0));
-        m1[off][dst] = Complex(1.0, 0.0);
+        m1[off][flip ? src : dst] = Complex(1.0, 0.0);
       }
     }
   }
@@ -1108,10 +1117,12 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     for (int lh = 0; lh < 16; lh++) {
       const int c = chan_of(col, lh);
       const int cd = Rev(kRank - Rev(c, 9), 9);
-      const int off = ((kRows * (c - cd)) % degree + degree) % degree;
+      const int step = kRows * (c - cd);
+      const int off = ((flip ? -step : step) % degree + degree) % degree;
       m2.try_emplace(off, degree, Complex(0.0, 0.0));
       for (int row = 1; row < kRows; row++) {
-        m2[off][slot_block(row - 1, cd)] = Complex(1.0, 0.0);
+        m2[off][flip ? slot_block(row - 1, c) : slot_block(row - 1, cd)] =
+            Complex(1.0, 0.0);
       }
     }
   }
