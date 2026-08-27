@@ -45,6 +45,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -322,4 +323,310 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
   }
   EXPECT_GT(moved, rank / 2)
       << "the two descents would be indistinguishable at this rank";
+}
+
+// ===========================================================================
+// The same projection on the conjugate-invariant ring, both descents, timed.
+//
+// Doing.md 1.5bi built both routes on R+ and measured their noise -- 5.7e-06
+// direct against 1.8-2.4e-05 switched, ~1.5-2 bits apart -- and then left the
+// choice open, on cost: "That trade is the leg's to measure; the ordinary
+// branch's answer (the ring switch won by 3.0 s, 1.5au) does not port
+// unexamined because the CI shapes halve the ciphertext count and double the
+// rank." This is that measurement, taken through `CoeffLinearLeg` rather than
+// by hand, so what is timed is the projection the block would actually call.
+//
+// THE SHAPE. On R+ a ciphertext holds `degree` real slots, so at T = 128 the
+// block puts 512 channels in one and `SmallDegreeFor` is T rather than 2T:
+//
+//     direct      65536 --ModDecomp(rank 512)--------------------> 128
+//     switched    65536 --RingSwitch(16)--> 4096 --ModDecomp(32)--> 128
+//
+// THE CONTRACT, AND IT IS NOT THE ORDINARY ONE. On the ordinary ring
+// ModDecomp splits coefficients by residue -- component `i`, position `t`, is
+// coefficient `i + rank*t` -- and the block can hand the leg a plainly packed
+// ciphertext. On R+ the module basis is not the monomials and the split is a
+// banded scan (1.5ba): what ModPack writes at coefficient `t*rank + i` is
+// `comp_i[t] + comp_{rank-i}[t+1]`, and ModDecomp is its inverse. So the
+// parent this test encrypts is the banded RECOMPOSITION of the block's
+// packing, and the result is read back through the inverse scan.
+//
+// That is not a wrinkle of the test. It composes: `R` and `S` are inverse, so
+// one projection's ModPack output is exactly the next projection's ModDecomp
+// input, and the whole coefficient-domain leg is closed under it. What it
+// costs is the half-density rule of 1.5by at the one place the payload has to
+// be READ as slots -- which is the bootstrap, not this product.
+// ===========================================================================
+
+namespace {
+
+// The banded two-term recomposition (Doing.md 1.5ba / 1.5bp): what ModPack
+// writes, and therefore what a parent has to carry for ModDecomp to hand back
+// the components asked for.
+std::vector<double> CiRecompose(const std::vector<std::vector<double>> &comp,
+                                int rank, int small_degree) {
+  std::vector<double> out(static_cast<size_t>(rank) * small_degree, 0.0);
+  for (int t = 0; t < small_degree; t++) {
+    for (int i = 0; i < rank; i++) {
+      double v = comp[i][t];
+      if (i != 0 && t + 1 < small_degree) v += comp[rank - i][t + 1];
+      out[static_cast<size_t>(t) * rank + i] = v;
+    }
+  }
+  return out;
+}
+
+// Its inverse, an alternating suffix scan down the position axis, coupling
+// `i` with `rank - i`.
+std::vector<std::vector<double>> CiComponents(const std::vector<double> &coeffs,
+                                              int rank, int small_degree) {
+  std::vector<std::vector<double>> comp(rank,
+                                        std::vector<double>(small_degree));
+  for (int t = 0; t < small_degree; t++) {
+    comp[0][t] = coeffs[static_cast<size_t>(t) * rank];
+  }
+  for (int i = 1; i <= rank / 2; i++) {
+    const int mi = rank - i;
+    double acc_i = 0.0, acc_m = 0.0;
+    for (int t = small_degree - 1; t >= 0; t--) {
+      const double new_i = coeffs[static_cast<size_t>(t) * rank + i] - acc_m;
+      const double new_m = coeffs[static_cast<size_t>(t) * rank + mi] - acc_i;
+      comp[i][t] = new_i;
+      comp[mi][t] = new_m;
+      acc_i = new_i;
+      acc_m = new_m;
+    }
+  }
+  return comp;
+}
+
+double SecondsSince(const std::chrono::steady_clock::time_point &t0) {
+  cudaDeviceSynchronize();
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+}  // namespace
+
+TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
+  const char *big_param = std::getenv("CHEDDAR_CI_SWITCH_PARAM");
+  const char *small_param = std::getenv("CHEDDAR_CI_SMALL_PARAM");
+  Ring block(big_param && big_param[0] ? big_param
+                                       : "ci_ringswitch16_35.json");
+  Ring small(small_param && small_param[0] ? small_param : "ci12_35.json");
+  ASSERT_TRUE(block.param->conjugate_invariant_);
+  ASSERT_TRUE(small.param->conjugate_invariant_);
+
+  using Leg = cheddar::CoeffLinearLeg<word>;
+  const int degree = block.Degree();
+  const int num_slots = block.param->MaxNumSlots();
+  const int mid_degree = small.Degree();
+  const int ci_small_degree = Leg::SmallDegreeFor(kTokens, *block.param);
+  const int rank = degree / ci_small_degree;          // 512 channels per ct
+  const int ring_rank = degree / mid_degree;          // 16
+  const int sub_rank = mid_degree / ci_small_degree;  // 32
+  const int num_parents = kInChannels / rank;
+
+  ASSERT_EQ(num_slots, degree) << "R+ gives `degree` real slots";
+  ASSERT_EQ(ci_small_degree, kTokens)
+      << "on R+ a T-token channel occupies T coefficients, not 2T";
+  ASSERT_EQ(rank, 512);
+  ASSERT_EQ(ring_rank * sub_rank, rank);
+  ASSERT_EQ(num_slots / kTokens, rank);
+  ASSERT_GE(num_parents, 1);
+
+  const double ct_scale = block.param->GetScale(kLevel);
+
+  // ---- the tensors ------------------------------------------------------
+  std::mt19937_64 gen(0xC15117);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.0175);  // Llama-3's W_Q RMS
+  std::vector<double> x(static_cast<size_t>(kTokens) * kInChannels);
+  std::vector<double> w(static_cast<size_t>(kInChannels) * kOutChannels);
+  for (auto &v : x) v = xd(gen);
+  for (auto &v : w) v = wd(gen);
+  for (int t = 0; t < kTokens; t++) {
+    double sq = 0.0;
+    for (int c = 0; c < kInChannels; c++) {
+      const double v = x[static_cast<size_t>(t) * kInChannels + c];
+      sq += v * v;
+    }
+    const double inv = 1.0 / std::sqrt(sq / kInChannels + 1e-5);
+    for (int c = 0; c < kInChannels; c++) {
+      x[static_cast<size_t>(t) * kInChannels + c] *= inv;
+    }
+  }
+
+  std::vector<double> want(static_cast<size_t>(kTokens) * kOutChannels, 0.0);
+  double want_max = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int o = 0; o < kOutChannels; o++) {
+      double acc = 0.0;
+      for (int c = 0; c < kInChannels; c++) {
+        acc += x[static_cast<size_t>(t) * kInChannels + c] *
+               w[static_cast<size_t>(c) * kOutChannels + o];
+      }
+      want[static_cast<size_t>(t) * kOutChannels + o] = acc;
+      want_max = std::max(want_max, std::abs(acc));
+    }
+  }
+
+  // ---- encrypt: the block's packing, delivered as a banded image --------
+  //
+  // The plain packing says where a (token, channel) sits in the coefficient
+  // index; splitting that index into (component, position) says which module
+  // component has to carry it; and the banded recomposition is what a parent
+  // must hold for ModDecomp to hand those components back.
+  auto pack_components = [&](int parent) {
+    std::vector<std::vector<double>> comp(
+        rank, std::vector<double>(ci_small_degree, 0.0));
+    for (int c = 0; c < rank; c++) {
+      for (int t = 0; t < kTokens; t++) {
+        const int k = AttentionPacking::CoeffOfSlot(
+            {t + kTokens * c, false}, degree, /*conjugate_invariant=*/true);
+        comp[k % rank][k / rank] =
+            x[static_cast<size_t>(t) * kInChannels + parent * rank + c];
+      }
+    }
+    return comp;
+  };
+
+  std::vector<Ciphertext<word>> parents(num_parents);
+  for (int p = 0; p < num_parents; p++) {
+    Plaintext<word> pt;
+    block.context->encoder_.EncodeCoeff(
+        pt, kLevel, ct_scale,
+        CiRecompose(pack_components(p), rank, ci_small_degree));
+    block.ui->Encrypt(parents[p], pt);
+  }
+
+  auto read_back = [&](std::vector<double> &out,
+                       const std::vector<Ciphertext<word>> &res) {
+    out.assign(static_cast<size_t>(kTokens) * kOutChannels, 0.0);
+    for (size_t g = 0; g < res.size(); g++) {
+      Plaintext<word> pt;
+      block.ui->Decrypt(pt, res[g]);
+      std::vector<double> coeffs;
+      block.context->encoder_.DecodeCoeff(coeffs, pt);
+      const auto comp = CiComponents(coeffs, rank, ci_small_degree);
+      for (int c = 0; c < rank; c++) {
+        for (int t = 0; t < kTokens; t++) {
+          const int k = AttentionPacking::CoeffOfSlot(
+              {t + kTokens * c, false}, degree, /*conjugate_invariant=*/true);
+          out[static_cast<size_t>(t) * kOutChannels + g * rank + c] =
+              comp[k % rank][k / rank];
+        }
+      }
+    }
+  };
+
+  auto report = [&](const char *name, const std::vector<double> &got,
+                    double seconds, int emissions) {
+    double mx = 0.0;
+    for (size_t i = 0; i < want.size(); i++) {
+      mx = std::max(mx, std::abs(got[i] - want[i]));
+    }
+    std::cout << "  " << name << ": max abs err " << mx << " ("
+              << -std::log2(mx / want_max) << " bits), " << (seconds * 1e3)
+              << " ms for " << emissions << " output ciphertext(s) = "
+              << (seconds * 1e3 / emissions) << " ms/ct" << std::endl;
+    return mx;
+  };
+
+  Leg::Config cfg;
+  cfg.num_tokens = kTokens;
+  cfg.product_level = kLevel;
+
+  // ---- [SYLPH] section 3.2's route --------------------------------------
+  block.ui->PrepareRingSwitchKey(mid_degree, small.ui->GetSecretCoeffs(),
+                                 kLevel);
+  block.ui->PrepareInverseRingSwitchKey(mid_degree,
+                                        small.ui->GetSecretCoeffs(), kLevel);
+  small.ui->PrepareModPackKeys(ci_small_degree, kLevel);
+  std::vector<const EvaluationKey<word> *> small_keys(sub_rank);
+  for (int j = 0; j < sub_rank; j++) {
+    small_keys[j] = &small.ui->GetModPackKey(sub_rank, j);
+  }
+
+  Leg::Descent descent;
+  descent.switch_context = block.context;
+  descent.small_context = small.context;
+  descent.forward = &block.ui->GetRingSwitchKey(ring_rank);
+  descent.inverse = &block.ui->GetInverseRingSwitchKey(ring_rank);
+  descent.modpack_keys = small_keys;
+
+  std::vector<double> got_switched;
+  double sw_seconds = 0.0;
+  {
+    Leg::Config sw_cfg = cfg;
+    sw_cfg.parents_per_tile = 0;  // the descent holds a sixteenth
+    ProjectOnlyLeg leg(block.context, sw_cfg, {}, descent);
+    EXPECT_TRUE(leg.IsRingSwitched());
+    EXPECT_EQ(leg.GetRank(), rank);
+    EXPECT_EQ(leg.GetSmallDegree(), ci_small_degree);
+    EXPECT_EQ(leg.GetRingRank(), ring_rank);
+    EXPECT_EQ(leg.GetSubRank(), sub_rank);
+
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "warm");
+    const auto t0 = std::chrono::steady_clock::now();
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    sw_seconds = SecondsSince(t0);
+    ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
+    EXPECT_EQ(block.param->NPToLevel(res[0].GetNP()), kLevel - 1);
+    EXPECT_NEAR(res[0].GetScale() / block.param->GetScale(kLevel - 1), 1.0,
+                1e-6);
+    EXPECT_EQ(res[0].GetNumSlots(), num_slots);
+    read_back(got_switched, res);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const double sw_max =
+      report("ring-switched", got_switched, sw_seconds, kOutChannels / rank);
+  EXPECT_LT(sw_max / want_max, 1e-3)
+      << "the ring-switched projection disagrees with the host product";
+
+  // ---- the direct route, 512 ModPack keys at the block's degree ----------
+  block.ui->PrepareModPackKeys(ci_small_degree, kLevel);
+  std::vector<const EvaluationKey<word> *> big_keys(rank);
+  for (int j = 0; j < rank; j++) {
+    big_keys[j] = &block.ui->GetModPackKey(rank, j);
+  }
+
+  std::vector<double> got_direct;
+  double dir_seconds = 0.0;
+  {
+    Leg::Config direct_cfg = cfg;
+    direct_cfg.parents_per_tile = 0;
+    ProjectOnlyLeg leg(block.context, direct_cfg, big_keys);
+    EXPECT_FALSE(leg.IsRingSwitched());
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "warm");
+    const auto t0 = std::chrono::steady_clock::now();
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    dir_seconds = SecondsSince(t0);
+    ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
+    read_back(got_direct, res);
+  }
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const double dir_max =
+      report("direct       ", got_direct, dir_seconds, kOutChannels / rank);
+  EXPECT_LT(dir_max / want_max, 1e-3)
+      << "the direct projection disagrees with the host product";
+
+  double gap = 0.0;
+  for (size_t i = 0; i < want.size(); i++) {
+    gap = std::max(gap, std::abs(got_direct[i] - got_switched[i]));
+  }
+  std::cout << "  the two routes differ by at most " << gap << " ("
+            << (gap / want_max) << " relative); |Y| max " << want_max
+            << std::endl;
+  std::cout << "  THE TRADE (Doing.md 1.5bi): switched " << (sw_seconds * 1e3)
+            << " ms and 1 + 1 + " << sub_rank << " keys against direct "
+            << (dir_seconds * 1e3) << " ms and " << rank
+            << " keys at degree " << degree << "; noise "
+            << -std::log2(sw_max / want_max) << " vs "
+            << -std::log2(dir_max / want_max) << " bits" << std::endl;
+  EXPECT_LT(gap / want_max, 1e-3)
+      << "the two descents computed different products, which means the "
+         "component reindexing is wrong rather than the arithmetic";
 }
