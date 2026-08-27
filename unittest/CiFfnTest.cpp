@@ -957,6 +957,10 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   // The boundary constant, measured once on the first crossing and reused:
   // it is a property of the BootParameter, not of the data (1.5bz).
   double boundary = 0.0;
+  // And what a whole turn -- crossing, restore, ToCoeff -- multiplies the
+  // message by, which is 1 only if the crossing's constant is exactly the
+  // nominal `2^-log_message_ratio`. It is not.
+  double kappa = 1.0;
 
   // ---- turn 1: RMSNorm ---------------------------------------------------
   {
@@ -1000,11 +1004,32 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
                 << (res / (boundary * wmax)) << " = 2^"
                 << std::log2(res / (boundary * wmax))
                 << " of the live signal" << std::endl;
+      // What a whole turn through the coefficient domain multiplies the
+      // message by: the crossing restores by the MEASURED constant and
+      // `ToCoeff` undoes it by the NOMINAL one. See turn 3.
+      kappa = std::pow(2.0, -bctx->GetBootParameter().GetLogMessageRatio()) /
+              boundary;
+      std::cout << "  a turn through the coefficient domain carries "
+                << kappa << " (nominal 2^-"
+                << bctx->GetBootParameter().GetLogMessageRatio()
+                << " over the measured crossing)" << std::endl;
     }
     canonicalise(up, 1.0 / (boundary * beta));
 
+    // THE INVSQRT WINDOW IS THE SAME MISTAKE AS SiLU'S RANGE, one step
+    // smaller. `TheFitsAloneExplainTheFfnError` measures the argument in
+    // [0.839, 1.250] -- a ratio of 1.49 -- against a window of 6, and a
+    // Chebyshev fit's error is uniform over its interval, so four fifths of
+    // the window is being paid for and not used. The default stays 6 so that
+    // nothing measured before this line moves without being asked.
+    const double norm_window = [] {
+      const char *e = std::getenv("CHEDDAR_CI_FFN_NORM_WINDOW");
+      return (e && e[0]) ? std::atof(e) : 6.0;
+    }();
+    std::cout << "invsqrt window ratio " << norm_window
+              << " (CHEDDAR_CI_FFN_NORM_WINDOW)" << std::endl;
     cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
-                                      op_level, kEps, 6.0, 9,
+                                      op_level, kEps, norm_window, 9,
                                       /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
@@ -1042,14 +1067,17 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   // that lands the rescaled product canonical at level 0. The crossing bound
   // rides the weight scale for free, exactly as [SYLPH] folds its calibration
   // into the model conversion.
-  const double proj_size = 0.4 / std::max(gate_absmax, 1e-12);
+  // The SAME ride height as the residual's crossing: `beta_target` sets how
+  // hot every message in this test enters HalfBoot, and the gate's and the
+  // up's crossings are the two the SwiGLU turn is bound by.
+  const double proj_size = beta_target / std::max(gate_absmax, 1e-12);
   // `up` had been sharing it. Its own maximum is what it has to be scaled by.
   const bool shared_up = [] {
     const char *e = std::getenv("CHEDDAR_CI_FFN_SHARED_UP_SCALE");
     return e && e[0] == '1';
   }();
   const double up_size =
-      shared_up ? proj_size : 0.4 / std::max(up_absmax, 1e-12);
+      shared_up ? proj_size : beta_target / std::max(up_absmax, 1e-12);
   std::cout << "gate scale " << proj_size << ", up scale " << up_size
             << (shared_up ? "  (SHARED, the old behaviour)" : "") << std::endl;
   std::vector<Ciphertext<word>> gate, upv;
@@ -1108,12 +1136,101 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
       Ciphertext<word> g_up, u_up;
       sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
       sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
-      // SiLU takes x / range, so the restore carries 1/range as well.
-      canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
-      canonicalise(u_up, 1.0 / (boundary * up_size));
+      // THE ROUND TRIP IS NOT CLOSED, AND ONLY SiLU CAN SEE IT.
+      //
+      // `SylphSchedule::ToCoeff` undoes the crossing by the NOMINAL
+      // `2^-log_message_ratio`, because that is what makes `Boot` message
+      // preserving. The crossing's own constant is not that number -- it is
+      // the measured `boundary` = 2^-4.9829 -- so every turn through the
+      // coefficient domain leaves the message multiplied by
+      // `kappa = 2^-log_message_ratio / boundary` = 0.98804, and the ledger
+      // shows exactly that: `carried 0.988036` at RMSNorm's read, at the
+      // gate, at the up and at `g_up`, the same six digits at every ride
+      // height and every invsqrt window.
+      //
+      // Everything LINEAR absorbs it. The projections carry it, the next
+      // crossing carries it, every read divides it out as its fitted
+      // `carried`, and RMSNorm is scale invariant so the one operator that
+      // stands between it and its first nonlinear consumer cannot see it
+      // either -- 1.5cu's third cause, in a different disguise.
+      //
+      // SiLU is not linear and cannot absorb it: `SiLU(0.988x)/0.988` differs
+      // from `SiLU(x)` by `0.012 x^2 sigma'(x)`, which peaks at 2^-9.2 of the
+      // span and IS the 2^-8.99 the SwiGLU turn measures. So it is folded
+      // into the restore, where it costs nothing.
+      canonicalise(g_up, 1.0 / (kappa * boundary * proj_size * silu_range));
+      canonicalise(u_up, 1.0 / (kappa * boundary * up_size));
       Ciphertext<word> s;
       silu.Apply(s, g_up, boot.ui->GetEvkMap());
       const int s_level = boot.param->NPToLevel(s.GetNP());
+      // WHERE THE SwiGLU TURN'S BITS GO, read one stage at a time.
+      //
+      // The gate and the up are clean at level 0 -- 2^-13.8 at ride 0.2 --
+      // and the product is 2^-8.4, and the ride sweep says the crossings are
+      // NOT what costs the five bits: halving the ride moves the crossing
+      // residual by two bits and moves this turn by nothing. So the three
+      // stages between the two measurements get read separately, and SiLU
+      // gets read TWICE -- against the true function and against its own
+      // compiled polynomial -- because the fit and the circuit are different
+      // problems with different fixes.
+      {
+        auto slot_read = [&](const Ciphertext<word> &ct) {
+          Plaintext<word> p;
+          boot.ui->Decrypt(p, ct);
+          std::vector<Complex> raw;
+          boot.context->encoder_.Decode(raw, p);
+          std::vector<double> v(static_cast<size_t>(kTokens) * kRank, 0.0);
+          for (int t = 0; t < kTokens; t++) {
+            for (int c = 0; c < kRank; c++) {
+              v[static_cast<size_t>(t) * kRank + c] =
+                  raw[static_cast<size_t>(c) * kTokens + t].real();
+            }
+          }
+          return v;
+        };
+        auto slot_err = [&](const char *name, const std::vector<double> &got,
+                            const std::vector<double> &want_v) {
+          double num = 0.0, den = 0.0, wmax = 0.0;
+          for (int t = 0; t < kTokens; t++) {
+            for (int c = 0; c < kRank; c += 2) {
+              const double w = want_v[static_cast<size_t>(t) * kRank + c];
+              num += got[static_cast<size_t>(t) * kRank + c] * w;
+              den += w * w;
+              wmax = std::max(wmax, std::abs(w));
+            }
+          }
+          const double fit = num / den;
+          double mx = 0.0;
+          for (int t = 0; t < kTokens; t++) {
+            for (int c = 0; c < kRank; c += 2) {
+              const size_t k = static_cast<size_t>(t) * kRank + c;
+              mx = std::max(mx, std::abs(got[k] / fit - want_v[k]));
+            }
+          }
+          std::cout << "    [" << name << "] carried " << fit << ", relative "
+                    << (mx / wmax) << " = 2^" << std::log2(mx / wmax)
+                    << std::endl;
+        };
+        std::vector<double> wg_(static_cast<size_t>(kTokens) * kRank, 0.0);
+        std::vector<double> wu_ = wg_, ws_ = wg_, wf_ = wg_;
+        for (int t = 0; t < kTokens; t++) {
+          for (int c = 0; c < kRank; c += 2) {
+            const size_t k = static_cast<size_t>(t) * declared_hidden +
+                             i * kRank + c;
+            const size_t m = static_cast<size_t>(t) * kRank + c;
+            wg_[m] = g_host[k] / silu_range;
+            wu_[m] = u_host[k];
+            ws_[m] = g_host[k] / (1.0 + std::exp(-g_host[k]));
+            wf_[m] = silu.PlainSiLu(g_host[k]);
+          }
+        }
+        slot_err(i == 0 ? "g_up[0]" : "g_up[1]", slot_read(g_up), wg_);
+        slot_err(i == 0 ? "u_up[0]" : "u_up[1]", slot_read(u_up), wu_);
+        const std::vector<double> sr = slot_read(s);
+        slot_err(i == 0 ? "SiLU[0] vs true" : "SiLU[1] vs true", sr, ws_);
+        slot_err(i == 0 ? "SiLU[0] vs its own poly" : "SiLU[1] vs own poly",
+                 sr, wf_);
+      }
       Ciphertext<word> u_low;
       boot.context->LevelDown(u_low, u_up, s_level);
       boot.context->HMult(prod[i], s, u_low,
@@ -2386,8 +2503,13 @@ TEST(CiFfn, TheFitsAloneExplainTheFfnError) {
   // The two handlers, built with the arguments the FFN test builds them with.
   // Only the polynomial matters here, so the level is any legal one.
   const int lvl = 6;
+  const double norm_window = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_NORM_WINDOW");
+    return (e && e[0]) ? std::atof(e) : 6.0;
+  }();
   cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
-                                    lvl, kEps, 6.0, 9, /*channel_stride=*/2);
+                                    lvl, kEps, norm_window, 9,
+                                    /*channel_stride=*/2);
   const double silu_margin = [] {
     const char *e = std::getenv("CHEDDAR_CI_FFN_SILU_MARGIN");
     return (e && e[0]) ? std::atof(e) : 0.0;
@@ -2493,5 +2615,473 @@ TEST(CiFfn, TheFitsAloneExplainTheFfnError) {
             << std::log2(only_silu) << std::endl;
   std::cout << "  both             : " << both << " = 2^" << std::log2(both)
             << "   <-- the FLOOR the encrypted FFN cannot beat" << std::endl;
+  SUCCEED();
+}
+
+// WHAT THE CROSSING COSTS, AS A FUNCTION OF HOW HOT THE MESSAGE RIDES.
+//
+// 1.5cu closed with the layer bound by the crossing's own per-slot residual --
+// 2^-10.16 of the live signal after fitting ONE constant -- and named riding
+// hotter (1.5bz's lever) as the way down. That is a GUESS about the mechanism,
+// and the two mechanisms available predict OPPOSITE things:
+//
+//   * an ADDITIVE floor -- key-switch and rescale noise at the level-0
+//     modulus, a fixed number of ulps whatever the message is -- gives a
+//     relative residual proportional to `1/beta`. Ride HOTTER.
+//   * EvalMod's APPROXIMATION is a smooth odd function of the slot's own
+//     value, whose leading term is cubic, so it gives a relative residual
+//     proportional to `beta^2`. Ride COLDER.
+//
+// Both are absolute in the sense 1.5cs meant -- neither moves with Delta,
+// which is why `ci16_40` and `ci16_35` agreed to three digits -- so that
+// observation does not separate them. Their sum is a U with an optimum, and
+// this test finds it by crossing the same data at a range of ride heights in
+// one process.
+//
+// It also asks whether the residual is a property of the SLOT or of the VALUE,
+// because the two cost differently. A per-slot deviation is a per-slot restore
+// VECTOR, and that is free: the canonicalise downstream is already a plaintext
+// multiply, so `EncodeConstant` simply becomes `Encode`. A function of the
+// value needs a polynomial and a level.
+//
+// The discriminator for the first question is the residual referred back to
+// the INPUT -- `max|r| / fit`, in message units. Additive noise makes that
+// number constant across `beta`; a cubic distortion makes it grow as
+// `beta^3`. The discriminator for the second is running two independent
+// datasets at one ride height and correlating `r_j / (fit * w_j)` between
+// them: a per-slot constant correlates at 1, a function of the value does not
+// correlate at all.
+TEST(CiFfn, TheCrossingResidualIsMeasuredAgainstItsRideHeight) {
+  Ring boot(Param());
+  std::cout << "preset " << Param() << std::endl;
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr) << Param() << " did not come up as a BootContext";
+
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  ASSERT_EQ(num_slots, degree);
+  const int declared = kRank;
+
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const int land_level = boot.param->default_encryption_level_;
+  std::cout << "  log_message_ratio = "
+            << bctx->GetBootParameter().GetLogMessageRatio()
+            << ", HalfBoot lands at level " << land_level << std::endl;
+
+  // One dataset is a coefficient vector normalised to unit maximum, so that
+  // `beta` IS the ride height and nothing else changes between runs.
+  auto make_data = [&](uint64_t seed) {
+    std::mt19937_64 gen(seed);
+    std::normal_distribution<double> xd(0.0, 1.0);
+    std::vector<std::vector<double>> comp(kRank,
+                                          std::vector<double>(kTokens, 0.0));
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < declared; c += 2) {
+        comp[Rev(c, 9)][Rev(t, 7)] = xd(gen);
+      }
+    }
+    std::vector<double> co = CiRecompose(comp, kRank, kTokens);
+    double mx = 0.0;
+    for (double v : co) mx = std::max(mx, std::abs(v));
+    for (double &v : co) v /= mx;
+    // Read as a SLOT vector: slot `rev16(k)` holds coefficient `k`, and both
+    // bands carry known values (the live half its own component, the dead half
+    // the partner at the next position), so every slot is a sample.
+    std::vector<double> want(num_slots, 0.0);
+    for (int k = 0; k < num_slots; k++) want[Rev(k, 16)] = co[k];
+    return std::make_pair(co, want);
+  };
+
+  const auto data_a = make_data(0xF7A11);
+  const auto data_b = make_data(0x2C0FFEE);
+
+  // One crossing at one ride height. Returns the fitted constant and the
+  // per-slot residual referred back to the input.
+  struct Crossing {
+    double fit = 0.0;
+    std::vector<double> resid;  // (got - fit*want) / fit, in message units
+  };
+  auto cross = [&](const std::pair<std::vector<double>, std::vector<double>>
+                       &data,
+                   double beta) {
+    std::vector<double> co = data.first;
+    for (double &v : co) v *= beta;
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), co);
+    Ciphertext<word> ct;
+    boot.ui->Encrypt(ct, pt);
+    ct.SetNumSlots(num_slots);
+    Ciphertext<word> lifted;
+    bctx->HalfBoot(lifted, ct, boot.ui->GetEvkMap());
+    Plaintext<word> raw_pt;
+    boot.ui->Decrypt(raw_pt, lifted);
+    std::vector<Complex> raw;
+    boot.context->encoder_.Decode(raw, raw_pt);
+    double num = 0.0, den = 0.0;
+    for (int j = 0; j < num_slots; j++) {
+      const double w = beta * data.second[j];
+      num += raw[j].real() * w;
+      den += w * w;
+    }
+    Crossing out;
+    out.fit = num / den;
+    out.resid.resize(num_slots);
+    for (int j = 0; j < num_slots; j++) {
+      const double w = beta * data.second[j];
+      out.resid[j] = raw[j].real() / out.fit - w;
+    }
+    return out;
+  };
+
+  // ---- the sweep --------------------------------------------------------
+  const std::vector<double> rides = {0.0125, 0.025, 0.05, 0.1, 0.2,
+                                     0.4,    0.8,   1.6,  3.2};
+  std::cout << "  ride      fit        2^          rel(max)    rel(rms)    "
+               "input-referred max   cubic a"
+            << std::endl;
+  double best_rel = 1e30, best_ride = 0.0;
+  for (double beta : rides) {
+    const Crossing cr = cross(data_a, beta);
+    double mx = 0.0, ss = 0.0;
+    // The leading term of a smooth odd distortion is cubic, so fit
+    // `r = a * w^3` and report how much of the residual it takes with it.
+    double cn = 0.0, cd = 0.0;
+    for (int j = 0; j < num_slots; j++) {
+      const double w = beta * data_a.second[j];
+      mx = std::max(mx, std::abs(cr.resid[j]));
+      ss += cr.resid[j] * cr.resid[j];
+      cn += cr.resid[j] * w * w * w;
+      cd += w * w * w * w * w * w;
+    }
+    const double rms = std::sqrt(ss / num_slots);
+    const double a = cd > 0.0 ? cn / cd : 0.0;
+    double after = 0.0;
+    for (int j = 0; j < num_slots; j++) {
+      const double w = beta * data_a.second[j];
+      after = std::max(after, std::abs(cr.resid[j] - a * w * w * w));
+    }
+    const double rel = mx / beta;
+    if (rel < best_rel) {
+      best_rel = rel;
+      best_ride = beta;
+    }
+    std::cout << "  " << beta << "\t" << cr.fit << "\t2^"
+              << std::log2(cr.fit) << "\t" << rel << " (2^" << std::log2(rel)
+              << ")\t" << (rms / beta) << "\t" << mx << "\t a=" << a
+              << " leaves " << (after / beta) << std::endl;
+  }
+  std::cout << "  the best ride height on this sweep is " << best_ride
+            << " at 2^" << std::log2(best_rel) << " of the live signal"
+            << std::endl;
+
+  // ---- is it the slot or the value? -------------------------------------
+  //
+  // Two independent datasets at one ride height. If the crossing's constant
+  // varies per slot -- `got_j = fit * (1 + d_j) * w_j` -- then
+  // `r_j / w_j = fit * d_j` is the SAME vector for both, and a per-slot
+  // restore removes it for free. If instead the residual is a function of the
+  // slot's own value, the two are uncorrelated.
+  {
+    const double beta = 0.4;
+    const Crossing ca = cross(data_a, beta);
+    const Crossing cb = cross(data_b, beta);
+    double sa = 0.0, sb = 0.0, sab = 0.0, ma = 0.0, mb = 0.0;
+    int n = 0;
+    for (int j = 0; j < num_slots; j++) {
+      const double wa = beta * data_a.second[j];
+      const double wb = beta * data_b.second[j];
+      // Only where both are well away from zero: `r/w` is meaningless at a
+      // slot whose own value is tiny, and a ratio of two small numbers would
+      // dominate any correlation computed over all of them.
+      if (std::abs(wa) < 0.3 * beta || std::abs(wb) < 0.3 * beta) continue;
+      const double da = ca.resid[j] / wa;
+      const double db = cb.resid[j] / wb;
+      ma += da;
+      mb += db;
+      n++;
+    }
+    ASSERT_GT(n, 100);
+    ma /= n;
+    mb /= n;
+    for (int j = 0; j < num_slots; j++) {
+      const double wa = beta * data_a.second[j];
+      const double wb = beta * data_b.second[j];
+      if (std::abs(wa) < 0.3 * beta || std::abs(wb) < 0.3 * beta) continue;
+      const double da = ca.resid[j] / wa - ma;
+      const double db = cb.resid[j] / wb - mb;
+      sa += da * da;
+      sb += db * db;
+      sab += da * db;
+    }
+    const double corr = sab / std::sqrt(sa * sb);
+    std::cout << "  per-slot deviation, two datasets at ride " << beta << ": "
+              << n << " slots, correlation " << corr << std::endl;
+    std::cout << "    (1 means a per-slot restore VECTOR removes it for free; "
+                 "0 means it is a function of the value)"
+              << std::endl;
+  }
+  SUCCEED();
+}
+
+// WHAT THE SiLU CIRCUIT COSTS, AS A FUNCTION OF ITS LEVEL AND ITS DEGREE.
+//
+// `TheFeedForwardNetworkRunsOnTheRealSubring` reads the SwiGLU turn one stage
+// at a time and the answer is not the crossing and not the fit: SiLU's input
+// arrives at 2^-14.4, its output leaves at 2^-8.99, and **the output is that
+// far from its OWN compiled polynomial**, to six digits. So the 5.4 bits are
+// the homomorphic evaluation, which is the one term `SiLu.h` says is "a fixed
+// integer magnitude divided by the scaling factor" -- and 2^-8.99 against the
+// 2^-16.86 that section records is a factor of seventy that has to come from
+// somewhere.
+//
+// The candidate is the LEVEL. `SiLu.h`'s table was measured on a fresh
+// encryption near the top of the ladder; the FFN evaluates at `slot_level - 1`,
+// which on `ci16_35` at slack nine is level 9, and a Grafting ladder's rescale
+// prime products are not the same size at every rung. This probe needs no
+// bootstrap and no rotation keys, so it costs seconds per point instead of the
+// ninety-second FFN run, and it sweeps the degree at the same time -- the fit
+// is 2^-31 at the calibrated range, so the degree is over-provisioned and a
+// smaller one is both cheaper and (if the circuit term grows with the tree)
+// more accurate.
+TEST(CiFfn, TheSiLuCircuitIsMeasuredAgainstItsLevel) {
+  Ring boot(Param());
+  std::cout << "preset " << Param() << std::endl;
+  const int num_slots = boot.param->MaxNumSlots();
+
+  // The FFN's own gate, so the numbers are comparable with its ledger.
+  const double gate_absmax = 3.03442;
+  const double range = 1.2 * gate_absmax;
+  std::mt19937_64 gen(0x51LU);
+  std::uniform_real_distribution<double> xd(-gate_absmax, gate_absmax);
+  std::vector<double> x(num_slots, 0.0);
+  for (int i = 0; i < num_slots; i++) x[i] = xd(gen);
+
+  std::cout << "  level   rescale prime prod      degree  vs own poly   "
+               "vs true SiLU"
+            << std::endl;
+  const std::vector<int> levels = {19, 15, 12, 10, 9, 8, 7, 6};
+  const std::vector<int> degrees = {31, 15, 7};
+  for (int lvl : levels) {
+    for (int deg : degrees) {
+      cheddar::SiLuHandler<word> silu(boot.context, range, lvl, deg);
+      std::vector<Complex> u(num_slots);
+      for (int i = 0; i < num_slots; i++) u[i] = Complex(x[i] / range, 0.0);
+      Plaintext<word> pt;
+      boot.context->encoder_.Encode(pt, lvl, boot.param->GetScale(lvl), u);
+      Ciphertext<word> ct;
+      boot.ui->Encrypt(ct, pt);
+      ct.SetNumSlots(num_slots);
+      Ciphertext<word> res;
+      silu.Apply(res, ct, boot.ui->GetEvkMap());
+      Plaintext<word> rp;
+      boot.ui->Decrypt(rp, res);
+      std::vector<Complex> got;
+      boot.context->encoder_.Decode(got, rp);
+      double mx_poly = 0.0, mx_true = 0.0, span = 0.0;
+      for (int i = 0; i < num_slots; i++) {
+        const double t = x[i] / (1.0 + std::exp(-x[i]));
+        const double p = silu.PlainSiLu(x[i]);
+        span = std::max(span, std::abs(t));
+        mx_poly = std::max(mx_poly, std::abs(got[i].real() - p));
+        mx_true = std::max(mx_true, std::abs(got[i].real() - t));
+      }
+      std::cout << "  " << lvl << "\t2^"
+                << std::log2(boot.param->GetRescalePrimeProd(lvl)) << "\t\t"
+                << deg << "\t2^" << std::log2(mx_poly / span) << "\t2^"
+                << std::log2(mx_true / span) << std::endl;
+    }
+  }
+  SUCCEED();
+}
+
+// RMSNorm CARRIES A SCALE, AND A NONLINEAR CONSUMER CANNOT ABSORB IT.
+//
+// Every stage of the FFN downstream of RMSNorm reports `carried 0.988036` --
+// the same six digits at RMSNorm's own output, at `g_up` and at `u_up`, at
+// every ride height and at every invsqrt window. The crossing cannot be the
+// source: `canonicalise` divides by the constant that was FITTED on that
+// crossing, so RMSNorm's input carries exactly 1 by construction. And a scale
+// error is invisible to everything linear, which is why it survived: the
+// projections, the crossings and the coefficient reads all divide it out
+// again. SiLU does not, and 1.2% on its argument is
+// `SiLU(0.988x)/0.988 - SiLU(x) ~ 0.012 x^2 sigma'(x)`, which peaks at
+// 2^-9.2 of the span against the 2^-8.99 the FFN measures.
+//
+// So the question is where the 1.2% is made, and this probe asks it with no
+// bootstrap, no crossing and no projection in the way: build the half-density
+// slot image by hand, run the operator, read the output.
+TEST(CiFfn, TheRmsNormCarriesAScaleAndItIsMeasured) {
+  Ring boot(Param());
+  std::cout << "preset " << Param() << std::endl;
+  const int num_slots = boot.param->MaxNumSlots();
+  const int declared = kRank;
+  const int lvl = 9;
+
+  const bool drop_c0 = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_DROP_C0");
+    return e && e[0] == '1';
+  }();
+  const double window = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_NORM_WINDOW");
+    return (e && e[0]) ? std::atof(e) : 6.0;
+  }();
+
+  std::mt19937_64 gen(0xF7A11);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::vector<double> x(static_cast<size_t>(kTokens) * declared, 0.0);
+  std::vector<double> wn(declared, 0.0);
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared; c += 2) {
+      if (drop_c0 && (c % kRank) == 0) continue;
+      x[static_cast<size_t>(t) * declared + c] = xd(gen);
+    }
+  }
+  for (int c = 0; c < declared; c += 2) {
+    if (drop_c0 && (c % kRank) == 0) continue;
+    wn[c] = 0.5 + 0.5 * std::abs(xd(gen));
+  }
+
+  // The layer constant, exactly as the FFN test calibrates it: the reciprocal
+  // of the geometric mean of the per-token mean square over the DECLARED
+  // width.
+  std::vector<double> ms(kTokens, 0.0);
+  double log_sum = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    double s = 0.0;
+    for (int c = 0; c < declared; c++) {
+      const double v = x[static_cast<size_t>(t) * declared + c];
+      s += v * v;
+    }
+    ms[t] = s / declared;
+    log_sum += std::log(ms[t]);
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+
+  // The half-density image, built directly in slots: live channel `c` even at
+  // slot `c*T + t`, and the odd slots carrying the partner channel at the
+  // NEXT position, which is what the banded recomposition puts there.
+  std::vector<Complex> in(num_slots, Complex(0.0, 0.0));
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared; c++) {
+      double v = 0.0;
+      if (c % 2 == 0) {
+        v = x[static_cast<size_t>(t) * declared + c];
+      } else {
+        const int I = Rev(c, 9);
+        const int p = Rev(t, 7);
+        const int pc = Rev(kRank - I, 9);
+        if (p + 1 < kTokens) {
+          v = x[static_cast<size_t>(Rev(p + 1, 7)) * declared + pc];
+        }
+      }
+      in[static_cast<size_t>(c) * kTokens + t] = Complex(v, 0.0);
+    }
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, lvl, boot.param->GetScale(lvl), in);
+  std::vector<Ciphertext<word>> ct(1);
+  boot.ui->Encrypt(ct[0], pt);
+  ct[0].SetNumSlots(num_slots);
+
+  cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared, alpha,
+                                    lvl, kEps, window, 9,
+                                    /*channel_stride=*/2);
+  for (int d : rms.GetRotationDistances()) {
+    boot.ui->PrepareRotationKey(d, lvl);
+  }
+  const double root_alpha = std::sqrt(alpha);
+  std::vector<std::vector<Complex>> wts(1);
+  wts[0].assign(num_slots, Complex(0.0, 0.0));
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared; c++) {
+      double w = 0.0;
+      if (c % 2 == 0) {
+        w = wn[c];
+      } else {
+        const int I = Rev(c, 9);
+        w = wn[Rev(kRank - I, 9)];
+      }
+      wts[0][static_cast<size_t>(c) * kTokens + t] =
+          Complex(root_alpha * w, 0.0);
+    }
+  }
+  std::vector<Ciphertext<word>> out;
+  rms.Apply(out, ct, wts, boot.ui->GetEvkMap());
+
+  Plaintext<word> op;
+  boot.ui->Decrypt(op, out[0]);
+  std::vector<Complex> got;
+  boot.context->encoder_.Decode(got, op);
+
+  // Two references: the one the FFN test uses (mean square over the DECLARED
+  // width, no epsilon) and the one the circuit actually computes (with the
+  // epsilon inside).
+  auto measure = [&](const char *name, bool with_eps) {
+    double num = 0.0, den = 0.0, wmax = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double d = std::sqrt(ms[t] + (with_eps ? kEps : 0.0));
+      for (int c = 0; c < declared; c += 2) {
+        const double w = x[static_cast<size_t>(t) * declared + c] * wn[c] / d;
+        num += got[static_cast<size_t>(c) * kTokens + t].real() * w;
+        den += w * w;
+        wmax = std::max(wmax, std::abs(w));
+      }
+    }
+    const double fit = num / den;
+    double mx = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double d = std::sqrt(ms[t] + (with_eps ? kEps : 0.0));
+      for (int c = 0; c < declared; c += 2) {
+        const double w = x[static_cast<size_t>(t) * declared + c] * wn[c] / d;
+        mx = std::max(
+            mx,
+            std::abs(got[static_cast<size_t>(c) * kTokens + t].real() / fit -
+                     w));
+      }
+    }
+    std::cout << "  [" << name << "] carried " << fit << ", relative "
+              << (mx / wmax) << " = 2^" << std::log2(mx / wmax) << std::endl;
+    return fit;
+  };
+  std::cout << "  drop_c0 " << drop_c0 << ", window " << window
+            << ", alpha " << alpha << std::endl;
+  measure("no eps", false);
+  measure("with eps", true);
+
+  // And the same number against the polynomial the circuit actually
+  // evaluates, which separates the fit's bias from the arithmetic.
+  {
+    double num = 0.0, den = 0.0, wmax = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double r = rms.PlainInvSqrt(alpha * (ms[t] + kEps)) * root_alpha;
+      for (int c = 0; c < declared; c += 2) {
+        const double w = x[static_cast<size_t>(t) * declared + c] * wn[c] * r;
+        num += got[static_cast<size_t>(c) * kTokens + t].real() * w;
+        den += w * w;
+        wmax = std::max(wmax, std::abs(w));
+      }
+    }
+    const double fit = num / den;
+    double mx = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double r = rms.PlainInvSqrt(alpha * (ms[t] + kEps)) * root_alpha;
+      for (int c = 0; c < declared; c += 2) {
+        const double w = x[static_cast<size_t>(t) * declared + c] * wn[c] * r;
+        mx = std::max(
+            mx,
+            std::abs(got[static_cast<size_t>(c) * kTokens + t].real() / fit -
+                     w));
+      }
+    }
+    std::cout << "  [vs its own polynomial] carried " << fit << ", relative "
+              << (mx / wmax) << " = 2^" << std::log2(mx / wmax) << std::endl;
+  }
   SUCCEED();
 }

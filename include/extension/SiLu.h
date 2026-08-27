@@ -67,7 +67,33 @@ namespace cheddar {
  * 1.109; carrying the 12 without the calibration keeps its cost and drops its
  * benefit. A caller that has measured its gate should pass a small multiple of
  * that maximum -- and may then also drop the degree, since the table above is
- * a 12-bit target and a matched range clears it with far less.
+ * a 12-bit target and a matched range clears it with far less. Measured:
+ * `CiFfn.TheSiLuCircuitIsMeasuredAgainstItsLevel` runs this handler on a fresh
+ * encryption at a calibrated range and finds **degree 15 and degree 31
+ * indistinguishable** -- 2^-15.2 to 2^-16.0 at both, at every level from 19
+ * down to 6 -- while degree 7 is fit-limited at 2^-8.54. Degree 15 is one
+ * level cheaper.
+ *
+ * ## The argument's SCALE is part of the argument
+ *
+ * This is the one operator in the FFN where a systematic factor on the input
+ * cannot be absorbed downstream, which makes it the detector for every scale
+ * mistake upstream of it. `SiLU(k x) / k` is not `SiLU(x)`: the difference is
+ * `(k - 1) x^2 sigma'(x)`, so a **1.2%** error on the argument is 2^-9.2 of
+ * the span -- three bits worse than everything else in the circuit put
+ * together, and indistinguishable from noise in an end-to-end number.
+ *
+ * Doing.md 1.5cv is the instance. `SylphSchedule::ToCoeff` undoes the HalfBoot
+ * crossing by the NOMINAL `2^-log_message_ratio`, because that is what makes
+ * `Boot` message preserving, while the crossing's own constant is the measured
+ * 2^-4.9829 -- so a turn through the coefficient domain carries 0.98804. Every
+ * linear stage absorbed it and RMSNorm is scale invariant, so it reached this
+ * operator unchallenged and cost the FFN four bits.
+ *
+ * A caller owes this handler an argument whose scale it has MEASURED, not one
+ * it has reasoned about. A caller debugging it should read the output against
+ * `PlainSiLu` as well as against the true function: the two agreeing is what
+ * eliminates the fit in one line, and they agreed to six digits here.
  *
  * ## What this bundle cannot tell us
  *

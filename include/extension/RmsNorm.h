@@ -126,6 +126,16 @@ class RmsNormHandler {
    * across layers; a caller whose measured spread is narrower should say so,
    * because the degree needed falls quickly with it and every two degrees is a
    * level. Measured on this bundle's user tokens the spread is 4.18.
+   *
+   * **Passing more than the measured spread is not the safe side**, for the
+   * same reason `SiLuHandler`'s range is not: a Chebyshev fit's error is
+   * uniform over its interval, so the excess is thrown away silently. Measured
+   * by `CiFfn.TheFitsAloneExplainTheFfnError` on an argument spanning 1.54,
+   * the fit floor follows the window and nothing else -- 2^-13.09 at 6,
+   * 2^-19.43 at 3, 2^-26.03 at 2 -- so the FFN's stated 6 was costing thirteen
+   * bits it did not need to. This operator is scale invariant, which is what
+   * lets it swallow a badly scaled input for free; it does NOT let it swallow
+   * a badly chosen window.
    * @param degree Chebyshev degree for the inverse square root. Measured
    * against a 12-bit target: ratio 30 needs 23 (5 levels), ratio 6 needs 9
    * (4 levels), ratio 4.18 needs 7 (3 levels). Degree 7 clears 12 bits only up

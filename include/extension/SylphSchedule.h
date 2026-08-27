@@ -199,6 +199,24 @@ class SylphSchedule {
   /**
    * @brief The slot to coefficient leg: descend to StC's level, then StC.
    *
+   * ## A FULL TURN IS NOT MESSAGE PRESERVING UNLESS THE CALLER MAKES IT SO
+   *
+   * This undoes the crossing by the NOMINAL `2^-log_message_ratio` -- on
+   * purpose, because that is what makes `Boot` message preserving and keeps
+   * the state inside what ModRaise can carry. But `ToSlot`'s actual constant
+   * is not that number: it measures **2^-4.9829** against a nominal 2^-5 on
+   * `ci16_35`, and a caller that restores by the measured constant (which is
+   * what a fitted `boundary` gives it) therefore leaves the message multiplied
+   * by `2^-log_message_ratio / boundary` = **0.98804** once per turn.
+   *
+   * Every linear stage absorbs that -- projections, the next crossing, and the
+   * fitted `carried` of any read -- and `RmsNormHandler` is scale invariant,
+   * so a whole FFN can be built on top of it and report clean. `SiLuHandler`
+   * is neither: 1.2% on its argument is 2^-9.2 of the span, and it cost the CI
+   * FFN four bits (Doing.md 1.5cv). **A caller crossing both ways owes the
+   * ratio to its first nonlinear operator**, folded into whatever plaintext
+   * multiply is already there.
+   *
    * @param res output, coefficient-encoded at `GetCoeffLevel()`
    * @param x slot-encoded, at or above `GetStCLevel()`
    * @param evk_map supplies the rotation keys StC needs

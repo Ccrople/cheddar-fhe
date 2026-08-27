@@ -8741,12 +8741,29 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   W wq(kLanes, std::vector<std::vector<double>>(
                    kDim, std::vector<double>(in_ch, 0.0)));
   W wk = wq, wv = wq;
+  // THE LEG'S OWN RIDE HEIGHT, and it is the same lever as the FFN's.
+  // Q, K and V enter HalfBoot at whatever their projection reaches -- about
+  // 0.36 here -- and 1.5cv's crossing residual is `a * w^3` with
+  // `a = -0.00258`, so that costs `a * 0.36^2` = 2^-11.2, which is exactly
+  // where the O projection reads its input. Scaling all three weights is free
+  // of side effects, which is why it is done here rather than in the handler:
+  // the softmax calibration is fitted from the same host twins and
+  // `exp(m_eff (S - shift) / span)` is invariant under a uniform scaling of
+  // the scores, so P is unchanged; and V's factor is taken straight back out
+  // in the O projection's weight scale below, so the residual stream and
+  // everything after it are unchanged as well.
+  const double leg_ride = [] {
+    const char *e = std::getenv("CHEDDAR_CI_LEG_RIDE");
+    return (e && e[0]) ? std::atof(e) : 1.0;
+  }();
+  std::cout << "  leg ride factor " << leg_ride << " (CHEDDAR_CI_LEG_RIDE)"
+            << std::endl;
   for (int i = 0; i < kLanes; i++) {
     for (int c = 0; c < kDim; c++) {
       for (int o = 0; o < in_ch; o++) {
-        wq[i][c][o] = wd(gen);
-        wk[i][c][o] = wd(gen);
-        wv[i][c][o] = wd(gen);
+        wq[i][c][o] = wd(gen) * leg_ride;
+        wk[i][c][o] = wd(gen) * leg_ride;
+        wv[i][c][o] = wd(gen) * leg_ride;
       }
     }
   }
@@ -9600,7 +9617,12 @@ ledger("before the FFN context");
   // product is its own size, so the bound is bought where it is free: in the
   // O projection's weight scale, with the same factor folded into the
   // stream's encode so the residual still adds.
-  const auto o_unit = host_mm2(attn_flat, attn_channels, wo, model_declared);
+  // `attn_flat` carries `leg_ride` -- V's weights were scaled by it -- and the
+  // O projection's weight scale takes it straight back out, so `o_unit` and
+  // everything sized against it are the leg ride's own business and nobody
+  // else's. `wo` is a plaintext, so the division is free.
+  auto o_unit = host_mm2(attn_flat, attn_channels, wo, model_declared);
+  for (double &v : o_unit) v /= leg_ride;
   double res_max = 0.0;
   for (int t = 0; t < proj_small; t++) {
     for (int c = 0; c < model_declared; c += 2) {
@@ -9610,7 +9632,20 @@ ledger("before the FFN context");
                                              model_declared + c]));
     }
   }
-  const double res_scale = 0.35 / std::max(res_max, 1e-12);
+  // HOW HOT THE MESSAGE RIDES INTO HalfBoot, and it is a lever with an
+  // optimum rather than a ceiling to sit under.
+  // `CiFfn.TheCrossingResidualIsMeasuredAgainstItsRideHeight` fits the
+  // crossing's per-slot residual as `a * w^3` with `a = -0.00258` at every
+  // ride height from 0.0125 to 3.2 -- EvalMod's own odd-function
+  // approximation, cubic in the message-to-modulus ratio -- so the RELATIVE
+  // cost is `a * ride^2` and every halving is two bits, until the additive
+  // floor (~3e-08 referred to the input) takes over below ~0.02. 0.35 and 0.4
+  // were chosen as "as much as ModRaise can carry", which is the wrong end.
+  const double ride = [] {
+    const char *e = std::getenv("CHEDDAR_CI_RIDE");
+    return (e && e[0]) ? std::atof(e) : 0.2;
+  }();
+  const double res_scale = ride / std::max(res_max, 1e-12);
   std::cout << "  residual would reach " << res_max << ", so the O weight "
             << "carries " << res_scale << std::endl;
 
@@ -9621,8 +9656,8 @@ ledger("before the FFN context");
       boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, ins, attn_channels, model_declared, wo, res_scale,
-                "o");
+    leg.Project(res, ins, attn_channels, model_declared, wo,
+                res_scale / leg_ride, "o");
     ASSERT_EQ(res.size(), 1u);
     o_out = std::move(res[0]);
   }
@@ -9642,7 +9677,8 @@ ledger("before the FFN context");
     for (size_t k = 0; k < h_cts.size(); k++) {
       boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
     }
-    leg.Project(again, ins, attn_channels, model_declared, wo, res_scale, "o");
+    leg.Project(again, ins, attn_channels, model_declared, wo,
+                res_scale / leg_ride, "o");
     cudaDeviceSynchronize();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     stage("the O projection again, off the weight cache: ONLINE");
@@ -9843,6 +9879,7 @@ ledger("before the FFN context");
 
   double boundary = 0.0;
   double crossing = 0.0;  // the BootParameter's own, see below
+  double kappa = 1.0;     // what a full coefficient-domain turn carries
   Ciphertext<word> normed;
   {
     Ciphertext<word> up;
@@ -9889,10 +9926,21 @@ ledger("before the FFN context");
               << boundary << " = that times the O projection's carried "
               << o_fit << std::endl;
     canonicalise(up, 1.0 / boundary);
+    // What a whole turn through the coefficient domain carries; see the
+    // SwiGLU turn, which is the only stage that cannot absorb it.
+    kappa = std::pow(2.0, -bctx->GetBootParameter().GetLogMessageRatio()) /
+            crossing;
+    std::cout << "  a turn through the coefficient domain carries " << kappa
+              << std::endl;
 
+    // The window follows the measured spread, for the same reason the SiLU
+    // range does: a Chebyshev fit's error is uniform over its interval, and
+    // `CiFfn.TheFitsAloneExplainTheFfnError` measures this argument in
+    // [0.81, 1.25] -- a ratio of 1.54 -- against a window of 6. Narrowing it
+    // to 2 takes the FFN's fit floor from 2^-13.15 to 2^-26.
     cheddar::RmsNormHandler<word> rms(boot_ffn.context, proj_small,
                                       model_declared, alpha, op_level, 1e-5,
-                                      6.0, 9, /*channel_stride=*/2);
+                                      2.0, 9, /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
       boot.ui->PrepareRotationKey(d, op_level);
@@ -9937,7 +9985,7 @@ ledger("before the FFN context");
   const auto u_host = host_mm2(n_host, model_declared, wup, hidden_declared);
   double gmax = 0.0;
   for (double v : g_host) gmax = std::max(gmax, std::abs(v));
-  const double proj_size = 0.4 / std::max(gmax, 1e-12);
+  const double proj_size = ride / std::max(gmax, 1e-12);
   // THE RANGE IS CALIBRATION AND 12.0 WAS A GUESS. A Chebyshev fit's error is
   // uniform over its interval, so a range wider than the data uses throws the
   // ratio away: `CiFfn.TheFitsAloneExplainTheFfnError` measures the compiled
@@ -10030,8 +10078,19 @@ ledger("before the FFN context");
                   << std::log2(res / (std::abs(gb) * wmx)) << std::endl;
       }
       // `crossing`, NOT `boundary`: these ciphertexts carry no `o_fit`.
-      canonicalise(g_up, 1.0 / (crossing * proj_size * silu_range));
-      canonicalise(u_up, 1.0 / (crossing * proj_size));
+      //
+      // And `kappa` beside it, which is the SAME kind of mistake one turn
+      // further out. `SylphSchedule::ToCoeff` undoes the crossing by the
+      // NOMINAL `2^-log_message_ratio` -- that is what makes Boot message
+      // preserving -- while the crossing's own constant is the measured
+      // 2^-4.9829, so a full turn through the coefficient domain multiplies
+      // the message by `2^-log_message_ratio / crossing` = 0.98804. Every
+      // linear stage absorbs it and RMSNorm is scale invariant, so it reaches
+      // SiLU unchallenged; `SiLU(0.988x)/0.988 - SiLU(x)` is
+      // `0.012 x^2 sigma'(x)`, 2^-9.2 of the span, and on `CiFfn`'s own FFN
+      // folding it in moved the whole thing from 2^-8.21 to 2^-12.28.
+      canonicalise(g_up, 1.0 / (kappa * crossing * proj_size * silu_range));
+      canonicalise(u_up, 1.0 / (kappa * crossing * proj_size));
       silu.Apply(sv, g_up, boot.ui->GetEvkMap());
       if (i == 0) {  // SiLU's own output, in slots, before the multiply
         Plaintext<word> sp;
