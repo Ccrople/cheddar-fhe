@@ -132,10 +132,36 @@ class RmsNormHandler {
    * to ratio 4.18 and falls to 11.9 bits at 5, so depth 7 is reachable but has
    * no margin.
    */
+  /**
+   * @param channel_stride how many channel slots the reduction steps over.
+   *
+   * 1 is every channel and is the ordinary ring's case. **2 is what the
+   * conjugate-invariant coefficient leg needs**, and it is a contract rather
+   * than an optimisation. On R+ a projection's output is the banded
+   * recomposition of its components (Doing.md 1.5ba), and a half-density
+   * emission -- the only kind that is readable at all (1.5by) -- carries its
+   * live values at their own addresses and SHIFTED DUPLICATES at the others.
+   * That image is simultaneously clean for a slot operator and correct for
+   * the next `ModDecomp`, and it stops being either the moment the duplicates
+   * are destroyed.
+   *
+   * So the duplicates have to survive this operator, and a full-stride
+   * rotate-and-add would fold them into the live sum. Stepping by two keeps
+   * the parities apart: the live slots sum the live channels and the duplicate
+   * slots sum the duplicates -- which are exactly the live values of the
+   * partner position, so they land the SAME inverse square root the partner
+   * needs. Give the weight plaintext the partner's weight at those slots and
+   * the output is again a valid banded image, at no extra level and one
+   * rotation fewer.
+   *
+   * `num_channels` stays the DECLARED width either way: it is what the
+   * ciphertext count and the mean are stated against, half of it is zero on
+   * R+, and a caller's `layer_constant` is calibrated on that mean.
+   */
   RmsNormHandler(ConstContextPtr<word> context, int num_tokens,
                  int num_channels, double layer_constant, int input_level,
                  double eps = 1e-5, double window_ratio = 30.0,
-                 int degree = 23);
+                 int degree = 23, int channel_stride = 1);
 
   // disable copying (or moving also)
   RmsNormHandler(const RmsNormHandler &) = delete;

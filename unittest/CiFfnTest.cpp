@@ -757,19 +757,25 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   // Built once per (level, restore) pair. `restore` is 1 / (the HalfBoot
   // boundary constant times whatever the producer scaled by), so the operator
   // downstream sees the magnitude its polynomial was fitted for.
-  auto mask_and_canonicalise = [&](Ciphertext<word> &ct, double restore) {
-    const double pt_scale = boot.param->GetScale(op_level) *
-                            boot.param->GetRescalePrimeProd(slot_level) /
-                            ct.GetScale();
-    std::vector<Complex> mask(num_slots, Complex(0.0, 0.0));
-    for (int c = 0; c < num_slots / kTokens; c += 2) {
-      for (int t = 0; t < kTokens; t++) {
-        mask[c * kTokens + t] = Complex(restore, 0.0);
-      }
-    }
-    Plaintext<word> mpt;
-    boot.context->encoder_.Encode(mpt, slot_level, pt_scale, mask);
-    boot.context->Mult(ct, ct, mpt);
+  // NOT A MASK, and that is the whole finding of this test.
+  //
+  // The first version killed the half-density duplicates here, because the
+  // reduction would otherwise fold them into the live sum. It made RMSNorm
+  // right in SLOTS and the next projection wrong, because a projection's
+  // input has to be the BANDED recomposition of its channels (1.5ba) and the
+  // only coefficient vector that is both clean at the live addresses and
+  // correctly banded is the one that still has its duplicates. StC produces
+  // the plain vector; the duplicates are what make it banded as well.
+  //
+  // So the canonicalise is uniform -- every slot, live and duplicate alike --
+  // and the reduction steps by two instead (RmsNormHandler's channel_stride).
+  auto canonicalise = [&](Ciphertext<word> &ct, double restore) {
+    const double factor = boot.param->GetScale(op_level) *
+                          boot.param->GetRescalePrimeProd(slot_level) /
+                          ct.GetScale();
+    cheddar::Constant<word> k;
+    boot.context->encoder_.EncodeConstant(k, slot_level, factor, restore);
+    boot.context->Mult(ct, ct, k);
     boot.context->Rescale(ct, ct);
   };
 
@@ -800,10 +806,11 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
                 << std::log2(boundary) << ")" << std::endl;
       ASSERT_GT(boundary, 0.0);
     }
-    mask_and_canonicalise(up, 1.0 / (boundary * beta));
+    canonicalise(up, 1.0 / (boundary * beta));
 
     cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
-                                      op_level, kEps, 6.0, 9);
+                                      op_level, kEps, 6.0, 9,
+                                      /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
       boot.ui->PrepareRotationKey(d, op_level);
@@ -811,9 +818,17 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     const double root_alpha = std::sqrt(alpha);
     std::vector<std::vector<Complex>> wts(1);
     wts[0].assign(num_slots, Complex(0.0, 0.0));
+    // The duplicate slots need the PARTNER channel's weight: slot field c odd
+    // carries component I = rev9(c) >= 256, whose value is v_{512-I}[p+1] --
+    // channel rev9(512 - I) at the next position. Giving them that weight is
+    // what leaves the output a valid banded image; giving them zero is what
+    // the first version did, and it destroyed the very thing the next
+    // projection reads.
     for (int c = 0; c < declared_h; c++) {
+      const int I = Rev(c, 9);
+      const int src = (c % 2 == 0) ? c : Rev(kRank - I, 9);
       for (int t = 0; t < kTokens; t++) {
-        wts[0][c * kTokens + t] = Complex(wn[c] * root_alpha, 0.0);
+        wts[0][c * kTokens + t] = Complex(wn[src] * root_alpha, 0.0);
       }
     }
     std::vector<Ciphertext<word>> in(1), out;
@@ -869,8 +884,8 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
       sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
       sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
       // SiLU takes x / range, so the restore carries 1/range as well.
-      mask_and_canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
-      mask_and_canonicalise(u_up, 1.0 / (boundary * proj_size));
+      canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
+      canonicalise(u_up, 1.0 / (boundary * proj_size));
       Ciphertext<word> s;
       silu.Apply(s, g_up, boot.ui->GetEvkMap());
       const int s_level = boot.param->NPToLevel(s.GetNP());

@@ -12,7 +12,7 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
                                      int num_tokens, int num_channels,
                                      double layer_constant, int input_level,
                                      double eps, double window_ratio,
-                                     int degree)
+                                     int degree, int channel_stride)
     : context_{std::move(context)},
       num_tokens_{num_tokens},
       num_channels_{num_channels},
@@ -46,7 +46,15 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   // Rotate-and-add over whole token blocks. The same sequence reduces and
   // broadcasts, so the sum lands in every block and nothing has to be
   // redistributed afterwards.
-  for (int d = num_tokens_; d < num_slots_; d *= 2) {
+  //
+  // `channel_stride` steps the tree over every stride-th channel instead of
+  // every one, which is what the conjugate-invariant coefficient leg needs to
+  // keep a half-density image's duplicates intact; see the header.
+  AssertTrue(channel_stride >= 1 && IsPowOfTwo(channel_stride),
+             "RmsNorm: channel_stride must be a power of two");
+  AssertTrue(num_tokens_ * channel_stride < num_slots_,
+             "RmsNorm: channel_stride leaves the reduction nothing to sum");
+  for (int d = num_tokens_ * channel_stride; d < num_slots_; d *= 2) {
     rotation_distances_.push_back(d);
   }
 
