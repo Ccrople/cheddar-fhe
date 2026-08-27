@@ -486,7 +486,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   // one. The layer's projections are 8 groups (4096 channels) or 56
   // (14336), never one.
   const char *ow = std::getenv("CHEDDAR_CI_OUT_CHANNELS");
-  const int out_channels = ow ? std::atoi(ow) : out_channels;
+  const int out_channels = ow ? std::atoi(ow) : kOutChannels;
   const int num_parents = in_channels / rank;
 
   ASSERT_EQ(num_slots, degree) << "R+ gives `degree` real slots";
