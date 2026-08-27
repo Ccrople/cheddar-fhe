@@ -9330,7 +9330,15 @@ ledger("before the FFN context");
   typename cheddar::CoeffLinearLeg<word>::Config lcfg;
   lcfg.num_tokens = proj_small;
   lcfg.product_level = pcmm_level;
-  lcfg.parents_per_tile = 0;
+  // TILE THE DESCENT. On the direct route a parent's `rank` module components
+  // are each as large as the parent's own a-part -- `Decompose`'s own comment
+  // says so, and says the tile is what bounds it -- so sixteen parents at rank
+  // 512 and five limbs at the product level is 10.7 GB standing at once. The
+  // ledger says the layer arrives at the O projection with 15.4 GB, and that
+  // is where four runs died. Four parents a tile is 2.7 GB. It is paid for in
+  // ModPacks: a tile costs one per output group, so the projections run four
+  // times as many. That is time, and the alternative was not running.
+  lcfg.parents_per_tile = 4;
   ledger("before the leg object");
   ProjectOnlyLegCi leg(boot_ffn.context, lcfg, pack_keys);
   ledger("leg object built");
