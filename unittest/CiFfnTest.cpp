@@ -1810,3 +1810,279 @@ TEST(CiFfn, TheProjectionReadsSixteenHalfDensityParents) {
          "not in four: the tiled accumulation is what the layer's O "
          "projection newly exercises";
 }
+
+// ---------------------------------------------------------------------------
+// THE JOIN. The seam passes read as components; the projection passes over
+// sixteen half-density parents, tiled and not. The layer still fails between
+// them, so what is left is the one step neither test covers: `SlotToCoeff` on
+// the seam's own slot image, and the projection reading the coefficients THAT
+// produces.
+//
+// The layer's arrangement verbatim -- slack 12, the seam at 11/10/9, StC at 7,
+// the product at 1 -- with one ciphertext instead of sixteen, which is all it
+// takes to see a scale drift or a wrong slot-to-coefficient correspondence.
+// It prints scale over canonical at every step and checks the coefficients as
+// components BEFORE any product touches them, so a failure says which half.
+TEST(CiFfn, TheSeamHandsTheProjectionAReadableImage) {
+  constexpr int kSlack = 12;
+  Ring boot(Param(), {}, kSlack);
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  ASSERT_EQ(degree, num_slots);
+
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  cheddar::SylphSchedule<word> sched(bctx, num_slots);
+  const int product_level = 1;
+  std::cout << "slot " << sched.GetSlotLevel() << ", StC "
+            << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
+            << ", product " << product_level << std::endl;
+
+  constexpr int kCols = 16, kRows = 128, kLanes = 32;
+  const int t1_level = 11, tok_level = 10, t2_level = 9;
+  ASSERT_GT(t2_level - 1, sched.GetStCLevel())
+      << "the seam has to leave the ciphertext above StC's level with a "
+         "rescale to spare";
+  auto slot_chain = [&](int row, int col, int lane) {
+    return Rev(col, 4) * 4096 + Rev(row, 7) * 32 + lane;
+  };
+  auto slot_block = [&](int token, int chan) { return token + kRows * chan; };
+  auto chan_of = [&](int col, int lh) { return Rev(col, 4) * 32 + Rev(lh, 5); };
+  auto pt_scale = [&](int l) {
+    return boot.param->GetScale(l - 1) * boot.param->GetRescalePrimeProd(l) /
+           boot.param->GetScale(l);
+  };
+  auto split = [](int need) {
+    int bs = 1;
+    while (bs * bs < need) bs *= 2;
+    int gs = 1;
+    while (bs * gs < need) gs *= 2;
+    return std::make_pair(bs, gs);
+  };
+  const int half = 0;
+
+  // ---- the three maps ----------------------------------------------------
+  cheddar::StripedMatrix m1(degree, degree), mtok(degree, degree),
+      m2(degree, degree);
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      const int lane = half * 16 + lh;
+      const int c = chan_of(col, lh);
+      for (int row = 0; row < kRows; row++) {
+        const int dst = slot_block(row, c);
+        const int off =
+            ((slot_chain(row, col, lane) - dst) % degree + degree) % degree;
+        m1.try_emplace(off, degree, Complex(0.0, 0.0));
+        m1[off][dst] = Complex(1.0, 0.0);
+      }
+      for (int row = 0; row < kRows; row++) {
+        const int pos = Rev(row, 7);
+        if (pos == 0) continue;
+        const int td = Rev(pos - 1, 7);
+        const int dst = slot_block(td, c);
+        const int off = ((slot_block(row, c) - dst) % degree + degree) % degree;
+        mtok.try_emplace(off, degree, Complex(0.0, 0.0));
+        mtok[off][dst] = Complex(1.0, 0.0);
+      }
+      const int I = Rev(c, 9);
+      if (I == 0) continue;
+      const int cd = Rev(kRank - I, 9);
+      const int off2 = ((kRows * (c - cd)) % degree + degree) % degree;
+      m2.try_emplace(off2, degree, Complex(0.0, 0.0));
+      for (int td = 0; td < kRows; td++) {
+        if (Rev(td, 7) == kRows - 1) continue;
+        m2[off2][slot_block(td, cd)] = Complex(1.0, 0.0);
+      }
+    }
+  }
+  int n1 = 0, nt = 0, n2 = 0;
+  const int w1 = BestWindow(m1, degree, &n1);
+  const int wt = BestWindow(mtok, degree, &nt);
+  const int w2 = BestWindow(m2, degree, &n2);
+  const auto s1 = split(n1);
+  const auto st = split(nt);
+  const auto s2 = split(n2);
+  cheddar::LinearTransform<word> t1(boot.context, m1, t1_level,
+                                    pt_scale(t1_level), s1.first, s1.second,
+                                    w1, -w1);
+  cheddar::LinearTransform<word> ttok(boot.context, mtok, tok_level,
+                                      pt_scale(tok_level), st.first, st.second,
+                                      wt, -wt);
+  cheddar::LinearTransform<word> t2(boot.context, m2, t2_level,
+                                    pt_scale(t2_level), s2.first, s2.second,
+                                    w2, -w2);
+  {
+    cheddar::EvkRequest req;
+    t1.AddRequiredRotations(req);
+    ttok.AddRequiredRotations(req);
+    t2.AddRequiredRotations(req);
+    req.AddRequest(((w1 % degree) + degree) % degree, t1_level - 1);
+    req.AddRequest(((wt % degree) + degree) % degree, tok_level - 1);
+    req.AddRequest(((w2 % degree) + degree) % degree, t2_level - 1);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // ---- the data, and the host product it owes ---------------------------
+  std::mt19937_64 gen(0x105E);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.02);
+  std::vector<Complex> msg(num_slots, Complex(0.0, 0.0));
+  std::vector<double> flat(static_cast<size_t>(kRows) * kRank, 0.0);
+  for (int row = 0; row < kRows; row++) {
+    for (int col = 0; col < kCols; col++) {
+      for (int lane = 0; lane < kLanes; lane++) {
+        const double x = xd(gen);
+        msg[slot_chain(row, col, lane)] = Complex(x, 0.0);
+        if (lane / 16 == half) {
+          flat[static_cast<size_t>(row) * kRank + chan_of(col, lane % 16)] = x;
+        }
+      }
+    }
+  }
+  std::vector<double> w(static_cast<size_t>(kRank) * kRank, 0.0);
+  for (int i = 0; i < kRank; i += 2) {
+    for (int o = 0; o < kRank; o += 2) {
+      w[static_cast<size_t>(i) * kRank + o] = wd(gen);
+    }
+  }
+  std::vector<double> want(static_cast<size_t>(kRows) * kRank, 0.0);
+  double want_absmax = 0.0;
+  for (int t = 0; t < kRows; t++) {
+    for (int o = 0; o < kRank; o += 2) {
+      double acc = 0.0;
+      for (int i = 0; i < kRank; i += 2) {
+        acc += flat[static_cast<size_t>(t) * kRank + i] *
+               w[static_cast<size_t>(i) * kRank + o];
+      }
+      want[static_cast<size_t>(t) * kRank + o] = acc;
+      want_absmax = std::max(want_absmax, std::abs(acc));
+    }
+  }
+
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, t1_level, boot.param->GetScale(t1_level),
+                                msg);
+  Ciphertext<word> ct;
+  boot.ui->Encrypt(ct, pt);
+
+  // ---- the seam ----------------------------------------------------------
+  auto close = [&](Ciphertext<word> &x, int back) {
+    if (back == 0) return;
+    Ciphertext<word> y;
+    boot.context->HRot(y, x, boot.ui->GetEvkMap().GetRotationKey(back), back);
+    x = std::move(y);
+  };
+  auto canon = [&](const Ciphertext<word> &x) {
+    return x.GetScale() /
+           boot.param->GetScale(boot.param->NPToLevel(x.GetNP()));
+  };
+  Ciphertext<word> a, sh, dup, live, sum;
+  t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
+  close(a, ((w1 % degree) + degree) % degree);
+  ttok.Evaluate(boot.context, sh, a, boot.ui->GetEvkMap());
+  close(sh, ((wt % degree) + degree) % degree);
+  t2.Evaluate(boot.context, dup, sh, boot.ui->GetEvkMap());
+  close(dup, ((w2 % degree) + degree) % degree);
+  {
+    const int dl = boot.param->NPToLevel(dup.GetNP());
+    if (boot.param->NPToLevel(a.GetNP()) != dl + 1) {
+      Ciphertext<word> d;
+      boot.context->LevelDown(d, a, dl + 1);
+      a = std::move(d);
+    }
+    cheddar::Constant<word> one;
+    boot.context->encoder_.EncodeConstant(
+        one, dl + 1,
+        boot.param->GetScale(dl) * boot.param->GetRescalePrimeProd(dl + 1) /
+            a.GetScale(),
+        1.0);
+    boot.context->Mult(live, a, one);
+    boot.context->Rescale(live, live);
+  }
+  boot.context->Add(sum, live, dup);
+  std::cout << "  seam output: level " << boot.param->NPToLevel(sum.GetNP())
+            << ", scale / canonical " << canon(sum) << std::endl;
+
+  // ---- SlotToCoeff, and the projection reading it ------------------------
+  Ciphertext<word> coeff_ct;
+  sched.ToCoeff(coeff_ct, sum, boot.ui->GetEvkMap());
+  std::cout << "  after ToCoeff: level "
+            << boot.param->NPToLevel(coeff_ct.GetNP())
+            << ", scale / canonical " << canon(coeff_ct) << std::endl;
+  {  // what the coefficients hold, before any product touches them
+    Plaintext<word> cp;
+    boot.ui->Decrypt(cp, coeff_ct);
+    std::vector<double> cf;
+    boot.context->encoder_.DecodeCoeff(cf, cp);
+    const auto comp = CiComponentsFfn(cf, kRank, kRows);
+    double err = 0.0, mx = 0.0, dead = 0.0;
+    for (int t = 0; t < kRows; t++) {
+      for (int c = 0; c < kRank; c += 2) {
+        const double q = flat[static_cast<size_t>(t) * kRank + c];
+        mx = std::max(mx, std::abs(q));
+        err = std::max(err, std::abs(comp[Rev(c, 9)][Rev(t, 7)] - q));
+      }
+    }
+    for (int I = kLive; I < kRank; I++) {
+      for (int p = 0; p < kRows; p++) {
+        dead = std::max(dead, std::abs(comp[I][p]));
+      }
+    }
+    std::cout << "  the coefficients after StC, as components: live " << err
+              << ", dead " << dead << " (|v| <= " << mx << ")" << std::endl;
+    EXPECT_LT(err, 1e-2 * mx)
+        << "SlotToCoeff did not carry the seam's slot image to the banded "
+           "coefficient image the projection reads";
+    EXPECT_LT(dead, 1e-2 * mx) << "StC left mass in the dead components";
+  }
+
+  boot.ui->PrepareModPackKeys(kRows, product_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = kRows;
+  lcfg.product_level = product_level;
+  lcfg.parents_per_tile = 0;
+  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
+  std::vector<Ciphertext<word>> ins(1), res;
+  boot.context->LevelDown(ins[0], coeff_ct, product_level);
+  leg.Project(res, ins, kRank, kRank, w, 1.0, "seam_join");
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  Plaintext<word> op;
+  boot.ui->Decrypt(op, res[0]);
+  std::vector<double> oc;
+  boot.context->encoder_.DecodeCoeff(oc, op);
+  const auto got = CiComponentsFfn(oc, kRank, kRows);
+  double num = 0.0, den = 0.0;
+  for (int t = 0; t < kRows; t++) {
+    for (int c = 0; c < kRank; c += 2) {
+      const double q = want[static_cast<size_t>(t) * kRank + c];
+      num += got[Rev(c, 9)][Rev(t, 7)] * q;
+      den += q * q;
+    }
+  }
+  const double carried = num / den;
+  double err = 0.0;
+  for (int t = 0; t < kRows; t++) {
+    for (int c = 0; c < kRank; c += 2) {
+      err = std::max(err, std::abs(got[Rev(c, 9)][Rev(t, 7)] / carried -
+                                   want[static_cast<size_t>(t) * kRank + c]));
+    }
+  }
+  std::cout << "  THE JOIN: relative " << (err / want_absmax) << " (|y| <= "
+            << want_absmax << ", carried " << carried << ")" << std::endl;
+  EXPECT_LT(err / want_absmax, 0.05)
+      << "the seam image does not survive SlotToCoeff into the projection";
+}
