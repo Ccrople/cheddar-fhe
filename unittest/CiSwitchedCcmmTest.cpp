@@ -9087,7 +9087,20 @@ ledger("before the FFN context");
   // hoisted transforms stop working (1.5bt).
   const std::vector<std::vector<std::pair<int, int>>> t1_stages = {
       {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
-  const int t1_top = 12, t2_level = 9;
+  // THE TOKEN SHIFT IS NOT A SLOT ROTATION, which is what the O projection
+  // was reading through. The banded convention is a statement about
+  // COEFFICIENT positions -- coefficient `p * rank + I` carries
+  // `comp_I[p] + comp_{rank-I}[p+1]` -- and `SlotToCoeff` sends slot
+  // `t + 128 * c` to coefficient `rev7(t) * 512 + rev9(c)`, so a step of one
+  // in `p` is a step of one in `rev7(t)`, NOT in `t`. The seam shifted by one
+  // slot; on the host, reading the resulting image back through
+  // `BandedComponents` gives max error 38.56 against |v| <= 4.16, while the
+  // corrected token `rev7(rev7(t) - 1)` gives EXACTLY ZERO.
+  //
+  // That map costs almost nothing: a decrement in bit-reversed order is a
+  // carry, so it has just 7 distinct slot offsets, BSGS 8x8. It replaces the
+  // rotation and takes one level, so T1 starts one higher.
+  const int t1_top = 13, t2_level = 9, tokmap_level = 10;
   const int t1_level = t1_top;  // the level the seam's input is brought to
   auto swap_bits = [](int x, int i, int j) {
     if (((x >> i) & 1) != ((x >> j) & 1)) x ^= (1 << i) | (1 << j);
@@ -9227,8 +9240,40 @@ ledger("before the FFN context");
     std::cout << "  seam T2: " << m2.GetNumDiag() << " diagonals, "
               << sp.first << "x" << sp.second << std::endl;
   }
+  // The bit-reversed decrement, as a transform on the live image.
+  std::unique_ptr<cheddar::LinearTransform<word>> seam_tok;
+  int back_tok = 0;
+  {
+    cheddar::StripedMatrix mt(n, n);
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        const int c = chan_of(col, lh);
+        for (int t = 0; t < layout.dim; t++) {
+          const int pos = rev(t, 7);
+          if (pos == 0) continue;  // nothing sits one position below it
+          const int td = rev(pos - 1, 7);
+          const int dst = slot_block(td, c);
+          const int off = ((slot_block(t, c) - dst) % n + n) % n;
+          mt.try_emplace(off, n, Complex(0.0, 0.0));
+          mt[off][dst] = Complex(1.0, 0.0);
+        }
+      }
+    }
+    int need = 0;
+    const int w = best_window(mt, &need);
+    const auto sp = split(need);
+    seam_tok = std::make_unique<cheddar::LinearTransform<word>>(
+        boot_ffn.context, mt, tokmap_level, pt_scale(tokmap_level), sp.first,
+        sp.second, w, -w);
+    back_tok = ((w % n) + n) % n;
+    std::cout << "  seam token map: " << mt.GetNumDiag() << " diagonals, "
+              << sp.first << "x" << sp.second << " at level " << tokmap_level
+              << std::endl;
+  }
   {
     EvkRequest req;
+    seam_tok->AddRequiredRotations(req);
+    req.AddRequest(back_tok, tokmap_level - 1);
     seam_t2->AddRequiredRotations(req);
     req.AddRequest(back2, t2_level - 1);
     req.AddRequest(1, t2_level);
@@ -9263,7 +9308,13 @@ ledger("before the FFN context");
         }
         a2 = std::move(next);
       }
-      boot_ffn.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
+      seam_tok->Evaluate(boot_ffn.context, sh, a2, boot.ui->GetEvkMap());
+      if (back_tok) {
+        Ciphertext<word> r;
+        boot_ffn.context->HRot(
+            r, sh, boot.ui->GetEvkMap().GetRotationKey(back_tok), back_tok);
+        sh = std::move(r);
+      }
       seam_t2->Evaluate(boot_ffn.context, dup, sh, boot.ui->GetEvkMap());
       if (back2) {
         Ciphertext<word> r;
@@ -9272,6 +9323,14 @@ ledger("before the FFN context");
         dup = std::move(r);
       }
       const int dl = boot_ffn.param->NPToLevel(dup.GetNP());
+      // The live half now sits two levels above `dup`, because the token map
+      // took one; bring it to `dl + 1` so the constant multiply below lands
+      // both at the same level AND the same scale.
+      if (boot_ffn.param->NPToLevel(a2.GetNP()) != dl + 1) {
+        Ciphertext<word> d;
+        boot_ffn.context->LevelDown(d, a2, dl + 1);
+        a2 = std::move(d);
+      }
       cheddar::Constant<word> one;
       boot_ffn.context->encoder_.EncodeConstant(
           one, dl + 1,
