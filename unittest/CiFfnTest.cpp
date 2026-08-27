@@ -127,6 +127,72 @@ std::vector<std::vector<double>> CiComponentsFfn(
   return comp;
 }
 
+// THE SAME COMPARISON, READ WITHOUT THE SCAN.
+//
+// `CiComponentsFfn` is an alternating suffix sum along the token axis, so it
+// amplifies whatever coefficient noise it is handed -- up to sqrt(small_degree)
+// for independent noise, and 1.5bo measured worse than that because the walk
+// has a 1/f spectrum. It also MIXES the two halves: `comp[i][t]` is built from
+// `coeff[t*rank+i]` MINUS `comp[rank-i][t+1]`, so an error in a DUPLICATE
+// coefficient lands on a LIVE component with no attenuation at all.
+//
+// The ciphertext itself carries the banded image, and the banded image is what
+// the next projection consumes. So the honest question is how far the
+// coefficients are from the banded recomposition of the truth -- and asking it
+// separately for the live band `i < rank/2` and the duplicate band `i >= rank/2`
+// says which of the two the scan is amplifying.
+struct CoeffError {
+  double live = 0.0;  // max |err| over coefficients i < rank/2
+  double dup = 0.0;   // max |err| over coefficients i >= rank/2
+  double mx = 0.0;    // max |coefficient| of the reference
+  // WHERE the duplicate band goes wrong. Position `tokens - 1` has no
+  // successor, so the banded convention says its whole duplicate band is
+  // EXACTLY zero -- and a slot operator that normalises the duplicates by
+  // their own reduction is handed a sum of squares of nothing there. If the
+  // dup error is concentrated at that one position, ModDecomp's suffix
+  // recursion is what spreads it: `comp_i[P] = coeff[P][i] - comp_{r-i}[P+1]`
+  // walks a corruption at the top position down onto every position below it,
+  // undamped and with alternating sign.
+  int dup_worst_pos = -1;
+  double dup_but_last = 0.0;
+  double live_but_last = 0.0;
+};
+CoeffError CoeffDomainError(const std::vector<double> &coeffs,
+                            const std::vector<double> &want, double fit,
+                            int declared, int rank, int tokens) {
+  int lb = 0, lt = 0;
+  while ((1 << lb) < rank) lb++;
+  while ((1 << lt) < tokens) lt++;
+  std::vector<std::vector<double>> cw(rank, std::vector<double>(tokens, 0.0));
+  for (int t = 0; t < tokens; t++) {
+    for (int c = 0; c < declared; c += 2) {
+      cw[Rev(c, lb)][Rev(t, lt)] = want[static_cast<size_t>(t) * declared + c];
+    }
+  }
+  const auto rec = CiRecompose(cw, rank, tokens);
+  CoeffError e;
+  double worst = -1.0;
+  for (int t = 0; t < tokens; t++) {
+    for (int i = 0; i < rank; i++) {
+      const size_t k = static_cast<size_t>(t) * rank + i;
+      const double d = std::abs(coeffs[k] / fit - rec[k]);
+      e.mx = std::max(e.mx, std::abs(rec[k]));
+      if (i < rank / 2) {
+        e.live = std::max(e.live, d);
+        if (t + 1 < tokens) e.live_but_last = std::max(e.live_but_last, d);
+      } else {
+        e.dup = std::max(e.dup, d);
+        if (t + 1 < tokens) e.dup_but_last = std::max(e.dup_but_last, d);
+        if (d > worst) {
+          worst = d;
+          e.dup_worst_pos = t;
+        }
+      }
+    }
+  }
+  return e;
+}
+
 // `CoeffLinearLeg` implements only `Project`; the two ciphertext-ciphertext
 // products are pure virtual on purpose, so nothing falls back to a stand-in.
 class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
@@ -177,9 +243,15 @@ double ReportTurn(const char *name, const Ring &ring,
           v - want[static_cast<size_t>(t) * declared + c]));
     }
   }
+  const auto ce = CoeffDomainError(coeffs, want, fit, declared, rank, tokens);
   std::cout << "  [" << name << "] carried " << fit << ", relative "
             << (err / absmax) << " = 2^" << std::log2(err / absmax)
-            << std::endl;
+            << "   | coeff-domain live " << (ce.live / ce.mx) << " = 2^"
+            << std::log2(ce.live / ce.mx) << ", dup " << (ce.dup / ce.mx)
+            << " = 2^" << std::log2(ce.dup / ce.mx) << "  (worst dup position "
+            << ce.dup_worst_pos << " of " << tokens << "; dropping the last "
+            << "position: live " << (ce.live_but_last / ce.mx) << ", dup "
+            << (ce.dup_but_last / ce.mx) << ")" << std::endl;
   return fit;
 }
 
@@ -663,7 +735,17 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   // ---- the model, in double ---------------------------------------------
   std::mt19937_64 gen(0xFFA7);
   std::normal_distribution<double> xd(0.0, 1.0);
-  std::normal_distribution<double> wd(0.0, 0.03);
+  // The gate's magnitude is a knob, because the SwiGLU turn is the one stage
+  // whose error might not be scale invariant: everything upstream rides into
+  // its crossing at a fixed 0.4 by construction (`proj_size = 0.4 / gmax`), so
+  // the ONLY thing this changes is the absolute size at which SiLU and the
+  // pointwise multiply operate. The layer runs at |gate| ~ 1.05 and this test
+  // at ~3.03, and that is the only material difference between them.
+  const double w_sigma = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_WSIGMA");
+    return (e && e[0]) ? std::atof(e) : 0.03;
+  }();
+  std::normal_distribution<double> wd(0.0, w_sigma);
   std::vector<double> x(static_cast<size_t>(kTokens) * declared_h, 0.0);
   std::vector<double> wn(declared_h, 0.0);
   std::vector<double> wg(static_cast<size_t>(declared_h) * declared_hidden,
@@ -671,23 +753,56 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   std::vector<double> wu = wg;
   std::vector<double> wdn(static_cast<size_t>(declared_hidden) * declared_h,
                           0.0);
+  // COMPONENT ZERO HAS NO PARTNER, AND THE STRIDE-2 REDUCTION IS WHERE IT BITES.
+  //
+  // The even slots hold components `I = 0..255` at position P; the odd slots
+  // hold `comp_{512-I}[P+1]` for `I = 256..511`, i.e. components `J = 1..256`
+  // -- and `J = 256` is dead while `J = 0` is missing, because `512 - 0` wraps
+  // to 0 and the banded formula excludes `i == 0`. The map `I -> 512-I` has
+  // exactly two fixed points on [0, 512), 0 and 256, so NO choice of live half
+  // makes the two bands sum the same set: one component always falls out.
+  //
+  // Measured, that costs the duplicate band 12.5x the live band's error
+  // (9.02e-03 against 7.23e-04) and ModDecomp's suffix recursion then hands
+  // the whole of it to the live components of the NEXT projection.
+  //
+  // The fix is to spend the component rather than the bits: leave component 0
+  // empty, and both bands reduce over `J = 1..255` -- the same 255 channels,
+  // exactly. `num_channels` stays 512 declared on both sides, so the mean is
+  // unchanged and the caller needs no other adjustment. It costs one channel
+  // in 256.
+  const bool drop_c0 = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_DROP_C0");
+    return e && e[0] == '1';
+  }();
+  // Component 0 of EVERY ciphertext, so the hidden dimension loses channel 0
+  // of each of its two groups as well.
+  auto alive = [&](int ch) { return !drop_c0 || (ch % kRank) != 0; };
+  std::cout << "component 0 " << (drop_c0 ? "LEFT EMPTY" : "carries data")
+            << " (CHEDDAR_CI_FFN_DROP_C0)" << std::endl;
   for (int t = 0; t < kTokens; t++) {
     for (int c = 0; c < declared_h; c += 2) {
+      if (!alive(c)) continue;
       x[static_cast<size_t>(t) * declared_h + c] = xd(gen);
     }
   }
-  for (int c = 0; c < declared_h; c += 2) wn[c] = 0.5 + 0.5 * std::abs(xd(gen));
+  for (int c = 0; c < declared_h; c += 2) {
+    if (!alive(c)) continue;
+    wn[c] = 0.5 + 0.5 * std::abs(xd(gen));
+  }
   // Half density on BOTH axes of every weight: a projection's live output
   // channels are the even ones (1.5cq), and its live input channels are the
   // even ones of whatever produced them.
   for (int c = 0; c < declared_h; c += 2) {
     for (int j = 0; j < declared_hidden; j += 2) {
+      if (!alive(c) || !alive(j)) continue;
       wg[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
       wu[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
     }
   }
   for (int j = 0; j < declared_hidden; j += 2) {
     for (int c = 0; c < declared_h; c += 2) {
+      if (!alive(j) || !alive(c)) continue;
       wdn[static_cast<size_t>(j) * declared_h + c] = wd(gen);
     }
   }
@@ -742,8 +857,16 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   const auto want = host_project(gu, declared_hidden, wdn, declared_h);
   double want_absmax = 0.0;
   for (double v : want) want_absmax = std::max(want_absmax, std::abs(v));
-  std::cout << "gate |g| max " << gate_absmax << ", |y| max " << want_absmax
-            << std::endl;
+  // THE UP PROJECTION HAS ITS OWN RANGE. It was riding the gate's `proj_size`,
+  // which is calibrated on |g| and has nothing to do with |u|: the two are
+  // independent weight matrices and their outputs differ by whatever they
+  // differ by. Whatever `0.4` is protecting -- the crossing's input bound --
+  // it is only protecting the gate.
+  double up_absmax = 0.0;
+  for (double v : u_host) up_absmax = std::max(up_absmax, std::abs(v));
+  std::cout << "gate |g| max " << gate_absmax << ", up |u| max " << up_absmax
+            << " (ratio " << (up_absmax / gate_absmax) << "), |y| max "
+            << want_absmax << std::endl;
 
   // ---- keys: the direct descent, 512 ModPack keys on the block ring ------
   //
@@ -785,7 +908,18 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   std::vector<double> coeffs = CiRecompose(comp, kRank, kTokens);
   double coeff_max = 0.0;
   for (double v : coeffs) coeff_max = std::max(coeff_max, std::abs(v));
-  const double beta = 0.4 / coeff_max;
+  // HOW HOT THE MESSAGE RIDES INTO HalfBoot. `BootParameter`'s own
+  // `log_message_ratio` doc says feeding EvalMod an argument 32x smaller than
+  // it is built for loses five bits, and 1.5bz measured an order bought by
+  // riding 2^5 hotter -- so the 0.4 here is a lever and not a constant, and
+  // the crossing residual printed below is what it moves.
+  const double beta_target = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_BETA");
+    return (e && e[0]) ? std::atof(e) : 0.4;
+  }();
+  const double beta = beta_target / coeff_max;
+  std::cout << "coefficients ride into HalfBoot at " << beta_target
+            << " (CHEDDAR_CI_FFN_BETA)" << std::endl;
   for (double &v : coeffs) v *= beta;
   Plaintext<word> pt;
   boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), coeffs);
@@ -846,6 +980,26 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
       std::cout << "HalfBoot boundary constant " << boundary << " (2^"
                 << std::log2(boundary) << ")" << std::endl;
       ASSERT_GT(boundary, 0.0);
+      // IS IT ONE CONSTANT? Everything downstream divides by this single
+      // fitted scalar, so whatever the crossing does that a scalar cannot
+      // describe becomes a deterministic error that no bigger scale removes --
+      // which is exactly the signature 1.5cs reports for the 2.7 bits RMSNorm
+      // loses through the crossing (`ci16_40` and `ci16_35` agree to three
+      // digits across 3.85 bits of bootstrap precision). Measured here rather
+      // than assumed: the residual of the same fit, per slot.
+      double res = 0.0, wmax = 0.0;
+      for (int t = 0; t < kTokens; t++) {
+        for (int c = 0; c < declared_h; c += 2) {
+          const double w = beta * x[static_cast<size_t>(t) * declared_h + c];
+          wmax = std::max(wmax, std::abs(w));
+          res = std::max(res,
+                         std::abs(raw[c * kTokens + t].real() - boundary * w));
+        }
+      }
+      std::cout << "  the crossing as ONE constant: residual "
+                << (res / (boundary * wmax)) << " = 2^"
+                << std::log2(res / (boundary * wmax))
+                << " of the live signal" << std::endl;
     }
     canonicalise(up, 1.0 / (boundary * beta));
 
@@ -889,6 +1043,15 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   // rides the weight scale for free, exactly as [SYLPH] folds its calibration
   // into the model conversion.
   const double proj_size = 0.4 / std::max(gate_absmax, 1e-12);
+  // `up` had been sharing it. Its own maximum is what it has to be scaled by.
+  const bool shared_up = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_SHARED_UP_SCALE");
+    return e && e[0] == '1';
+  }();
+  const double up_size =
+      shared_up ? proj_size : 0.4 / std::max(up_absmax, 1e-12);
+  std::cout << "gate scale " << proj_size << ", up scale " << up_size
+            << (shared_up ? "  (SHARED, the old behaviour)" : "") << std::endl;
   std::vector<Ciphertext<word>> gate, upv;
   {
     Ciphertext<word> low;
@@ -896,27 +1059,48 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     std::vector<Ciphertext<word>> ins(1);
     ins[0] = std::move(low);
     leg.Project(gate, ins, declared_h, declared_hidden, wg, proj_size, "gate");
-    leg.Project(upv, ins, declared_h, declared_hidden, wu, proj_size, "up");
+    leg.Project(upv, ins, declared_h, declared_hidden, wu, up_size, "up");
     ASSERT_EQ(gate.size(), 2u);
     ASSERT_EQ(upv.size(), 2u);
     ASSERT_EQ(boot.param->NPToLevel(gate[0].GetNP()), 0);
     // Each output ciphertext carries `rank` declared channels of the inner
     // dimension, so group g is channels [g*512, (g+1)*512).
     for (int g = 0; g < 2; g++) {
-      std::vector<double> slice(static_cast<size_t>(kTokens) * kRank, 0.0);
+      std::vector<double> gs(static_cast<size_t>(kTokens) * kRank, 0.0);
+      std::vector<double> us = gs;
       for (int t = 0; t < kTokens; t++) {
         for (int j = 0; j < kRank; j++) {
-          slice[static_cast<size_t>(t) * kRank + j] =
-              g_host[static_cast<size_t>(t) * declared_hidden + g * kRank + j];
+          const size_t k = static_cast<size_t>(t) * declared_hidden +
+                           g * kRank + j;
+          gs[static_cast<size_t>(t) * kRank + j] = g_host[k];
+          us[static_cast<size_t>(t) * kRank + j] = u_host[k];
         }
       }
-      ReportTurn(g == 0 ? "gate[0]" : "gate[1]", boot, gate[g], slice, kRank,
+      ReportTurn(g == 0 ? "gate[0]" : "gate[1]", boot, gate[g], gs, kRank,
                  kRank, kTokens);
+      ReportTurn(g == 0 ? "up[0]" : "up[1]", boot, upv[g], us, kRank, kRank,
+                 kTokens);
     }
   }
 
   // ---- turn 3: SiLU(gate) * up ------------------------------------------
-  const double silu_range = 12.0;
+  //
+  // THE RANGE IS CALIBRATION, AND 12.0 WAS A GUESS. A Chebyshev fit's error is
+  // uniform over its interval, so a range wider than the data uses throws away
+  // exactly that ratio: `TheFitsAloneExplainTheFfnError` measures the compiled
+  // degree-31 fit at 2^-11.2 relative here, against a gate that reaches 2.57
+  // of the fitted +-12. [SYLPH] 3.1.3's own +-12 goes with a CALIBRATED input
+  // of 10.82; carrying the number without the calibration keeps the cost and
+  // drops the benefit. The margin covers the circuit's own error in the gate,
+  // which is ~1e-2 relative -- [SYLPH]'s 12/10.82 is 1.109.
+  const double silu_margin = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_SILU_MARGIN");
+    return (e && e[0]) ? std::atof(e) : 0.0;
+  }();
+  const double silu_range =
+      silu_margin > 0.0 ? silu_margin * gate_absmax : 12.0;
+  std::cout << "SiLU range " << silu_range << " against |gate| "
+            << gate_absmax << std::endl;
   std::vector<Ciphertext<word>> prod(2);
   {
     cheddar::SiLuHandler<word> silu(boot.context, silu_range, op_level, 31);
@@ -926,7 +1110,7 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
       sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
       // SiLU takes x / range, so the restore carries 1/range as well.
       canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
-      canonicalise(u_up, 1.0 / (boundary * proj_size));
+      canonicalise(u_up, 1.0 / (boundary * up_size));
       Ciphertext<word> s;
       silu.Apply(s, g_up, boot.ui->GetEvkMap());
       const int s_level = boot.param->NPToLevel(s.GetNP());
@@ -1000,6 +1184,19 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
             << rel << " = 2^" << std::log2(rel) << std::endl;
   std::cout << "  carried factor " << carried << " (the crossings' constants, "
             << "which a block folds into the next weight encode)" << std::endl;
+  {
+    const auto ce =
+        CoeffDomainError(out_coeffs, want, carried, declared_h, kRank, kTokens);
+    std::cout << "  WITHOUT THE SCAN: live band " << (ce.live / ce.mx) << " = 2^"
+              << std::log2(ce.live / ce.mx) << ", duplicate band "
+              << (ce.dup / ce.mx) << " = 2^" << std::log2(ce.dup / ce.mx)
+              << " (|coeff| <= " << ce.mx << "; worst dup position "
+              << ce.dup_worst_pos << ", dropping the last position live "
+              << (ce.live_but_last / ce.mx) << " dup "
+              << (ce.dup_but_last / ce.mx) << ")" << std::endl;
+    std::cout << "  the scan's amplification: "
+              << (rel / (std::max(ce.live, ce.dup) / ce.mx)) << "x" << std::endl;
+  }
   EXPECT_LT(rel, 0.05) << "the conjugate-invariant FFN disagrees with the "
                           "host reference by more than the circuit can "
                           "explain";
@@ -2106,4 +2303,195 @@ TEST(CiFfn, TheSeamHandsTheProjectionAReadableImage) {
             << want_absmax << ", carried " << carried << ")" << std::endl;
   EXPECT_LT(err / want_absmax, 0.05)
       << "the seam image does not survive SlotToCoeff into the projection";
+}
+
+// ---------------------------------------------------------------------------
+// WHAT THE TWO FITS COST, BEFORE ANY CIPHERTEXT EXISTS.
+//
+// The layer closes at 3.36-3.39 bits and everything through the O projection
+// is 10.7, so the seven bits are spent in the FFN -- and the FFN has exactly
+// two approximated functions in it. `RmsNormHandler::PlainInvSqrt` and
+// `SiLuHandler::PlainSiLu` evaluate the SAME compiled polynomials the circuit
+// evaluates, in the clear, which is what they exist for.
+//
+// So this runs the FFN twice in double on the same model the encrypted test
+// uses -- once exactly, once with the two library polynomials substituted --
+// and reports the difference. Whatever it says is a FLOOR: no amount of noise
+// engineering, no bigger scale and no better bootstrap can take the encrypted
+// answer below its own polynomial. The arguments are reported against the
+// intervals the fits were built for as well, because a fit evaluated outside
+// its window is not a fit at all and says so nowhere.
+//
+// Seconds, not minutes: no rotation keys, no bootstrap, one Context.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, TheFitsAloneExplainTheFfnError) {
+  Ring boot(Param());
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  const int declared_h = kRank;
+  const int declared_hidden = 2 * kRank;
+
+  // The model, drawn in EXACTLY the order TheFeedForwardNetworkRunsOnThe
+  // RealSubring draws it, so the two tests are the same numbers.
+  std::mt19937_64 gen(0xFFA7);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.03);
+  std::vector<double> x(static_cast<size_t>(kTokens) * declared_h, 0.0);
+  std::vector<double> wn(declared_h, 0.0);
+  std::vector<double> wg(static_cast<size_t>(declared_h) * declared_hidden, 0.0);
+  std::vector<double> wu = wg;
+  std::vector<double> wdn(static_cast<size_t>(declared_hidden) * declared_h,
+                          0.0);
+  const bool drop_c0 = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_DROP_C0");
+    return e && e[0] == '1';
+  }();
+  auto alive = [&](int ch) { return !drop_c0 || (ch % kRank) != 0; };
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared_h; c += 2) {
+      if (!alive(c)) continue;
+      x[static_cast<size_t>(t) * declared_h + c] = xd(gen);
+    }
+  }
+  for (int c = 0; c < declared_h; c += 2) {
+    if (!alive(c)) continue;
+    wn[c] = 0.5 + 0.5 * std::abs(xd(gen));
+  }
+  for (int c = 0; c < declared_h; c += 2) {
+    for (int j = 0; j < declared_hidden; j += 2) {
+      if (!alive(c) || !alive(j)) continue;
+      wg[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
+      wu[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
+    }
+  }
+  for (int j = 0; j < declared_hidden; j += 2) {
+    for (int c = 0; c < declared_h; c += 2) {
+      if (!alive(j) || !alive(c)) continue;
+      wdn[static_cast<size_t>(j) * declared_h + c] = wd(gen);
+    }
+  }
+
+  std::vector<double> ms(kTokens, 0.0);
+  double log_sum = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    double s = 0.0;
+    for (int c = 0; c < declared_h; c++) {
+      const double v = x[static_cast<size_t>(t) * declared_h + c];
+      s += v * v;
+    }
+    ms[t] = s / declared_h;
+    log_sum += std::log(ms[t]);
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+
+  // The two handlers, built with the arguments the FFN test builds them with.
+  // Only the polynomial matters here, so the level is any legal one.
+  const int lvl = 6;
+  cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
+                                    lvl, kEps, 6.0, 9, /*channel_stride=*/2);
+  const double silu_margin = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_SILU_MARGIN");
+    return (e && e[0]) ? std::atof(e) : 0.0;
+  }();
+
+  // ---- the inverse square root, at the arguments the data produces --------
+  double u_lo = 1e300, u_hi = 0.0, r_rel = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    const double u = alpha * (ms[t] + kEps);
+    u_lo = std::min(u_lo, u);
+    u_hi = std::max(u_hi, u);
+    const double exact = 1.0 / std::sqrt(u);
+    const double got = rms.PlainInvSqrt(u);
+    r_rel = std::max(r_rel, std::abs(got - exact) / exact);
+  }
+  std::cout << "invsqrt: argument in [" << u_lo << ", " << u_hi << "], ratio "
+            << (u_hi / u_lo) << " against the window ratio 6" << std::endl;
+  std::cout << "  the compiled degree-9 fit against 1/sqrt: relative " << r_rel
+            << " = 2^" << std::log2(r_rel) << std::endl;
+
+  // ---- RMSNorm both ways -------------------------------------------------
+  const double root_alpha = std::sqrt(alpha);
+  std::vector<double> h(static_cast<size_t>(kTokens) * declared_h, 0.0);
+  std::vector<double> h_fit = h;
+  for (int t = 0; t < kTokens; t++) {
+    const double inv = 1.0 / std::sqrt(ms[t] + kEps);
+    const double inv_fit = root_alpha * rms.PlainInvSqrt(alpha * (ms[t] + kEps));
+    for (int c = 0; c < declared_h; c++) {
+      const double v = x[static_cast<size_t>(t) * declared_h + c] * wn[c];
+      h[static_cast<size_t>(t) * declared_h + c] = v * inv;
+      h_fit[static_cast<size_t>(t) * declared_h + c] = v * inv_fit;
+    }
+  }
+
+  auto project = [&](const std::vector<double> &in, int in_w,
+                     const std::vector<double> &w, int out_w) {
+    std::vector<double> out(static_cast<size_t>(kTokens) * out_w, 0.0);
+    for (int t = 0; t < kTokens; t++) {
+      for (int o = 0; o < out_w; o++) {
+        double acc = 0.0;
+        for (int c = 0; c < in_w; c++) {
+          acc += in[static_cast<size_t>(t) * in_w + c] *
+                 w[static_cast<size_t>(c) * out_w + o];
+        }
+        out[static_cast<size_t>(t) * out_w + o] = acc;
+      }
+    }
+    return out;
+  };
+
+  // ---- SiLU, at the arguments the data produces --------------------------
+  const auto g_exact = project(h, declared_h, wg, declared_hidden);
+  double g_absmax = 0.0;
+  for (double v : g_exact) g_absmax = std::max(g_absmax, std::abs(v));
+  const double silu_range =
+      silu_margin > 0.0 ? silu_margin * g_absmax : 12.0;
+  cheddar::SiLuHandler<word> silu(boot.context, silu_range, lvl, 31);
+  double s_err = 0.0, s_absmax = 0.0;
+  for (double gv : g_exact) {
+    const double exact = gv / (1.0 + std::exp(-gv));
+    s_absmax = std::max(s_absmax, std::abs(exact));
+    s_err = std::max(s_err, std::abs(silu.PlainSiLu(gv) - exact));
+  }
+  std::cout << "SiLU: |gate| reaches " << g_absmax << " of a fitted +-"
+            << silu_range << " (the fit spends its accuracy over "
+            << (silu_range / g_absmax) << "x the interval the data uses)"
+            << std::endl;
+  std::cout << "  the compiled degree-31 fit against x*sigmoid(x): abs "
+            << s_err << ", relative to |SiLU| max " << (s_err / s_absmax)
+            << " = 2^" << std::log2(s_err / s_absmax) << std::endl;
+
+  // ---- the whole FFN, four ways ------------------------------------------
+  auto run_ffn = [&](bool fit_norm, bool fit_silu) {
+    const auto &hh = fit_norm ? h_fit : h;
+    const auto g = project(hh, declared_h, wg, declared_hidden);
+    const auto u = project(hh, declared_h, wu, declared_hidden);
+    std::vector<double> gu(g.size(), 0.0);
+    for (size_t i = 0; i < gu.size(); i++) {
+      const double s =
+          fit_silu ? silu.PlainSiLu(g[i]) : g[i] / (1.0 + std::exp(-g[i]));
+      gu[i] = s * u[i];
+    }
+    return project(gu, declared_hidden, wdn, declared_h);
+  };
+  const auto want = run_ffn(false, false);
+  double want_absmax = 0.0;
+  for (double v : want) want_absmax = std::max(want_absmax, std::abs(v));
+  auto rel_to_want = [&](const std::vector<double> &got) {
+    double e = 0.0;
+    for (size_t i = 0; i < got.size(); i++) {
+      e = std::max(e, std::abs(got[i] - want[i]));
+    }
+    return e / want_absmax;
+  };
+  const double only_norm = rel_to_want(run_ffn(true, false));
+  const double only_silu = rel_to_want(run_ffn(false, true));
+  const double both = rel_to_want(run_ffn(true, true));
+
+  std::cout << "THE FITS ALONE, no ciphertext anywhere:" << std::endl;
+  std::cout << "  invsqrt fit only : " << only_norm << " = 2^"
+            << std::log2(only_norm) << std::endl;
+  std::cout << "  SiLU fit only    : " << only_silu << " = 2^"
+            << std::log2(only_silu) << std::endl;
+  std::cout << "  both             : " << both << " = 2^" << std::log2(both)
+            << "   <-- the FLOOR the encrypted FFN cannot beat" << std::endl;
+  SUCCEED();
 }

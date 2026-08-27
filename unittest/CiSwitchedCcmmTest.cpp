@@ -141,6 +141,55 @@ std::vector<std::vector<double>> HostComponents(
   return comp;
 }
 
+// THE SAME COMPARISON, READ WITHOUT THE SCAN.
+//
+// `HostComponents` is an alternating suffix sum along the token axis, so it
+// amplifies whatever coefficient noise it is handed and, worse, MIXES the two
+// bands: `comp[i][t]` is `coeff[t*rank+i]` MINUS `comp[rank-i][t+1]`, so an
+// error in a DUPLICATE coefficient lands on a LIVE component undamped. The
+// ciphertext carries the banded image and the next projection consumes the
+// banded image, so this asks how far the coefficients themselves are from the
+// banded recomposition of the truth -- separately for the live band
+// `i < rank/2` and the duplicate band `i >= rank/2`.
+struct CoeffError {
+  double live = 0.0;
+  double dup = 0.0;
+  double mx = 0.0;
+};
+CoeffError CoeffDomainError(const std::vector<double> &coeffs,
+                            const std::vector<double> &want, double fit,
+                            int declared, int rank, int tokens) {
+  auto brv = [](int v, int bits) {
+    int r = 0;
+    for (int b = 0; b < bits; b++) r |= ((v >> b) & 1) << (bits - 1 - b);
+    return r;
+  };
+  int lb = 0, lt = 0;
+  while ((1 << lb) < rank) lb++;
+  while ((1 << lt) < tokens) lt++;
+  std::vector<std::vector<double>> cw(rank, std::vector<double>(tokens, 0.0));
+  for (int t = 0; t < tokens; t++) {
+    for (int c = 0; c < declared; c += 2) {
+      cw[brv(c, lb)][brv(t, lt)] = want[static_cast<size_t>(t) * declared + c];
+    }
+  }
+  const auto rec = HostRecompose(cw, rank, tokens);
+  CoeffError e;
+  for (int t = 0; t < tokens; t++) {
+    for (int i = 0; i < rank; i++) {
+      const size_t k = static_cast<size_t>(t) * rank + i;
+      const double d = std::abs(coeffs[k] / fit - rec[k]);
+      e.mx = std::max(e.mx, std::abs(rec[k]));
+      if (i < rank / 2) {
+        e.live = std::max(e.live, d);
+      } else {
+        e.dup = std::max(e.dup, d);
+      }
+    }
+  }
+  return e;
+}
+
 void RunChain(int sub_degree, uint64_t seed) {
   Ring big(kSwitchParam);
   Ring small(kSmallParam);
@@ -8655,7 +8704,34 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // half of a banded image (1.5by), and the O projection's output is
   // half-density by construction, so the stream it adds back to has to be
   // too or the residual would mix two channels.
-  for (int o = 0; o < proj_rank / 2; o++) {
+  //
+  // AND COMPONENT ZERO IS EMPTY, which is a second contract and a separate
+  // finding. `RmsNormHandler` at `channel_stride = 2` reduces the two slot
+  // parities apart: the even slots sum components `I = 0..255` at position P,
+  // the odd slots sum `comp_{512-I}[P+1]` for `I = 256..511`, i.e. components
+  // `J = 1..256`. `J = 256` is dead and `J = 0` is MISSING -- `512 - 0` wraps
+  // to 0 and the banded formula excludes `i == 0`, so component zero has no
+  // duplicate anywhere. `I -> 512-I` has exactly two fixed points on
+  // [0, 512), 0 and 256, so no choice of live half makes the two bands sum the
+  // same components: the live set must avoid both, which caps a half-density
+  // ciphertext at 255 live channels and not 256.
+  //
+  // Measured in `CiFfn.TheFeedForwardNetworkRunsOnTheRealSubring`: carrying
+  // data in component zero leaves the duplicate band at 9.02e-03 against the
+  // live band's 7.23e-04, and ModDecomp's suffix recursion then hands all of
+  // it to the next projection's LIVE components -- the gate lands at 2.35e-02
+  // where the live band alone would put it near 1e-04. Leaving component zero
+  // empty puts both bands at 4.0e-04 and takes the FFN from 2^-4.84 to
+  // 2^-7.72.
+  const bool keep_c0 = [] {
+    const char *e = std::getenv("CHEDDAR_CI_KEEP_C0");
+    return e && e[0] == '1';
+  }();
+  std::cout << "  model-dimension component 0 "
+            << (keep_c0 ? "CARRIES DATA (the old, wrong contract)"
+                        : "left empty (255 live channels, not 256)")
+            << std::endl;
+  for (int o = keep_c0 ? 0 : 1; o < proj_rank / 2; o++) {
     for (auto &v : x_comp[o]) v = xd(gen);
   }
   const int kDim = 128, kLanes = 32;
@@ -9462,12 +9538,25 @@ ledger("before the FFN context");
     }
     return w;
   };
-  const auto wo = half_weight(attn_channels, model_declared);
+  // Everything that WRITES the model dimension has to honour the empty
+  // component zero as well, or the next RMSNorm is handed the contract it was
+  // just fixed for. The two are the O projection and the down projection; the
+  // hidden dimension is untouched, because nothing reduces over its channels.
+  auto model_dim_weight = [&](int in_dec) {
+    auto w = half_weight(in_dec, model_declared);
+    if (!keep_c0) {
+      for (int i = 0; i < in_dec; i++) {
+        w[static_cast<size_t>(i) * model_declared] = 0.0;
+      }
+    }
+    return w;
+  };
+  const auto wo = model_dim_weight(attn_channels);
   const auto wgate = half_weight(model_declared, hidden_declared);
   const auto wup = half_weight(model_declared, hidden_declared);
-  const auto wdown = half_weight(hidden_declared, model_declared);
+  const auto wdown = model_dim_weight(hidden_declared);
   std::vector<double> wnorm(model_declared, 0.0);
-  for (int c = 0; c < model_declared; c += 2) {
+  for (int c = keep_c0 ? 0 : 2; c < model_declared; c += 2) {
     wnorm[c] = 0.5 + 0.5 * std::abs(lw(gen));
   }
 
@@ -9614,6 +9703,14 @@ ledger("before the FFN context");
     std::cout << "  O against the host product from the decrypted attention "
               << "output: " << err << " (|o| <= " << mx << ", carried " << fit
               << ")" << std::endl;
+    {
+      const auto ce = CoeffDomainError(coeffs, o_host, fit, model_declared,
+                                       proj_rank, proj_small);
+      std::cout << "    [O] without the scan: live " << (ce.live / ce.mx)
+                << " = 2^" << std::log2(ce.live / ce.mx) << ", dup "
+                << (ce.dup / ce.mx) << " = 2^" << std::log2(ce.dup / ce.mx)
+                << std::endl;
+    }
     EXPECT_LT(err / mx, 0.05)
         << "the seam did not hand the O projection a readable banded image";
   }
@@ -9682,6 +9779,49 @@ ledger("before the FFN context");
         restore);
     boot_ffn.context->Mult(ct, ct, k);
     boot_ffn.context->Rescale(ct, ct);
+  };
+
+  // The FFN half of the layer had no per-stage report at all, so its closing
+  // 0.0964 could not say which turn moved it. Every one of these is a host
+  // decrypt of a ciphertext the circuit produces anyway, and each prints the
+  // scanned read beside the read-free one.
+  auto rev9 = [](int v, int bits) {
+    int r = 0;
+    for (int b = 0; b < bits; b++) r |= ((v >> b) & 1) << (bits - 1 - b);
+    return r;
+  };
+  auto report_turn = [&](const char *name, const Ciphertext<word> &ct,
+                         const std::vector<double> &want, int declared) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, ct);
+    std::vector<double> coeffs;
+    boot_ffn.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, proj_rank, proj_small);
+    double num = 0.0, den = 0.0, absmax = 0.0;
+    for (int t = 0; t < proj_small; t++) {
+      for (int c = 0; c < declared; c += 2) {
+        const double w = want[static_cast<size_t>(t) * declared + c];
+        num += comp[rev9(c, 9)][rev9(t, 7)] * w;
+        den += w * w;
+        absmax = std::max(absmax, std::abs(w));
+      }
+    }
+    const double fit = num / den;
+    double err = 0.0;
+    for (int t = 0; t < proj_small; t++) {
+      for (int c = 0; c < declared; c += 2) {
+        const double v = comp[rev9(c, 9)][rev9(t, 7)] / fit;
+        err = std::max(
+            err, std::abs(v - want[static_cast<size_t>(t) * declared + c]));
+      }
+    }
+    const auto ce =
+        CoeffDomainError(coeffs, want, fit, declared, proj_rank, proj_small);
+    std::cout << "  [" << name << "] carried " << fit << ", scanned "
+              << (err / absmax) << " = 2^" << std::log2(err / absmax)
+              << "  | no scan: live " << (ce.live / ce.mx) << " = 2^"
+              << std::log2(ce.live / ce.mx) << ", dup " << (ce.dup / ce.mx)
+              << " = 2^" << std::log2(ce.dup / ce.mx) << std::endl;
   };
 
   double ms_lo = 1e300, ms_hi = 0.0, log_sum = 0.0;
@@ -9766,12 +9906,24 @@ ledger("before the FFN context");
     }
   }
 
+  report_turn("RMSNorm(ffn)", normed, n_host, model_declared);
+
   const auto g_host = host_mm2(n_host, model_declared, wgate, hidden_declared);
   const auto u_host = host_mm2(n_host, model_declared, wup, hidden_declared);
   double gmax = 0.0;
   for (double v : g_host) gmax = std::max(gmax, std::abs(v));
   const double proj_size = 0.4 / std::max(gmax, 1e-12);
-  const double silu_range = 12.0;
+  // THE RANGE IS CALIBRATION AND 12.0 WAS A GUESS. A Chebyshev fit's error is
+  // uniform over its interval, so a range wider than the data uses throws the
+  // ratio away: `CiFfn.TheFitsAloneExplainTheFfnError` measures the compiled
+  // degree-31 fit at 2^-11.2 relative against a gate reaching 2.57 of a fitted
+  // +-12, and at 2^-33 once the range follows the gate. [SYLPH] 3.1.3's own
+  // +-12 goes with a CALIBRATED input of 10.82 -- a margin of 1.109 -- so
+  // carrying the 12 without the calibration keeps its cost and drops its
+  // benefit. 1.2 covers the circuit's own ~1e-2 relative error in the gate.
+  const double silu_range = 1.2 * gmax;
+  std::cout << "  SiLU range " << silu_range << " against |gate| " << gmax
+            << std::endl;
 
   std::vector<Ciphertext<word>> gate, upv;
   {
@@ -9786,6 +9938,26 @@ ledger("before the FFN context");
   }
   ASSERT_EQ(gate.size(), 2u);
   stage("the gate and up projections");
+  // `up` had never been measured anywhere in this test, and the gate being
+  // clean while the product is not points straight at it.
+  double umax = 0.0;
+  for (double v : u_host) umax = std::max(umax, std::abs(v));
+  std::cout << "  |gate| " << gmax << ", |up| " << umax << " (ratio "
+            << (umax / gmax) << ")" << std::endl;
+  for (int g = 0; g < 2; g++) {
+    std::vector<double> gs(static_cast<size_t>(proj_small) * proj_rank, 0.0);
+    std::vector<double> us = gs;
+    for (int t = 0; t < proj_small; t++) {
+      for (int j = 0; j < proj_rank; j++) {
+        const size_t k =
+            static_cast<size_t>(t) * hidden_declared + g * proj_rank + j;
+        gs[static_cast<size_t>(t) * proj_rank + j] = g_host[k];
+        us[static_cast<size_t>(t) * proj_rank + j] = u_host[k];
+      }
+    }
+    report_turn(g == 0 ? "gate[0]" : "gate[1]", gate[g], gs, proj_rank);
+    report_turn(g == 0 ? "up[0]" : "up[1]", upv[g], us, proj_rank);
+  }
 
   std::vector<Ciphertext<word>> prod(2);
   {
@@ -9794,9 +9966,77 @@ ledger("before the FFN context");
       Ciphertext<word> g_up, u_up, sv, u_low;
       sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
       sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
+      // IS THE BOUNDARY CONSTANT THE SAME FOR EVERY CROSSING? It is measured
+      // once, on the residual's crossing, and then divided out of the gate's
+      // and the up's. Doing.md 1.5bz says it is a property of the BootParameter and
+      // not of the data, and the FFN test's `carried` of 0.963 agrees -- but
+      // the layer's swiglu turn came back at `carried` 0.199 with the stage
+      // before it clean, and a systematic factor with a clean predecessor is
+      // exactly what a mis-divided crossing constant looks like. So it is
+      // measured again here, on the gate, against the same reference.
+      if (i == 0) {
+        Plaintext<word> gp;
+        boot.ui->Decrypt(gp, g_up);
+        std::vector<Complex> raw;
+        boot_ffn.context->encoder_.Decode(raw, gp);
+        double num = 0.0, den = 0.0, res = 0.0, wmx = 0.0;
+        for (int c = 0; c < proj_rank; c += 2) {
+          for (int t = 0; t < proj_small; t++) {
+            const double w =
+                proj_size * g_host[static_cast<size_t>(t) * hidden_declared + c];
+            num += raw[c * proj_small + t].real() * w;
+            den += w * w;
+            wmx = std::max(wmx, std::abs(w));
+          }
+        }
+        const double gb = num / den;
+        for (int c = 0; c < proj_rank; c += 2) {
+          for (int t = 0; t < proj_small; t++) {
+            const double w =
+                proj_size * g_host[static_cast<size_t>(t) * hidden_declared + c];
+            res = std::max(res,
+                           std::abs(raw[c * proj_small + t].real() - gb * w));
+          }
+        }
+        std::cout << "  the GATE's crossing constant " << gb
+                  << " against the residual's " << boundary << " (ratio "
+                  << (gb / boundary) << "), residual of the fit "
+                  << (res / (std::abs(gb) * wmx)) << " = 2^"
+                  << std::log2(res / (std::abs(gb) * wmx)) << std::endl;
+      }
       canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
       canonicalise(u_up, 1.0 / (boundary * proj_size));
       silu.Apply(sv, g_up, boot.ui->GetEvkMap());
+      if (i == 0) {  // SiLU's own output, in slots, before the multiply
+        Plaintext<word> sp;
+        boot.ui->Decrypt(sp, sv);
+        std::vector<Complex> raw;
+        boot_ffn.context->encoder_.Decode(raw, sp);
+        double num = 0.0, den = 0.0, mx = 0.0;
+        for (int c = 0; c < proj_rank; c += 2) {
+          for (int t = 0; t < proj_small; t++) {
+            const double g =
+                g_host[static_cast<size_t>(t) * hidden_declared + c];
+            const double w = g / (1.0 + std::exp(-g));
+            num += raw[c * proj_small + t].real() * w;
+            den += w * w;
+            mx = std::max(mx, std::abs(w));
+          }
+        }
+        const double fit = num / den;
+        double err = 0.0;
+        for (int c = 0; c < proj_rank; c += 2) {
+          for (int t = 0; t < proj_small; t++) {
+            const double g =
+                g_host[static_cast<size_t>(t) * hidden_declared + c];
+            const double w = g / (1.0 + std::exp(-g));
+            err = std::max(err,
+                           std::abs(raw[c * proj_small + t].real() / fit - w));
+          }
+        }
+        std::cout << "  SiLU(gate) in slots: carried " << fit << ", relative "
+                  << (err / mx) << " = 2^" << std::log2(err / mx) << std::endl;
+      }
       boot_ffn.context->LevelDown(u_low, u_up,
                               boot_ffn.param->NPToLevel(sv.GetNP()));
       boot_ffn.context->HMult(prod[i], sv, u_low,
@@ -9819,6 +10059,17 @@ ledger("before the FFN context");
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> c2;
       sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap());
+      {
+        std::vector<double> slice(
+            static_cast<size_t>(proj_small) * proj_rank, 0.0);
+        for (int t = 0; t < proj_small; t++) {
+          for (int j = 0; j < proj_rank; j++) {
+            slice[static_cast<size_t>(t) * proj_rank + j] =
+                gu[static_cast<size_t>(t) * hidden_declared + i * proj_rank + j];
+          }
+        }
+        report_turn(i == 0 ? "swiglu[0]" : "swiglu[1]", c2, slice, proj_rank);
+      }
       boot_ffn.context->LevelDown(ins[i], c2, pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
@@ -9858,6 +10109,17 @@ ledger("before the FFN context");
     std::cout << "THE WHOLE CI LAYER: down-projection output " << err
               << " against |y| <= " << mx << " (relative " << (err / mx)
               << "), carried " << fit << std::endl;
+    {
+      const auto ce = CoeffDomainError(coeffs, y_host, fit, model_declared,
+                                       proj_rank, proj_small);
+      std::cout << "  WITHOUT THE SCAN: live band " << (ce.live / ce.mx)
+                << " = 2^" << std::log2(ce.live / ce.mx) << ", duplicate band "
+                << (ce.dup / ce.mx) << " = 2^" << std::log2(ce.dup / ce.mx)
+                << " (|coeff| <= " << ce.mx << ")" << std::endl;
+      std::cout << "  the scan's amplification: "
+                << ((err / mx) / (std::max(ce.live, ce.dup) / ce.mx)) << "x"
+                << std::endl;
+    }
     EXPECT_LT(err / mx, 0.10)
         << "the conjugate-invariant layer disagrees with the same layer in "
            "double by more than the circuit can explain";

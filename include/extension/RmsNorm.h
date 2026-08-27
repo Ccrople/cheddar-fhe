@@ -148,11 +148,44 @@ class RmsNormHandler {
    * So the duplicates have to survive this operator, and a full-stride
    * rotate-and-add would fold them into the live sum. Stepping by two keeps
    * the parities apart: the live slots sum the live channels and the duplicate
-   * slots sum the duplicates -- which are exactly the live values of the
-   * partner position, so they land the SAME inverse square root the partner
-   * needs. Give the weight plaintext the partner's weight at those slots and
-   * the output is again a valid banded image, at no extra level and one
-   * rotation fewer.
+   * slots sum the duplicates -- which are the live values of the partner
+   * position, so they land the SAME inverse square root the partner needs.
+   * Give the weight plaintext the partner's weight at those slots and the
+   * output is again a valid banded image, at no extra level and one rotation
+   * fewer.
+   *
+   * ### COMPONENT ZERO MUST BE EMPTY, and that is a contract on the CALLER
+   *
+   * The two bands do not sum the same components, and the gap is exactly one.
+   * The even slots hold components `I = 0 .. rank/2-1` at position P. The odd
+   * slots hold `comp_{rank-I}[P+1]` for `I = rank/2 .. rank-1`, i.e.
+   * components `J = 1 .. rank/2`. So `J = rank/2` is dead and contributes
+   * nothing, and `J = 0` is MISSING -- `rank - 0` wraps to 0 and the banded
+   * recomposition excludes `i == 0`, so component zero has no duplicate
+   * anywhere in the image.
+   *
+   * It is not a choice of packing. `I -> rank - I` has exactly two fixed
+   * points on `[0, rank)`, namely 0 and `rank/2`, and a live set `S` needs
+   * `S` restricted to `[0, rank/2)` to equal `S` restricted to `(0, rank/2]`
+   * for the bands to agree -- which forces both 0 and `rank/2` OUT of `S`.
+   * **A half-density ciphertext under this
+   * operator therefore carries at most `rank/2 - 1` live channels, not
+   * `rank/2`.**
+   *
+   * Carrying data in component zero does not corrupt component zero. It
+   * corrupts EVERY duplicate, because they are all normalised by a mean
+   * square that is short one channel, and then the next projection's
+   * `ModDecomp` -- whose suffix recursion is
+   * `comp_i[P] = coeff[P][i] - comp_{rank-i}[P+1]` -- hands the whole of it to
+   * the LIVE components. Measured on `ci16_35` at rank 512 by
+   * `CiFfn.TheFeedForwardNetworkRunsOnTheRealSubring`: the duplicate band sits
+   * at 9.02e-03 against the live band's 7.23e-04, the following projection
+   * lands at 2.35e-02 instead of ~2e-04, and the FFN closes at 2^-4.84.
+   * Leaving component zero empty puts both bands at 4.0e-04 and the FFN at
+   * 2^-7.72 -- **3.4 bits for one channel in 256.**
+   *
+   * The emptied component simply contributes zero to both bands, so neither
+   * the mean nor the caller's `layer_constant` needs adjusting.
    *
    * `num_channels` stays the DECLARED width either way: it is what the
    * ciphertext count and the mean are stated against, half of it is zero on

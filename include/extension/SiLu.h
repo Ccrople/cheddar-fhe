@@ -55,6 +55,20 @@ namespace cheddar {
  * sets the accuracy, which is why 2^40 gains nothing while costing three levels
  * (max level 19 against 16). **2^35 is the preset this operator wants.**
  *
+ * ## Guessing HIGH is not the safe side
+ *
+ * A Chebyshev fit's error is uniform over its interval, so a range wider than
+ * the data uses throws away exactly that ratio and says so nowhere -- the same
+ * silence as guessing low, without the crash. Measured by
+ * `CiFfn.TheFitsAloneExplainTheFfnError` on a gate reaching 2.57: the compiled
+ * degree-31 fit is **2^-11.2** relative at range +-12 and **2^-33** at +-3.08,
+ * and the whole FFN's fit floor moves from 2^-8.95 to 2^-13.15 with it.
+ * [SYLPH] 3.1.3's own +-12 goes with a CALIBRATED input of 10.82, a margin of
+ * 1.109; carrying the 12 without the calibration keeps its cost and drops its
+ * benefit. A caller that has measured its gate should pass a small multiple of
+ * that maximum -- and may then also drop the degree, since the table above is
+ * a 12-bit target and a matched range clears it with far less.
+ *
  * ## What this bundle cannot tell us
  *
  * The true input is RMSNorm_ffn(h) @ W_gate with h the post-attention hidden
