@@ -552,10 +552,18 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
 // nothing else, as 1.5ce showed for the attention leg.
 // ---------------------------------------------------------------------------
 TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
-  // Slack for the deepest slot-domain stage: RMSNorm is 7 and the mask is 1,
-  // SiLU is 6 and the mask is 1. `SylphSchedule` refuses without it, which is
-  // the whole reason this is a construction-time argument.
-  constexpr int kSlack = 8;
+  // Slack for the deepest slot-domain stage, PLUS ONE. RMSNorm is 7 and the
+  // mask is 1; SiLU is 6, the mask is 1 and the gate multiply is 1. Eight
+  // consumed either way -- and eight is not enough, because `ToCoeff` scales
+  // its input back up to StC's own scale and a ciphertext that lands EXACTLY
+  // on StC's level has nowhere left to spend the rescale it owes. The library
+  // says so itself, which is the second time this session a Cheddar error
+  // message has been the diagnosis rather than the symptom:
+  //
+  //   ToCoeff: the input owes a rescale -- its scale is 1.18e21 against StC's
+  //   2.94e17 -- but it is already at StC's level 11, so there is nowhere to
+  //   spend it. Budget the operator at one level more than it consumes.
+  constexpr int kSlack = 9;
   Ring boot(Param(), {}, kSlack);
   std::cout << "preset " << Param() << ", slack " << kSlack << std::endl;
   ASSERT_TRUE(boot.param->conjugate_invariant_);
