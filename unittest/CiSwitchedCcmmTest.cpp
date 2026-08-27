@@ -9090,11 +9090,15 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
            boot_ffn.param->GetScale(l);
   };
 
-  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> seam_t1(2);
+  // ONE T1 AT A TIME. Each is 486 plaintext diagonals at level 10, which is
+  // 2.9 GB, and the two halves are never used together; building both up
+  // front only kept 2.9 GB pinned for the whole run. `make_t1` is called
+  // inside the half loop below and its result dies at the end of it.
   std::unique_ptr<cheddar::LinearTransform<word>> seam_t2;
   std::vector<int> back1(2, 0);
   int back2 = 0;
-  for (int half = 0; half < 2; half++) {
+  std::unique_ptr<cheddar::LinearTransform<word>> seam_t1_cur;
+  auto make_t1 = [&](int half) {
     cheddar::StripedMatrix m1(n, n);
     for (int col = 0; col < layout.rank; col++) {
       for (int lh = 0; lh < 16; lh++) {
@@ -9112,13 +9116,17 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     int need = 0;
     const int w = best_window(m1, &need);
     const auto sp = split(need);
-    seam_t1[half] = std::make_unique<cheddar::LinearTransform<word>>(
+    seam_t1_cur = std::make_unique<cheddar::LinearTransform<word>>(
         boot_ffn.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
         w, -w);
     back1[half] = ((w % n) + n) % n;
     std::cout << "  seam T1[" << half << "]: " << m1.GetNumDiag()
               << " diagonals, " << sp.first << "x" << sp.second << std::endl;
-  }
+    cheddar::EvkRequest req;
+    seam_t1_cur->AddRequiredRotations(req);
+    req.AddRequest(back1[half], t1_level - 1);
+    boot.ui->PrepareRotationKey(req);
+  };
   {
     cheddar::StripedMatrix m2(n, n);
     for (int col = 0; col < layout.rank; col++) {
@@ -9146,10 +9154,6 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   }
   {
     EvkRequest req;
-    for (int h = 0; h < 2; h++) {
-      seam_t1[h]->AddRequiredRotations(req);
-      req.AddRequest(back1[h], t1_level - 1);
-    }
     seam_t2->AddRequiredRotations(req);
     req.AddRequest(back2, t2_level - 1);
     req.AddRequest(1, t2_level);
@@ -9157,14 +9161,19 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   }
 
   // Boot the attention output, run the seam, come back to coefficients.
-  std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
+  std::vector<Ciphertext<word>> booted(layout.num_cts);
   for (int bi = 0; bi < layout.num_cts; bi++) {
-    Ciphertext<word> booted;
-    bctx->Boot(booted, out[bi], boot.ui->GetEvkMap());
-    for (int half = 0; half < 2; half++) {
+    bctx->Boot(booted[bi], out[bi], boot.ui->GetEvkMap());
+  }
+  out.clear();
+  out.shrink_to_fit();
+  std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
+  for (int half = 0; half < 2; half++) {
+    make_t1(half);
+    for (int bi = 0; bi < layout.num_cts; bi++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
-      boot_ffn.context->LevelDown(low, booted, t1_level);
-      seam_t1[half]->Evaluate(boot_ffn.context, a2, low, boot.ui->GetEvkMap());
+      boot_ffn.context->LevelDown(low, booted[bi], t1_level);
+      seam_t1_cur->Evaluate(boot_ffn.context, a2, low, boot.ui->GetEvkMap());
       if (back1[half]) {
         Ciphertext<word> r;
         boot_ffn.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
@@ -9191,7 +9200,14 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       boot_ffn.context->Add(sum, live, dup);
       sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
     }
+    seam_t1_cur.reset();
   }
+  booted.clear();
+  booted.shrink_to_fit();
+  // The seam is over, and nothing downstream reads it. Its three transforms
+  // are 486 + 486 + 129 plaintext diagonals -- 6.7 GB -- and the run that
+  // reached here died in the O projection with all of them still resident.
+  seam_t2.reset();
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  the seam gave " << h_cts.size()
