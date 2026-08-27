@@ -103,12 +103,16 @@ TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
   const double p = -std::log2(max_abs);
   const double p_rms = -std::log2(rms);
 
+  // Default cout precision rounds 2.9e-06 to "0.00000", which loses the one
+  // number this test exists to report.
+  const std::streamsize saved = std::cout.precision(6);
   std::cout << "[SYLPH 3.1.3] bootstrap precision on " << num_slots
             << (param_->conjugate_invariant_ ? " REAL" : " complex")
             << " slots filling [-1, 1]:" << std::endl;
-  std::cout << "  max abs err " << max_abs << "  ->  p = " << p << " bits"
-            << std::endl;
-  std::cout << "  rms abs err " << rms << "  ->  " << p_rms
+  std::cout << "  max abs err " << std::scientific << max_abs
+            << std::defaultfloat << "  ->  p = " << p << " bits" << std::endl;
+  std::cout << "  rms abs err " << std::scientific << rms
+            << std::defaultfloat << "  ->  " << p_rms
             << " bits (NOT the paper's convention; for comparison only)"
             << std::endl;
   std::cout << "  at Sylph's B = 128: effective " << (p - 7.0)
@@ -116,6 +120,7 @@ TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
   std::cout << "  largest B this preset affords at 12 bits: 2^" << (p - 12.0)
             << " = " << std::exp2(p - 12.0) << std::endl;
   std::cout << "  ([SYLPH] has p = 20, B = 128, effective 13)" << std::endl;
+  std::cout.precision(saved);
 
   // Not a precision assertion -- only that the message is still there. A
   // bootstrap that lost the payload would otherwise report a small p as
