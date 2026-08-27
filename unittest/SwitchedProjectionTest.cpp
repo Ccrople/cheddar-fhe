@@ -445,6 +445,38 @@ TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
   std::vector<double> w(static_cast<size_t>(kInChannels) * kOutChannels);
   for (auto &v : x) v = xd(gen);
   for (auto &v : w) v = wd(gen);
+
+  // HALF DENSITY, WHICH IS THE LEG'S CONTRACT ON R+ AND NOT A CONVENIENCE.
+  //
+  // 1.5by: ModPack's banded recomposition writes `comp_I[t] + comp_{rank-I}
+  // [t+1]`, so a full-density projection output is a MIXTURE of two channels
+  // and nothing downstream can read it. What a projection on R+ emits is 256
+  // live components of 512, with the partner of every live one dead -- and
+  // then every entry lands clean at its primary coefficient and the upper
+  // half holds shifted duplicates rather than mixtures.
+  //
+  // A component `i` carries channel `BitReverse(i, 9)`, so the live half
+  // `i < 256` is exactly the EVEN channels. Zeroing the odd ones on both
+  // axes is that contract, stated in the units this test speaks.
+  //
+  // Whether the ring-switched descent needs it is the question this test was
+  // rewritten to ask; the run below (`CHEDDAR_CI_FULL_DENSITY=1`) is the
+  // control that says what happens without it.
+  const bool half_density = std::getenv("CHEDDAR_CI_FULL_DENSITY") == nullptr;
+  if (half_density) {
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 1; c < kInChannels; c += 2) {
+        x[static_cast<size_t>(t) * kInChannels + c] = 0.0;
+      }
+    }
+    for (int c = 0; c < kInChannels; c++) {
+      for (int o = 0; o < kOutChannels; o++) {
+        if ((c % 2) || (o % 2)) w[static_cast<size_t>(c) * kOutChannels + o] = 0.0;
+      }
+    }
+  }
+  std::cout << "  operands are " << (half_density ? "HALF" : "FULL")
+            << " density" << std::endl;
   for (int t = 0; t < kTokens; t++) {
     double sq = 0.0;
     for (int c = 0; c < kInChannels; c++) {
