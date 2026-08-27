@@ -169,6 +169,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   // `slot = channel * 128 + rev7(token)` with the live half at bit 7 = 0, and
   // it is checked rather than assumed -- 1.5bx's lesson is that these maps are
   // never to be hand-derived and believed.
+  double landed = 0.0;  // HalfBoot's boundary constant, measured
   {
     Plaintext<word> raw_pt;
     boot.ui->Decrypt(raw_pt, lifted);
@@ -182,7 +183,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
         den += want * want;
       }
     }
-    const double landed = num / den;  // HalfBoot's boundary constant
+    landed = num / den;
     double live_err = 0.0, dead_max = 0.0, dead_neighbour = 0.0;
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < declared; c++) {
@@ -230,7 +231,13 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   // plain operation and stops being silent three layers later, inside
   // EvalPoly.
   const int op_level = land_level - 1;
-  const double restore = 1.0;  // no magnitude to put back in this stage
+  // 1.5bz's fold: HalfBoot divides the message by a fixed boundary constant
+  // (2^-4.98 there, measured again above), and `restore = 1 / c` in the mask
+  // puts it back for free. It is not optional here -- RMSNorm's polynomial is
+  // fitted on a window around one, and an input 32x too small lands its
+  // argument three orders below the window, where a Chebyshev fit is not an
+  // approximation of anything.
+  const double restore = 1.0 / landed;
   const double pt_scale = boot.param->GetScale(op_level) *
                           boot.param->GetRescalePrimeProd(land_level) /
                           lifted.GetScale();
