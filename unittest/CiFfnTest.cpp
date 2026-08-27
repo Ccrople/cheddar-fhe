@@ -1054,7 +1054,13 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   };
 
   const int half = 0;  // heads 0..15; the other half is the same map shifted
-  const int t1_level = 5, t2_level = 4;
+  // ABOVE THE ZONE. CLAUDE.md: "ci16_35's alpha-12 basis puts every hoisted
+  // transform at levels 0..6 in 1.5x's num_accum == 1 zone (mod-Q noise,
+  // measured 1.8e+25 and pinned as a regression)". A `LinearTransform` IS a
+  // hoisted transform, and run at levels 5 and 4 these two returned 1e38 --
+  // the same failure, one decade worse. The leg's own exchange sits at 8 for
+  // exactly this reason and its floor is 7 (`Config::exchange_level`).
+  const int t1_level = 10, t2_level = 9;
   ASSERT_LE(t1_level, boot.param->max_level_);
 
   // ---- T1: chain layout -> the block's live addresses -------------------
