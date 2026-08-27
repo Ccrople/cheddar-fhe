@@ -254,9 +254,25 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
       comp[I][Rev(t, 7)] = x[static_cast<size_t>(t) * declared + c];
     }
   }
+  // THE CROSSING HAS AN INPUT BOUND AND IT IS NOT OPTIONAL. The banded
+  // recomposition sums two components, so unit-variance data reaches about 6
+  // in the coefficients, which is outside what ModRaise can carry: the first
+  // run of this test crossed at that magnitude and came back with a fitted
+  // boundary constant of 2^-8.15 against the true 2^-4.99, i.e. garbage that
+  // still decrypted. 1.5ca states the real leg's version as a bound -- "pre-
+  // RoPE |projection| <= 0.45" -- and a projection's output is sized to meet
+  // it. RMSNorm is invariant under x -> beta*x with alpha/beta^2 and
+  // eps*beta^2, so here the sizing is exactly free.
+  std::vector<double> coeffs = CiRecompose(comp, kRank, kTokens);
+  double coeff_max = 0.0;
+  for (double v : coeffs) coeff_max = std::max(coeff_max, std::abs(v));
+  const double beta = 0.4 / coeff_max;
+  for (double &v : coeffs) v *= beta;
+  std::cout << "coefficients reach " << coeff_max << ", so beta = " << beta
+            << " puts the crossing at 0.4" << std::endl;
+
   Plaintext<word> pt;
-  boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0),
-                                     CiRecompose(comp, kRank, kTokens));
+  boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), coeffs);
   Ciphertext<word> ct;
   boot.ui->Encrypt(ct, pt);
   ct.SetNumSlots(num_slots);
@@ -279,7 +295,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
     double num = 0.0, den = 0.0;
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < declared; c += 2) {
-        const double want = x[static_cast<size_t>(t) * declared + c];
+        const double want = beta * x[static_cast<size_t>(t) * declared + c];
         num += raw[c * kTokens + Rev(t, 7)].real() * want;
         den += want * want;
       }
@@ -291,7 +307,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
         const double got = raw[c * kTokens + Rev(t, 7)].real();
         if (c % 2 == 0) {
           const double want =
-              landed * x[static_cast<size_t>(t) * declared + c];
+              landed * beta * x[static_cast<size_t>(t) * declared + c];
           live_err = std::max(live_err, std::abs(got - want));
         } else {
           dead_max = std::max(dead_max, std::abs(got));
@@ -300,7 +316,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
           const int I = Rev(c, 9);
           const int p = Rev(t, 7);
           const double neighbour =
-              (p + 1 < kTokens) ? comp[kRank - I][p + 1] : 0.0;
+              (p + 1 < kTokens) ? beta * comp[kRank - I][p + 1] : 0.0;
           dead_neighbour =
               std::max(dead_neighbour, std::abs(got - landed * neighbour));
         }
@@ -344,7 +360,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   // fitted on a window around one, and an input 32x too small lands its
   // argument three orders below the window, where a Chebyshev fit is not an
   // approximation of anything.
-  const double restore = 1.0 / landed;
+  const double restore = 1.0 / (landed * beta);
   const double pt_scale = boot.param->GetScale(op_level) *
                           boot.param->GetRescalePrimeProd(land_level) /
                           lifted.GetScale();
