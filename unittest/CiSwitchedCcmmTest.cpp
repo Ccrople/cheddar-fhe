@@ -9061,7 +9061,38 @@ ledger("before the FFN context");
   ledger("FFN context up");
 
   // ---- the seam: chain layout -> the block's banded half-density image --
-  const int t1_level = 10, t2_level = 9;
+  // T1 IS A BIT PERMUTATION OF THE SLOT INDEX, and running it as one
+  // transform was the whole of the seam's memory. Written out, the chain
+  // address `rev4(col) * 4096 + rev7(row) * 32 + lane` and the block address
+  // `row + 128 * (rev4(col) * 32 + rev5(lh))` agree on the column field and
+  // differ by six TRANSPOSITIONS of index bits -- (11,0) (10,1) (9,2) (8,3)
+  // (6,5) (7,4) -- plus a shift of 128 for the upper half, because the
+  // transposition puts `half` at destination bit 7 where the packing wants a
+  // zero. That is exactly why the one-shot count was 486: a transposition
+  // contributes offsets {0, +-(2^i - 2^j)}, so six of them give 3^6 = 729
+  // combinations, and the fixed source bit 4 collapses one factor to two:
+  // 2 * 3^5 = 486, measured to the digit.
+  //
+  // Splitting the six across stages multiplies out far less. Searched on the
+  // host over every ordered partition, minimising rotation keys:
+  //
+  //     one stage    486 diagonals, 192 keys   (BSGS 128x64)
+  //     two stages   165 diagonals, 100 keys
+  //     three        60 diagonals,   56 keys   <-- this
+  //
+  // The stages are (11,0) | (10,1) | (9,2) (8,3) (6,5) (7,4), at 3, 3 and 54
+  // diagonals. Each costs a level, and the levels are there: 12/11/10 for T1
+  // and 9 for T2 leaves the output at 8, one above `SlotToCoeff`'s 7 under
+  // slack 12 -- and every one of them is above 7, which is where ci16_35's
+  // hoisted transforms stop working (1.5bt).
+  const std::vector<std::vector<std::pair<int, int>>> t1_stages = {
+      {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
+  const int t1_top = 12, t2_level = 9;
+  const int t1_level = t1_top;  // the level the seam's input is brought to
+  auto swap_bits = [](int x, int i, int j) {
+    if (((x >> i) & 1) != ((x >> j) & 1)) x ^= (1 << i) | (1 << j);
+    return x;
+  };
   cheddar::SylphSchedule<word> sched(fctx, num_slots);
   std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
             << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
@@ -9113,37 +9144,63 @@ ledger("before the FFN context");
   // front only kept 2.9 GB pinned for the whole run. `make_t1` is called
   // inside the half loop below and its result dies at the end of it.
   std::unique_ptr<cheddar::LinearTransform<word>> seam_t2;
-  std::vector<int> back1(2, 0);
   int back2 = 0;
-  std::unique_ptr<cheddar::LinearTransform<word>> seam_t1_cur;
+  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> seam_t1_cur;
+  std::vector<int> back1_stage;
   auto make_t1 = [&](int half) {
-    cheddar::StripedMatrix m1(n, n);
+    seam_t1_cur.clear();
+    back1_stage.assign(t1_stages.size(), 0);
+    // The live source addresses, walked through the stages. A stage's matrix
+    // is built from where its inputs are and where it sends them, so the
+    // composition is checked by construction rather than re-derived.
+    std::vector<int> cur;
+    cur.reserve(static_cast<size_t>(layout.rank) * 16 * layout.dim);
     for (int col = 0; col < layout.rank; col++) {
       for (int lh = 0; lh < 16; lh++) {
-        const int lane = half * 16 + lh;
-        const int c = chan_of(col, lh);
         for (int row = 0; row < layout.dim; row++) {
-          const int dst = slot_block(row, c);
-          const int off =
-              ((slot_chain(row, col, lane) - dst) % n + n) % n;
-          m1.try_emplace(off, n, Complex(0.0, 0.0));
-          m1[off][dst] = Complex(1.0, 0.0);
+          cur.push_back(slot_chain(row, col, half * 16 + lh));
         }
       }
     }
-    int need = 0;
-    const int w = best_window(m1, &need);
-    const auto sp = split(need);
-    seam_t1_cur = std::make_unique<cheddar::LinearTransform<word>>(
-        boot_ffn.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
-        w, -w);
-    back1[half] = ((w % n) + n) % n;
-    std::cout << "  seam T1[" << half << "]: " << m1.GetNumDiag()
-              << " diagonals, " << sp.first << "x" << sp.second << std::endl;
-    cheddar::EvkRequest req;
-    seam_t1_cur->AddRequiredRotations(req);
-    req.AddRequest(back1[half], t1_level - 1);
-    boot.ui->PrepareRotationKey(req);
+    for (size_t st = 0; st < t1_stages.size(); st++) {
+      const bool last = (st + 1 == t1_stages.size());
+      std::vector<int> mid(cur.size());
+      cheddar::StripedMatrix ms(n, n);
+      for (size_t e = 0; e < cur.size(); e++) {
+        int y = cur[e];
+        for (const auto &sw : t1_stages[st]) y = swap_bits(y, sw.first, sw.second);
+        if (last) y -= 128 * half;  // destination bit 7 is a zero, not `half`
+        mid[e] = y;
+        const int off = ((cur[e] - y) % n + n) % n;
+        ms.try_emplace(off, n, Complex(0.0, 0.0));
+        ms[off][y] = Complex(1.0, 0.0);
+      }
+      int need = 0;
+      const int w = best_window(ms, &need);
+      const auto sp = split(need);
+      const int lvl = t1_top - static_cast<int>(st);
+      seam_t1_cur.push_back(std::make_unique<cheddar::LinearTransform<word>>(
+          boot_ffn.context, ms, lvl, pt_scale(lvl), sp.first, sp.second, w, -w));
+      back1_stage[st] = ((w % n) + n) % n;
+      std::cout << "  seam T1[" << half << "] stage " << st << ": "
+                << ms.GetNumDiag() << " diagonals, " << sp.first << "x"
+                << sp.second << " at level " << lvl << std::endl;
+      cheddar::EvkRequest req;
+      seam_t1_cur.back()->AddRequiredRotations(req);
+      req.AddRequest(back1_stage[st], lvl - 1);
+      boot.ui->PrepareRotationKey(req);
+      cur.swap(mid);
+    }
+    // The last stage must land exactly on the block's live addresses.
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        for (int row = 0; row < layout.dim; row++) {
+          const size_t e = (static_cast<size_t>(col) * 16 + lh) * layout.dim + row;
+          ASSERT_EQ(cur[e], slot_block(row, chan_of(col, lh)))
+              << "the staged bit permutation is not T1";
+        }
+      }
+    }
   };
   {
     cheddar::StripedMatrix m2(n, n);
@@ -9191,13 +9248,20 @@ ledger("before the FFN context");
     make_t1(half);
     for (int bi = 0; bi < layout.num_cts; bi++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
-      boot_ffn.context->LevelDown(low, booted[bi], t1_level);
-      seam_t1_cur->Evaluate(boot_ffn.context, a2, low, boot.ui->GetEvkMap());
-      if (back1[half]) {
-        Ciphertext<word> r;
-        boot_ffn.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
-                                      back1[half]), back1[half]);
-        a2 = std::move(r);
+      boot_ffn.context->LevelDown(low, booted[bi], t1_top);
+      a2 = std::move(low);
+      for (size_t st = 0; st < seam_t1_cur.size(); st++) {
+        Ciphertext<word> next;
+        seam_t1_cur[st]->Evaluate(boot_ffn.context, next, a2,
+                                  boot.ui->GetEvkMap());
+        if (back1_stage[st]) {
+          Ciphertext<word> r;
+          boot_ffn.context->HRot(
+              r, next, boot.ui->GetEvkMap().GetRotationKey(back1_stage[st]),
+              back1_stage[st]);
+          next = std::move(r);
+        }
+        a2 = std::move(next);
       }
       boot_ffn.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
       seam_t2->Evaluate(boot_ffn.context, dup, sh, boot.ui->GetEvkMap());
@@ -9219,7 +9283,7 @@ ledger("before the FFN context");
       boot_ffn.context->Add(sum, live, dup);
       sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
     }
-    seam_t1_cur.reset();
+    seam_t1_cur.clear();
   }
   booted.clear();
   booted.shrink_to_fit();
