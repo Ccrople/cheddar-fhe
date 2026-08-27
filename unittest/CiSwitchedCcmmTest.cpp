@@ -8726,7 +8726,25 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   }
 
   const double w_scale = boot.param->GetRescalePrimeProd(pcmm_level);
+  // THE PROJECTION ROWS, SPLIT THREE WAYS. 1.5cr's estimate says this is where
+  // R+ loses to the ordinary ring -- half density doubles the ciphertext count,
+  // so a layer pays 192 HalfBoots against 84 pair-HalfBoots -- and the layer
+  // ledger below has never covered it, because the emissions happen before the
+  // handler exists. The weight marshalling and `EncodeMatrix` are ONE-TIME, a
+  // layer's weights being fixed; the mix, the pack and the crossing are the
+  // online cost, and the crossing is the row the estimate is about.
+  double t_encode = 0.0, t_mix = 0.0, t_hb = 0.0;
+  int n_emit = 0;
+  auto tick = [] {
+    cudaDeviceSynchronize();
+    return std::chrono::steady_clock::now();
+  };
+  auto span_ms = [](const std::chrono::steady_clock::time_point &a,
+                    const std::chrono::steady_clock::time_point &b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   auto emit_half = [&](const W &w, int l, int fam, Ciphertext<word> &out) {
+    const auto e0 = tick();
     std::vector<double> vals(static_cast<size_t>(proj_rank) * in_ch, 0.0);
     for (int hh = 0; hh < 16; hh++) {
       for (int cp = 0; cp < 16; cp++) {
@@ -8739,13 +8757,20 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
     cheddar::PlainMatrix<word> u;
     pcmm.EncodeMatrix(u, pcmm_level, w_scale, vals, proj_rank, in_ch);
+    const auto e1 = tick();
     std::vector<cheddar::MlweCiphertext<word>> mixed;
     pcmm.Multiply(mixed, u, x_parts);
     Ciphertext<word> packed, dropped;
     mlwe.ModPack(boot.context, packed, mixed, pack_keys);
     boot.context->Rescale(dropped, packed);
     dropped.SetNumSlots(num_slots);
+    const auto e2 = tick();
     bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap());
+    const auto e3 = tick();
+    t_encode += span_ms(e0, e1);
+    t_mix += span_ms(e1, e2);
+    t_hb += span_ms(e2, e3);
+    n_emit++;
   };
 
   std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8),
@@ -8759,6 +8784,10 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     emit_half(wv, l, 1, v_b[l]);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  std::cout << "  [time] Q/K/V over " << n_emit
+            << " emissions: ONE-TIME weight encode " << t_encode
+            << " ms, ONLINE mix+pack+rescale " << t_mix
+            << " ms, ONLINE HalfBoot " << t_hb << " ms" << std::endl;
   EXPECT_NEAR(q_a[0].GetScale() / bctx->GetStCInputScale(), 1.0, 1e-9);
 
   double hb_const = 0.0;
