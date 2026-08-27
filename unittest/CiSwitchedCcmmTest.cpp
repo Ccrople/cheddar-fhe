@@ -9023,8 +9023,15 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // the switching ring is: a second Context over the SAME primes holding the
   // SAME secret, so a ciphertext crosses between them without a word
   // changing. Here the two differ only in slack.
+  // SLACK TWELVE, NOT NINE, AND THE REASON IS MEMORY. The seam's 192
+  // rotation keys are the layer's largest single key demand, and a key's
+  // size is its level's limb count; more slack puts StC lower, which lets
+  // the seam sit lower, which makes those keys smaller. Nine put the seam at
+  // 13/12 and the run died in the pool; twelve puts it at 10/9. The FFN's
+  // own stages still fit -- RMSNorm leaves 11 against StC's 7 -- and
+  // `GetCoeffLevel()` is 4, still above the product level.
   Ring boot_ffn(kBootParam, boot.ui->GetSecretCoeffs(),
-                /*boot_slack_levels=*/9);
+                /*boot_slack_levels=*/12);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
   ASSERT_NE(fctx, nullptr);
   fctx->PrepareEvalMod();
@@ -9036,7 +9043,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   }
 
   // ---- the seam: chain layout -> the block's banded half-density image --
-  const int t1_level = 13, t2_level = 12;
+  const int t1_level = 10, t2_level = 9;
   cheddar::SylphSchedule<word> sched(fctx, num_slots);
   std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
             << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
