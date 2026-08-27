@@ -161,20 +161,20 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
   std::mt19937_64 gen(0x5117C4);
   std::normal_distribution<double> xd(0.0, 1.0);
   std::normal_distribution<double> wd(0.0, 0.0175);  // Llama-3's W_Q RMS
-  std::vector<double> x(static_cast<size_t>(kTokens) * kInChannels);
-  std::vector<double> w(static_cast<size_t>(kInChannels) * kOutChannels);
+  std::vector<double> x(static_cast<size_t>(kTokens) * in_channels);
+  std::vector<double> w(static_cast<size_t>(in_channels) * kOutChannels);
   for (auto &v : x) v = xd(gen);
   for (auto &v : w) v = wd(gen);
   // RMSNorm the activation, as the block does before this product.
   for (int t = 0; t < kTokens; t++) {
     double sq = 0.0;
-    for (int c = 0; c < kInChannels; c++) {
-      const double v = x[static_cast<size_t>(t) * kInChannels + c];
+    for (int c = 0; c < in_channels; c++) {
+      const double v = x[static_cast<size_t>(t) * in_channels + c];
       sq += v * v;
     }
-    const double inv = 1.0 / std::sqrt(sq / kInChannels + 1e-5);
-    for (int c = 0; c < kInChannels; c++) {
-      x[static_cast<size_t>(t) * kInChannels + c] *= inv;
+    const double inv = 1.0 / std::sqrt(sq / in_channels + 1e-5);
+    for (int c = 0; c < in_channels; c++) {
+      x[static_cast<size_t>(t) * in_channels + c] *= inv;
     }
   }
 
@@ -183,8 +183,8 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
   for (int t = 0; t < kTokens; t++) {
     for (int o = 0; o < kOutChannels; o++) {
       double acc = 0.0;
-      for (int c = 0; c < kInChannels; c++) {
-        acc += x[static_cast<size_t>(t) * kInChannels + c] *
+      for (int c = 0; c < in_channels; c++) {
+        acc += x[static_cast<size_t>(t) * in_channels + c] *
                w[static_cast<size_t>(c) * kOutChannels + o];
       }
       want[static_cast<size_t>(t) * kOutChannels + o] = acc;
@@ -239,7 +239,7 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
     EXPECT_EQ(leg.GetSubRank(), sub_rank);
 
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, parents, in_channels, kOutChannels, w, 1.0, "switched");
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
     EXPECT_EQ(block.param->NPToLevel(res[0].GetNP()), 0)
         << "the product spends exactly one level however it descends";
@@ -285,7 +285,7 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
     ProjectOnlyLeg leg(block.context, direct_cfg, big_keys);
     EXPECT_FALSE(leg.IsRingSwitched());
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, parents, in_channels, kOutChannels, w, 1.0, "direct");
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
     ReadBack(got_direct, res, block, rank, num_slots);
   }
@@ -328,44 +328,57 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
 // ===========================================================================
 // The same projection on the conjugate-invariant ring, both descents.
 //
-// THE ANSWER IS NOT THE COST, IT IS THAT ONE OF THEM DOES NOT COMPUTE THE
-// PROJECTION. The direct route is exact to 24.3 bits; the ring-switched one
-// disagrees with the host product by 3.8 relative. See the pinned assertion
-// below for why -- composing two banded scans at ranks 16 and 32 is not the
-// rank-512 banded scan, and `Component()`'s permutation cannot express the
-// difference. 1.5bi's `RingSwitch.DescendsToTheProjectionShapeAndReturns`
-// validated the switched chain against "the same composition of maps on the
-// host", i.e. against whatever the composition gives -- not against the
-// channel indexing a projection has to honour. This test is the difference.
-//
-// Doing.md 1.5bi built both routes on R+ and measured their noise -- 5.7e-06
-// direct against 1.8-2.4e-05 switched, ~1.5-2 bits apart -- and then left the
-// choice open, on cost: "That trade is the leg's to measure; the ordinary
-// branch's answer (the ring switch won by 3.0 s, 1.5au) does not port
-// unexamined because the CI shapes halve the ciphertext count and double the
-// rank." This is that measurement, taken through `CoeffLinearLeg` rather than
-// by hand, so what is timed is the projection the block would actually call.
-//
-// THE SHAPE. On R+ a ciphertext holds `degree` real slots, so at T = 128 the
-// block puts 512 channels in one and `SmallDegreeFor` is T rather than 2T:
+// [SYLPH] section 3.2's descent DOES port to R+ -- but not as the reindexing
+// it is on the ordinary ring, and the difference is what this test pins.
 //
 //     direct      65536 --ModDecomp(rank 512)--------------------> 128
 //     switched    65536 --RingSwitch(16)--> 4096 --ModDecomp(32)--> 128
 //
-// THE CONTRACT, AND IT IS NOT THE ORDINARY ONE. On the ordinary ring
-// ModDecomp splits coefficients by residue -- component `i`, position `t`, is
-// coefficient `i + rank*t` -- and the block can hand the leg a plainly packed
-// ciphertext. On R+ the module basis is not the monomials and the split is a
-// banded scan (1.5ba): what ModPack writes at coefficient `t*rank + i` is
-// `comp_i[t] + comp_{rank-i}[t+1]`, and ModDecomp is its inverse. So the
-// parent this test encrypts is the banded RECOMPOSITION of the block's
-// packing, and the result is read back through the inverse scan.
+// ON THE ORDINARY RING both decompositions split coefficients by residue, so
+// the two strides compose as an index identity and `CoeffLinearLeg::
+// Component` -- one permutation of the plaintext -- is the whole difference
+// between the routes.
 //
-// That is not a wrinkle of the test. It composes: `R` and `S` are inverse, so
-// one projection's ModPack output is exactly the next projection's ModDecomp
-// input, and the whole coefficient-domain leg is closed under it. What it
-// costs is the half-density rule of 1.5by at the one place the payload has to
-// be READ as slots -- which is the bootstrap, not this product.
+// ON R+ NEITHER IS A SPLIT. The module basis is not the monomials but the
+// Chebyshev elements `c_m = Y^m + Y^-m`, and `c_a c_b = c_{a+b} + c_{a-b}`,
+// so the composed basis element for the two-stage index `(j, n)` is
+//
+//     c_{ring_rank * n + j}  +  c_{|ring_rank * n - j|}
+//
+// -- a SUM of two one-stage components, not one of them. Enumerated on a
+// miniature ring (D = 32 at 2 x 4) and confirmed at D = 256 at 4 x 8: the
+// ordinary formula returns exactly the first of the two and the second is
+// missing. Measured on the device before the fix, the switched route
+// disagreed with the host product by 3.8 relative at half density and 5.8 at
+// full, while the direct route was exact to 24.3 bits on the same
+// ciphertexts. No permutation repairs that; a two-term sum is not a
+// relabelling. (Half density does not repair it either -- it repairs the
+// READ, 1.5by, where the pairing is at the big rank and the dead half kills
+// the partner; here the pairing happens twice, at ranks 16 and 32, and a
+// big-rank half-density set is scattered in both.)
+//
+// WHAT REPAIRS IT is refusing the question. Nothing forces the channel to be
+// a one-stage module component -- the block chooses its packing. Declaring
+// the channel to be the TWO-STAGE index makes the switched descent exact:
+// the decomposition hands back what the recomposition put in, the mix is a
+// scalar combination of those, and one projection's output is the next
+// one's input under the same convention, so it composes across the whole
+// coefficient-domain leg. The price is paid only where the payload is read
+// as slots: each channel then appears at two coefficient addresses,
+// `ring_rank*n + j` and `|ring_rank*n - j|`, ADDED -- exactly the structure
+// Doing.md 1.5bp found for the CC-MM chain's nested operand, resolved the
+// same way, by the layout rather than by a transform.
+//
+// So the two routes are read in DIFFERENT packings here and compared on the
+// channels, which is the only thing a projection promises.
+//
+// 1.5bi's `RingSwitch.DescendsToTheProjectionShapeAndReturns` validated the
+// switched chain against "the same composition of maps on the host" -- i.e.
+// against whatever the composition gives, not against a channel indexing.
+// That is why this went unnoticed until a projection asked for it.
+//
+// CHEDDAR_CI_IN_CHANNELS sets the contraction width, which is the only knob
+// that moves the trade: ModPack is width-independent and the PP-MM is not.
 // ===========================================================================
 
 namespace {
@@ -446,7 +459,7 @@ double SecondsSince(const std::chrono::steady_clock::time_point &t0) {
 
 }  // namespace
 
-TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
+TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   const char *big_param = std::getenv("CHEDDAR_CI_SWITCH_PARAM");
   const char *small_param = std::getenv("CHEDDAR_CI_SMALL_PARAM");
   Ring block(big_param && big_param[0] ? big_param
@@ -463,7 +476,9 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   const int rank = degree / ci_small_degree;          // 512 channels per ct
   const int ring_rank = degree / mid_degree;          // 16
   const int sub_rank = mid_degree / ci_small_degree;  // 32
-  const int num_parents = kInChannels / rank;
+  const char *width = std::getenv("CHEDDAR_CI_IN_CHANNELS");
+  const int in_channels = width ? std::atoi(width) : kInChannels;
+  const int num_parents = in_channels / rank;
 
   ASSERT_EQ(num_slots, degree) << "R+ gives `degree` real slots";
   ASSERT_EQ(ci_small_degree, kTokens)
@@ -479,8 +494,8 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   std::mt19937_64 gen(0xC15117);
   std::normal_distribution<double> xd(0.0, 1.0);
   std::normal_distribution<double> wd(0.0, 0.0175);  // Llama-3's W_Q RMS
-  std::vector<double> x(static_cast<size_t>(kTokens) * kInChannels);
-  std::vector<double> w(static_cast<size_t>(kInChannels) * kOutChannels);
+  std::vector<double> x(static_cast<size_t>(kTokens) * in_channels);
+  std::vector<double> w(static_cast<size_t>(in_channels) * kOutChannels);
   for (auto &v : x) v = xd(gen);
   for (auto &v : w) v = wd(gen);
 
@@ -503,11 +518,11 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   const bool half_density = std::getenv("CHEDDAR_CI_FULL_DENSITY") == nullptr;
   if (half_density) {
     for (int t = 0; t < kTokens; t++) {
-      for (int c = 1; c < kInChannels; c += 2) {
-        x[static_cast<size_t>(t) * kInChannels + c] = 0.0;
+      for (int c = 1; c < in_channels; c += 2) {
+        x[static_cast<size_t>(t) * in_channels + c] = 0.0;
       }
     }
-    for (int c = 0; c < kInChannels; c++) {
+    for (int c = 0; c < in_channels; c++) {
       for (int o = 0; o < kOutChannels; o++) {
         if ((c % 2) || (o % 2)) w[static_cast<size_t>(c) * kOutChannels + o] = 0.0;
       }
@@ -517,13 +532,13 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
             << " density" << std::endl;
   for (int t = 0; t < kTokens; t++) {
     double sq = 0.0;
-    for (int c = 0; c < kInChannels; c++) {
-      const double v = x[static_cast<size_t>(t) * kInChannels + c];
+    for (int c = 0; c < in_channels; c++) {
+      const double v = x[static_cast<size_t>(t) * in_channels + c];
       sq += v * v;
     }
-    const double inv = 1.0 / std::sqrt(sq / kInChannels + 1e-5);
-    for (int c = 0; c < kInChannels; c++) {
-      x[static_cast<size_t>(t) * kInChannels + c] *= inv;
+    const double inv = 1.0 / std::sqrt(sq / in_channels + 1e-5);
+    for (int c = 0; c < in_channels; c++) {
+      x[static_cast<size_t>(t) * in_channels + c] *= inv;
     }
   }
 
@@ -532,8 +547,8 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   for (int t = 0; t < kTokens; t++) {
     for (int o = 0; o < kOutChannels; o++) {
       double acc = 0.0;
-      for (int c = 0; c < kInChannels; c++) {
-        acc += x[static_cast<size_t>(t) * kInChannels + c] *
+      for (int c = 0; c < in_channels; c++) {
+        acc += x[static_cast<size_t>(t) * in_channels + c] *
                w[static_cast<size_t>(c) * kOutChannels + o];
       }
       want[static_cast<size_t>(t) * kOutChannels + o] = acc;
@@ -555,7 +570,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
         const int k = AttentionPacking::CoeffOfSlot(
             {t + kTokens * c, false}, degree, /*conjugate_invariant=*/true);
         comp[k % rank][k / rank] =
-            x[static_cast<size_t>(t) * kInChannels + parent * rank + c];
+            x[static_cast<size_t>(t) * in_channels + parent * rank + c];
       }
     }
     return comp;
@@ -659,9 +674,9 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
 
     const auto sw_parents = encode_parents(/*two_stage=*/true);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, sw_parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, in_channels, kOutChannels, w, 1.0, "switched");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, sw_parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, in_channels, kOutChannels, w, 1.0, "switched");
     sw_seconds = SecondsSince(t0);
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
     EXPECT_EQ(block.param->NPToLevel(res[0].GetNP()), kLevel - 1);
@@ -715,9 +730,9 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
     EXPECT_FALSE(leg.IsRingSwitched());
     const auto dir_parents = encode_parents(/*two_stage=*/false);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, dir_parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, in_channels, kOutChannels, w, 1.0, "direct");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, dir_parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, in_channels, kOutChannels, w, 1.0, "direct");
     dir_seconds = SecondsSince(t0);
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
     read_back(got_direct, res, /*two_stage=*/false);
