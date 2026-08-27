@@ -1167,7 +1167,8 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
     cheddar::EvkRequest req;
     t1.AddRequiredRotations(req);
     t2.AddRequiredRotations(req);
-    req.AddRequest(1, t2_level);  // the token shift
+    req.AddRequest(1, t2_level);           // the token shift
+    req.AddRequest(degree - 1, t2_level);  // and the other direction
     // The window convention leaves the result rotated: `additional_pt_rot`
     // shifts every plaintext, so the caller pays one closing rotation, as
     // `CiSinCAttention::ExchangeAll` does (1.5by).
@@ -1211,6 +1212,11 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   Ciphertext<word> a, shifted, dup, live, b;
   t1.Evaluate(boot.context, a, ct, boot.ui->GetEvkMap());
   close(a, back1);
+  // The token shift's direction is the last 50/50 in the seam, and it costs
+  // one key switch to settle, so both are run and both are reported rather
+  // than guessed and re-run.
+  const int shift = std::getenv("CHEDDAR_SEAM_SHIFT_BACK") ? degree - 1 : 1;
+  std::cout << "  token shift by " << shift << std::endl;
   std::cout << "  after T1: level " << boot.param->NPToLevel(a.GetNP())
             << ", scale / canonical "
             << (a.GetScale() /
@@ -1218,8 +1224,8 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
             << std::endl;
   // The token shift, then the channel permutation, then the sum with the
   // live image itself. HRot by 1 brings slot s + 1 down to slot s.
-  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1),
-                     1);
+  boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(shift),
+                     shift);
   t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
   close(dup, back2);
   // The live image has to meet `dup` at the same level AND the same scale,
