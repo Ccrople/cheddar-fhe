@@ -326,7 +326,17 @@ TEST(SwitchedProjection, TheDescentAgreesWithTheDirectRouteAndWithTheHost) {
 }
 
 // ===========================================================================
-// The same projection on the conjugate-invariant ring, both descents, timed.
+// The same projection on the conjugate-invariant ring, both descents.
+//
+// THE ANSWER IS NOT THE COST, IT IS THAT ONE OF THEM DOES NOT COMPUTE THE
+// PROJECTION. The direct route is exact to 24.3 bits; the ring-switched one
+// disagrees with the host product by 3.8 relative. See the pinned assertion
+// below for why -- composing two banded scans at ranks 16 and 32 is not the
+// rank-512 banded scan, and `Component()`'s permutation cannot express the
+// difference. 1.5bi's `RingSwitch.DescendsToTheProjectionShapeAndReturns`
+// validated the switched chain against "the same composition of maps on the
+// host", i.e. against whatever the composition gives -- not against the
+// channel indexing a projection has to honour. This test is the difference.
 //
 // Doing.md 1.5bi built both routes on R+ and measured their noise -- 5.7e-06
 // direct against 1.8-2.4e-05 switched, ~1.5-2 bits apart -- and then left the
@@ -408,7 +418,7 @@ double SecondsSince(const std::chrono::steady_clock::time_point &t0) {
 
 }  // namespace
 
-TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
+TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   const char *big_param = std::getenv("CHEDDAR_CI_SWITCH_PARAM");
   const char *small_param = std::getenv("CHEDDAR_CI_SMALL_PARAM");
   Ring block(big_param && big_param[0] ? big_param
@@ -600,7 +610,7 @@ TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
     EXPECT_EQ(leg.GetSubRank(), sub_rank);
 
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "warm");
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
     const auto t0 = std::chrono::steady_clock::now();
     leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
     sw_seconds = SecondsSince(t0);
@@ -614,8 +624,33 @@ TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const double sw_max =
       report("ring-switched", got_switched, sw_seconds, kOutChannels / rank);
-  EXPECT_LT(sw_max / want_max, 1e-3)
-      << "the ring-switched projection disagrees with the host product";
+  // THE FINDING, PINNED AS A REGRESSION.
+  //
+  // On the ordinary ring both decompositions split coefficients by residue,
+  // so composing the two strides is an index identity and `Component()` --
+  // one permutation of the plaintext -- is the whole difference between the
+  // routes. On R+ neither is a split: both are banded scans, pairing
+  // component `i` with `rank - i` at their OWN rank. Composing a rank-16
+  // scan with a rank-32 one is not a rank-512 scan, it is the rank-512 scan
+  // of a two-term sum (Doing.md 1.5bp's `g`), and no permutation of the
+  // plaintext expresses that. Measured: the switched route disagrees with
+  // the host product by 3.8 relative at half density and 5.8 at full, while
+  // the direct route is exact to 24.3 bits on the same ciphertexts.
+  //
+  // Half density does NOT rescue it, which is the part worth keeping. It
+  // rescues the READ (1.5by) because there the pairing is at the big rank
+  // and the dead half kills the partner. Here the pairing happens twice, at
+  // ranks 16 and 32, and a half-density set in big-rank terms is scattered
+  // in both -- neither partner is dead.
+  //
+  // So [SYLPH] section 3.2's descent does not port to R+ as a reindexing,
+  // and the CI leg takes the direct route. This assertion is the wrong way
+  // round on purpose: if someone derives the composition and fixes
+  // `Component()`, this fails and they delete it.
+  EXPECT_GT(sw_max / want_max, 1e-2)
+      << "the ring-switched descent now AGREES with the host product on R+, "
+         "which means the banded composition has been solved -- update this "
+         "test and Doing.md 1.5cq rather than deleting the assertion";
 
   // ---- the direct route, 512 ModPack keys at the block's degree ----------
   block.ui->PrepareModPackKeys(ci_small_degree, kLevel);
@@ -632,7 +667,7 @@ TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
     ProjectOnlyLeg leg(block.context, direct_cfg, big_keys);
     EXPECT_FALSE(leg.IsRingSwitched());
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "warm");
+    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
     const auto t0 = std::chrono::steady_clock::now();
     leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
     dir_seconds = SecondsSince(t0);
@@ -658,7 +693,11 @@ TEST(SwitchedProjection, TheConjugateInvariantDescentIsAChoiceOnCost) {
             << " keys at degree " << degree << "; noise "
             << -std::log2(sw_max / want_max) << " vs "
             << -std::log2(dir_max / want_max) << " bits" << std::endl;
-  EXPECT_LT(gap / want_max, 1e-3)
-      << "the two descents computed different products, which means the "
-         "component reindexing is wrong rather than the arithmetic";
+  EXPECT_GT(gap / want_max, 1e-2)
+      << "the two R+ descents now agree; see above";
+
+  // What DOES have to hold: the direct route is the leg's route on R+, so
+  // its agreement with the host product is a real assertion and not a pin.
+  EXPECT_LT(dir_max / want_max, 1e-5)
+      << "the direct conjugate-invariant projection is what the leg runs";
 }
