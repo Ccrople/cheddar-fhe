@@ -533,12 +533,42 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
     return comp;
   };
 
+  // THE g-COMPOSED PACKING, the one hypothesis that could rescue the
+  // switched route. 1.5bp: the two-stage recomposition equals the one-stage
+  // recomposition of `g(x)`, where `g(x)_I[t] = x_I[t] + [I!=0]
+  // x_{rank-I}[t+1]` -- which is `CiRecompose` read as a component map. So
+  // if the parent carries `R(g(comp))` instead of `R(comp)`, the two-stage
+  // DECOMPOSITION hands back `comp` exactly, the mix is clean, and the
+  // two-stage recomposition emits `R(g(U comp))` -- which is again the
+  // g-composed packing of the product. It COMPOSES: one projection's output
+  // is the next one's input under the same convention, so if this works the
+  // whole coefficient-domain leg can adopt it and Sylph's descent ports
+  // after all. Applying `g` is applying `CiRecompose` a second time, and
+  // undoing it is applying `CiComponents` a second time; both are free
+  // host-side relabellings of a packing the block chooses anyway.
+  const bool g_packing = std::getenv("CHEDDAR_CI_G_PACKING") != nullptr;
+  std::cout << "  packing: " << (g_packing ? "g-composed (1.5bp)" : "plain")
+            << std::endl;
+  auto as_components = [&](const std::vector<double> &flat) {
+    std::vector<std::vector<double>> c(rank,
+                                       std::vector<double>(ci_small_degree));
+    for (int i = 0; i < rank; i++) {
+      for (int t = 0; t < ci_small_degree; t++) {
+        c[i][t] = flat[static_cast<size_t>(t) * rank + i];
+      }
+    }
+    return c;
+  };
+
   std::vector<Ciphertext<word>> parents(num_parents);
   for (int p = 0; p < num_parents; p++) {
+    auto comp = pack_components(p);
+    if (g_packing) {
+      comp = as_components(CiRecompose(comp, rank, ci_small_degree));
+    }
     Plaintext<word> pt;
     block.context->encoder_.EncodeCoeff(
-        pt, kLevel, ct_scale,
-        CiRecompose(pack_components(p), rank, ci_small_degree));
+        pt, kLevel, ct_scale, CiRecompose(comp, rank, ci_small_degree));
     block.ui->Encrypt(parents[p], pt);
   }
 
@@ -550,7 +580,16 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
       block.ui->Decrypt(pt, res[g]);
       std::vector<double> coeffs;
       block.context->encoder_.DecodeCoeff(coeffs, pt);
-      const auto comp = CiComponents(coeffs, rank, ci_small_degree);
+      auto comp = CiComponents(coeffs, rank, ci_small_degree);
+      if (g_packing) {
+        std::vector<double> flat(static_cast<size_t>(rank) * ci_small_degree);
+        for (int i = 0; i < rank; i++) {
+          for (int t = 0; t < ci_small_degree; t++) {
+            flat[static_cast<size_t>(t) * rank + i] = comp[i][t];
+          }
+        }
+        comp = CiComponents(flat, rank, ci_small_degree);
+      }
       for (int c = 0; c < rank; c++) {
         for (int t = 0; t < kTokens; t++) {
           const int k = AttentionPacking::CoeffOfSlot(
