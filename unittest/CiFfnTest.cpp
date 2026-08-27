@@ -1133,13 +1133,18 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
             << ", needs " << need2 << " -> " << s2.first << "x" << s2.second
             << std::endl;
 
+  // The plaintext scale that leaves the output canonical one level down:
+  // Mult multiplies the scales and Rescale divides by the level's actual
+  // prime product, so this is the only choice that lands on GetScale(l - 1).
+  auto pt_scale = [&](int l) {
+    return boot.param->GetScale(l - 1) * boot.param->GetRescalePrimeProd(l) /
+           boot.param->GetScale(l);
+  };
   cheddar::LinearTransform<word> t1(
-      boot.context, m1, t1_level,
-      boot.param->GetRescalePrimeProd(t1_level), s1.first, s1.second,
+      boot.context, m1, t1_level, pt_scale(t1_level), s1.first, s1.second,
       /*pre_rotation=*/w1, /*additional_pt_rot=*/-w1);
   cheddar::LinearTransform<word> t2(
-      boot.context, m2, t2_level,
-      boot.param->GetRescalePrimeProd(t2_level), s2.first, s2.second,
+      boot.context, m2, t2_level, pt_scale(t2_level), s2.first, s2.second,
       /*pre_rotation=*/w2, /*additional_pt_rot=*/-w2);
   {
     cheddar::EvkRequest req;
@@ -1178,7 +1183,20 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   boot.context->HRot(shifted, a, boot.ui->GetEvkMap().GetRotationKey(1),
                      1);
   t2.Evaluate(boot.context, dup, shifted, boot.ui->GetEvkMap());
-  boot.context->LevelDown(live, a, boot.param->NPToLevel(dup.GetNP()));
+  // The live image has to meet `dup` at the same level AND the same scale,
+  // and LevelDown leaves a drift, so it comes down by the same multiply the
+  // transform used: a constant one at the scale that lands canonical.
+  {
+    const int dl = boot.param->NPToLevel(dup.GetNP());
+    cheddar::Constant<word> one;
+    boot.context->encoder_.EncodeConstant(
+        one, dl + 1,
+        boot.param->GetScale(dl) * boot.param->GetRescalePrimeProd(dl + 1) /
+            a.GetScale(),
+        1.0);
+    boot.context->Mult(live, a, one);
+    boot.context->Rescale(live, live);
+  }
   boot.context->Add(b, live, dup);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
