@@ -41,6 +41,7 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
       ring_rank_{1},
       sub_rank_{context->param_.degree_ /
                 SmallDegreeFor(cfg.num_tokens, context->param_)},
+      conjugate_invariant_{context->param_.conjugate_invariant_},
       modpack_keys_{std::move(modpack_keys)},
       mlwe_{context->param_, context->ntt_handler_},
       pcmm_{context->param_},

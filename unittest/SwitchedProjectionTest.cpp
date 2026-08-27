@@ -410,6 +410,34 @@ std::vector<std::vector<double>> CiComponents(const std::vector<double> &coeffs,
   return comp;
 }
 
+// The SAME two scans run in two stages, which is what the ring-switched
+// descent physically does: `ring_rank` parts of the big ring, each split at
+// `sub_rank`. Component `flat = j * sub_rank + n`.
+std::vector<double> CiRecomposeTwoStage(
+    const std::vector<std::vector<double>> &comp, int ring_rank, int sub_rank,
+    int small_degree) {
+  std::vector<std::vector<double>> parts(ring_rank);
+  for (int j = 0; j < ring_rank; j++) {
+    std::vector<std::vector<double>> sub(sub_rank);
+    for (int n = 0; n < sub_rank; n++) sub[n] = comp[j * sub_rank + n];
+    parts[j] = CiRecompose(sub, sub_rank, small_degree);
+  }
+  return CiRecompose(parts, ring_rank, sub_rank * small_degree);
+}
+
+std::vector<std::vector<double>> CiComponentsTwoStage(
+    const std::vector<double> &coeffs, int ring_rank, int sub_rank,
+    int small_degree) {
+  const auto parts =
+      CiComponents(coeffs, ring_rank, sub_rank * small_degree);
+  std::vector<std::vector<double>> comp(ring_rank * sub_rank);
+  for (int j = 0; j < ring_rank; j++) {
+    const auto sub = CiComponents(parts[j], sub_rank, small_degree);
+    for (int n = 0; n < sub_rank; n++) comp[j * sub_rank + n] = sub[n];
+  }
+  return comp;
+}
+
 double SecondsSince(const std::chrono::steady_clock::time_point &t0) {
   cudaDeviceSynchronize();
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
@@ -533,63 +561,44 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
     return comp;
   };
 
-  // THE g-COMPOSED PACKING, the one hypothesis that could rescue the
-  // switched route. 1.5bp: the two-stage recomposition equals the one-stage
-  // recomposition of `g(x)`, where `g(x)_I[t] = x_I[t] + [I!=0]
-  // x_{rank-I}[t+1]` -- which is `CiRecompose` read as a component map. So
-  // if the parent carries `R(g(comp))` instead of `R(comp)`, the two-stage
-  // DECOMPOSITION hands back `comp` exactly, the mix is clean, and the
-  // two-stage recomposition emits `R(g(U comp))` -- which is again the
-  // g-composed packing of the product. It COMPOSES: one projection's output
-  // is the next one's input under the same convention, so if this works the
-  // whole coefficient-domain leg can adopt it and Sylph's descent ports
-  // after all. Applying `g` is applying `CiRecompose` a second time, and
-  // undoing it is applying `CiComponents` a second time; both are free
-  // host-side relabellings of a packing the block chooses anyway.
-  const bool g_packing = std::getenv("CHEDDAR_CI_G_PACKING") != nullptr;
-  std::cout << "  packing: " << (g_packing ? "g-composed (1.5bp)" : "plain")
-            << std::endl;
-  auto as_components = [&](const std::vector<double> &flat) {
-    std::vector<std::vector<double>> c(rank,
-                                       std::vector<double>(ci_small_degree));
-    for (int i = 0; i < rank; i++) {
-      for (int t = 0; t < ci_small_degree; t++) {
-        c[i][t] = flat[static_cast<size_t>(t) * rank + i];
-      }
+  // THE PACKING IS THE ROUTE'S OWN, AND THAT IS THE FIX.
+  //
+  // Nothing forces the channel to be a ONE-stage module component -- the
+  // block chooses its packing. Declaring the channel to be the two-stage
+  // index makes the switched descent exact: the decomposition hands back
+  // what the recomposition put in, the mix is a scalar combination of
+  // those, and one projection's output is the next one's input under the
+  // same convention. Enumerated on miniature rings first (D = 32 at 2 x 4
+  // and D = 256 at 4 x 8, both exact to 1e-14) rather than derived on the
+  // device, which is 1.5bx's lesson.
+  auto encode_parents = [&](bool two_stage) {
+    std::vector<Ciphertext<word>> res(num_parents);
+    for (int p = 0; p < num_parents; p++) {
+      const auto comp = pack_components(p);
+      Plaintext<word> pt;
+      block.context->encoder_.EncodeCoeff(
+          pt, kLevel, ct_scale,
+          two_stage ? CiRecomposeTwoStage(comp, ring_rank, sub_rank,
+                                          ci_small_degree)
+                    : CiRecompose(comp, rank, ci_small_degree));
+      block.ui->Encrypt(res[p], pt);
     }
-    return c;
+    return res;
   };
 
-  std::vector<Ciphertext<word>> parents(num_parents);
-  for (int p = 0; p < num_parents; p++) {
-    auto comp = pack_components(p);
-    if (g_packing) {
-      comp = as_components(CiRecompose(comp, rank, ci_small_degree));
-    }
-    Plaintext<word> pt;
-    block.context->encoder_.EncodeCoeff(
-        pt, kLevel, ct_scale, CiRecompose(comp, rank, ci_small_degree));
-    block.ui->Encrypt(parents[p], pt);
-  }
-
   auto read_back = [&](std::vector<double> &out,
-                       const std::vector<Ciphertext<word>> &res) {
+                       const std::vector<Ciphertext<word>> &res,
+                       bool two_stage) {
     out.assign(static_cast<size_t>(kTokens) * kOutChannels, 0.0);
     for (size_t g = 0; g < res.size(); g++) {
       Plaintext<word> pt;
       block.ui->Decrypt(pt, res[g]);
       std::vector<double> coeffs;
       block.context->encoder_.DecodeCoeff(coeffs, pt);
-      auto comp = CiComponents(coeffs, rank, ci_small_degree);
-      if (g_packing) {
-        std::vector<double> flat(static_cast<size_t>(rank) * ci_small_degree);
-        for (int i = 0; i < rank; i++) {
-          for (int t = 0; t < ci_small_degree; t++) {
-            flat[static_cast<size_t>(t) * rank + i] = comp[i][t];
-          }
-        }
-        comp = CiComponents(flat, rank, ci_small_degree);
-      }
+      const auto comp =
+          two_stage ? CiComponentsTwoStage(coeffs, ring_rank, sub_rank,
+                                           ci_small_degree)
+                    : CiComponents(coeffs, rank, ci_small_degree);
       for (int c = 0; c < rank; c++) {
         for (int t = 0; t < kTokens; t++) {
           const int k = AttentionPacking::CoeffOfSlot(
@@ -648,17 +657,18 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
     EXPECT_EQ(leg.GetRingRank(), ring_rank);
     EXPECT_EQ(leg.GetSubRank(), sub_rank);
 
+    const auto sw_parents = encode_parents(/*two_stage=*/true);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, kInChannels, kOutChannels, w, 1.0, "switched");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, kInChannels, kOutChannels, w, 1.0, "switched");
     sw_seconds = SecondsSince(t0);
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
     EXPECT_EQ(block.param->NPToLevel(res[0].GetNP()), kLevel - 1);
     EXPECT_NEAR(res[0].GetScale() / block.param->GetScale(kLevel - 1), 1.0,
                 1e-6);
     EXPECT_EQ(res[0].GetNumSlots(), num_slots);
-    read_back(got_switched, res);
+    read_back(got_switched, res, /*two_stage=*/true);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const double sw_max =
@@ -686,10 +696,8 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
   // and the CI leg takes the direct route. This assertion is the wrong way
   // round on purpose: if someone derives the composition and fixes
   // `Component()`, this fails and they delete it.
-  EXPECT_GT(sw_max / want_max, 1e-2)
-      << "the ring-switched descent now AGREES with the host product on R+, "
-         "which means the banded composition has been solved -- update this "
-         "test and Doing.md 1.5cq rather than deleting the assertion";
+  EXPECT_LT(sw_max / want_max, 1e-3)
+      << "the ring-switched descent disagrees with the host product on R+";
 
   // ---- the direct route, 512 ModPack keys at the block's degree ----------
   block.ui->PrepareModPackKeys(ci_small_degree, kLevel);
@@ -705,13 +713,14 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
     direct_cfg.parents_per_tile = 0;
     ProjectOnlyLeg leg(block.context, direct_cfg, big_keys);
     EXPECT_FALSE(leg.IsRingSwitched());
+    const auto dir_parents = encode_parents(/*two_stage=*/false);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, kInChannels, kOutChannels, w, 1.0, "direct");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, parents, kInChannels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, kInChannels, kOutChannels, w, 1.0, "direct");
     dir_seconds = SecondsSince(t0);
     ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
-    read_back(got_direct, res);
+    read_back(got_direct, res, /*two_stage=*/false);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const double dir_max =
@@ -732,8 +741,10 @@ TEST(SwitchedProjection, TheRingSwitchedDescentDoesNotPortToTheRealSubring) {
             << " keys at degree " << degree << "; noise "
             << -std::log2(sw_max / want_max) << " vs "
             << -std::log2(dir_max / want_max) << " bits" << std::endl;
-  EXPECT_GT(gap / want_max, 1e-2)
-      << "the two R+ descents now agree; see above";
+  EXPECT_LT(gap / want_max, 1e-3)
+      << "the two R+ descents computed different products -- each is read in "
+         "its own packing, so this compares the CHANNELS and not the "
+         "coefficients";
 
   // What DOES have to hold: the direct route is the leg's route on R+, so
   // its agreement with the host product is a real assertion and not a pin.

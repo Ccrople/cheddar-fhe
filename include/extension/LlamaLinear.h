@@ -326,9 +326,37 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
    * nothing at all.
    *
    * Without the descent `ring_rank_` is 1 and this is the identity.
+   *
+   * ## AND ON THE REAL SUBRING IT IS THE IDENTITY TOO, WHICH IS NOT THE SAME
+   * ## STATEMENT
+   *
+   * All of the above rests on `ModDecomp` being a split by residue, which it
+   * is only on the ordinary ring. On R+ the module basis is not the monomials
+   * but the Chebyshev elements `c_m = Y^m + Y^-m`, and `c_a c_b = c_{a+b} +
+   * c_{a-b}` -- so the composed basis element for the two-stage index
+   * `(j, n)` is `c_{ring_rank*n + j} + c_{|ring_rank*n - j|}`, a SUM of two
+   * one-stage components rather than one of them. Enumerated on a miniature
+   * ring (D = 32, 2 x 4) and confirmed at D = 256, 4 x 8: the formula above
+   * returns exactly the FIRST of those two, and the second is missing. That
+   * is why the switched descent came back wrong by 3.8 relative on R+ while
+   * the direct one was exact to 24.3 bits, and it is not fixable by any
+   * permutation -- a two-term sum is not a relabelling.
+   *
+   * What fixes it is refusing the question. Nothing forces the channel to be
+   * a *one-stage* component; the block chooses its own packing. Declaring
+   * the channel to be the TWO-STAGE index `flat` makes the switched descent
+   * exact -- the decomposition hands back what the recomposition put in, the
+   * mix is a scalar combination of those, and one projection's output is the
+   * next one's input under the same convention, so it composes across the
+   * whole coefficient-domain leg. The price is paid only where the payload
+   * has to be read as slots: there each channel appears at TWO coefficient
+   * addresses, `ring_rank*n + j` and `|ring_rank*n - j|`, ADDED. That is
+   * exactly the structure Doing.md 1.5bp found for the CC-MM chain's nested
+   * operand, and it is resolved the same way -- by the layout, not by a
+   * transform.
    */
   int Component(int flat) const {
-    if (ring_rank_ == 1) return flat;
+    if (ring_rank_ == 1 || conjugate_invariant_) return flat;
     return (flat / sub_rank_) + ring_rank_ * (flat % sub_rank_);
   }
 
@@ -347,6 +375,9 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! the descent they are 1 and `rank_`.
   int ring_rank_;
   int sub_rank_;
+  //! Whether the block's ring is the conjugate-invariant one, which changes
+  //! what `Component()` means; see there.
+  bool conjugate_invariant_;
   std::vector<const EvaluationKey<word> *> modpack_keys_;
   MlweHandler<word> mlwe_;
   PcmmHandler<word> pcmm_;
