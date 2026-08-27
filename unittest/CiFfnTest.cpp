@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -248,6 +249,8 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   EXPECT_NEAR(masked.GetScale() / boot.param->GetScale(op_level), 1.0, 1e-6)
       << "the mask's scale has to leave the ciphertext canonical, or EvalPoly "
          "aborts inside RMSNorm";
+  const double masked_scale = masked.GetScale();
+  (void)masked_scale;
 
   // ---- RMSNorm, at a DECLARED width of twice the live one --------------
   //
@@ -290,7 +293,9 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
       wts[0][c * kTokens + t] = Complex(wn[c] * root_alpha, 0.0);
     }
   }
-  std::vector<Ciphertext<word>> in{masked}, out;
+  // Ciphertext is move-only, so the operand vector is built by move.
+  std::vector<Ciphertext<word>> in(1), out;
+  in[0] = std::move(masked);
   rms.Apply(out, in, wts, boot.ui->GetEvkMap());
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
