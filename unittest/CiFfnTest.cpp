@@ -52,7 +52,10 @@
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/BootContext.h"
+#include "extension/LlamaLinear.h"
 #include "extension/RmsNorm.h"
+#include "extension/SiLu.h"
+#include "extension/SylphSchedule.h"
 
 using word = uint32_t;
 using cheddar::BootContext;
@@ -97,6 +100,50 @@ std::vector<double> CiRecompose(const std::vector<std::vector<double>> &comp,
   }
   return out;
 }
+
+// The inverse scan, to read a projection's output back as components.
+std::vector<std::vector<double>> CiComponentsFfn(
+    const std::vector<double> &coeffs, int rank, int small_degree) {
+  std::vector<std::vector<double>> comp(rank,
+                                        std::vector<double>(small_degree));
+  for (int t = 0; t < small_degree; t++) {
+    comp[0][t] = coeffs[static_cast<size_t>(t) * rank];
+  }
+  for (int i = 1; i <= rank / 2; i++) {
+    const int mi = rank - i;
+    double acc_i = 0.0, acc_m = 0.0;
+    for (int t = small_degree - 1; t >= 0; t--) {
+      const double new_i = coeffs[static_cast<size_t>(t) * rank + i] - acc_m;
+      const double new_m = coeffs[static_cast<size_t>(t) * rank + mi] - acc_i;
+      comp[i][t] = new_i;
+      comp[mi][t] = new_m;
+      acc_i = new_i;
+      acc_m = new_m;
+    }
+  }
+  return comp;
+}
+
+// `CoeffLinearLeg` implements only `Project`; the two ciphertext-ciphertext
+// products are pure virtual on purpose, so nothing falls back to a stand-in.
+class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
+ public:
+  using cheddar::CoeffLinearLeg<word>::CoeffLinearLeg;
+  void Scores(std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double,
+              const std::vector<double> &) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no Scores here");
+  }
+  void Values(std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &,
+              const std::vector<Ciphertext<word>> &, double) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no Values here");
+  }
+  void LocateScore(int, int, int, int &, int &) const override {
+    cheddar::AssertTrue(false, "ProjectOnlyLegCi: no score layout here");
+  }
+};
 
 }  // namespace
 
@@ -475,4 +522,359 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   EXPECT_LT(dead_after, 1e-3 * want_absmax)
       << "the mask did not kill the duplicates, so the reduction summed two "
          "tokens";
+}
+
+// ---------------------------------------------------------------------------
+// The whole FFN on R+: RMSNorm, gate and up, SiLU and the gate multiply, down.
+//
+// Stage one (above) confirmed the crossing and RMSNorm on the half-density
+// image a projection emits. This runs the rest of Doing.md 1.5cs's walk, so
+// that half of a Llama-3 decoder layer executes end to end on the
+// conjugate-invariant ring against a host reference. Nothing here is new
+// machinery: `SylphSchedule` supplies both crossings, `CoeffLinearLeg` the
+// three projections, and `RmsNormHandler` / `SiLuHandler` the two operators,
+// each of which reached R+ this session for the cost of an assertion or a
+// slot count.
+//
+// THE ONE THING THE SCHEDULE DOES NOT DO is the duplicate mask. `Canonicalise`
+// multiplies by a CONSTANT, and half density needs a plaintext -- 1 on the
+// live addresses and 0 on the shifted duplicates. So the canonicalise is done
+// by hand, at the plaintext scale that lands the result on the level below's
+// canonical scale, with `restore` folded in exactly as `Config::restore` does
+// in `CiSinCAttention`. That multiply pays for itself three times over: it
+// canonicalises HalfBoot's output scale, restores the boundary constant, and
+// kills the duplicates.
+//
+// TOY WIDTH, and the reason is the same as 1.5ca's. One ciphertext of hidden
+// state (256 live channels of 512) against two of the FFN's inner dimension
+// exercises every stage, every crossing and every layout rule at the real
+// T = 128 alignment; the layer's width multiplies the ciphertext count and
+// nothing else, as 1.5ce showed for the attention leg.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
+  // Slack for the deepest slot-domain stage: RMSNorm is 7 and the mask is 1,
+  // SiLU is 6 and the mask is 1. `SylphSchedule` refuses without it, which is
+  // the whole reason this is a construction-time argument.
+  constexpr int kSlack = 8;
+  Ring boot(Param(), {}, kSlack);
+  std::cout << "preset " << Param() << ", slack " << kSlack << std::endl;
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  ASSERT_EQ(degree / kTokens, kRank);
+  const int hidden_live = 2 * kLive;          // 512 live inner channels
+  const int declared_h = kRank;               // 512 declared, 256 live
+  const int declared_hidden = 2 * kRank;      // 1024 declared, 512 live
+
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  cheddar::SylphSchedule<word> sched(bctx, num_slots);
+  const int slot_level = sched.GetSlotLevel();
+  const int op_level = slot_level - 1;   // after the mask multiply
+  const int coeff_level = sched.GetCoeffLevel();
+  const int product_level = 1;
+  std::cout << "slot level " << slot_level << ", operators at " << op_level
+            << ", StC leaves " << coeff_level << ", product at "
+            << product_level << std::endl;
+  ASSERT_GE(coeff_level, product_level);
+
+  // ---- the model, in double ---------------------------------------------
+  std::mt19937_64 gen(0xFFA7);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> wd(0.0, 0.03);
+  std::vector<double> x(static_cast<size_t>(kTokens) * declared_h, 0.0);
+  std::vector<double> wn(declared_h, 0.0);
+  std::vector<double> wg(static_cast<size_t>(declared_h) * declared_hidden,
+                         0.0);
+  std::vector<double> wu = wg;
+  std::vector<double> wdn(static_cast<size_t>(declared_hidden) * declared_h,
+                          0.0);
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared_h; c += 2) {
+      x[static_cast<size_t>(t) * declared_h + c] = xd(gen);
+    }
+  }
+  for (int c = 0; c < declared_h; c += 2) wn[c] = 0.5 + 0.5 * std::abs(xd(gen));
+  // Half density on BOTH axes of every weight: a projection's live output
+  // channels are the even ones (1.5cq), and its live input channels are the
+  // even ones of whatever produced them.
+  for (int c = 0; c < declared_h; c += 2) {
+    for (int j = 0; j < declared_hidden; j += 2) {
+      wg[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
+      wu[static_cast<size_t>(c) * declared_hidden + j] = wd(gen);
+    }
+  }
+  for (int j = 0; j < declared_hidden; j += 2) {
+    for (int c = 0; c < declared_h; c += 2) {
+      wdn[static_cast<size_t>(j) * declared_h + c] = wd(gen);
+    }
+  }
+
+  // The reference: RMSNorm over the DECLARED width (which is what the circuit
+  // reduces over), then SwiGLU, then down.
+  std::vector<double> ms(kTokens, 0.0);
+  double log_sum = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    double s = 0.0;
+    for (int c = 0; c < declared_h; c++) {
+      const double v = x[static_cast<size_t>(t) * declared_h + c];
+      s += v * v;
+    }
+    ms[t] = s / declared_h;
+    log_sum += std::log(ms[t]);
+  }
+  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+
+  std::vector<double> h(static_cast<size_t>(kTokens) * declared_h, 0.0);
+  for (int t = 0; t < kTokens; t++) {
+    const double inv = 1.0 / std::sqrt(ms[t] + kEps);
+    for (int c = 0; c < declared_h; c++) {
+      h[static_cast<size_t>(t) * declared_h + c] =
+          x[static_cast<size_t>(t) * declared_h + c] * inv * wn[c];
+    }
+  }
+  auto host_project = [&](const std::vector<double> &in, int in_w,
+                          const std::vector<double> &w, int out_w) {
+    std::vector<double> out(static_cast<size_t>(kTokens) * out_w, 0.0);
+    for (int t = 0; t < kTokens; t++) {
+      for (int o = 0; o < out_w; o++) {
+        double acc = 0.0;
+        for (int c = 0; c < in_w; c++) {
+          acc += in[static_cast<size_t>(t) * in_w + c] *
+                 w[static_cast<size_t>(c) * out_w + o];
+        }
+        out[static_cast<size_t>(t) * out_w + o] = acc;
+      }
+    }
+    return out;
+  };
+  const auto g_host = host_project(h, declared_h, wg, declared_hidden);
+  const auto u_host = host_project(h, declared_h, wu, declared_hidden);
+  std::vector<double> gu(g_host.size(), 0.0);
+  double gate_absmax = 0.0;
+  for (size_t i = 0; i < gu.size(); i++) {
+    gate_absmax = std::max(gate_absmax, std::abs(g_host[i]));
+    const double s = g_host[i] / (1.0 + std::exp(-g_host[i]));
+    gu[i] = s * u_host[i];
+  }
+  const auto want = host_project(gu, declared_hidden, wdn, declared_h);
+  double want_absmax = 0.0;
+  for (double v : want) want_absmax = std::max(want_absmax, std::abs(v));
+  std::cout << "gate |g| max " << gate_absmax << ", |y| max " << want_absmax
+            << std::endl;
+
+  // ---- keys: the direct descent, 512 ModPack keys on the block ring ------
+  //
+  // 1.5cq settled the layer's descent as the ring-switched one, which is
+  // 1.83x here; the direct route is taken in this test because its channel
+  // indexing is the one-stage packing stage one already confirmed, and this
+  // test is about the FFN and not about the descent.
+  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = kTokens;
+  lcfg.product_level = product_level;
+  lcfg.parents_per_tile = 0;
+  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
+  ASSERT_EQ(leg.GetRank(), kRank);
+  ASSERT_EQ(leg.GetSmallDegree(), kTokens);
+
+  // ---- encrypt the residual stream, sized for the crossing --------------
+  std::vector<std::vector<double>> comp(kRank,
+                                        std::vector<double>(kTokens, 0.0));
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared_h; c += 2) {
+      comp[Rev(c, 9)][Rev(t, 7)] = x[static_cast<size_t>(t) * declared_h + c];
+    }
+  }
+  std::vector<double> coeffs = CiRecompose(comp, kRank, kTokens);
+  double coeff_max = 0.0;
+  for (double v : coeffs) coeff_max = std::max(coeff_max, std::abs(v));
+  const double beta = 0.4 / coeff_max;
+  for (double &v : coeffs) v *= beta;
+  Plaintext<word> pt;
+  boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0), coeffs);
+  std::vector<Ciphertext<word>> state(1);
+  boot.ui->Encrypt(state[0], pt);
+  state[0].SetNumSlots(num_slots);
+
+  // ---- the mask, which is also the canonicalise and the restore ---------
+  //
+  // Built once per (level, restore) pair. `restore` is 1 / (the HalfBoot
+  // boundary constant times whatever the producer scaled by), so the operator
+  // downstream sees the magnitude its polynomial was fitted for.
+  auto mask_and_canonicalise = [&](Ciphertext<word> &ct, double restore) {
+    const double pt_scale = boot.param->GetScale(op_level) *
+                            boot.param->GetRescalePrimeProd(slot_level) /
+                            ct.GetScale();
+    std::vector<Complex> mask(num_slots, Complex(0.0, 0.0));
+    for (int c = 0; c < num_slots / kTokens; c += 2) {
+      for (int t = 0; t < kTokens; t++) {
+        mask[c * kTokens + t] = Complex(restore, 0.0);
+      }
+    }
+    Plaintext<word> mpt;
+    boot.context->encoder_.Encode(mpt, slot_level, pt_scale, mask);
+    boot.context->Mult(ct, ct, mpt);
+    boot.context->Rescale(ct, ct);
+  };
+
+  // The boundary constant, measured once on the first crossing and reused:
+  // it is a property of the BootParameter, not of the data (1.5bz).
+  double boundary = 0.0;
+
+  // ---- turn 1: RMSNorm ---------------------------------------------------
+  {
+    Ciphertext<word> up;
+    sched.ToSlot(up, state[0], boot.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(up.GetNP()), slot_level);
+    {  // measure the boundary constant against the known input
+      Plaintext<word> rp;
+      boot.ui->Decrypt(rp, up);
+      std::vector<Complex> raw;
+      boot.context->encoder_.Decode(raw, rp);
+      double num = 0.0, den = 0.0;
+      for (int t = 0; t < kTokens; t++) {
+        for (int c = 0; c < declared_h; c += 2) {
+          const double w = beta * x[static_cast<size_t>(t) * declared_h + c];
+          num += raw[c * kTokens + t].real() * w;
+          den += w * w;
+        }
+      }
+      boundary = num / den;
+      std::cout << "HalfBoot boundary constant " << boundary << " (2^"
+                << std::log2(boundary) << ")" << std::endl;
+      ASSERT_GT(boundary, 0.0);
+    }
+    mask_and_canonicalise(up, 1.0 / (boundary * beta));
+
+    cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
+                                      op_level, kEps, 6.0, 9);
+    ASSERT_EQ(rms.GetNumCiphertexts(), 1);
+    for (int d : rms.GetRotationDistances()) {
+      boot.ui->PrepareRotationKey(d, op_level);
+    }
+    const double root_alpha = std::sqrt(alpha);
+    std::vector<std::vector<Complex>> wts(1);
+    wts[0].assign(num_slots, Complex(0.0, 0.0));
+    for (int c = 0; c < declared_h; c++) {
+      for (int t = 0; t < kTokens; t++) {
+        wts[0][c * kTokens + t] = Complex(wn[c] * root_alpha, 0.0);
+      }
+    }
+    std::vector<Ciphertext<word>> in(1), out;
+    in[0] = std::move(up);
+    rms.Apply(out, in, wts, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    sched.ToCoeff(state[0], out[0], boot.ui->GetEvkMap());
+    ASSERT_EQ(boot.param->NPToLevel(state[0].GetNP()), coeff_level);
+  }
+
+  // ---- turn 2: gate and up ----------------------------------------------
+  //
+  // The projection runs at `product_level` and the weight scale is the one
+  // that lands the rescaled product canonical at level 0. The crossing bound
+  // rides the weight scale for free, exactly as [SYLPH] folds its calibration
+  // into the model conversion.
+  const double proj_size = 0.4 / std::max(gate_absmax, 1e-12);
+  std::vector<Ciphertext<word>> gate, upv;
+  {
+    Ciphertext<word> low;
+    boot.context->LevelDown(low, state[0], product_level);
+    std::vector<Ciphertext<word>> ins(1);
+    ins[0] = std::move(low);
+    leg.Project(gate, ins, declared_h, declared_hidden, wg, proj_size, "gate");
+    leg.Project(upv, ins, declared_h, declared_hidden, wu, proj_size, "up");
+    ASSERT_EQ(gate.size(), 2u);
+    ASSERT_EQ(upv.size(), 2u);
+    ASSERT_EQ(boot.param->NPToLevel(gate[0].GetNP()), 0);
+  }
+
+  // ---- turn 3: SiLU(gate) * up ------------------------------------------
+  const double silu_range = 12.0;
+  std::vector<Ciphertext<word>> prod(2);
+  {
+    cheddar::SiLuHandler<word> silu(boot.context, silu_range, op_level, 31);
+    for (int i = 0; i < 2; i++) {
+      Ciphertext<word> g_up, u_up;
+      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
+      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
+      // SiLU takes x / range, so the restore carries 1/range as well.
+      mask_and_canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
+      mask_and_canonicalise(u_up, 1.0 / (boundary * proj_size));
+      Ciphertext<word> s;
+      silu.Apply(s, g_up, boot.ui->GetEvkMap());
+      const int s_level = boot.param->NPToLevel(s.GetNP());
+      Ciphertext<word> u_low;
+      boot.context->LevelDown(u_low, u_up, s_level);
+      boot.context->HMult(prod[i], s, u_low,
+                          boot.ui->GetEvkMap().GetMultiplicationKey());
+      cudaDeviceSynchronize();
+      ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    }
+  }
+
+  // ---- turn 4: down ------------------------------------------------------
+  std::vector<Ciphertext<word>> res;
+  {
+    std::vector<Ciphertext<word>> ins(2);
+    for (int i = 0; i < 2; i++) {
+      Ciphertext<word> c;
+      sched.ToCoeff(c, prod[i], boot.ui->GetEvkMap());
+      boot.context->LevelDown(ins[i], c, product_level);
+    }
+    leg.Project(res, ins, declared_hidden, declared_h, wdn, 1.0, "down");
+    ASSERT_EQ(res.size(), 1u);
+    ASSERT_EQ(boot.param->NPToLevel(res[0].GetNP()), 0);
+  }
+
+  // ---- read it back, in the coefficient packing the projection emits ----
+  Plaintext<word> out_pt;
+  boot.ui->Decrypt(out_pt, res[0]);
+  std::vector<double> out_coeffs;
+  boot.context->encoder_.DecodeCoeff(out_coeffs, out_pt);
+  const auto got = CiComponentsFfn(out_coeffs, kRank, kTokens);
+
+  double max_abs = 0.0, sum_abs = 0.0;
+  int counted = 0;
+  double scale_fit_num = 0.0, scale_fit_den = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared_h; c += 2) {
+      const double v = got[Rev(c, 9)][Rev(t, 7)];
+      const double w = want[static_cast<size_t>(t) * declared_h + c];
+      scale_fit_num += v * w;
+      scale_fit_den += w * w;
+    }
+  }
+  const double carried = scale_fit_num / scale_fit_den;
+  for (int t = 0; t < kTokens; t++) {
+    for (int c = 0; c < declared_h; c += 2) {
+      const double v = got[Rev(c, 9)][Rev(t, 7)] / carried;
+      const double w = want[static_cast<size_t>(t) * declared_h + c];
+      max_abs = std::max(max_abs, std::abs(v - w));
+      sum_abs += std::abs(v - w);
+      counted++;
+    }
+  }
+  const double rel = max_abs / want_absmax;
+  std::cout << "THE FFN ON R+: |y| max " << want_absmax << ", max abs err "
+            << max_abs << ", mean " << (sum_abs / counted) << ", relative "
+            << rel << " = 2^" << std::log2(rel) << std::endl;
+  std::cout << "  carried factor " << carried << " (the crossings' constants, "
+            << "which a block folds into the next weight encode)" << std::endl;
+  EXPECT_LT(rel, 0.05) << "the conjugate-invariant FFN disagrees with the "
+                          "host reference by more than the circuit can "
+                          "explain";
 }
