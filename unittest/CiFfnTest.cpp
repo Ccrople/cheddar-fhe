@@ -145,6 +145,41 @@ class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
   }
 };
 
+// Read a coefficient-encoded half-density ciphertext back as [token][channel],
+// fitting the one scalar the crossings carry. Used to check each turn of the
+// FFN separately: a single end-to-end number cannot say which turn moved.
+double ReportTurn(const char *name, const Ring &ring,
+                  const Ciphertext<word> &ct, const std::vector<double> &want,
+                  int declared, int rank, int tokens) {
+  Plaintext<word> pt;
+  ring.ui->Decrypt(pt, ct);
+  std::vector<double> coeffs;
+  ring.context->encoder_.DecodeCoeff(coeffs, pt);
+  const auto comp = CiComponentsFfn(coeffs, rank, tokens);
+  double num = 0.0, den = 0.0, absmax = 0.0;
+  for (int t = 0; t < tokens; t++) {
+    for (int c = 0; c < declared; c += 2) {
+      const double w = want[static_cast<size_t>(t) * declared + c];
+      num += comp[Rev(c, 9)][Rev(t, 7)] * w;
+      den += w * w;
+      absmax = std::max(absmax, std::abs(w));
+    }
+  }
+  const double fit = num / den;
+  double err = 0.0;
+  for (int t = 0; t < tokens; t++) {
+    for (int c = 0; c < declared; c += 2) {
+      const double v = comp[Rev(c, 9)][Rev(t, 7)] / fit;
+      err = std::max(err, std::abs(
+          v - want[static_cast<size_t>(t) * declared + c]));
+    }
+  }
+  std::cout << "  [" << name << "] carried " << fit << ", relative "
+            << (err / absmax) << " = 2^" << std::log2(err / absmax)
+            << std::endl;
+  return fit;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -788,6 +823,7 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     sched.ToCoeff(state[0], out[0], boot.ui->GetEvkMap());
     ASSERT_EQ(boot.param->NPToLevel(state[0].GetNP()), coeff_level);
+    ReportTurn("RMSNorm", boot, state[0], h, declared_h, kRank, kTokens);
   }
 
   // ---- turn 2: gate and up ----------------------------------------------
@@ -808,6 +844,19 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     ASSERT_EQ(gate.size(), 2u);
     ASSERT_EQ(upv.size(), 2u);
     ASSERT_EQ(boot.param->NPToLevel(gate[0].GetNP()), 0);
+    // Each output ciphertext carries `rank` declared channels of the inner
+    // dimension, so group g is channels [g*512, (g+1)*512).
+    for (int g = 0; g < 2; g++) {
+      std::vector<double> slice(static_cast<size_t>(kTokens) * kRank, 0.0);
+      for (int t = 0; t < kTokens; t++) {
+        for (int j = 0; j < kRank; j++) {
+          slice[static_cast<size_t>(t) * kRank + j] =
+              g_host[static_cast<size_t>(t) * declared_hidden + g * kRank + j];
+        }
+      }
+      ReportTurn(g == 0 ? "gate[0]" : "gate[1]", boot, gate[g], slice, kRank,
+                 kRank, kTokens);
+    }
   }
 
   // ---- turn 3: SiLU(gate) * up ------------------------------------------
@@ -831,6 +880,19 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
                           boot.ui->GetEvkMap().GetMultiplicationKey());
       cudaDeviceSynchronize();
       ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+      {  // the SwiGLU product, checked in the coefficient domain
+        Ciphertext<word> c;
+        sched.ToCoeff(c, prod[i], boot.ui->GetEvkMap());
+        std::vector<double> slice(static_cast<size_t>(kTokens) * kRank, 0.0);
+        for (int t = 0; t < kTokens; t++) {
+          for (int j = 0; j < kRank; j++) {
+            slice[static_cast<size_t>(t) * kRank + j] =
+                gu[static_cast<size_t>(t) * declared_hidden + i * kRank + j];
+          }
+        }
+        ReportTurn(i == 0 ? "swiglu[0]" : "swiglu[1]", boot, c, slice, kRank,
+                   kRank, kTokens);
+      }
     }
   }
 
