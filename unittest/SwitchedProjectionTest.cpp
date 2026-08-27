@@ -480,6 +480,13 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   const int sub_rank = mid_degree / ci_small_degree;  // 32
   const char *width = std::getenv("CHEDDAR_CI_IN_CHANNELS");
   const int in_channels = width ? std::atoi(width) : kInChannels;
+  // The output width matters for a reason the input one does not: `Decompose`
+  // is hoisted OUT of the group loop, so the whole decomposition is shared by
+  // every output ciphertext and a one-group measurement charges all of it to
+  // one. The layer's projections are 8 groups (4096 channels) or 56
+  // (14336), never one.
+  const char *ow = std::getenv("CHEDDAR_CI_OUT_CHANNELS");
+  const int out_channels = ow ? std::atoi(ow) : out_channels;
   const int num_parents = in_channels / rank;
 
   ASSERT_EQ(num_slots, degree) << "R+ gives `degree` real slots";
@@ -497,7 +504,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   std::normal_distribution<double> xd(0.0, 1.0);
   std::normal_distribution<double> wd(0.0, 0.0175);  // Llama-3's W_Q RMS
   std::vector<double> x(static_cast<size_t>(kTokens) * in_channels);
-  std::vector<double> w(static_cast<size_t>(in_channels) * kOutChannels);
+  std::vector<double> w(static_cast<size_t>(in_channels) * out_channels);
   for (auto &v : x) v = xd(gen);
   for (auto &v : w) v = wd(gen);
 
@@ -525,8 +532,8 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
       }
     }
     for (int c = 0; c < in_channels; c++) {
-      for (int o = 0; o < kOutChannels; o++) {
-        if ((c % 2) || (o % 2)) w[static_cast<size_t>(c) * kOutChannels + o] = 0.0;
+      for (int o = 0; o < out_channels; o++) {
+        if ((c % 2) || (o % 2)) w[static_cast<size_t>(c) * out_channels + o] = 0.0;
       }
     }
   }
@@ -544,16 +551,16 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
     }
   }
 
-  std::vector<double> want(static_cast<size_t>(kTokens) * kOutChannels, 0.0);
+  std::vector<double> want(static_cast<size_t>(kTokens) * out_channels, 0.0);
   double want_max = 0.0;
   for (int t = 0; t < kTokens; t++) {
-    for (int o = 0; o < kOutChannels; o++) {
+    for (int o = 0; o < out_channels; o++) {
       double acc = 0.0;
       for (int c = 0; c < in_channels; c++) {
         acc += x[static_cast<size_t>(t) * in_channels + c] *
-               w[static_cast<size_t>(c) * kOutChannels + o];
+               w[static_cast<size_t>(c) * out_channels + o];
       }
-      want[static_cast<size_t>(t) * kOutChannels + o] = acc;
+      want[static_cast<size_t>(t) * out_channels + o] = acc;
       want_max = std::max(want_max, std::abs(acc));
     }
   }
@@ -606,7 +613,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   auto read_back = [&](std::vector<double> &out,
                        const std::vector<Ciphertext<word>> &res,
                        bool two_stage) {
-    out.assign(static_cast<size_t>(kTokens) * kOutChannels, 0.0);
+    out.assign(static_cast<size_t>(kTokens) * out_channels, 0.0);
     for (size_t g = 0; g < res.size(); g++) {
       Plaintext<word> pt;
       block.ui->Decrypt(pt, res[g]);
@@ -620,7 +627,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
         for (int t = 0; t < kTokens; t++) {
           const int k = AttentionPacking::CoeffOfSlot(
               {t + kTokens * c, false}, degree, /*conjugate_invariant=*/true);
-          out[static_cast<size_t>(t) * kOutChannels + g * rank + c] =
+          out[static_cast<size_t>(t) * out_channels + g * rank + c] =
               comp[k % rank][k / rank];
         }
       }
@@ -676,11 +683,11 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
 
     const auto sw_parents = encode_parents(/*two_stage=*/true);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, sw_parents, in_channels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, in_channels, out_channels, w, 1.0, "switched");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, sw_parents, in_channels, kOutChannels, w, 1.0, "switched");
+    leg.Project(res, sw_parents, in_channels, out_channels, w, 1.0, "switched");
     sw_seconds = SecondsSince(t0);
-    ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
+    ASSERT_EQ(static_cast<int>(res.size()), out_channels / rank);
     EXPECT_EQ(block.param->NPToLevel(res[0].GetNP()), kLevel - 1);
     EXPECT_NEAR(res[0].GetScale() / block.param->GetScale(kLevel - 1), 1.0,
                 1e-6);
@@ -689,7 +696,7 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const double sw_max =
-      report("ring-switched", got_switched, sw_seconds, kOutChannels / rank);
+      report("ring-switched", got_switched, sw_seconds, out_channels / rank);
   // THE FINDING, PINNED AS A REGRESSION.
   //
   // On the ordinary ring both decompositions split coefficients by residue,
@@ -732,16 +739,16 @@ TEST(SwitchedProjection, TheRingSwitchedDescentPortsToTheRealSubring) {
     EXPECT_FALSE(leg.IsRingSwitched());
     const auto dir_parents = encode_parents(/*two_stage=*/false);
     std::vector<Ciphertext<word>> res;
-    leg.Project(res, dir_parents, in_channels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, in_channels, out_channels, w, 1.0, "direct");
     const auto t0 = std::chrono::steady_clock::now();
-    leg.Project(res, dir_parents, in_channels, kOutChannels, w, 1.0, "direct");
+    leg.Project(res, dir_parents, in_channels, out_channels, w, 1.0, "direct");
     dir_seconds = SecondsSince(t0);
-    ASSERT_EQ(static_cast<int>(res.size()), kOutChannels / rank);
+    ASSERT_EQ(static_cast<int>(res.size()), out_channels / rank);
     read_back(got_direct, res, /*two_stage=*/false);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const double dir_max =
-      report("direct       ", got_direct, dir_seconds, kOutChannels / rank);
+      report("direct       ", got_direct, dir_seconds, out_channels / rank);
   EXPECT_LT(dir_max / want_max, 1e-3)
       << "the direct projection disagrees with the host product";
 
