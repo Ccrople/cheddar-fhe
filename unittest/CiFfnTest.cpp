@@ -1824,7 +1824,14 @@ TEST(CiFfn, TheProjectionReadsSixteenHalfDensityParents) {
 // It prints scale over canonical at every step and checks the coefficients as
 // components BEFORE any product touches them, so a failure says which half.
 TEST(CiFfn, TheSeamHandsTheProjectionAReadableImage) {
-  constexpr int kSlack = 12;
+  // THE SLACK IS THE EXPERIMENT. It sets where `SlotToCoeff` is compiled --
+  // `GetStCStartLevel()` -- and StC is a hoisted transform, so at slack 12 it
+  // starts at 7 and its phases run at 7, 6, 5: two of them inside ci16_35's
+  // `num_accum == 1` zone, which is levels 0..6. The FFN test runs at slack 9,
+  // where StC starts at 10 and never enters it.
+  const char *sl = std::getenv("CHEDDAR_JOIN_SLACK");
+  const int kSlack = sl ? std::atoi(sl) : 9;
+  std::cout << "slack " << kSlack << std::endl;
   Ring boot(Param(), {}, kSlack);
   ASSERT_TRUE(boot.param->conjugate_invariant_);
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
@@ -1847,7 +1854,14 @@ TEST(CiFfn, TheSeamHandsTheProjectionAReadableImage) {
             << ", product " << product_level << std::endl;
 
   constexpr int kCols = 16, kRows = 128, kLanes = 32;
-  const int t1_level = 11, tok_level = 10, t2_level = 9;
+  // The seam sits directly on top of StC, wherever the slack put it, with the
+  // rescale `ToCoeff` owes still to spare.
+  const int t2_level = sched.GetStCLevel() + 2;
+  const int tok_level = t2_level + 1;
+  const int t1_level = tok_level + 1;
+  std::cout << "seam at " << t1_level << "/" << tok_level << "/" << t2_level
+            << std::endl;
+  ASSERT_LE(t1_level, boot.param->max_level_);
   ASSERT_GT(t2_level - 1, sched.GetStCLevel())
       << "the seam has to leave the ciphertext above StC's level with a "
          "rescale to spare";
