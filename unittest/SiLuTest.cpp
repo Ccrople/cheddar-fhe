@@ -356,8 +356,11 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
+    // ci16_35: SiLU is pointwise, so the conjugate-invariant ring should cost
+    // it nothing but give it twice the slots ([SYLPH] section 2.1). Measured
+    // rather than assumed.
     testing::Values("bootparam_30.json", "bootparam_35.json",
-                    "bootparam_40.json"),
+                    "bootparam_40.json", "ci16_35.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

@@ -45,6 +45,84 @@ TEST_P(Testbed32, Bootstrap) {
   CompareMessages(msg1, res);
 }
 
+// [SYLPH] section 3.1.3 states the bootstrap requirement as one number and a
+// rule, and neither is the SNR this suite has always printed:
+//
+//   "given a p-bit bootstrapping procedure and an input bound B, we scale a
+//    ciphertext ct by 1/B so that all slot values lie within [-1, 1]. This
+//    scaling reduces the effective precision by log2 B bits, yielding
+//    p - log2 B bits of precision after bootstrapping. For Llama-3-8B, we use
+//    a 20-bit bootstrapping procedure with B = 128, resulting in 13-bit
+//    effective precision."
+//
+// So p is the MAX ABSOLUTE error over a message filling [-1, 1] -- the
+// worst slot, not the average and not a ratio -- and the layer's budget is
+//
+//     effective bits = p - log2(B)   >=  12    ([SYLPH] 3.1.2 / table 7)
+//
+// with B the largest magnitude any tensor carries into a bootstrap. Sylph's
+// calibration (tables 2 and 3) is what puts B at 128: RMSNorm's input falls
+// from 2243.97 to 7.65, SoftMax's from 39.24 to 32.78, down-proj's output
+// from 310.56 to 1.92, and 128 covers all of them with margin.
+//
+// This test reports p for whichever preset it runs on, and the two numbers
+// that follow from it: the effective precision at Sylph's own B = 128, and
+// the largest B this preset could afford while still clearing 12 bits. It
+// asserts nothing about p -- a preset that misses 20 bits is a budget fact to
+// design around, not a broken bootstrap -- but it does check that the message
+// survived at all, so a silent failure cannot masquerade as a small p.
+TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
+  using word = uint32_t;
+  const int num_slots = param_->MaxNumSlots();
+  std::shared_ptr<BootContext<word>> boot_context =
+      std::dynamic_pointer_cast<BootContext<word>>(context_);
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  // Fill [-1, 1], which is the interval the rule is stated on.
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots, -1.0, 1.0,
+                        /*complex=*/!param_->conjugate_invariant_);
+  Ciphertext<word> ct, ct_res;
+  EncodeAndEncrypt(ct, msg, 0);
+  boot_context->Boot(ct_res, ct, interface_->GetEvkMap());
+  std::vector<Complex> res;
+  DecryptAndDecode(res, ct_res);
+
+  ASSERT_EQ(msg.size(), res.size());
+  double max_abs = 0.0, sq_sum = 0.0;
+  for (size_t i = 0; i < msg.size(); i++) {
+    const double d = std::abs(msg[i] - res[i]);
+    max_abs = std::max(max_abs, d);
+    sq_sum += d * d;
+  }
+  const double rms = std::sqrt(sq_sum / static_cast<double>(msg.size()));
+  const double p = -std::log2(max_abs);
+  const double p_rms = -std::log2(rms);
+
+  std::cout << "[SYLPH 3.1.3] bootstrap precision on " << num_slots
+            << (param_->conjugate_invariant_ ? " REAL" : " complex")
+            << " slots filling [-1, 1]:" << std::endl;
+  std::cout << "  max abs err " << max_abs << "  ->  p = " << p << " bits"
+            << std::endl;
+  std::cout << "  rms abs err " << rms << "  ->  " << p_rms
+            << " bits (NOT the paper's convention; for comparison only)"
+            << std::endl;
+  std::cout << "  at Sylph's B = 128: effective " << (p - 7.0)
+            << " bits, and the target is 12" << std::endl;
+  std::cout << "  largest B this preset affords at 12 bits: 2^" << (p - 12.0)
+            << " = " << std::exp2(p - 12.0) << std::endl;
+  std::cout << "  ([SYLPH] has p = 20, B = 128, effective 13)" << std::endl;
+
+  // Not a precision assertion -- only that the message is still there. A
+  // bootstrap that lost the payload would otherwise report a small p as
+  // though it were a budget number.
+  EXPECT_LT(max_abs, 0.05) << "the payload did not survive the bootstrap";
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_35.json",

@@ -28,7 +28,14 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
   window_lo_ = 1.0 / std::sqrt(window_ratio);
   window_hi_ = std::sqrt(window_ratio);
 
-  num_slots_ = context_->param_.degree_ / 2;
+  // MaxNumSlots(), not degree/2: the conjugate-invariant ring gives `degree`
+  // REAL slots against the ordinary ring's `degree / 2` complex ones, and
+  // this operator's payload is real either way. On R+ a 128 x 4096 tensor is
+  // therefore 8 ciphertexts rather than 16 -- which is the whole reason
+  // [SYLPH] section 2.1 works there and the class comment's "one deliberate
+  // divergence" is no longer one. Ordinary-ring behaviour is unchanged:
+  // MaxNumSlots() IS degree/2 there.
+  num_slots_ = context_->param_.MaxNumSlots();
   AssertTrue(num_slots_ % num_tokens_ == 0,
              "RmsNorm: tokens must divide the slot count");
   const long long total = 1LL * num_tokens_ * num_channels_;

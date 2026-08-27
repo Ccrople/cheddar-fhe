@@ -331,7 +331,16 @@ TEST_P(Testbed32, RmsNormReductionNeedsOrderOneInput) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, Testbed32, testing::Values("bootparam_30.json"),
+    // ci16_35 is here because [SYLPH] section 2.1 says outright that the paper
+    // works over the conjugate-invariant ring, so its table 4 "ring degree
+    // 65536, slot" for the non-linear operators is 65536 REAL slots. On R+
+    // this operator's tensor is half the ciphertexts it is on the ordinary
+    // ring, and nothing else about it changes -- the square, the
+    // rotate-and-add reduction, the polynomial and the two multiplies are all
+    // slot arithmetic. That claim is worth a measurement rather than an
+    // argument, which is what running the same test on both rings is.
+    Cheddar, Testbed32,
+    testing::Values("bootparam_30.json", "ci16_35.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');
