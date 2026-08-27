@@ -63,7 +63,14 @@ using Ring = ringfixture::Ring<word>;
 
 namespace {
 
-constexpr const char *kParam = "ci16_35.json";
+// The preset is a knob because [SYLPH]'s 12-bit target is a BUDGET claim and
+// this stage is where it gets spent. 1.5cp measured `ci16_35` at p = 15.05
+// and `ci16_40` at 18.90; RMSNorm alone reaches 2^-13.5 on either, so what
+// the crossing costs is the difference. CHEDDAR_CI_FFN_PARAM overrides.
+const char *Param() {
+  const char *env = std::getenv("CHEDDAR_CI_FFN_PARAM");
+  return (env && env[0]) ? env : "ci16_35.json";
+}
 constexpr int kTokens = 128;      // T, and the small degree on R+
 constexpr int kRank = 512;        // degree / T, the channels a ciphertext holds
 constexpr int kLive = kRank / 2;  // 1.5by: 256 live components of 512
@@ -112,7 +119,7 @@ std::vector<double> CiRecompose(const std::vector<std::vector<double>> &comp,
 // for.
 // ---------------------------------------------------------------------------
 TEST(CiFfn, WhereTheCoefficientImageLandsInSlots) {
-  Ring boot(kParam);
+  Ring boot(Param());
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   ASSERT_NE(bctx, nullptr);
   const int degree = boot.Degree();
@@ -210,10 +217,11 @@ TEST(CiFfn, WhereTheCoefficientImageLandsInSlots) {
 //   - that `RmsNormHandler` needs nothing but a doubled declared width.
 // ---------------------------------------------------------------------------
 TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
-  Ring boot(kParam);
+  Ring boot(Param());
+  std::cout << "preset " << Param() << std::endl;
   ASSERT_TRUE(boot.param->conjugate_invariant_);
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
-  ASSERT_NE(bctx, nullptr) << kParam << " did not come up as a BootContext";
+  ASSERT_NE(bctx, nullptr) << Param() << " did not come up as a BootContext";
 
   const int degree = boot.Degree();
   const int num_slots = boot.param->MaxNumSlots();
