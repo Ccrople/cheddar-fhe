@@ -1314,14 +1314,30 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   std::cout << "THE SEAM: live " << live_err << ", duplicates " << dup_err
             << ", everywhere else " << elsewhere << " (|v| <= " << absmax
             << ")" << std::endl;
-  // T2 IS THE OPEN HALF and it is reported rather than asserted, so the
-  // settled half stays green while it is finished. What is known: T1 alone
-  // is exact (above), the offset convention is `out[j + i] = in[j]`, the
-  // transforms must sit above ci16_35's level-7 hoisted zone, and T2's own
-  // map -- a pure channel permutation at 130 diagonals after the token
-  // shift -- is one index convention from working. Neither direction of the
-  // shift is right yet, which says the remaining error is in the matrix's
-  // own (key, row) pairing and not in the rotation.
-  std::cout << "  T2 is not settled; see the comment above this line."
+  // NEITHER TRANSFORM IS SETTLED YET, and the honest state is worth more
+  // than a green assertion. What IS settled, measured:
+  //
+  //   - the diagonal counts: T1 is 486 and T2 is 130, against the leg's own
+  //     converters at 2048, so the seam is affordable if it can be built;
+  //   - the orders that buy them: `token = row` and `channel = rev4(col)*32
+  //     + rev5(lane)`, which beat the worst arrangement by 87x and make the
+  //     half-density split fall out (heads 0..15 / 16..31);
+  //   - the LEVEL: a LinearTransform is a hoisted transform and ci16_35's
+  //     levels 0..6 are the num_accum == 1 zone, where these returned 1e38
+  //     against CLAUDE.md's pinned 1.8e+25. Above it the output is finite
+  //     and lands almost entirely inside the intended address set.
+  //
+  // What is NOT settled is which (key, row) pairing `StripedMatrix` wants.
+  // Both readings were run -- `out[j] = in[j + i]` indexed at the
+  // destination, and `out[j + i] = in[j]` indexed at the source -- and
+  // neither is exact, so the remaining error is not the convention alone;
+  // the closing rotation the window convention owes, or `BestWindow`'s sign,
+  // is the other candidate. The shipped exchange cannot arbitrate any of it
+  // because `Exch` is an involution and its window is symmetric.
+  //
+  // A LOG THAT WAS READ WRONG COST A CYCLE HERE: `tail -16` cut the first of
+  // three failures, and "T1 passed" was recorded from what survived. The
+  // assertion above reads T1's own output for exactly that reason.
+  std::cout << "  neither transform is settled; see the comment above."
             << std::endl;
 }
