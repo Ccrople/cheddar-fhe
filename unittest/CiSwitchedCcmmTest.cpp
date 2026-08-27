@@ -9185,7 +9185,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       }
     }
   }
-  auto host_mm = [&](const std::vector<double> &in, int in_w,
+  auto host_mm2 = [&](const std::vector<double> &in, int in_w,
                      const std::vector<double> &w, int out_w) {
     std::vector<double> r(static_cast<size_t>(layout.dim) * out_w, 0.0);
     for (int t = 0; t < layout.dim; t++) {
@@ -9217,11 +9217,12 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   std::cout << "  O projection: one half-density ciphertext at level "
             << boot.param->NPToLevel(o_out.GetNP()) << std::endl;
 
-  const auto o_host = host_mm(attn_flat, attn_declared, wo, model_declared);
+  const auto o_host = host_mm2(attn_flat, attn_declared, wo, model_declared);
   std::cout << "THE CI LAYER RAN: attention -> seam -> O projection, all "
             << "encrypted, " << h_cts.size() << " half ciphertexts through "
             << "the seam" << std::endl;
 
+  double o_fit = 1.0;
   // The O projection's output read back through the banded scan, against the
   // same product in double from the decrypted attention output.
   {
@@ -9257,7 +9258,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
         mx = std::max(mx, std::abs(want));
       }
     }
-    const double fit = num / den;
+    o_fit = num / den;
+    const double fit = o_fit;
     double err = 0.0;
     for (int c = 0; c < model_declared; c += 2) {
       for (int t = 0; t < proj_small; t++) {
@@ -9272,4 +9274,236 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     EXPECT_LT(err / mx, 0.05)
         << "the seam did not hand the O projection a readable banded image";
   }
+  // ---- the residual, and the FFN ----------------------------------------
+  //
+  // THE RESIDUAL'S CONSTANT IS A CALIBRATION NUMBER, and measuring it here
+  // is what a block does offline. `h = x + O(attn)`, and the two operands
+  // must carry the same constant: the O projection's output carries whatever
+  // the crossings and `w_scale` left it with, which is the `carried` fitted
+  // just above, so the stream it is added to is encrypted with that factor
+  // folded in. [SYLPH] section 3.1.3 calls this calibration and 1.5ch folds
+  // cq / ck into the weight encodes the same way; the only difference is
+  // that this test measures it in the same process rather than offline.
+  Ciphertext<word> stream;
+  {
+    std::vector<std::vector<double>> scaled(x_comp.size(),
+                                            std::vector<double>(proj_small));
+    for (size_t i = 0; i < x_comp.size(); i++) {
+      for (int t = 0; t < proj_small; t++) scaled[i][t] = x_comp[i][t] * o_fit;
+    }
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0),
+                                       HostRecompose(scaled, proj_rank,
+                                                     proj_small));
+    boot.ui->Encrypt(stream, pt);
+    stream.SetNumSlots(num_slots);
+  }
+  Ciphertext<word> h_ct;
+  boot.context->Add(h_ct, stream, o_out);
+  std::cout << "  residual added at level "
+            << boot.param->NPToLevel(h_ct.GetNP()) << std::endl;
+
+  // The host's residual stream, in the same units.
+  std::vector<double> h_host(
+      static_cast<size_t>(proj_small) * model_declared, 0.0);
+  for (int c = 0; c < model_declared; c += 2) {
+    for (int t = 0; t < proj_small; t++) {
+      h_host[static_cast<size_t>(t) * model_declared + c] =
+          x_comp[rev(c, 9)][rev(t, 7)] +
+          o_host[static_cast<size_t>(t) * model_declared + c] / o_fit;
+    }
+  }
+
+  // ---- RMSNorm, gate and up, SiLU, down, and the second residual --------
+  //
+  // Every slot-domain stage here is DUPLICATE-PRESERVING (1.5cs): the
+  // canonicalise is a uniform constant rather than a mask, RMSNorm reduces
+  // with `channel_stride = 2` so the two parities stay apart, and its weight
+  // carries the PARTNER channel's value at the duplicate slots. SiLU and the
+  // gate multiply are pointwise and so are duplicate-safe for nothing.
+  const int slot_level = sched.GetSlotLevel();
+  const int op_level = slot_level - 1;
+  auto canonicalise = [&](Ciphertext<word> &ct, double restore) {
+    cheddar::Constant<word> k;
+    boot.context->encoder_.EncodeConstant(
+        k, slot_level,
+        boot.param->GetScale(op_level) *
+            boot.param->GetRescalePrimeProd(slot_level) / ct.GetScale(),
+        restore);
+    boot.context->Mult(ct, ct, k);
+    boot.context->Rescale(ct, ct);
+  };
+
+  double ms_lo = 1e300, ms_hi = 0.0, log_sum = 0.0;
+  std::vector<double> ms(proj_small, 0.0);
+  for (int t = 0; t < proj_small; t++) {
+    double s2 = 0.0;
+    for (int c = 0; c < model_declared; c++) {
+      const double v = h_host[static_cast<size_t>(t) * model_declared + c];
+      s2 += v * v;
+    }
+    ms[t] = s2 / model_declared;
+    log_sum += std::log(ms[t]);
+    ms_lo = std::min(ms_lo, ms[t]);
+    ms_hi = std::max(ms_hi, ms[t]);
+  }
+  const double alpha = 1.0 / std::exp(log_sum / proj_small);
+  std::cout << "  residual mean-square spread " << (ms_hi / ms_lo) << "x"
+            << std::endl;
+
+  double boundary = 0.0;
+  Ciphertext<word> normed;
+  {
+    Ciphertext<word> up;
+    sched.ToSlot(up, h_ct, boot.ui->GetEvkMap());
+    {
+      Plaintext<word> rp;
+      boot.ui->Decrypt(rp, up);
+      std::vector<Complex> raw;
+      boot.context->encoder_.Decode(raw, rp);
+      double num = 0.0, den = 0.0;
+      for (int c = 0; c < model_declared; c += 2) {
+        for (int t = 0; t < proj_small; t++) {
+          const double w = h_host[static_cast<size_t>(t) * model_declared + c];
+          num += raw[c * proj_small + t].real() * w;
+          den += w * w;
+        }
+      }
+      boundary = num / den;
+      std::cout << "  HalfBoot boundary constant " << boundary << std::endl;
+      ASSERT_GT(std::abs(boundary), 0.0);
+    }
+    canonicalise(up, 1.0 / boundary);
+
+    cheddar::RmsNormHandler<word> rms(boot.context, proj_small,
+                                      model_declared, alpha, op_level, 1e-5,
+                                      6.0, 9, /*channel_stride=*/2);
+    ASSERT_EQ(rms.GetNumCiphertexts(), 1);
+    for (int d : rms.GetRotationDistances()) {
+      boot.ui->PrepareRotationKey(d, op_level);
+    }
+    const double root_alpha = std::sqrt(alpha);
+    std::vector<std::vector<Complex>> wts(1);
+    wts[0].assign(num_slots, Complex(0.0, 0.0));
+    for (int c = 0; c < model_declared; c++) {
+      const int I = rev(c, 9);
+      const int src = (c % 2 == 0) ? c : rev(proj_rank - I, 9);
+      for (int t = 0; t < proj_small; t++) {
+        wts[0][c * proj_small + t] = Complex(wnorm[src] * root_alpha, 0.0);
+      }
+    }
+    std::vector<Ciphertext<word>> in(1), outv;
+    in[0] = std::move(up);
+    rms.Apply(outv, in, wts, boot.ui->GetEvkMap());
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    sched.ToCoeff(normed, outv[0], boot.ui->GetEvkMap());
+  }
+  std::cout << "  RMSNorm(ffn) done, coefficients at level "
+            << boot.param->NPToLevel(normed.GetNP()) << std::endl;
+
+  std::vector<double> n_host(h_host.size(), 0.0);
+  for (int t = 0; t < proj_small; t++) {
+    const double inv = 1.0 / std::sqrt(ms[t] + 1e-5);
+    for (int c = 0; c < model_declared; c++) {
+      n_host[static_cast<size_t>(t) * model_declared + c] =
+          h_host[static_cast<size_t>(t) * model_declared + c] * inv *
+          wnorm[c];
+    }
+  }
+
+  const auto g_host = host_mm2(n_host, model_declared, wgate, hidden_declared);
+  const auto u_host = host_mm2(n_host, model_declared, wup, hidden_declared);
+  double gmax = 0.0;
+  for (double v : g_host) gmax = std::max(gmax, std::abs(v));
+  const double proj_size = 0.4 / std::max(gmax, 1e-12);
+  const double silu_range = 12.0;
+
+  std::vector<Ciphertext<word>> gate, upv;
+  {
+    Ciphertext<word> low;
+    boot.context->LevelDown(low, normed, pcmm_level);
+    std::vector<Ciphertext<word>> ins(1);
+    ins[0] = std::move(low);
+    leg.Project(gate, ins, model_declared, hidden_declared, wgate, proj_size,
+                "gate");
+    leg.Project(upv, ins, model_declared, hidden_declared, wup, proj_size,
+                "up");
+  }
+  ASSERT_EQ(gate.size(), 2u);
+
+  std::vector<Ciphertext<word>> prod(2);
+  {
+    cheddar::SiLuHandler<word> silu(boot.context, silu_range, op_level, 31);
+    for (int i = 0; i < 2; i++) {
+      Ciphertext<word> g_up, u_up, sv, u_low;
+      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
+      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
+      canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
+      canonicalise(u_up, 1.0 / (boundary * proj_size));
+      silu.Apply(sv, g_up, boot.ui->GetEvkMap());
+      boot.context->LevelDown(u_low, u_up,
+                              boot.param->NPToLevel(sv.GetNP()));
+      boot.context->HMult(prod[i], sv, u_low,
+                          boot.ui->GetEvkMap().GetMultiplicationKey());
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::vector<double> gu(g_host.size(), 0.0);
+  for (size_t i = 0; i < gu.size(); i++) {
+    gu[i] = (g_host[i] / (1.0 + std::exp(-g_host[i]))) * u_host[i];
+  }
+  const auto y_host = host_mm2(gu, hidden_declared, wdown, model_declared);
+
+  Ciphertext<word> down;
+  {
+    std::vector<Ciphertext<word>> ins(2);
+    for (int i = 0; i < 2; i++) {
+      Ciphertext<word> c2;
+      sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap());
+      boot.context->LevelDown(ins[i], c2, pcmm_level);
+    }
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, ins, hidden_declared, model_declared, wdown, 1.0, "down");
+    ASSERT_EQ(res.size(), 1u);
+    down = std::move(res[0]);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  // ---- the layer's output, against the same layer in double -------------
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, down);
+    std::vector<double> coeffs;
+    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    const auto comp = HostComponents(coeffs, proj_rank, proj_small);
+    double num = 0.0, den = 0.0, mx = 0.0;
+    for (int c = 0; c < model_declared; c += 2) {
+      for (int t = 0; t < proj_small; t++) {
+        const double want = y_host[static_cast<size_t>(t) * model_declared + c];
+        num += comp[rev(c, 9)][rev(t, 7)] * want;
+        den += want * want;
+        mx = std::max(mx, std::abs(want));
+      }
+    }
+    const double fit = num / den;
+    double err = 0.0;
+    for (int c = 0; c < model_declared; c += 2) {
+      for (int t = 0; t < proj_small; t++) {
+        const double got = comp[rev(c, 9)][rev(t, 7)] / fit;
+        err = std::max(err, std::abs(
+            got - y_host[static_cast<size_t>(t) * model_declared + c]));
+      }
+    }
+    std::cout << "THE WHOLE CI LAYER: down-projection output " << err
+              << " against |y| <= " << mx << " (relative " << (err / mx)
+              << "), carried " << fit << std::endl;
+    EXPECT_LT(err / mx, 0.10)
+        << "the conjugate-invariant layer disagrees with the same layer in "
+           "double by more than the circuit can explain";
+  }
 }
+
