@@ -1449,3 +1449,165 @@ TEST(CiFfn, TheStripedMatrixOffsetConventionIsPinned) {
       << "neither reading of the StripedMatrix key describes what Evaluate "
          "did, so the offset is not the whole story";
 }
+
+// ---------------------------------------------------------------------------
+// THE SEAM'S T1, STAGED. `TheSeamCarriesTheChainLayoutToTheBandedImage` above
+// builds T1 as one 486-diagonal transform and measures it exact. The layer
+// cannot afford that -- 486 plaintext diagonals is 2.9 GB and the seam set the
+// whole run's memory ceiling (Doing.md 1.5ct) -- so it runs the same map as
+// three stages of bit transpositions, 60 diagonals in total.
+//
+// The map IS six transpositions of slot-index bits. The chain address
+// `rev4(col) * 4096 + rev7(row) * 32 + lane` and the block address
+// `row + 128 * (rev4(col) * 32 + rev5(lh))` agree on the column field and
+// differ by (11,0) (10,1) (9,2) (8,3) (6,5) (7,4), plus a shift of 128 on the
+// upper half because the transposition puts `half` at destination bit 7 where
+// the packing wants a zero. 486 = 2 * 3^5 is that statement counted.
+//
+// This test runs T1 ALONE, both halves, so the staging is separated from T2
+// and from everything the layer wraps around it -- the layer measured the pair
+// at err/mx 14.48 and could not say which. Two minutes here against seventeen
+// there.
+// ---------------------------------------------------------------------------
+TEST(CiFfn, TheStagedSeamCarriesTheSameMapAsTheOneShot) {
+  Ring boot(Param());
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  const int degree = boot.Degree();
+  const int num_slots = boot.param->MaxNumSlots();
+  constexpr int kCols = 16, kRows = 128;
+  auto slot_chain = [&](int row, int col, int lane) {
+    return Rev(col, 4) * 4096 + Rev(row, 7) * 32 + lane;
+  };
+  auto slot_block = [&](int token, int chan) { return token + kRows * chan; };
+  auto chan_of = [&](int col, int lh) { return Rev(col, 4) * 32 + Rev(lh, 5); };
+  auto swap_bits = [](int x, int i, int j) {
+    if (((x >> i) & 1) != ((x >> j) & 1)) x ^= (1 << i) | (1 << j);
+    return x;
+  };
+  auto split = [](int need) {
+    int bs = 1;
+    while (bs * bs < need) bs *= 2;
+    int gs = 1;
+    while (bs * gs < need) gs *= 2;
+    return std::make_pair(bs, gs);
+  };
+  auto pt_scale = [&](int l) {
+    return boot.param->GetScale(l - 1) * boot.param->GetRescalePrimeProd(l) /
+           boot.param->GetScale(l);
+  };
+  const std::vector<std::vector<std::pair<int, int>>> stages = {
+      {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
+  const int top = 12;
+
+  std::mt19937_64 gen(0x5EA3);
+  std::normal_distribution<double> xd(0.0, 1.0);
+
+  for (int half = 0; half < 2; half++) {
+    std::vector<Complex> msg(num_slots, Complex(0.0, 0.0));
+    std::vector<std::vector<std::vector<double>>> v(
+        kRows, std::vector<std::vector<double>>(kCols,
+                                                std::vector<double>(16, 0.0)));
+    for (int row = 0; row < kRows; row++) {
+      for (int col = 0; col < kCols; col++) {
+        for (int lh = 0; lh < 16; lh++) {
+          v[row][col][lh] = xd(gen);
+          msg[slot_chain(row, col, half * 16 + lh)] =
+              Complex(v[row][col][lh], 0.0);
+        }
+      }
+    }
+    Plaintext<word> pt;
+    boot.context->encoder_.Encode(pt, top, boot.param->GetScale(top), msg);
+    Ciphertext<word> ct;
+    boot.ui->Encrypt(ct, pt);
+
+    std::vector<int> cur;
+    for (int col = 0; col < kCols; col++)
+      for (int lh = 0; lh < 16; lh++)
+        for (int row = 0; row < kRows; row++)
+          cur.push_back(slot_chain(row, col, half * 16 + lh));
+
+    Ciphertext<word> a = std::move(ct);
+    for (size_t st = 0; st < stages.size(); st++) {
+      const bool last = (st + 1 == stages.size());
+      std::vector<int> mid(cur.size());
+      cheddar::StripedMatrix ms(degree, degree);
+      for (size_t e = 0; e < cur.size(); e++) {
+        int y = cur[e];
+        for (const auto &sw : stages[st]) y = swap_bits(y, sw.first, sw.second);
+        if (last) y -= 128 * half;
+        mid[e] = y;
+        const int off = ((cur[e] - y) % degree + degree) % degree;
+        ms.try_emplace(off, degree, Complex(0.0, 0.0));
+        ms[off][y] = Complex(1.0, 0.0);
+      }
+      int need = 0;
+      const int w = BestWindow(ms, degree, &need);
+      const auto sp = split(need);
+      const int lvl = top - static_cast<int>(st);
+      cheddar::LinearTransform<word> lt(boot.context, ms, lvl, pt_scale(lvl),
+                                        sp.first, sp.second, w, -w);
+      const int back = ((w % degree) + degree) % degree;
+      {
+        cheddar::EvkRequest req;
+        lt.AddRequiredRotations(req);
+        req.AddRequest(back, lvl - 1);
+        boot.ui->PrepareRotationKey(req);
+      }
+      std::cout << "  half " << half << " stage " << st << ": "
+                << ms.GetNumDiag() << " diagonals, " << sp.first << "x"
+                << sp.second << " at level " << lvl << ", window " << w
+                << std::endl;
+      Ciphertext<word> next;
+      lt.Evaluate(boot.context, next, a, boot.ui->GetEvkMap());
+      if (back) {
+        Ciphertext<word> r;
+        boot.context->HRot(r, next, boot.ui->GetEvkMap().GetRotationKey(back),
+                           back);
+        next = std::move(r);
+      }
+      a = std::move(next);
+      cur.swap(mid);
+    }
+    cudaDeviceSynchronize();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    // The addresses, on the host, before anything is decrypted.
+    for (int col = 0; col < kCols; col++)
+      for (int lh = 0; lh < 16; lh++)
+        for (int row = 0; row < kRows; row++)
+          ASSERT_EQ(cur[(static_cast<size_t>(col) * 16 + lh) * kRows + row],
+                    slot_block(row, chan_of(col, lh)))
+              << "the staged bit permutation is not T1";
+
+    Plaintext<word> ap;
+    boot.ui->Decrypt(ap, a);
+    std::vector<Complex> as;
+    boot.context->encoder_.Decode(as, ap);
+    double err = 0.0, mx = 0.0, outside = 0.0;
+    std::vector<char> live_set(num_slots, 0);
+    for (int col = 0; col < kCols; col++) {
+      for (int lh = 0; lh < 16; lh++) {
+        const int c = chan_of(col, lh);
+        for (int row = 0; row < kRows; row++) {
+          const double want = v[row][col][lh];
+          mx = std::max(mx, std::abs(want));
+          const int ls = slot_block(row, c);
+          live_set[ls] = 1;
+          err = std::max(err, std::abs(as[ls].real() - want));
+        }
+      }
+    }
+    for (int i = 0; i < num_slots; i++)
+      if (!live_set[i]) outside = std::max(outside, std::abs(as[i].real()));
+    std::cout << "STAGED T1 half " << half << ": live " << err
+              << ", everything else " << outside << " (|v| <= " << mx
+              << "), level " << boot.param->NPToLevel(a.GetNP())
+              << ", scale / canonical "
+              << (a.GetScale() /
+                  boot.param->GetScale(boot.param->NPToLevel(a.GetNP())))
+              << std::endl;
+    EXPECT_LT(err, 1e-3 * mx) << "the staged T1 lost the live entries";
+    EXPECT_LT(outside, 1e-3 * mx) << "the staged T1 put something outside";
+  }
+}
