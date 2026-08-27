@@ -183,6 +183,34 @@ double ReportTurn(const char *name, const Ring &ring,
   return fit;
 }
 
+// `LinearTransform` computes `rot = (offset - pre_rotation) mod degree` and
+// insists on `max(rot) <= (bs*gs - 1) * gcd(rot)`. A matrix whose offsets
+// straddle zero therefore fails with gcd 1 and max ~degree until it is given
+// a window: 1.5by's exchange does it by hand, and this picks the best one by
+// trying every offset as the origin -- O(n^2) on a few hundred diagonals,
+// which is nothing beside building the plaintexts.
+int BestWindow(const cheddar::StripedMatrix &m, int degree, int *need) {
+  std::vector<int> offs;
+  for (const auto &kv : m) offs.push_back(kv.first);
+  int best_w = 0;
+  long long best_need = -1;
+  for (int w : offs) {
+    long long g = 0, mx = 0;
+    for (int o : offs) {
+      const long long r = ((o - w) % degree + degree) % degree;
+      mx = std::max(mx, r);
+      long long a = g, b = r;
+      while (b) { const long long t = a % b; a = b; b = t; }
+      g = a;
+    }
+    if (g == 0) continue;
+    const long long n = mx / g + 1;
+    if (best_need < 0 || n < best_need) { best_need = n; best_w = w; }
+  }
+  if (need) *need = static_cast<int>(best_need);
+  return best_w;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1064,18 +1092,11 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   // transform's own plaintexts rather than by a separate mask, so T2 is one
   // rotation, one transform and one add.
   cheddar::StripedMatrix m2(degree, degree);
-  int t2_window = 0;
-  {
-    std::set<int> raw_offs;
-    for (int col = 0; col < kCols; col++) {
-      for (int lh = 0; lh < 16; lh++) {
-        const int c = chan_of(col, lh);
-        const int I = Rev(c, 9);
-        ASSERT_LT(I, kRank / 2) << "an even channel must be a live component";
-        raw_offs.insert(kRows * (c - Rev(kRank - I, 9)));
-      }
+  for (int col = 0; col < kCols; col++) {
+    for (int lh = 0; lh < 16; lh++) {
+      ASSERT_LT(Rev(chan_of(col, lh), 9), kRank / 2)
+          << "an even channel must be a live component";
     }
-    t2_window = *raw_offs.begin();
   }
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
@@ -1091,19 +1112,35 @@ TEST(CiFfn, TheSeamCarriesTheChainLayoutToTheBandedImage) {
   std::cout << "T2 (channel permutation after the -1 rotation): "
             << m2.GetNumDiag() << " diagonals" << std::endl;
 
-  // The windows are `DetermineStride`'s wrap wall, handled exactly as the
-  // leg's own exchange handles it (1.5by). T1 needs bs*gs >= 7827, T2 >= 1023.
-  constexpr int kT1Window = 61679;
+  // The windows are `DetermineStride`'s wrap wall, handled the way 1.5by's
+  // exchange handles it, but chosen rather than guessed: `BestWindow` tries
+  // every offset as the origin and reports the smallest `bs * gs` that will
+  // be accepted.
+  int need1 = 0, need2 = 0;
+  const int w1 = BestWindow(m1, degree, &need1);
+  const int w2 = BestWindow(m2, degree, &need2);
+  auto split = [](int need) {
+    int bs = 1;
+    while (bs * bs < need) bs *= 2;
+    int gs = 1;
+    while (bs * gs < need) gs *= 2;
+    return std::make_pair(bs, gs);
+  };
+  const auto s1 = split(need1);
+  const auto s2 = split(need2);
+  std::cout << "  T1 window " << w1 << ", needs bs*gs >= " << need1 << " -> "
+            << s1.first << "x" << s1.second << "; T2 window " << w2
+            << ", needs " << need2 << " -> " << s2.first << "x" << s2.second
+            << std::endl;
+
   cheddar::LinearTransform<word> t1(
       boot.context, m1, t1_level,
-      boot.param->GetRescalePrimeProd(t1_level), 128, 64,
-      /*pre_rotation=*/-kT1Window, /*additional_pt_rot=*/kT1Window);
+      boot.param->GetRescalePrimeProd(t1_level), s1.first, s1.second,
+      /*pre_rotation=*/w1, /*additional_pt_rot=*/-w1);
   cheddar::LinearTransform<word> t2(
       boot.context, m2, t2_level,
-      boot.param->GetRescalePrimeProd(t2_level), 32, 32,
-      /*pre_rotation=*/-t2_window, /*additional_pt_rot=*/t2_window);
-  std::cout << "  T1 BSGS " << t1.GetBS() << "x" << t1.GetGS() << ", T2 "
-            << t2.GetBS() << "x" << t2.GetGS() << std::endl;
+      boot.param->GetRescalePrimeProd(t2_level), s2.first, s2.second,
+      /*pre_rotation=*/w2, /*additional_pt_rot=*/-w2);
   {
     cheddar::EvkRequest req;
     t1.AddRequiredRotations(req);
