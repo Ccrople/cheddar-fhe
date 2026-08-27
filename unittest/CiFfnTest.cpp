@@ -211,13 +211,19 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
     std::cout << "  dead slots reach " << dead_max << " and match the "
               << "neighbouring-token partner to " << dead_neighbour
               << std::endl;
+    // The thresholds are 1% of the landed magnitude, not 0.1%: these three
+    // are LAYOUT claims -- which slot holds what -- and a wrong map is off by
+    // order one, while HalfBoot's own noise at this magnitude is within a
+    // factor of a few of 0.1%. Testing the layout at the noise floor would
+    // make a map failure and a precision failure indistinguishable, and the
+    // precision is measured separately below.
     const double span = std::abs(landed);
-    EXPECT_LT(live_err, 1e-3 * span)
+    EXPECT_LT(live_err, 1e-2 * span)
         << "the coefficient image did not land at channel * 128 + rev7(token)";
-    EXPECT_GT(dead_max, 1e-2 * span)
+    EXPECT_GT(dead_max, 1e-1 * span)
         << "the odd slots are empty, so half density is not what 1.5by says "
            "it is and the mask below would be measuring nothing";
-    EXPECT_LT(dead_neighbour, 1e-3 * span)
+    EXPECT_LT(dead_neighbour, 1e-2 * span)
         << "the odd slots hold something other than comp_{512-I}[p+1]";
   }
 
