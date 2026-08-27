@@ -8590,7 +8590,7 @@ class ProjectOnlyLegCi : public cheddar::CoeffLinearLeg<word> {
 };
 
 TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
-  Ring boot(kBootParam, {}, /*boot_slack_levels=*/9);
+  Ring boot(kBootParam);
   Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
   Ring small(kBootSmallParam);
   Ring lifted(kBootLiftedParam,
@@ -8980,9 +8980,34 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
   }
 
+  // ---- a second BootContext, because the two halves want opposite things
+  //
+  // The leg's softmax walk needs `GetEndLevel()` at 16 -- affine, exp,
+  // norm, invsqrt and P at 3 (1.5bv) -- and that is `dec - num_stc - slack`,
+  // so the leg needs slack ZERO. The FFN needs slack, because `SlotToCoeff`
+  // is compiled at `GetStCStartLevel()` and an operator eight levels deep
+  // cannot arrive there without it. Run with slack 9 the leg refuses, in as
+  // many words: "the softmax walk overspends its levels".
+  //
+  // The conflict is real and the tree already knows the answer -- it is what
+  // the switching ring is: a second Context over the SAME primes holding the
+  // SAME secret, so a ciphertext crosses between them without a word
+  // changing. Here the two differ only in slack.
+  Ring boot_ffn(kBootParam, boot.ui->GetSecretCoeffs(),
+                /*boot_slack_levels=*/9);
+  auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
+  ASSERT_NE(fctx, nullptr);
+  fctx->PrepareEvalMod();
+  fctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    EvkRequest req;
+    fctx->AddRequiredRotations(req, num_slots);
+    boot_ffn.ui->PrepareRotationKey(req);
+  }
+
   // ---- the seam: chain layout -> the block's banded half-density image --
   const int t1_level = 13, t2_level = 12;
-  cheddar::SylphSchedule<word> sched(bctx, num_slots);
+  cheddar::SylphSchedule<word> sched(fctx, num_slots);
   std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
             << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
             << ", seam at " << t1_level << "/" << t2_level << std::endl;
@@ -9024,8 +9049,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     return std::make_pair(bs, gs);
   };
   auto pt_scale = [&](int l) {
-    return boot.param->GetScale(l - 1) * boot.param->GetRescalePrimeProd(l) /
-           boot.param->GetScale(l);
+    return boot_ffn.param->GetScale(l - 1) * boot_ffn.param->GetRescalePrimeProd(l) /
+           boot_ffn.param->GetScale(l);
   };
 
   std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> seam_t1(2);
@@ -9051,7 +9076,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     const int w = best_window(m1, &need);
     const auto sp = split(need);
     seam_t1[half] = std::make_unique<cheddar::LinearTransform<word>>(
-        boot.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
+        boot_ffn.context, m1, t1_level, pt_scale(t1_level), sp.first, sp.second,
         w, -w);
     back1[half] = ((w % n) + n) % n;
     std::cout << "  seam T1[" << half << "]: " << m1.GetNumDiag()
@@ -9076,7 +9101,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     const int w = best_window(m2, &need);
     const auto sp = split(need);
     seam_t2 = std::make_unique<cheddar::LinearTransform<word>>(
-        boot.context, m2, t2_level, pt_scale(t2_level), sp.first, sp.second,
+        boot_ffn.context, m2, t2_level, pt_scale(t2_level), sp.first, sp.second,
         w, -w);
     back2 = ((w % n) + n) % n;
     std::cout << "  seam T2: " << m2.GetNumDiag() << " diagonals, "
@@ -9091,7 +9116,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     seam_t2->AddRequiredRotations(req);
     req.AddRequest(back2, t2_level - 1);
     req.AddRequest(1, t2_level);
-    boot.ui->PrepareRotationKey(req);
+    boot_ffn.ui->PrepareRotationKey(req);
   }
 
   // Boot the attention output, run the seam, come back to coefficients.
@@ -9101,40 +9126,40 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     bctx->Boot(booted, out[bi], boot.ui->GetEvkMap());
     for (int half = 0; half < 2; half++) {
       Ciphertext<word> low, a2, sh, dup, live, sum;
-      boot.context->LevelDown(low, booted, t1_level);
-      seam_t1[half]->Evaluate(boot.context, a2, low, boot.ui->GetEvkMap());
+      boot_ffn.context->LevelDown(low, booted, t1_level);
+      seam_t1[half]->Evaluate(boot_ffn.context, a2, low, boot_ffn.ui->GetEvkMap());
       if (back1[half]) {
         Ciphertext<word> r;
-        boot.context->HRot(r, a2, boot.ui->GetEvkMap().GetRotationKey(
+        boot_ffn.context->HRot(r, a2, boot_ffn.ui->GetEvkMap().GetRotationKey(
                                       back1[half]), back1[half]);
         a2 = std::move(r);
       }
-      boot.context->HRot(sh, a2, boot.ui->GetEvkMap().GetRotationKey(1), 1);
-      seam_t2->Evaluate(boot.context, dup, sh, boot.ui->GetEvkMap());
+      boot_ffn.context->HRot(sh, a2, boot_ffn.ui->GetEvkMap().GetRotationKey(1), 1);
+      seam_t2->Evaluate(boot_ffn.context, dup, sh, boot_ffn.ui->GetEvkMap());
       if (back2) {
         Ciphertext<word> r;
-        boot.context->HRot(r, dup, boot.ui->GetEvkMap().GetRotationKey(back2),
+        boot_ffn.context->HRot(r, dup, boot_ffn.ui->GetEvkMap().GetRotationKey(back2),
                            back2);
         dup = std::move(r);
       }
-      const int dl = boot.param->NPToLevel(dup.GetNP());
+      const int dl = boot_ffn.param->NPToLevel(dup.GetNP());
       cheddar::Constant<word> one;
-      boot.context->encoder_.EncodeConstant(
+      boot_ffn.context->encoder_.EncodeConstant(
           one, dl + 1,
-          boot.param->GetScale(dl) * boot.param->GetRescalePrimeProd(dl + 1) /
+          boot_ffn.param->GetScale(dl) * boot_ffn.param->GetRescalePrimeProd(dl + 1) /
               a2.GetScale(),
           1.0);
-      boot.context->Mult(live, a2, one);
-      boot.context->Rescale(live, live);
-      boot.context->Add(sum, live, dup);
-      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
+      boot_ffn.context->Mult(live, a2, one);
+      boot_ffn.context->Rescale(live, live);
+      boot_ffn.context->Add(sum, live, dup);
+      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot_ffn.ui->GetEvkMap());
     }
   }
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  the seam gave " << h_cts.size()
             << " half-density coefficient ciphertexts at level "
-            << boot.param->NPToLevel(h_cts[0].GetNP()) << std::endl;
+            << boot_ffn.param->NPToLevel(h_cts[0].GetNP()) << std::endl;
 
   // ---- the O projection, the residual, and the FFN ----------------------
   //
@@ -9170,7 +9195,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   lcfg.num_tokens = proj_small;
   lcfg.product_level = pcmm_level;
   lcfg.parents_per_tile = 0;
-  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
+  ProjectOnlyLegCi leg(boot_ffn.context, lcfg, pack_keys);
 
   // The attention output's live channels, laid out as the projection reads
   // them: half ciphertext `k` holds live channels `2 * j` for j < 256.
@@ -9205,7 +9230,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   {
     std::vector<Ciphertext<word>> ins(h_cts.size());
     for (size_t k = 0; k < h_cts.size(); k++) {
-      boot.context->LevelDown(ins[k], h_cts[k], pcmm_level);
+      boot_ffn.context->LevelDown(ins[k], h_cts[k], pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
     leg.Project(res, ins, attn_declared, model_declared, wo, 1.0, "o");
@@ -9215,7 +9240,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   std::cout << "  O projection: one half-density ciphertext at level "
-            << boot.param->NPToLevel(o_out.GetNP()) << std::endl;
+            << boot_ffn.param->NPToLevel(o_out.GetNP()) << std::endl;
 
   const auto o_host = host_mm2(attn_flat, attn_declared, wo, model_declared);
   std::cout << "THE CI LAYER RAN: attention -> seam -> O projection, all "
@@ -9229,7 +9254,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     Plaintext<word> pt;
     boot.ui->Decrypt(pt, o_out);
     std::vector<double> coeffs;
-    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    boot_ffn.context->encoder_.DecodeCoeff(coeffs, pt);
     // comp[i][p], the inverse of the banded recomposition
     std::vector<std::vector<double>> comp(
         proj_rank, std::vector<double>(proj_small, 0.0));
@@ -9292,16 +9317,16 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       for (int t = 0; t < proj_small; t++) scaled[i][t] = x_comp[i][t] * o_fit;
     }
     Plaintext<word> pt;
-    boot.context->encoder_.EncodeCoeff(pt, 0, boot.param->GetScale(0),
+    boot_ffn.context->encoder_.EncodeCoeff(pt, 0, boot_ffn.param->GetScale(0),
                                        HostRecompose(scaled, proj_rank,
                                                      proj_small));
     boot.ui->Encrypt(stream, pt);
     stream.SetNumSlots(num_slots);
   }
   Ciphertext<word> h_ct;
-  boot.context->Add(h_ct, stream, o_out);
+  boot_ffn.context->Add(h_ct, stream, o_out);
   std::cout << "  residual added at level "
-            << boot.param->NPToLevel(h_ct.GetNP()) << std::endl;
+            << boot_ffn.param->NPToLevel(h_ct.GetNP()) << std::endl;
 
   // The host's residual stream, in the same units.
   std::vector<double> h_host(
@@ -9325,13 +9350,13 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   const int op_level = slot_level - 1;
   auto canonicalise = [&](Ciphertext<word> &ct, double restore) {
     cheddar::Constant<word> k;
-    boot.context->encoder_.EncodeConstant(
+    boot_ffn.context->encoder_.EncodeConstant(
         k, slot_level,
-        boot.param->GetScale(op_level) *
-            boot.param->GetRescalePrimeProd(slot_level) / ct.GetScale(),
+        boot_ffn.param->GetScale(op_level) *
+            boot_ffn.param->GetRescalePrimeProd(slot_level) / ct.GetScale(),
         restore);
-    boot.context->Mult(ct, ct, k);
-    boot.context->Rescale(ct, ct);
+    boot_ffn.context->Mult(ct, ct, k);
+    boot_ffn.context->Rescale(ct, ct);
   };
 
   double ms_lo = 1e300, ms_hi = 0.0, log_sum = 0.0;
@@ -9355,12 +9380,12 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   Ciphertext<word> normed;
   {
     Ciphertext<word> up;
-    sched.ToSlot(up, h_ct, boot.ui->GetEvkMap());
+    sched.ToSlot(up, h_ct, boot_ffn.ui->GetEvkMap());
     {
       Plaintext<word> rp;
       boot.ui->Decrypt(rp, up);
       std::vector<Complex> raw;
-      boot.context->encoder_.Decode(raw, rp);
+      boot_ffn.context->encoder_.Decode(raw, rp);
       double num = 0.0, den = 0.0;
       for (int c = 0; c < model_declared; c += 2) {
         for (int t = 0; t < proj_small; t++) {
@@ -9375,12 +9400,12 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
     canonicalise(up, 1.0 / boundary);
 
-    cheddar::RmsNormHandler<word> rms(boot.context, proj_small,
+    cheddar::RmsNormHandler<word> rms(boot_ffn.context, proj_small,
                                       model_declared, alpha, op_level, 1e-5,
                                       6.0, 9, /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
-      boot.ui->PrepareRotationKey(d, op_level);
+      boot_ffn.ui->PrepareRotationKey(d, op_level);
     }
     const double root_alpha = std::sqrt(alpha);
     std::vector<std::vector<Complex>> wts(1);
@@ -9394,13 +9419,13 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     }
     std::vector<Ciphertext<word>> in(1), outv;
     in[0] = std::move(up);
-    rms.Apply(outv, in, wts, boot.ui->GetEvkMap());
+    rms.Apply(outv, in, wts, boot_ffn.ui->GetEvkMap());
     cudaDeviceSynchronize();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    sched.ToCoeff(normed, outv[0], boot.ui->GetEvkMap());
+    sched.ToCoeff(normed, outv[0], boot_ffn.ui->GetEvkMap());
   }
   std::cout << "  RMSNorm(ffn) done, coefficients at level "
-            << boot.param->NPToLevel(normed.GetNP()) << std::endl;
+            << boot_ffn.param->NPToLevel(normed.GetNP()) << std::endl;
 
   std::vector<double> n_host(h_host.size(), 0.0);
   for (int t = 0; t < proj_small; t++) {
@@ -9422,7 +9447,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   std::vector<Ciphertext<word>> gate, upv;
   {
     Ciphertext<word> low;
-    boot.context->LevelDown(low, normed, pcmm_level);
+    boot_ffn.context->LevelDown(low, normed, pcmm_level);
     std::vector<Ciphertext<word>> ins(1);
     ins[0] = std::move(low);
     leg.Project(gate, ins, model_declared, hidden_declared, wgate, proj_size,
@@ -9434,18 +9459,18 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
 
   std::vector<Ciphertext<word>> prod(2);
   {
-    cheddar::SiLuHandler<word> silu(boot.context, silu_range, op_level, 31);
+    cheddar::SiLuHandler<word> silu(boot_ffn.context, silu_range, op_level, 31);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> g_up, u_up, sv, u_low;
-      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
-      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
+      sched.ToSlot(g_up, gate[i], boot_ffn.ui->GetEvkMap());
+      sched.ToSlot(u_up, upv[i], boot_ffn.ui->GetEvkMap());
       canonicalise(g_up, 1.0 / (boundary * proj_size * silu_range));
       canonicalise(u_up, 1.0 / (boundary * proj_size));
-      silu.Apply(sv, g_up, boot.ui->GetEvkMap());
-      boot.context->LevelDown(u_low, u_up,
-                              boot.param->NPToLevel(sv.GetNP()));
-      boot.context->HMult(prod[i], sv, u_low,
-                          boot.ui->GetEvkMap().GetMultiplicationKey());
+      silu.Apply(sv, g_up, boot_ffn.ui->GetEvkMap());
+      boot_ffn.context->LevelDown(u_low, u_up,
+                              boot_ffn.param->NPToLevel(sv.GetNP()));
+      boot_ffn.context->HMult(prod[i], sv, u_low,
+                          boot_ffn.ui->GetEvkMap().GetMultiplicationKey());
     }
   }
   cudaDeviceSynchronize();
@@ -9462,8 +9487,8 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     std::vector<Ciphertext<word>> ins(2);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> c2;
-      sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap());
-      boot.context->LevelDown(ins[i], c2, pcmm_level);
+      sched.ToCoeff(c2, prod[i], boot_ffn.ui->GetEvkMap());
+      boot_ffn.context->LevelDown(ins[i], c2, pcmm_level);
     }
     std::vector<Ciphertext<word>> res;
     leg.Project(res, ins, hidden_declared, model_declared, wdown, 1.0, "down");
@@ -9478,7 +9503,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     Plaintext<word> pt;
     boot.ui->Decrypt(pt, down);
     std::vector<double> coeffs;
-    boot.context->encoder_.DecodeCoeff(coeffs, pt);
+    boot_ffn.context->encoder_.DecodeCoeff(coeffs, pt);
     const auto comp = HostComponents(coeffs, proj_rank, proj_small);
     double num = 0.0, den = 0.0, mx = 0.0;
     for (int c = 0; c < model_declared; c += 2) {
