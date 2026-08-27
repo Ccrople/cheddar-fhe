@@ -759,7 +759,17 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
   typename cheddar::CoeffLinearLeg<word>::Config lcfg;
   lcfg.num_tokens = kTokens;
   lcfg.product_level = product_level;
-  lcfg.parents_per_tile = 0;
+  // TILING HAS NEVER RUN ON R+. Every validation of `parents_per_tile` is on
+  // the ordinary ring (`LlamaProjectionTest` sweeps it, `SwitchedProjection`
+  // fixes 16 for the direct route); this test and every other CI one have run
+  // it at 0. The layer needs it -- sixteen parents at rank 512 is 10.7 GB
+  // (Doing.md 1.5ct) -- so make it a knob here, where a wrong answer costs
+  // three minutes instead of seventeen.
+  {
+    const char *t = std::getenv("CHEDDAR_CI_TILE");
+    lcfg.parents_per_tile = t ? std::atoi(t) : 0;
+  }
+  std::cout << "  parents_per_tile = " << lcfg.parents_per_tile << std::endl;
   ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
   ASSERT_EQ(leg.GetRank(), kRank);
   ASSERT_EQ(leg.GetSmallDegree(), kTokens);
