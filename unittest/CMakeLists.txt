@@ -140,6 +140,14 @@ add_executable(ci_lift_test CiLiftTest.cpp)
 target_link_libraries(ci_lift_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+# The conjugate-invariant FFN, one stage at a time: the crossing, RMSNorm on
+# the half-density image a projection emits, SiLU and the two products. Its
+# own binary because ci_switched_ccmm_test's converter builds dominate that
+# suite and none of them are needed here.
+add_executable(ci_ffn_test CiFfnTest.cpp)
+target_link_libraries(ci_ffn_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
 # ci16 -> RingSwitch -> CiLift -> [KANG] Alg. 4 -> CiDescend -> SwitchBack:
 # the conjugate-invariant CC-MM chain end to end, three rings alive at once.
 add_executable(ci_switched_ccmm_test CiSwitchedCcmmTest.cpp)
