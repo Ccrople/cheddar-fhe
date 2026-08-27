@@ -9066,15 +9066,21 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // the switching ring is: a second Context over the SAME primes holding the
   // SAME secret, so a ciphertext crosses between them without a word
   // changing. Here the two differ only in slack.
-  // SLACK TWELVE, NOT NINE, AND THE REASON IS MEMORY. The seam's 192
-  // rotation keys are the layer's largest single key demand, and a key's
-  // size is its level's limb count; more slack puts StC lower, which lets
-  // the seam sit lower, which makes those keys smaller. Nine put the seam at
-  // 13/12 and the run died in the pool; twelve puts it at 10/9. The FFN's
-  // own stages still fit -- RMSNorm leaves 11 against StC's 7 -- and
-  // `GetCoeffLevel()` is 4, still above the product level.
+  // SLACK NINE, AND TWELVE WAS A SILENT DISASTER. Twelve was chosen to chase
+  // the seam's rotation keys down a level -- a key's size is its level's limb
+  // count -- and it did nothing for the memory, which three other changes
+  // fixed instead. What it DID do is move `GetStCStartLevel()` from 10 to 7,
+  // and `SlotToCoeff` is a hoisted transform: its phases then ran at 7, 6 and
+  // 5, two of them inside ci16_35's `num_accum == 1` zone (levels 0..6,
+  // 1.5bt). `CiFfn.TheSeamHandsTheProjectionAReadableImage` measures it --
+  // slack 12 destroys the coefficients at 4.78e+47, slack 9 does not -- and
+  // the layer's own symptom was the same corruption capped by the modulus:
+  // the O projection lands at level 0 where q0/Delta is about 128, so
+  // `err * carried` came out 16426 both before and after the token map was
+  // fixed. Everything the FFN needs still fits at nine: RMSNorm leaves 11
+  // against StC's 10, and `GetCoeffLevel()` is 7, well above the product.
   Ring boot_ffn(kBootParam, boot.ui->GetSecretCoeffs(),
-                /*boot_slack_levels=*/12);
+                /*boot_slack_levels=*/9);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
   ASSERT_NE(fctx, nullptr);
 ledger("before the FFN context");
@@ -9110,10 +9116,9 @@ ledger("before the FFN context");
   //     three        60 diagonals,   56 keys   <-- this
   //
   // The stages are (11,0) | (10,1) | (9,2) (8,3) (6,5) (7,4), at 3, 3 and 54
-  // diagonals. Each costs a level, and the levels are there: 12/11/10 for T1
-  // and 9 for T2 leaves the output at 8, one above `SlotToCoeff`'s 7 under
-  // slack 12 -- and every one of them is above 7, which is where ci16_35's
-  // hoisted transforms stop working (1.5bt).
+  // diagonals. Each costs a level, and they are stacked directly on top of
+  // `SlotToCoeff` -- see the derivation below, which is not a written-down
+  // ladder any more.
   const std::vector<std::vector<std::pair<int, int>>> t1_stages = {
       {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
   // THE TOKEN SHIFT IS NOT A SLOT ROTATION, which is what the O projection
@@ -9129,19 +9134,33 @@ ledger("before the FFN context");
   // That map costs almost nothing: a decrement in bit-reversed order is a
   // carry, so it has just 7 distinct slot offsets, BSGS 8x8. It replaces the
   // rotation and takes one level, so T1 starts one higher.
-  const int t1_top = 13, t2_level = 9, tokmap_level = 10;
-  const int t1_level = t1_top;  // the level the seam's input is brought to
   auto swap_bits = [](int x, int i, int j) {
     if (((x >> i) & 1) != ((x >> j) & 1)) x ^= (1 << i) | (1 << j);
     return x;
   };
   cheddar::SylphSchedule<word> sched(fctx, num_slots);
+  // THE SEAM'S LEVELS ARE DERIVED, NOT WRITTEN DOWN, and that is the whole
+  // lesson of the run that came back at 4.78e+47. The ladder used to be the
+  // literal 13/10/9, correct only for the slack it was typed under; the slack
+  // then moved for a memory reason and took `GetStCStartLevel()` with it,
+  // straight into ci16_35's `num_accum == 1` zone. Stacking the seam on
+  // whatever StC reports cannot come apart that way.
+  const int t2_level = sched.GetStCLevel() + 2;
+  const int tokmap_level = t2_level + 1;
+  const int t1_top = tokmap_level + static_cast<int>(t1_stages.size());
+  const int t1_level = t1_top;  // the level the seam's input is brought to
   std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
             << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
-            << ", seam at " << t1_level << "/" << t2_level << std::endl;
+            << ", seam at " << t1_top << "/" << tokmap_level << "/" << t2_level
+            << std::endl;
+  ASSERT_LE(t1_top, boot_ffn.param->max_level_)
+      << "the seam does not fit above SlotToCoeff at this slack";
   ASSERT_GT(t2_level - 1, sched.GetStCLevel())
       << "the seam has to leave the ciphertext above StC's level with a "
          "rescale to spare";
+  // 1.5bt's zone, asserted rather than remembered: a `LinearTransform` is a
+  // hoisted transform and ci16_35 returns 1e25..1e47 below level 7.
+  ASSERT_GT(t2_level, 7) << "the seam runs inside the num_accum == 1 zone";
 
   auto slot_chain = [&](int row, int col, int lane) {
     return rev(col, 4) * 4096 + rev(row, 7) * 32 + lane;
