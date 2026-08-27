@@ -8,21 +8,24 @@
 // only hard part is the layout and a single end-to-end number cannot say
 // which stage moved it.
 //
-// THE LAYOUT, WHICH IS THE WHOLE QUESTION. A projection's output on R+ is the
-// banded image at rank 512: coefficient `k = p * 512 + I` carries component
-// `I` at position `p`. `CoeffOfSlot` on R+ is `BitReverse(k, 16)` (1.5bh), and
-// k's bits are `I` in 0..8 and `p` in 9..15, so
+// THE LAYOUT, AND IT IS SIMPLER THAN IT LOOKS. The block's packing puts token
+// `t` of channel `c` at slot `s = t + T*c`, and its coefficient image is
+// `CoeffOfSlot(s)` = `BitReverse(s, 16)` (1.5bh) -- so the projection's module
+// component is `I = rev9(c)` at position `p = rev7(t)`. HalfBoot's CoeffToSlot
+// is the INVERSE of that map, so the data comes back at
 //
-//     slot = rev9(I) * 128 + rev7(p)
+//     slot = rev16(rev16(s)) = s = token + 128 * channel
 //
-// -- the channel in the high nine bits and the token in the low seven, which
-// is the block's own packing and [SYLPH] 3.2's "token index varies fastest".
-// The channel a component carries is `rev9(I)` (`CoeffLinearLeg`'s
-// `BitReverse(Component(r))`), so slot = channel * 128 + rev7(token).
+// -- its original slot, in natural order on both axes. Measured:
+// `CiFfn.WhereTheCoefficientImageLandsInSlots` puts unit spikes in as
+// coefficients and finds every one at exactly `BitReverse(k, 16)` with nothing
+// else above 7.2e-10.
 //
-// The token comes out BIT-REVERSED and that costs nothing: RMSNorm reduces
-// over the channel field at a fixed low field, and rev7 is a bijection on the
-// low field, so the reduction sums the right token whatever order they sit in.
+// Getting this wrong by applying the reversal TWICE -- placing the data at
+// `rev7(t)` in the component array *and* reading it back at `rev7(t)` in the
+// slots -- is what the first two runs of the stage below did, and it fails as
+// a fitted boundary constant of 2^-8.12 against the true 2^-4.99 rather than
+// as anything that names itself.
 //
 // HALF DENSITY. Live components are `I < 256`, i.e. bit 8 of I clear, i.e.
 // `rev9(I)` EVEN, i.e. **slot bit 7 = 0** -- 1.5by's statement re-derived from
@@ -296,7 +299,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < declared; c += 2) {
         const double want = beta * x[static_cast<size_t>(t) * declared + c];
-        num += raw[c * kTokens + Rev(t, 7)].real() * want;
+        num += raw[c * kTokens + t].real() * want;
         den += want * want;
       }
     }
@@ -304,7 +307,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
     double live_err = 0.0, dead_max = 0.0, dead_neighbour = 0.0;
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < declared; c++) {
-        const double got = raw[c * kTokens + Rev(t, 7)].real();
+        const double got = raw[c * kTokens + t].real();
         if (c % 2 == 0) {
           const double want =
               landed * beta * x[static_cast<size_t>(t) * declared + c];
@@ -441,7 +444,7 @@ TEST(CiFfn, TheCrossingAndRmsNormRunOnTheHalfDensityImage) {
   for (int t = 0; t < kTokens; t++) {
     const double inv = 1.0 / std::sqrt(ms[t] + kEps);
     for (int c = 0; c < declared; c++) {
-      const double v = got[c * kTokens + Rev(t, 7)].real();
+      const double v = got[c * kTokens + t].real();
       if (c % 2) {
         dead_after = std::max(dead_after, std::abs(v));
         continue;
