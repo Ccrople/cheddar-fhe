@@ -229,8 +229,15 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
   constexpr int kHidden = 14336;
   constexpr int kTokens = 64;
   constexpr int kFirstToken = 64;  // clear of the BOS sinks
-  constexpr int kDims = 512;       // slice of the intermediate dimension
   constexpr double kEps = 1e-5;
+  // A slice of the intermediate dimension wide enough to fill exactly one
+  // ciphertext, which is 512 on the ordinary ring and 1024 on R+. Taken from
+  // the ring rather than fixed at 512 so the proxy is the same *shape* of
+  // object on both -- one full ciphertext of gate activations -- rather than
+  // a half-empty one on the ring with twice the slots.
+  const int slots = param_->MaxNumSlots();
+  const int kDims = slots / kTokens;
+  ASSERT_LE(kDims, kHidden);
 
   std::vector<double> x, w;
   ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
@@ -293,7 +300,6 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
          "measuring extrapolation and not SiLU";
 
   const int level = default_encryption_level_;
-  const int slots = param_->MaxNumSlots();
   ASSERT_EQ(kTokens * kDims, slots);
   SiLuHandler<word> silu(context_, kSylphRange, level, kSylphDegree);
 
@@ -360,7 +366,7 @@ INSTANTIATE_TEST_SUITE_P(
     // it nothing but give it twice the slots ([SYLPH] section 2.1). Measured
     // rather than assumed.
     testing::Values("bootparam_30.json", "bootparam_35.json",
-                    "bootparam_40.json", "ci16_35.json"),
+                    "bootparam_40.json", "ci16_35.json", "ci16_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

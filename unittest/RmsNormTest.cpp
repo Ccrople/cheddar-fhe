@@ -346,7 +346,7 @@ INSTANTIATE_TEST_SUITE_P(
     // slot arithmetic. That claim is worth a measurement rather than an
     // argument, which is what running the same test on both rings is.
     Cheddar, Testbed32,
-    testing::Values("bootparam_30.json", "ci16_35.json"),
+    testing::Values("bootparam_30.json", "ci16_35.json", "ci16_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

@@ -127,7 +127,7 @@ INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_35.json",
                     "bootparam_40.json", "sylphflow16_35.json",
-                    "ci16_35.json"),
+                    "ci16_35.json", "ci16_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
