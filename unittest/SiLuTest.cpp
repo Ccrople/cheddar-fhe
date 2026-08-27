@@ -139,7 +139,7 @@ TEST_P(Testbed32, SiLuPolynomialFit) {
 // ---------------------------------------------------------------------------
 TEST_P(Testbed32, SiLuOnEncryptedSweep) {
   const int level = default_encryption_level_;
-  const int slots = param_->degree_ / 2;
+  const int slots = param_->MaxNumSlots();
   SiLuHandler<word> silu(context_, kSylphRange, level, kSylphDegree);
 
   // A dense sweep of the whole interval, so the worst point cannot be missed.
@@ -293,7 +293,7 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
          "measuring extrapolation and not SiLU";
 
   const int level = default_encryption_level_;
-  const int slots = param_->degree_ / 2;
+  const int slots = param_->MaxNumSlots();
   ASSERT_EQ(kTokens * kDims, slots);
   SiLuHandler<word> silu(context_, kSylphRange, level, kSylphDegree);
 

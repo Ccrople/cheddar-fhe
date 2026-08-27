@@ -35,10 +35,12 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
     : context_{context},
       cfg_{cfg},
       descent_{std::move(descent)},
-      small_degree_{SmallDegreeFor(cfg.num_tokens)},
-      rank_{context->param_.degree_ / SmallDegreeFor(cfg.num_tokens)},
+      small_degree_{SmallDegreeFor(cfg.num_tokens, context->param_)},
+      rank_{context->param_.degree_ /
+            SmallDegreeFor(cfg.num_tokens, context->param_)},
       ring_rank_{1},
-      sub_rank_{context->param_.degree_ / SmallDegreeFor(cfg.num_tokens)},
+      sub_rank_{context->param_.degree_ /
+                SmallDegreeFor(cfg.num_tokens, context->param_)},
       modpack_keys_{std::move(modpack_keys)},
       mlwe_{context->param_, context->ntt_handler_},
       pcmm_{context->param_},
@@ -50,15 +52,21 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
       cache_weights_{EnvOn("CHEDDAR_WEIGHT_CACHE", true)},
       use_blas_{false} {
   const int degree = context_->param_.degree_;
-  const int num_slots = degree / 2;
+  const int num_slots = context_->param_.MaxNumSlots();
 
-  // `Mlwe.cu:158`. This is what rules out T = 64 at degree 65536: it would
-  // want rank 512, hence small_degree 128, which the kernel cannot launch.
-  AssertTrue(small_degree_ % 256 == 0,
-             "CoeffLinearLeg: ModDecomp needs small_degree (= 2 * num_tokens) "
-             "to be a multiple of 256, so num_tokens must be at least 128");
+  // `Mlwe.cu:158` used to launch one 256-thread block per 256 positions and
+  // so computed a zero-block grid below 256, which ruled out small_degree
+  // 128 -- and hence T = 64 at degree 65536, and hence R+ at T = 128, where
+  // small_degree IS 128. Doing.md 1.5bi relaxed all three such launches to
+  // `min(length, 256)`; both quantities are powers of two, so the smaller
+  // divides the larger and the grid shrinks instead of refusing, bit
+  // identically at 256 and above. What is left is the power-of-two shape the
+  // index arithmetic actually needs.
+  AssertTrue(small_degree_ >= 128 && IsPowOfTwo(small_degree_),
+             "CoeffLinearLeg: small_degree must be a power of two and at "
+             "least 128");
   AssertTrue(small_degree_ < degree && degree % small_degree_ == 0,
-             "CoeffLinearLeg: 2 * num_tokens must properly divide the ring "
+             "CoeffLinearLeg: the small degree must properly divide the ring "
              "degree");
 
   // The alignment itself, stated as a check rather than trusted. The block
@@ -95,8 +103,12 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                "CoeffLinearLeg: the product ring's degree must properly "
                "divide the block's");
     AssertTrue(sm_param.degree_ % small_degree_ == 0,
-               "CoeffLinearLeg: 2 * num_tokens must divide the product ring's "
-               "degree, or ModDecomp has no rank to run at");
+               "CoeffLinearLeg: the small degree must divide the product "
+               "ring's degree, or ModDecomp has no rank to run at");
+    AssertTrue(sm_param.conjugate_invariant_ ==
+                   context_->param_.conjugate_invariant_,
+               "CoeffLinearLeg: the product ring must be the same KIND of "
+               "ring as the block's -- the coefficient packing differs");
     ring_rank_ = degree / sm_param.degree_;
     sub_rank_ = sm_param.degree_ / small_degree_;
     // The one identity the index permutation rests on. It is arithmetic, not

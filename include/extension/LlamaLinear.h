@@ -206,7 +206,23 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   /// N' = 2 * num_tokens.
   int GetSmallDegree() const { return small_degree_; }
   /// The ModPack keys a caller has to generate, for `PrepareModPackKeys`.
-  static int SmallDegreeFor(int num_tokens) { return 2 * num_tokens; }
+  static int SmallDegreeFor(int num_tokens, bool conjugate_invariant = false) {
+    // T on the conjugate-invariant ring, 2T on the ordinary one, and the
+    // reason is the coefficient packing rather than the product. A channel
+    // occupies one module component and a component holds one coefficient
+    // per token; the ordinary ring's `Ecdcoeff` spends coefficient `i` on a
+    // real part and `i + N/2` on an imaginary one, so a T-token channel needs
+    // 2T coefficients of which half are zero on this layer's real payload.
+    // R+ has no imaginary axis, so T coefficients hold T tokens and the
+    // component is half the size -- which is the same statement as
+    // `MaxNumSlots()` being `degree` rather than `degree / 2`, read in the
+    // coefficient domain instead of the slot one.
+    return conjugate_invariant ? num_tokens : 2 * num_tokens;
+  }
+  /// The same, for a ring already in hand.
+  static int SmallDegreeFor(int num_tokens, const Parameter<word> &param) {
+    return SmallDegreeFor(num_tokens, param.conjugate_invariant_);
+  }
   /// Whether the product descends through [SYLPH]'s ring switch.
   bool IsRingSwitched() const { return descent_.Enabled(); }
   /// N / N1, the ring-switch rank. 1 without the descent.

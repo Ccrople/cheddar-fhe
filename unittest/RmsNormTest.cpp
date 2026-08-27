@@ -150,8 +150,14 @@ TEST_P(Testbed32, RmsNormOnRealLlama3) {
     interface_->PrepareRotationKey(d, level);
   }
 
-  // Pack token-fastest, matching [SYLPH] section 3.2.
-  const int slots = param_->degree_ / 2;
+  // Pack token-fastest, matching [SYLPH] section 3.2. MaxNumSlots(), not
+  // degree/2: on the conjugate-invariant ring a ciphertext holds `degree`
+  // real slots, which is the count the handler reduces over. Packing at
+  // degree/2 there fills half of each ciphertext, and the reduction then
+  // sums the periodic repetition Encode leaves behind -- which comes back as
+  // a plausible-looking few-percent error on the recovered 1/sqrt rather
+  // than as anything obviously broken.
+  const int slots = param_->MaxNumSlots();
   const int channels_per_ct = slots / kTokens;
   std::vector<Ciphertext<word>> cts(num_ct);
   std::vector<std::vector<Complex>> wts(num_ct);
@@ -266,7 +272,7 @@ TEST_P(Testbed32, RmsNormReductionNeedsOrderOneInput) {
   ASSERT_TRUE(ReadF32(dir + "/input.f32", kAllTokens * kChannels, x));
 
   const int level = default_encryption_level_;
-  const int slots = param_->degree_ / 2;
+  const int slots = param_->MaxNumSlots();
   const int channels_per_ct = slots / kTokens;
   const int num_ct = kChannels / channels_per_ct;
 
