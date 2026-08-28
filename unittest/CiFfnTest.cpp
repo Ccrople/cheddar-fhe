@@ -3085,3 +3085,103 @@ TEST(CiFfn, TheRmsNormCarriesAScaleAndItIsMeasured) {
   }
   SUCCEED();
 }
+
+// WHY THE BOOTSTRAP'S OWN PRECISION TEST CANNOT SEE THE CROSSING'S CUBIC.
+//
+// [SYLPH] 3.1.3 states bootstrap precision as p bits of max ABSOLUTE error on
+// a message filling the SLOTS with [-1, 1], and
+// `Testbed32.BootstrapPrecisionAgainstSylph` measures exactly that: ci16_35
+// gives p = 15.05 and ci16_40 gives 18.90. 1.5cs then found that the two
+// return the same layer number to three digits across those 3.85 bits, and
+// 1.5cp's budget table has been read as an upper bound ever since without a
+// reason being known.
+//
+// This is the reason. EvalMod acts on the COEFFICIENTS -- `Boot` is ModRaise,
+// CoeffToSlot, EvalMod, SlotToCoeff, and the slots at the EvalMod step hold
+// the coefficients of the input. By Parseval on the canonical embedding,
+// `||slots||_2 = sqrt(N) ||coeff||_2`, so a slot vector filling [-1, 1] has
+// coefficients at rms `1/sqrt(3N)` -- 2.3e-03 here, a factor of 256 down. The
+// distortion is CUBIC, so the slot test sees it 256^3 smaller per coefficient
+// and it returns to the slots 2^-22.6: seven bits under the measured p, i.e.
+// invisible.
+//
+// A COEFFICIENT-encoded crossing has no such shrinkage. Its payload IS the
+// coefficients, at whatever the caller rides, and it pays `a * ride^2`
+// relative. Every projection in this pipeline crosses that way. So p is not
+// the number that governs this layer, and buying more of it buys nothing --
+// which is what 1.5cs measured and could not explain.
+//
+// Measured here in one process on one ring, so the two conventions are not
+// being compared across runs.
+TEST(CiFfn, TheSlotConventionIsBlindToTheCrossingsCubic) {
+  Ring boot(Param());
+  std::cout << "preset " << Param() << std::endl;
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int num_slots = boot.param->MaxNumSlots();
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  // ---- the paper's convention: fill the SLOTS with [-1, 1] --------------
+  std::mt19937_64 gen(0x5107);
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  std::vector<Complex> msg(num_slots);
+  for (int i = 0; i < num_slots; i++) msg[i] = Complex(ud(gen), 0.0);
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, 0, boot.param->GetScale(0), msg);
+
+  // What those slots put in the COEFFICIENTS, which is what EvalMod sees.
+  std::vector<double> co;
+  boot.context->encoder_.DecodeCoeff(co, pt);
+  double cmax = 0.0, csq = 0.0;
+  for (double v : co) {
+    cmax = std::max(cmax, std::abs(v));
+    csq += v * v;
+  }
+  const double crms = std::sqrt(csq / co.size());
+  std::cout << "  slots fill [-1, 1]; the SAME plaintext's coefficients reach "
+            << cmax << ", rms " << crms << "  (a factor of " << (1.0 / crms)
+            << " = 2^" << -std::log2(crms) << " down)" << std::endl;
+
+  Ciphertext<word> ct, res;
+  boot.ui->Encrypt(ct, pt);
+  ct.SetNumSlots(num_slots);
+  bctx->Boot(res, ct, boot.ui->GetEvkMap());
+  Plaintext<word> rp;
+  boot.ui->Decrypt(rp, res);
+  std::vector<Complex> got;
+  boot.context->encoder_.Decode(got, rp);
+  double mx = 0.0;
+  for (int i = 0; i < num_slots; i++) {
+    mx = std::max(mx, std::abs(got[i].real() - msg[i].real()));
+  }
+  std::cout << "  [SLOT convention] max abs err " << mx << "  ->  p = "
+            << -std::log2(mx) << " bits" << std::endl;
+
+  // ---- what the cubic predicts for THIS message ------------------------
+  //
+  // `a` is what `TheCrossingResidualIsMeasuredAgainstItsRideHeight` fits, and
+  // it is the same number at every ride height, so it is a property of the
+  // EvalMod polynomial and not of the data.
+  const double a = 0.00258;
+  double esq = 0.0;
+  for (double v : co) {
+    const double e = a * v * v * v;
+    esq += e * e;
+  }
+  const double e_slot_rms =
+      std::sqrt(esq / co.size()) * std::sqrt(static_cast<double>(num_slots));
+  std::cout << "  the cubic's own contribution at the slots: rms "
+            << e_slot_rms << " = 2^" << std::log2(e_slot_rms) << ", i.e. "
+            << (-std::log2(e_slot_rms) + std::log2(mx))
+            << " bits BELOW what this convention can measure" << std::endl;
+  std::cout << "  a coefficient-encoded crossing at ride 0.2 pays 2^"
+            << std::log2(a * 0.2 * 0.2) << " of its own signal by comparison"
+            << std::endl;
+  SUCCEED();
+}
