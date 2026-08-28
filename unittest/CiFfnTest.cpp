@@ -807,6 +807,51 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     }
   }
 
+  // A CALIBRATION FITTED TO THE INPUT IT IS MEASURED ON PROVES NOTHING.
+  //
+  // Every constant this test hands the circuit is one of two kinds, and only
+  // one of them is safe to read off the run itself:
+  //
+  //   INPUT-INDEPENDENT -- the crossing constant (2^-4.9829 on every ride
+  //   height and every dataset, 1.5cv), `kappa`, the ride height, and the
+  //   weight scales, which are properties of the BootParameter and of the
+  //   model conversion. Measuring these in-run is legitimate; a deployment
+  //   measures them once at setup.
+  //
+  //   CALIBRATION -- `alpha` (RMSNorm's layer constant), the invsqrt window,
+  //   and SiLU's range. [SYLPH] 3.1 fits these OFFLINE on a calibration set
+  //   and carries a margin (its table 2: a calibrated SiLU input of 10.82
+  //   inside a fitted +-12, a margin of 1.109). Fitting them to the very
+  //   tensor being measured makes every number this test reports optimistic,
+  //   and `SiLuHandler` says outright that an input outside its range is
+  //   evaluated wrongly and SILENTLY.
+  //
+  // So the input becomes a knob while the MODEL stays bit-identical: the
+  // weights are already drawn above, and only `x` is redrawn. Freeze the
+  // calibration from one input with CHEDDAR_CI_FFN_ALPHA and
+  // CHEDDAR_CI_FFN_SILU_RANGE, evaluate on another with
+  // CHEDDAR_CI_FFN_INPUT_SEED, and the gap between the two is what a
+  // deployment would actually pay.
+  const uint64_t input_seed = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_INPUT_SEED");
+    return (e && e[0]) ? std::strtoull(e, nullptr, 10) : 0ull;
+  }();
+  if (input_seed != 0) {
+    std::mt19937_64 ig(input_seed);
+    std::normal_distribution<double> id(0.0, 1.0);
+    std::fill(x.begin(), x.end(), 0.0);
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < declared_h; c += 2) {
+        if (!alive(c)) continue;
+        x[static_cast<size_t>(t) * declared_h + c] = id(ig);
+      }
+    }
+  }
+  std::cout << "input seed " << input_seed
+            << (input_seed ? "  (the MODEL is unchanged; only x is redrawn)"
+                           : "  (the calibration input)")
+            << std::endl;
+
   // The reference: RMSNorm over the DECLARED width (which is what the circuit
   // reduces over), then SwiGLU, then down.
   std::vector<double> ms(kTokens, 0.0);
@@ -820,7 +865,16 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     ms[t] = s / declared_h;
     log_sum += std::log(ms[t]);
   }
-  const double alpha = 1.0 / std::exp(log_sum / kTokens);
+  const double alpha_measured = 1.0 / std::exp(log_sum / kTokens);
+  // Frozen from the calibration input when asked; a deployment cannot refit
+  // this per prompt.
+  const double alpha = [&] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_ALPHA");
+    return (e && e[0]) ? std::atof(e) : alpha_measured;
+  }();
+  std::cout << "RMSNorm layer constant alpha " << alpha << " (this input's own "
+            << "would be " << alpha_measured << ", ratio "
+            << (alpha / alpha_measured) << ")" << std::endl;
 
   std::vector<double> h(static_cast<size_t>(kTokens) * declared_h, 0.0);
   for (int t = 0; t < kTokens; t++) {
@@ -1022,12 +1076,53 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     // Chebyshev fit's error is uniform over its interval, so four fifths of
     // the window is being paid for and not used. The default stays 6 so that
     // nothing measured before this line moves without being asked.
-    const double norm_window = [] {
+    // Derived from the CALIBRATION input's spread with a stated margin, not
+    // typed: `alpha` puts the argument's geometric mean at 1, so the window
+    // ratio is the argument's own ratio times the margin. The rule reproduces
+    // both numbers this file has carried -- the synthetic spread of 1.54 gives
+    // 2.0, and RmsNorm.h's measured Llama-3 user tokens span 4.87 and give
+    // 6.3, which is the 6 that was hard-coded here. A window narrower than the
+    // data uses evaluates the polynomial where it was never fitted, and says
+    // so nowhere.
+    const double norm_margin = [] {
+      const char *e = std::getenv("CHEDDAR_CI_NORM_MARGIN");
+      return (e && e[0]) ? std::atof(e) : 1.3;
+    }();
+    double ms_lo = 1e300, ms_hi = 0.0;
+    for (int t = 0; t < kTokens; t++) {
+      const double u = alpha * (ms[t] + kEps);
+      ms_lo = std::min(ms_lo, u);
+      ms_hi = std::max(ms_hi, u);
+    }
+    const double norm_window = [&] {
       const char *e = std::getenv("CHEDDAR_CI_FFN_NORM_WINDOW");
-      return (e && e[0]) ? std::atof(e) : 6.0;
+      if (e && e[0]) return std::atof(e);
+      return std::max(1.5, (ms_hi / ms_lo) * norm_margin);
     }();
     std::cout << "invsqrt window ratio " << norm_window
               << " (CHEDDAR_CI_FFN_NORM_WINDOW)" << std::endl;
+    // The third calibration, and the one a frozen `alpha` moves directly: the
+    // polynomial is fitted on [1/sqrt(w), sqrt(w)] and the argument is
+    // `alpha * (mean square + eps)`. If a different input shifts the mean
+    // square, the argument leaves the window and the fit is evaluated where it
+    // was never fitted -- the same silent failure as SiLU's range.
+    {
+      double lo = 1e300, hi = 0.0;
+      for (int t = 0; t < kTokens; t++) {
+        const double u = alpha * (ms[t] + kEps);
+        lo = std::min(lo, u);
+        hi = std::max(hi, u);
+      }
+      const double wlo = 1.0 / std::sqrt(norm_window);
+      const double whi = std::sqrt(norm_window);
+      std::cout << "  invsqrt argument in [" << lo << ", " << hi
+                << "] against the window [" << wlo << ", " << whi << "]"
+                << std::endl;
+      if (lo < wlo || hi > whi) {
+        std::cout << "  *** THE INVSQRT ARGUMENT IS OUTSIDE ITS WINDOW ***"
+                  << std::endl;
+      }
+    }
     cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h, alpha,
                                       op_level, kEps, norm_window, 9,
                                       /*channel_stride=*/2);
@@ -1125,10 +1220,24 @@ TEST(CiFfn, TheFeedForwardNetworkRunsOnTheRealSubring) {
     const char *e = std::getenv("CHEDDAR_CI_FFN_SILU_MARGIN");
     return (e && e[0]) ? std::atof(e) : 0.0;
   }();
-  const double silu_range =
-      silu_margin > 0.0 ? silu_margin * gate_absmax : 12.0;
-  std::cout << "SiLU range " << silu_range << " against |gate| "
-            << gate_absmax << std::endl;
+  // Frozen from the calibration input when asked. A range SMALLER than this
+  // input's own gate is the silent-failure case `SiLuHandler` documents, so
+  // it is named here rather than left to show up as noise.
+  const double silu_range = [&] {
+    const char *e = std::getenv("CHEDDAR_CI_FFN_SILU_RANGE");
+    if (e && e[0]) return std::atof(e);
+    return silu_margin > 0.0 ? silu_margin * gate_absmax : 12.0;
+  }();
+  std::cout << "SiLU range " << silu_range << " against |gate| " << gate_absmax
+            << "  (headroom " << (silu_range / gate_absmax) << ")"
+            << std::endl;
+  if (silu_range < gate_absmax) {
+    std::cout << "  *** THE GATE IS OUTSIDE THE FITTED RANGE by a factor of "
+              << (gate_absmax / silu_range)
+              << " -- the polynomial is being evaluated where it was never "
+                 "fitted, and nothing downstream will say so ***"
+              << std::endl;
+  }
   std::vector<Ciphertext<word>> prod(2);
   {
     cheddar::SiLuHandler<word> silu(boot.context, silu_range, op_level, 31);

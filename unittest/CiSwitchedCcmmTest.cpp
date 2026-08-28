@@ -9874,8 +9874,33 @@ ledger("before the FFN context");
     ms_hi = std::max(ms_hi, ms[t]);
   }
   const double alpha = 1.0 / std::exp(log_sum / proj_small);
-  std::cout << "  residual mean-square spread " << (ms_hi / ms_lo) << "x"
-            << std::endl;
+  // THE WINDOW IS DERIVED FROM THE SPREAD, NOT TYPED.
+  //
+  // A Chebyshev fit's error is uniform over its interval, so a window wider
+  // than the data uses throws away exactly that ratio (1.5cv) -- and a window
+  // NARROWER than the data uses evaluates the polynomial where it was never
+  // fitted, silently. Both failures are invisible in an end-to-end number, so
+  // the window has to follow a measured spread with a stated margin, the way
+  // [SYLPH] 3.1 fits every other range offline.
+  //
+  // `alpha` puts the argument's geometric mean at 1 by construction, so the
+  // window ratio is the argument's own ratio times the margin. That rule
+  // reproduces both numbers this file has carried: the synthetic spread here
+  // is 1.35-1.54, giving ~2, and RmsNorm.h's measured Llama-3 user tokens
+  // span 4.87, giving 6.3 -- which is the 6 the shipped default was. **The
+  // margin, not the window, is the thing a caller chooses**, and it has to
+  // cover input variation rather than this one tensor: measured by
+  // `CiFfn.TheFeedForwardNetworkRunsOnTheRealSubring` with the calibration
+  // frozen and the input redrawn, three fresh inputs moved the argument's
+  // upper end by 5% and the FFN by half a bit.
+  const double norm_margin = [] {
+    const char *e = std::getenv("CHEDDAR_CI_NORM_MARGIN");
+    return (e && e[0]) ? std::atof(e) : 1.3;
+  }();
+  const double norm_window = std::max(1.5, (ms_hi / ms_lo) * norm_margin);
+  std::cout << "  residual mean-square spread " << (ms_hi / ms_lo)
+            << "x, so the invsqrt window is " << norm_window << " (margin "
+            << norm_margin << ")" << std::endl;
 
   double boundary = 0.0;
   double crossing = 0.0;  // the BootParameter's own, see below
@@ -9940,7 +9965,7 @@ ledger("before the FFN context");
     // to 2 takes the FFN's fit floor from 2^-13.15 to 2^-26.
     cheddar::RmsNormHandler<word> rms(boot_ffn.context, proj_small,
                                       model_declared, alpha, op_level, 1e-5,
-                                      2.0, 9, /*channel_stride=*/2);
+                                      norm_window, 9, /*channel_stride=*/2);
     ASSERT_EQ(rms.GetNumCiphertexts(), 1);
     for (int d : rms.GetRotationDistances()) {
       boot.ui->PrepareRotationKey(d, op_level);
