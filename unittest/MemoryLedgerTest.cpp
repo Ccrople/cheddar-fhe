@@ -206,35 +206,37 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
   // ---- and the adopted tables ARE the tables ---------------------------
   //
   // The premise above is algebra about level accessors, and the assertions
-  // inside `PrepareEvalSpecialFFT` check the inputs to that algebra. Neither
-  // checks the conclusion. This does, and it is the cheapest decisive form:
-  // CoeffToSlot is the whole of what the two Contexts now share, so running it
-  // on one input through the leg's own tables and through the FFN's adopted
-  // ones has to agree EXACTLY -- the transform is deterministic and the keys
-  // are one map. A wrong donation is not a small error here; the plaintexts
-  // would be encoded at other levels against another constant and the two
-  // sides would disagree at O(1).
+  // inside `PrepareEvalSpecialFFT` check the INPUTS to that algebra. Neither
+  // checks the conclusion. This does, in the form the layer actually uses:
+  // `SylphSchedule::ToSlot` on the FFN Context is a `HalfBoot`, which is
+  // ModRaise, CoeffToSlot, EvalMod -- every stage of it compiled from
+  // parameters at or above `GetEvalModEndLevel()` and so slack-independent.
+  // Run it on one input through each Context and the two have to agree
+  // EXACTLY: the transform is deterministic and the keys are one map. A wrong
+  // donation is not a small error here -- the plaintexts would be encoded at
+  // other levels against another constant, and the two sides would disagree
+  // at O(1).
+  //
+  // Level 0 in, because ModRaise is HalfBoot's first step. Calling
+  // `CoeffToSlot` directly instead would need an input at
+  // `GetCtSStartLevel()`, which is above `default_encryption_level_` and so
+  // has no `GetScale`; both of those cost a run to find out.
   {
     std::mt19937 rng(20260829);
-    std::uniform_real_distribution<double> dist(-0.5, 0.5);
+    std::uniform_real_distribution<double> dist(-0.02, 0.02);
     std::vector<double> coeffs(leg->param->degree_);
     for (double &c : coeffs) c = dist(rng);
 
-    // At CtS's own start level, not at level 0: this calls the transform
-    // directly rather than through `HalfBoot`, so there is no ModRaise in
-    // front of it and the input has to arrive where the first phase's
-    // plaintexts are encoded.
-    const int cts_level = lctx->GetBootParameter().GetCtSStartLevel();
     cheddar::Plaintext<word> ptxt;
-    leg->context->encoder_.EncodeCoeff(ptxt, cts_level,
-                                       leg->param->GetScale(cts_level), coeffs);
+    leg->context->encoder_.EncodeCoeff(ptxt, 0, leg->param->GetScale(0),
+                                       coeffs);
     cheddar::Ciphertext<word> ct;
     leg->ui->Encrypt(ct, ptxt);
     ct.SetNumSlots(num_slots);
 
     cheddar::Ciphertext<word> from_leg, from_ffn;
-    lctx->CoeffToSlot(from_leg, num_slots, ct, leg->ui->GetEvkMap());
-    fctx->CoeffToSlot(from_ffn, num_slots, ct, leg->ui->GetEvkMap());
+    lctx->HalfBoot(from_leg, ct, leg->ui->GetEvkMap());
+    fctx->HalfBoot(from_ffn, ct, leg->ui->GetEvkMap());
 
     std::vector<cheddar::Complex> a, b;
     cheddar::Plaintext<word> pa, pb;
@@ -249,10 +251,10 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
       worst = std::max(worst, std::abs(a[j] - b[j]));
       mx = std::max(mx, std::abs(a[j]));
     }
-    std::cout << "\n  [check] CoeffToSlot through the leg's own tables vs the "
-                 "FFN's adopted ones: max diff "
+    std::cout << "\n  [check] HalfBoot through the leg's own CoeffToSlot vs "
+                 "the FFN's adopted one: max diff "
               << worst << " against |.| <= " << mx << std::endl;
-    EXPECT_LT(worst, 1e-9 * (mx + 1.0))
+    EXPECT_LT(worst, 1e-12 * (mx + 1.0))
         << "the adopted CoeffToSlot tables are not the leg's";
   }
 
