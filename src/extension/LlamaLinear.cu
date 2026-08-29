@@ -158,6 +158,27 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                    std::to_string(rank_));
   }
 
+  // Half density is a claim about the CALLER's ciphertexts that nothing here
+  // can verify, so the only thing checkable is that the shape admits it.
+  AssertTrue(cfg_.input_density == 1 || cfg_.input_density == 2,
+             "CoeffLinearLeg: input_density is 1 (dense) or 2 (half density)");
+  if (cfg_.input_density == 2) {
+    AssertTrue(conjugate_invariant_,
+               "CoeffLinearLeg: half density is a conjugate-invariant "
+               "contract -- on the ordinary ring a coefficient image has no "
+               "banded partner and every module component is live");
+    // The direct route has `ring_rank_ == 1` -- the parts are the components
+    // -- so only the descent needs an even part count. Requiring it of both
+    // refused the direct route outright, which is what the first run of
+    // `CiFfn.TheFullWidthLayerRowsAreMeasured` at density 2 hit.
+    AssertTrue(rank_ % 2 == 0,
+               "CoeffLinearLeg: half density needs an even rank");
+    AssertTrue(!descent_.Enabled() || ring_rank_ % 2 == 0,
+               "CoeffLinearLeg: half density needs an even number of "
+               "product-ring parts, because a live flat index is "
+               "i * sub_rank + n < rank/2 exactly when i < ring_rank/2");
+  }
+
 #ifdef USE_CUBLAS
   use_blas_ = EnvOn("CHEDDAR_PCMM_BLAS", true);
   if (use_blas_) {
@@ -218,7 +239,10 @@ void CoeffLinearLeg<word>::GatherWeights(std::vector<double> &values,
                                          int first_parent,
                                          int num_parents) const {
   const int log_rank = Log2Ceil(rank_);
-  const int cols = num_parents * rank_;
+  // The dead half of a half-density input is not a column of zeros here -- it
+  // is not a column at all. See `Config::input_density`.
+  const int live = LiveColumns();
+  const int cols = num_parents * live;
   values.assign(static_cast<size_t>(rank_) * cols, 0.0);
   // `Component` is the identity on the direct route and the two-stride
   // reindexing on the ring-switched one; the channel map itself is the same
@@ -228,11 +252,11 @@ void CoeffLinearLeg<word>::GatherWeights(std::vector<double> &values,
         group * rank_ +
         static_cast<int>(BitReverseInt(Component(r), log_rank));
     for (int p = 0; p < num_parents; p++) {
-      for (int i = 0; i < rank_; i++) {
+      for (int i = 0; i < live; i++) {
         const int in_channel =
             (first_parent + p) * rank_ +
             static_cast<int>(BitReverseInt(Component(i), log_rank));
-        values[static_cast<size_t>(r) * cols + p * rank_ + i] =
+        values[static_cast<size_t>(r) * cols + p * live + i] =
             w[static_cast<size_t>(in_channel) * out_channels + out_channel] *
             w_scale;
       }
@@ -255,7 +279,7 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
   // from the wrong Parameter would be a silent scale error rather than a
   // mismatch, so it is read from the product's own.
   const double scale = product_param_->GetScale(level);
-  const int cols = num_parents * rank_;
+  const int cols = num_parents * LiveColumns();
   std::vector<double> values;
   for (int g = 0; g < groups; g++) {
     GatherWeights(values, w, in_channels, out_channels, g, w_scale,
@@ -349,7 +373,11 @@ void CoeffLinearLeg<word>::Decompose(
       AssertTrue(static_cast<int>(decomposed.size()) == rank_,
                  "CoeffLinearLeg: ModDecomp did not yield one module component "
                  "per input channel");
-      for (auto &c : decomposed) columns.push_back(std::move(c));
+      // At half density the tail is identically zero and is dropped rather
+      // than contracted over; the scan produces it either way, but nothing
+      // downstream holds it or multiplies by it.
+      const int live = LiveColumns();
+      for (int c = 0; c < live; c++) columns.push_back(std::move(decomposed[c]));
       continue;
     }
 
@@ -366,7 +394,16 @@ void CoeffLinearLeg<word>::Decompose(
                "CoeffLinearLeg: the ring switch returned the wrong number of "
                "parts");
     NvtxScope _n("pcmm: ModDecomp");
+    // A live flat index is `i * sub_rank_ + n < rank_ / input_density`, so at
+    // half density the live components are exactly the FIRST HALF OF THE
+    // PARTS: their `ModDecomp` is skipped outright rather than done and
+    // discarded, and the part is freed unread.
+    const int live_parts = ring_rank_ / cfg_.input_density;
     for (int i = 0; i < ring_rank_; i++) {
+      if (i >= live_parts) {
+        parts[i] = Ct();
+        continue;
+      }
       std::vector<MlweCiphertext<word>> decomposed;
       small_mlwe_->ModDecomp(decomposed, parts[i], small_degree_);
       AssertTrue(static_cast<int>(decomposed.size()) == sub_rank_,
@@ -378,9 +415,9 @@ void CoeffLinearLeg<word>::Decompose(
       parts[i] = Ct();
     }
   }
-  AssertTrue(static_cast<int>(columns.size()) == span * rank_,
+  AssertTrue(static_cast<int>(columns.size()) == span * LiveColumns(),
              "CoeffLinearLeg: the descent did not yield one module component "
-             "per input channel of the tile");
+             "per live input channel of the tile");
 }
 
 template <typename word>

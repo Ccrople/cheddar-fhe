@@ -21,8 +21,19 @@ RmsNormHandler<word>::RmsNormHandler(ConstContextPtr<word> context,
       input_level_{input_level} {
   AssertTrue(num_tokens_ > 0 && IsPowOfTwo(num_tokens_),
              "RmsNorm: num_tokens must be a power of two");
-  AssertTrue(num_channels_ > 0 && IsPowOfTwo(num_channels_),
-             "RmsNorm: num_channels must be a power of two");
+  // NOT a power of two: a whole number of ciphertexts is all the reduction
+  // needs. The tree below runs INSIDE one ciphertext and its stride sequence
+  // depends only on `num_slots_` and `num_tokens_`, both powers of two; the
+  // channel axis is crossed between ciphertexts by a plain `Add` in `Apply`
+  // step 1. The stricter test refused widths the operator computes correctly,
+  // and the conjugate-invariant coefficient leg needs one of them: component
+  // zero has no partner (Doing.md 1.5cu), so a residual-stream ciphertext
+  // carries `rank/2 - 1` live channels and Llama-3's 4096 need seventeen of
+  // them -- a declared width of 8704, which is not a power of two and is a
+  // whole number of ciphertexts. The divisibility test below is the real
+  // condition and was always there.
+  AssertTrue(num_channels_ > 0,
+             "RmsNorm: num_channels must be positive");
   AssertTrue(layer_constant_ > 0.0, "RmsNorm: layer constant must be positive");
   AssertTrue(window_ratio > 1.0, "RmsNorm: window ratio must exceed one");
   window_lo_ = 1.0 / std::sqrt(window_ratio);

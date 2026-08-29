@@ -143,6 +143,25 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     //! components of the parent's own size -- about 201 MB at level 1 on
     //! `bootparam_35` -- so 16 is roughly 3.2 GB. 0 means no tiling.
     int parents_per_tile = 16;
+    //! HALF DENSITY, DECLARED (Doing.md 1.5by / 1.5cs / 1.5db). On the
+    //! conjugate-invariant ring a ciphertext that will be read in slots
+    //! carries live channels only at EVEN declared indices -- the odd ones
+    //! hold the shifted duplicates the banded convention requires -- and
+    //! `GatherWeights` maps column `i` to declared channel
+    //! `BitReverseInt(Component(i), log_rank)`, which is even exactly when
+    //! `i < rank/2`. So the live module components are a **contiguous
+    //! prefix**, and a full-width projection otherwise contracts 8192 of them
+    //! per output ciphertext with 4080 carrying anything at all.
+    //!
+    //! Setting this to 2 drops the dead half from the descent and from the
+    //! weight operand. `CiFfn.TheFullWidthLayerRowsAreMeasured` measures the
+    //! gap directly -- the same 4096 live channels as sixteen half-density
+    //! parents against eight dense ones -- at **1.9991x**.
+    //!
+    //! Nothing can check this from inside: a dead component is
+    //! indistinguishable from a live zero once encrypted. Leave it 1 unless
+    //! **every** input ciphertext really is a half-density banded image.
+    int input_density = 1;
   };
 
   /**
@@ -360,9 +379,14 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     return (flat / sub_rank_) + ring_rank_ * (flat % sub_rank_);
   }
 
+  //! Live module components per parent: `rank_` at full density and half of
+  //! them when `Config::input_density` is 2. See there for why the live set
+  //! is a contiguous prefix rather than a stride.
+  int LiveColumns() const { return rank_ / cfg_.input_density; }
+
   //! One tile's module components, in `Component()`'s order: `ModDecomp`
   //! straight from the parent, or a ring switch and then `ModDecomp` on each
-  //! part. `span * rank_` of them either way.
+  //! part. `span * LiveColumns()` of them either way.
   void Decompose(std::vector<MlweCiphertext<word>> &columns,
                  const std::vector<Ct> &x, int base, int span) const;
 
