@@ -141,9 +141,10 @@ class BootContext : public Context<word>,
    * at slack zero for the softmax walk and the FFN's at slack nine so that
    * `SlotToCoeff` compiles clear of the `num_accum == 1` zone (Doing.md
    * 1.5ct) -- builds the SAME CoeffToSlot plaintexts twice. `MemoryLedger`
-   * prices the pair of table sets at 6408.5 and 5426.5 MiB and the whole of
-   * the 982.0 MiB between them is StC, so the duplicate is **~4.4 GiB** and
-   * about forty seconds of build.
+   * prepares the FFN's tables both ways in one process and splits them: CtS
+   * **3084.0 MiB**, StC 3324.5 at slack zero and 2342.5 at slack nine. The
+   * pair of sets is 6408.5 and 5426.5 MiB, the 982.0 between them is the two
+   * StCs, and **3084.0 MiB is the duplicate** -- with its build time.
    *
    * Adoption is by `shared_ptr`, so the order the two Contexts are released in
    * does not matter: `ReleaseEvalSpecialFFT` on the donor drops its StC and
@@ -186,9 +187,9 @@ class BootContext : public Context<word>,
    * If another BootContext adopted these CoeffToSlot tables (see
    * `PrepareEvalSpecialFFT`'s `cts_donor`), this drops the SlotToCoeff half and
    * this Context's reference to the CtS half, and the CtS itself lives on for
-   * the borrower -- so the bytes returned are the ~1 GiB of StC rather than the
-   * ~6.4 GiB of both, and the layer's ledger row shrinks by exactly the amount
-   * the donation already saved earlier.
+   * the borrower -- so the bytes returned are the 3324.5 MiB of StC rather than
+   * the 6408.5 of both, and the layer's ledger row shrinks by exactly the
+   * 3084.0 the donation had already saved earlier.
    *
    * @param num_slots the slot count the tables were compiled for
    * @return whether anything was dropped

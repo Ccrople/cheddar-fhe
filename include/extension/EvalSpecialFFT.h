@@ -54,9 +54,11 @@ class EvalSpecialFFT {
    * softmax walk and the FFN's at slack nine so `SlotToCoeff` compiles above
    * the `num_accum == 1` zone (Doing.md 1.5ct) -- compile CtS at the same
    * levels, from the same stage matrices, against the same constant, and
-   * produce bit-identical plaintexts. `MemoryLedger` prices the pair at
-   * 6408.5 and 5426.5 MiB, of which the 982.0 MiB difference is all the StC
-   * has ever been: **the CtS is ~4.4 GiB, built and held twice.**
+   * produce bit-identical plaintexts. `MemoryLedger` prepares the FFN's tables
+   * both ways in one process and splits them: **CtS 3084.0 MiB**, StC 3324.5
+   * at slack zero and 2342.5 at slack nine. So the pair of table sets is
+   * 6408.5 and 5426.5 MiB, the 982.0 between them is the two StCs, and
+   * **3084.0 MiB was one object built and held twice**.
    *
    * The vectors are the two possible phase types and exactly one is populated,
    * as for StC below.
