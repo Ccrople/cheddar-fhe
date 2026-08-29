@@ -59,6 +59,7 @@
 #include "core/Pcmm.h"
 #include "extension/BootContext.h"
 #include "extension/ChebyshevFit.h"
+#include "extension/CiLlamaSeam.h"
 #include "extension/CiSinCAttention.h"
 #include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
@@ -9335,212 +9336,33 @@ ledger("before the FFN context");
   // diagonals. Each costs a level, and they are stacked directly on top of
   // `SlotToCoeff` -- see the derivation below, which is not a written-down
   // ladder any more.
-  const std::vector<std::vector<std::pair<int, int>>> t1_stages = {
-      {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
-  // THE TOKEN SHIFT IS NOT A SLOT ROTATION, which is what the O projection
-  // was reading through. The banded convention is a statement about
-  // COEFFICIENT positions -- coefficient `p * rank + I` carries
-  // `comp_I[p] + comp_{rank-I}[p+1]` -- and `SlotToCoeff` sends slot
-  // `t + 128 * c` to coefficient `rev7(t) * 512 + rev9(c)`, so a step of one
-  // in `p` is a step of one in `rev7(t)`, NOT in `t`. The seam shifted by one
-  // slot; on the host, reading the resulting image back through
-  // `BandedComponents` gives max error 38.56 against |v| <= 4.16, while the
-  // corrected token `rev7(rev7(t) - 1)` gives EXACTLY ZERO.
+  // ---- the seam, now a library class ------------------------------------
   //
-  // That map costs almost nothing: a decrement in bit-reversed order is a
-  // carry, so it has just 7 distinct slot offsets, BSGS 8x8. It replaces the
-  // rotation and takes one level, so T1 starts one higher.
-  auto swap_bits = [](int x, int i, int j) {
-    if (((x >> i) & 1) != ((x >> j) & 1)) x ^= (1 << i) | (1 << j);
-    return x;
-  };
+  // `CiLlamaSeam` owns the three transforms and their contracts: the staged
+  // bit permutation, the bit-reversed token decrement, the duplicate copy that
+  // skips component zero, the window convention and its closing rotation, and
+  // the ladder derived from `SylphSchedule::GetStCLevel()` rather than typed.
+  // Its header has the derivations that used to live here; `ci_seam_test`
+  // checks it in two and a half minutes against this test's quarter of an
+  // hour.
+  //
+  // THE TWO RANKS ARE NOT THE SAME RANK. `layout.rank` is the chain's columns
+  // per ciphertext (16); `proj_rank` is the module rank the banded convention
+  // is stated against (512). The extraction found them conflated in its own
+  // first draft, which would have produced a layer that decrypts cleanly and
+  // is wrong.
   cheddar::SylphSchedule<word> sched(fctx, num_slots);
-  // THE SEAM'S LEVELS ARE DERIVED, NOT WRITTEN DOWN, and that is the whole
-  // lesson of the run that came back at 4.78e+47. The ladder used to be the
-  // literal 13/10/9, correct only for the slack it was typed under; the slack
-  // then moved for a memory reason and took `GetStCStartLevel()` with it,
-  // straight into ci16_35's `num_accum == 1` zone. Stacking the seam on
-  // whatever StC reports cannot come apart that way.
-  const int t2_level = sched.GetStCLevel() + 2;
-  const int tokmap_level = t2_level + 1;
-  const int t1_top = tokmap_level + static_cast<int>(t1_stages.size());
-  const int t1_level = t1_top;  // the level the seam's input is brought to
+  typename cheddar::CiLlamaSeam<word>::Config scfg;
+  scfg.proj_rank = proj_rank;
+  cheddar::CiLlamaSeam<word> seam(boot_ffn.context, layout,
+                                  sched.GetStCLevel(), scfg);
+  const int t1_top = seam.GetInputLevel();
   std::cout << "layer: slot " << sched.GetSlotLevel() << ", StC "
             << sched.GetStCLevel() << ", coeff " << sched.GetCoeffLevel()
-            << ", seam at " << t1_top << "/" << tokmap_level << "/" << t2_level
-            << std::endl;
-  ASSERT_LE(t1_top, boot_ffn.param->max_level_)
-      << "the seam does not fit above SlotToCoeff at this slack";
-  ASSERT_GT(t2_level - 1, sched.GetStCLevel())
-      << "the seam has to leave the ciphertext above StC's level with a "
-         "rescale to spare";
-  // 1.5bt's zone, asserted rather than remembered: a `LinearTransform` is a
-  // hoisted transform and ci16_35 returns 1e25..1e47 below level 7.
-  ASSERT_GT(t2_level, 7) << "the seam runs inside the num_accum == 1 zone";
-
-  auto slot_chain = [&](int row, int col, int lane) {
-    return rev(col, 4) * 4096 + rev(row, 7) * 32 + lane;
-  };
-  auto slot_block = [&](int token, int chan) { return token + 128 * chan; };
-  auto chan_of = [&](int col, int lh) { return rev(col, 4) * 32 + rev(lh, 5); };
-  auto best_window = [&](const cheddar::StripedMatrix &m, int *need) {
-    std::vector<int> offs;
-    for (const auto &kv : m) offs.push_back(kv.first);
-    int bw = 0;
-    long long bn = -1;
-    for (int w : offs) {
-      long long g = 0, mx = 0;
-      for (int o : offs) {
-        const long long r = ((o - w) % n + n) % n;
-        mx = std::max(mx, r);
-        long long a2 = g, b2 = r;
-        while (b2) { const long long t = a2 % b2; a2 = b2; b2 = t; }
-        g = a2;
-      }
-      if (g == 0) continue;
-      const long long q = mx / g + 1;
-      if (bn < 0 || q < bn) { bn = q; bw = w; }
-    }
-    *need = static_cast<int>(bn);
-    return bw;
-  };
-  auto split = [](int need) {
-    int bs = 1;
-    while (bs * bs < need) bs *= 2;
-    int gs = 1;
-    while (bs * gs < need) gs *= 2;
-    return std::make_pair(bs, gs);
-  };
-  auto pt_scale = [&](int l) {
-    return boot_ffn.param->GetScale(l - 1) * boot_ffn.param->GetRescalePrimeProd(l) /
-           boot_ffn.param->GetScale(l);
-  };
-
-  // ONE T1 AT A TIME. Each is 486 plaintext diagonals at level 10, which is
-  // 2.9 GB, and the two halves are never used together; building both up
-  // front only kept 2.9 GB pinned for the whole run. `make_t1` is called
-  // inside the half loop below and its result dies at the end of it.
-  std::unique_ptr<cheddar::LinearTransform<word>> seam_t2;
-  int back2 = 0;
-  std::vector<std::unique_ptr<cheddar::LinearTransform<word>>> seam_t1_cur;
-  std::vector<int> back1_stage;
-  auto make_t1 = [&](int half) {
-    seam_t1_cur.clear();
-    back1_stage.assign(t1_stages.size(), 0);
-    // The live source addresses, walked through the stages. A stage's matrix
-    // is built from where its inputs are and where it sends them, so the
-    // composition is checked by construction rather than re-derived.
-    std::vector<int> cur;
-    cur.reserve(static_cast<size_t>(layout.rank) * 16 * layout.dim);
-    for (int col = 0; col < layout.rank; col++) {
-      for (int lh = 0; lh < 16; lh++) {
-        for (int row = 0; row < layout.dim; row++) {
-          cur.push_back(slot_chain(row, col, half * 16 + lh));
-        }
-      }
-    }
-    for (size_t st = 0; st < t1_stages.size(); st++) {
-      const bool last = (st + 1 == t1_stages.size());
-      std::vector<int> mid(cur.size());
-      cheddar::StripedMatrix ms(n, n);
-      for (size_t e = 0; e < cur.size(); e++) {
-        int y = cur[e];
-        for (const auto &sw : t1_stages[st]) y = swap_bits(y, sw.first, sw.second);
-        if (last) y -= 128 * half;  // destination bit 7 is a zero, not `half`
-        mid[e] = y;
-        const int off = ((cur[e] - y) % n + n) % n;
-        ms.try_emplace(off, n, Complex(0.0, 0.0));
-        ms[off][y] = Complex(1.0, 0.0);
-      }
-      int need = 0;
-      const int w = best_window(ms, &need);
-      const auto sp = split(need);
-      const int lvl = t1_top - static_cast<int>(st);
-      seam_t1_cur.push_back(std::make_unique<cheddar::LinearTransform<word>>(
-          boot_ffn.context, ms, lvl, pt_scale(lvl), sp.first, sp.second, w, -w));
-      back1_stage[st] = ((w % n) + n) % n;
-      std::cout << "  seam T1[" << half << "] stage " << st << ": "
-                << ms.GetNumDiag() << " diagonals, " << sp.first << "x"
-                << sp.second << " at level " << lvl << std::endl;
-      cheddar::EvkRequest req;
-      seam_t1_cur.back()->AddRequiredRotations(req);
-      req.AddRequest(back1_stage[st], lvl - 1);
-      boot.ui->PrepareRotationKey(req);
-      cur.swap(mid);
-    }
-    // The last stage must land exactly on the block's live addresses.
-    for (int col = 0; col < layout.rank; col++) {
-      for (int lh = 0; lh < 16; lh++) {
-        for (int row = 0; row < layout.dim; row++) {
-          const size_t e = (static_cast<size_t>(col) * 16 + lh) * layout.dim + row;
-          ASSERT_EQ(cur[e], slot_block(row, chan_of(col, lh)))
-              << "the staged bit permutation is not T1";
-        }
-      }
-    }
-  };
-  {
-    cheddar::StripedMatrix m2(n, n);
-    for (int col = 0; col < layout.rank; col++) {
-      for (int lh = 0; lh < 16; lh++) {
-        const int c = chan_of(col, lh);
-        const int I = rev(c, 9);
-        if (I == 0) continue;  // component zero has no partner
-        const int cd = rev(proj_rank - I, 9);
-        const int off = ((128 * (c - cd)) % n + n) % n;
-        m2.try_emplace(off, n, Complex(0.0, 0.0));
-        for (int row = 1; row < layout.dim; row++) {
-          m2[off][slot_block(row - 1, cd)] = Complex(1.0, 0.0);
-        }
-      }
-    }
-    int need = 0;
-    const int w = best_window(m2, &need);
-    const auto sp = split(need);
-    seam_t2 = std::make_unique<cheddar::LinearTransform<word>>(
-        boot_ffn.context, m2, t2_level, pt_scale(t2_level), sp.first, sp.second,
-        w, -w);
-    back2 = ((w % n) + n) % n;
-    std::cout << "  seam T2: " << m2.GetNumDiag() << " diagonals, "
-              << sp.first << "x" << sp.second << std::endl;
-  }
-  // The bit-reversed decrement, as a transform on the live image.
-  std::unique_ptr<cheddar::LinearTransform<word>> seam_tok;
-  int back_tok = 0;
-  {
-    cheddar::StripedMatrix mt(n, n);
-    for (int col = 0; col < layout.rank; col++) {
-      for (int lh = 0; lh < 16; lh++) {
-        const int c = chan_of(col, lh);
-        for (int t = 0; t < layout.dim; t++) {
-          const int pos = rev(t, 7);
-          if (pos == 0) continue;  // nothing sits one position below it
-          const int td = rev(pos - 1, 7);
-          const int dst = slot_block(td, c);
-          const int off = ((slot_block(t, c) - dst) % n + n) % n;
-          mt.try_emplace(off, n, Complex(0.0, 0.0));
-          mt[off][dst] = Complex(1.0, 0.0);
-        }
-      }
-    }
-    int need = 0;
-    const int w = best_window(mt, &need);
-    const auto sp = split(need);
-    seam_tok = std::make_unique<cheddar::LinearTransform<word>>(
-        boot_ffn.context, mt, tokmap_level, pt_scale(tokmap_level), sp.first,
-        sp.second, w, -w);
-    back_tok = ((w % n) + n) % n;
-    std::cout << "  seam token map: " << mt.GetNumDiag() << " diagonals, "
-              << sp.first << "x" << sp.second << " at level " << tokmap_level
-              << std::endl;
-  }
+            << ", seam input at " << t1_top << std::endl;
   {
     EvkRequest req;
-    seam_tok->AddRequiredRotations(req);
-    req.AddRequest(back_tok, tokmap_level - 1);
-    seam_t2->AddRequiredRotations(req);
-    req.AddRequest(back2, t2_level - 1);
-    req.AddRequest(1, t2_level);
+    seam.AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
 
@@ -9570,68 +9392,26 @@ ledger("before the FFN context");
   ledger("the leg's CtS/StC tables released");
   std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
   for (int half = 0; half < 2; half++) {
-    make_t1(half);
+    // ONE T1 AT A TIME. Each half's stages are the largest object the seam
+    // owns and the two are never used together, which is why `PrepareHalf`
+    // exists rather than a constructor that builds both -- and why the
+    // rotation keys can only be asked for once the stages exist.
+    seam.PrepareHalf(half);
+    {
+      EvkRequest req;
+      seam.AddHalfRotations(req);
+      boot.ui->PrepareRotationKey(req);
+    }
     stage("ONE-TIME one half's T1 stage plaintexts and their keys");
     for (int bi = 0; bi < layout.num_cts; bi++) {
-      Ciphertext<word> low, a2, sh, dup, live, sum;
-      boot_ffn.context->LevelDown(low, booted[bi], t1_top);
-      a2 = std::move(low);
-      for (size_t st = 0; st < seam_t1_cur.size(); st++) {
-        Ciphertext<word> next;
-        seam_t1_cur[st]->Evaluate(boot_ffn.context, next, a2,
-                                  boot.ui->GetEvkMap());
-        if (back1_stage[st]) {
-          Ciphertext<word> r;
-          boot_ffn.context->HRot(
-              r, next, boot.ui->GetEvkMap().GetRotationKey(back1_stage[st]),
-              back1_stage[st]);
-          next = std::move(r);
-        }
-        a2 = std::move(next);
-      }
-      seam_tok->Evaluate(boot_ffn.context, sh, a2, boot.ui->GetEvkMap());
-      if (back_tok) {
-        Ciphertext<word> r;
-        boot_ffn.context->HRot(
-            r, sh, boot.ui->GetEvkMap().GetRotationKey(back_tok), back_tok);
-        sh = std::move(r);
-      }
-      seam_t2->Evaluate(boot_ffn.context, dup, sh, boot.ui->GetEvkMap());
-      if (back2) {
-        Ciphertext<word> r;
-        boot_ffn.context->HRot(r, dup, boot.ui->GetEvkMap().GetRotationKey(back2),
-                           back2);
-        dup = std::move(r);
-      }
-      const int dl = boot_ffn.param->NPToLevel(dup.GetNP());
-      // The live half now sits two levels above `dup`, because the token map
-      // took one; bring it to `dl + 1` so the constant multiply below lands
-      // both at the same level AND the same scale.
-      if (boot_ffn.param->NPToLevel(a2.GetNP()) != dl + 1) {
-        Ciphertext<word> d;
-        boot_ffn.context->LevelDown(d, a2, dl + 1);
-        a2 = std::move(d);
-      }
-      cheddar::Constant<word> one;
-      boot_ffn.context->encoder_.EncodeConstant(
-          one, dl + 1,
-          boot_ffn.param->GetScale(dl) * boot_ffn.param->GetRescalePrimeProd(dl + 1) /
-              a2.GetScale(),
-          1.0);
-      boot_ffn.context->Mult(live, a2, one);
-      boot_ffn.context->Rescale(live, live);
-      boot_ffn.context->Add(sum, live, dup);
-      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap(), min_ks);
+      seam.Apply(h_cts[bi * 2 + half], booted[bi], sched,
+                 boot.ui->GetEvkMap(), min_ks);
     }
     stage("the seam over one half's eight ciphertexts");
-    seam_t1_cur.clear();
   }
+  seam.DropHalf();
   booted.clear();
   booted.shrink_to_fit();
-  // The seam is over, and nothing downstream reads it. Its three transforms
-  // are 486 + 486 + 129 plaintext diagonals -- 6.7 GB -- and the run that
-  // reached here died in the O projection with all of them still resident.
-  seam_t2.reset();
   ledger("seam done and released");
   // The T1 stages are rebuilt inside the half loop, so this row carries one
   // one-time cost per half that a real layer would hoist out.
