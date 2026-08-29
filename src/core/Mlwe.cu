@@ -105,7 +105,8 @@ __global__ void ModDecompA(word *const *dst_ptrs, const word *src,
 // grid: (degree / block, k /* j */, num_total_primes)
 template <typename word>
 __global__ void ModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
-                         int log_rank, int small_degree, int degree) {
+                         int log_rank, int small_degree, int degree,
+                         int num_src) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int j = blockIdx.y;
   const int limb = blockIdx.z;
@@ -114,15 +115,17 @@ __global__ void ModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
   const int i = x & (rank - 1);
   const int s = x >> log_rank;
 
-  const word value = basic::StreamingLoad(
-      src_ptrs[i] + (limb * rank + j) * small_degree + s);
+  const word value =
+      (i < num_src) ? basic::StreamingLoad(
+                          src_ptrs[i] + (limb * rank + j) * small_degree + s)
+                    : word{0};
   dst_ptrs[j][limb * degree + x] = value;
 }
 
 // grid: (degree / block, num_total_primes)
 template <typename word>
 __global__ void ModPackB(word *dst, const word *const *src_ptrs, int log_rank,
-                         int small_degree, int degree) {
+                         int small_degree, int degree, int num_src) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int limb = blockIdx.y;
 
@@ -130,7 +133,9 @@ __global__ void ModPackB(word *dst, const word *const *src_ptrs, int log_rank,
   const int s = x >> log_rank;
 
   const word value =
-      basic::StreamingLoad(src_ptrs[i] + limb * small_degree + s);
+      (i < num_src)
+          ? basic::StreamingLoad(src_ptrs[i] + limb * small_degree + s)
+          : word{0};
   dst[limb * degree + x] = value;
 }
 
@@ -279,7 +284,7 @@ __global__ void CiModDecompCombine(word *const *dst_ptrs, const word *alpha,
 template <typename word>
 __global__ void CiModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
                            const word *primes, int log_rank, int small_degree,
-                           int degree) {
+                           int degree, int num_src) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int j = blockIdx.y;
   const int limb = blockIdx.z;
@@ -288,9 +293,14 @@ __global__ void CiModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
   const int i = x & (rank - 1);
   const int t = x >> log_rank;
 
-  word value = basic::StreamingLoad(src_ptrs[i] +
-                                    (limb * rank + j) * small_degree + t);
-  if (i != 0 && t + 1 < small_degree) {
+  // `num_src` components were handed in; the rest of the rank are known zero
+  // and are not stored at all, so an absent index contributes nothing rather
+  // than reading past the pointer array.
+  word value = (i < num_src)
+                   ? basic::StreamingLoad(
+                         src_ptrs[i] + (limb * rank + j) * small_degree + t)
+                   : word{0};
+  if (i != 0 && rank - i < num_src && t + 1 < small_degree) {
     const word prime = basic::StreamingLoadConst(primes + limb);
     const word mirror = basic::StreamingLoad(
         src_ptrs[rank - i] + (limb * rank + j) * small_degree + t + 1);
@@ -303,7 +313,7 @@ __global__ void CiModPackA(word *const *dst_ptrs, const word *const *src_ptrs,
 template <typename word>
 __global__ void CiModPackB(word *dst, const word *const *src_ptrs,
                            const word *primes, int log_rank, int small_degree,
-                           int degree) {
+                           int degree, int num_src) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int limb = blockIdx.y;
 
@@ -311,8 +321,10 @@ __global__ void CiModPackB(word *dst, const word *const *src_ptrs,
   const int i = x & (rank - 1);
   const int t = x >> log_rank;
 
-  word value = basic::StreamingLoad(src_ptrs[i] + limb * small_degree + t);
-  if (i != 0 && t + 1 < small_degree) {
+  word value = (i < num_src) ? basic::StreamingLoad(src_ptrs[i] +
+                                                    limb * small_degree + t)
+                             : word{0};
+  if (i != 0 && rank - i < num_src && t + 1 < small_degree) {
     const word prime = basic::StreamingLoadConst(primes + limb);
     const word mirror =
         basic::StreamingLoad(src_ptrs[rank - i] + limb * small_degree + t + 1);
@@ -519,8 +531,23 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
 
   AssertTrue(rank > 1 && IsPowOfTwo(rank) && rank * small_degree == degree,
              "ModPack: rank and degree do not decompose the ring degree");
-  AssertTrue(static_cast<int>(cts.size()) == rank,
-             "ModPack: expected exactly rank input ciphertexts");
+  // FEWER COMPONENTS THAN THE RANK IS A DECLARATION, NOT A SHORTFALL. A
+  // half-density emission on R+ has live output components only below
+  // `rank/2` (Doing.md 1.5db: `GatherWeights` sends row `r` to declared
+  // channel `BitReverseInt(r, log_rank)`, which is even exactly when
+  // `r < rank/2`), so the product need not compute the dead half and the
+  // caller need not store it. The recomposition treats an absent component as
+  // zero, which is what it is.
+  //
+  // The `rank` KEY SWITCHES BELOW DO NOT SHRINK WITH IT, and the reason is
+  // worth stating because it looks like they should: `keys[j]` switches the
+  // j-th SUB-SECRET of the rank-`rank` MLWE ciphertext, not the j-th channel,
+  // and with the live components below `rank/2` the mirror term still fills
+  // every one of the `rank` big a-parts. What this saves is the product and
+  // the weight operand -- half of each -- not the pack.
+  const int num_live = static_cast<int>(cts.size());
+  AssertTrue(num_live > 0 && num_live <= rank,
+             "ModPack: expected at most rank input ciphertexts");
   AssertTrue(static_cast<int>(keys.size()) == rank,
              "ModPack: expected exactly rank switching keys");
   AssertTrue(np.num_aux_ == 0, "ModPack: aux primes are not supported");
@@ -556,13 +583,13 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   const int a_words = num_total_primes * degree;
   DeviceVector<word> a_coeffs(rank * a_words);
 
-  HostVector<word *> h_src_a(rank), h_src_b(rank), h_dst_a(rank);
-  for (int i = 0; i < rank; i++) {
+  HostVector<word *> h_src_a(num_live), h_src_b(num_live), h_dst_a(rank);
+  for (int i = 0; i < num_live; i++) {
     h_src_a[i] = const_cast<word *>(cts[i].a_.data());
     h_src_b[i] = const_cast<word *>(cts[i].b_.data());
-    h_dst_a[i] = a_coeffs.data() + i * a_words;
   }
-  DeviceVector<word *> d_src_a(rank), d_src_b(rank), d_dst_a(rank);
+  for (int i = 0; i < rank; i++) h_dst_a[i] = a_coeffs.data() + i * a_words;
+  DeviceVector<word *> d_src_a(num_live), d_src_b(num_live), d_dst_a(rank);
   CopyHostToDevice(d_src_a, h_src_a);
   CopyHostToDevice(d_src_b, h_src_b);
   CopyHostToDevice(d_dst_a, h_dst_a);
@@ -573,15 +600,17 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
     const word *primes = param_.GetPrimesPtr(np);
     kernel::CiModPackA<word><<<grid_a, kernel_block_dim_>>>(
         d_dst_a.data(), d_src_a.data(), primes, log_rank, small_degree,
-        degree);
+        degree, num_live);
     kernel::CiModPackB<word><<<grid_b, kernel_block_dim_>>>(
         b_coeffs.data(), d_src_b.data(), primes, log_rank, small_degree,
-        degree);
+        degree, num_live);
   } else {
     kernel::ModPackA<word><<<grid_a, kernel_block_dim_>>>(
-        d_dst_a.data(), d_src_a.data(), log_rank, small_degree, degree);
+        d_dst_a.data(), d_src_a.data(), log_rank, small_degree, degree,
+        num_live);
     kernel::ModPackB<word><<<grid_b, kernel_block_dim_>>>(
-        b_coeffs.data(), d_src_b.data(), log_rank, small_degree, degree);
+        b_coeffs.data(), d_src_b.data(), log_rank, small_degree, degree,
+        num_live);
   }
 
   // 2. Key-switch (A_j, 0) from the j-th embedded secret to the ordinary one,

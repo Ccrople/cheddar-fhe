@@ -162,6 +162,21 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     //! indistinguishable from a live zero once encrypted. Leave it 1 unless
     //! **every** input ciphertext really is a half-density banded image.
     int input_density = 1;
+    //! THE SAME DECLARATION ON THE OUTPUT AXIS, and it is the one [SYLPH]'s
+    //! own memory table points at. Table 5 puts [BAE]'s packed PCMM tiles at
+    //! 1.6 GiB a layer; this leg converts `gate` alone into 1785 MiB, and
+    //! **half of every weight operand is exact zeros** -- `GatherWeights`
+    //! sends row `r` to declared channel `BitReverseInt(Component(r),
+    //! log_rank)`, which is even exactly when `r < rank/2`, and a
+    //! half-density emission has nothing at the odd ones.
+    //!
+    //! Setting this to 2 halves the operand and the product's output
+    //! dimension. It does NOT halve `ModPack`: its `rank` key switches are
+    //! over the MLWE sub-secret rather than the channel, and the mirror term
+    //! fills every big a-part however few components are live (see
+    //! `MlweHandler::ModPack`). At sixteen parents the mix is 46.5 ms of an
+    //! 81.1 ms output ciphertext, so this is the mix's half of that.
+    int output_density = 1;
   };
 
   /**
@@ -383,6 +398,10 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! them when `Config::input_density` is 2. See there for why the live set
   //! is a contiguous prefix rather than a stride.
   int LiveColumns() const { return rank_ / cfg_.input_density; }
+
+  //! Live output components, i.e. the weight operand's row count: `rank_` at
+  //! full density and half of them when `Config::output_density` is 2.
+  int LiveRows() const { return rank_ / cfg_.output_density; }
 
   //! One tile's module components, in `Component()`'s order: `ModDecomp`
   //! straight from the parent, or a ring switch and then `ModDecomp` on each

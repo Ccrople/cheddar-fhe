@@ -3373,11 +3373,30 @@ TEST(CiFfn, TheFullWidthLayerRowsAreMeasured) {
   ASSERT_EQ(degree / kTokens, kRank);
   const int product_level = 1;
 
-  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  // ModPack's SWITCHING KEYS CAN CARRY A NARROWER AUXILIARY BASIS, and the
+  // setting is the third argument here -- `PrepareModPackKeys` forwards it to
+  // `Context::PrepareNarrowKeySwitch`, which is what actually builds the
+  // narrow mod-switch handler. An earlier sweep of `CHEDDAR_MODPACK_AUX`
+  // against this benchmark read flat at 0/8/7/6 for exactly the reason that it
+  // never reached this call: **the environment variable is not the mechanism.**
+  //
+  // It matters because ModPack is 37.5 ms of the 81.1 ms an output ciphertext
+  // costs at sixteen parents (1.5dd's A/B splits the two), i.e. 46% of the
+  // layer's projection row. 1.5ck measured 18% off ModPack at the leg's shape
+  // with a floor set by the KEY's num_q rather than the level's -- below it
+  // beta rises above one and ModPack drops off the grouped mod-up, which shows
+  // up as a cliff rather than a slope.
+  const int modpack_aux = [] {
+    const char *e = std::getenv("CHEDDAR_MODPACK_AUX");
+    return (e && e[0]) ? std::atoi(e) : 0;
+  }();
+  boot.ui->PrepareModPackKeys(kTokens, product_level, modpack_aux);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
   for (int j = 0; j < kRank; j++) {
     pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
   }
+  std::cout << "  ModPack auxiliary primes: " << modpack_aux
+            << " (0 = the parameter set's alpha)" << std::endl;
 
   std::mt19937_64 gen(0xF117);
   std::normal_distribution<double> xd(0.0, 1.0);
@@ -3480,6 +3499,10 @@ TEST(CiFfn, TheFullWidthLayerRowsAreMeasured) {
     const char *e = std::getenv("CHEDDAR_CI_DENSITY");
     return (e && e[0]) ? std::atoi(e) : 1;
   }();
+  int out_density = [] {
+    const char *e = std::getenv("CHEDDAR_CI_OUT_DENSITY");
+    return (e && e[0]) ? std::atoi(e) : 1;
+  }();
   auto run = [&](const char *tag, const std::vector<Ciphertext<word>> &ins,
                  int in_declared, int out_declared, int tile) {
     std::vector<double> w(
@@ -3494,6 +3517,7 @@ TEST(CiFfn, TheFullWidthLayerRowsAreMeasured) {
     lcfg.product_level = product_level;
     lcfg.parents_per_tile = tile;
     lcfg.input_density = density;
+    lcfg.output_density = out_density;
     ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys, descent);
     std::vector<Ciphertext<word>> res;
     const auto a = tick();
@@ -3545,6 +3569,7 @@ TEST(CiFfn, TheFullWidthLayerRowsAreMeasured) {
   density = 1;
   const double dense = run("ab_dense_8p", p8dense, 8 * kRank, 4 * kRank, tile);
   density = keep_density;
+  (void)out_density;
   std::cout << "  [A/B] 4096 live channels in: 16 half-density parents "
             << half_density << " ms vs 8 dense parents " << dense
             << " ms -- the dead half is worth " << (half_density / dense)
@@ -3715,11 +3740,30 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
   const int slot_level = sched.GetSlotLevel();
   const int op_level = slot_level - 1;
   const int product_level = 1;
-  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  // ModPack's own auxiliary basis. `PrepareModPackKeys` forwards this to
+  // `Context::PrepareNarrowKeySwitch`; the environment variable alone does
+  // nothing, which is why an earlier sweep of it read flat.
+  // `CiFfn.TheFullWidthLayerRowsAreMeasured` sweeps it properly -- 81.16 ms per
+  // output ciphertext at the parameter set's alpha, 77.58 at 8, 76.81 at 7,
+  // then a cliff to 100.43 at 6 where beta rises above one and ModPack drops
+  // off the grouped mod-up (1.5ck's structure, at this shape).
+  //
+  // **THE DEFAULT STAYS AT THE SET'S ALPHA**, because the narrowing is a trade
+  // and this test is what measures it: at 7 the whole FFN is 13.72 s against
+  // 14.23 and **2^-8.954 against 2^-9.455**. Half a bit for 3.6% is the wrong
+  // side of a target stated in bits -- the same verdict, for the same reason,
+  // as the baby-step cap in 1.5dg. A narrower basis is fewer limbs to raise
+  // into AND a coarser decomposition; only the first half is a saving.
+  const int modpack_aux = [] {
+    const char *e = std::getenv("CHEDDAR_MODPACK_AUX");
+    return (e && e[0]) ? std::atoi(e) : 0;
+  }();
+  boot.ui->PrepareModPackKeys(kTokens, product_level, modpack_aux);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
   for (int j = 0; j < kRank; j++) {
     pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
   }
+  std::cout << "  ModPack auxiliary primes " << modpack_aux << std::endl;
   row("boot keys, EvalMod, ModPack keys", span(t_setup0, tick()), false);
   std::cout << "  full width: model " << kH << " live in " << num_h
             << " ciphertexts (" << kPerModel << " each, declared "
@@ -4001,6 +4045,14 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
   // contraction is over exact zeros; see `Config::input_density`.
   lcfg.input_density = [] {
     const char *e = std::getenv("CHEDDAR_CI_DENSITY");
+    return (e && e[0]) ? std::atoi(e) : 2;
+  }();
+  // Every emission here is read in slots, so its live output channels are the
+  // even declared ones and the weight's odd rows are exact zeros -- see
+  // `Config::output_density`, and [SYLPH] Table 5, whose 1.6 GiB a layer is
+  // what made this worth looking for.
+  lcfg.output_density = [] {
+    const char *e = std::getenv("CHEDDAR_CI_OUT_DENSITY");
     return (e && e[0]) ? std::atoi(e) : 2;
   }();
   ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);

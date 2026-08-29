@@ -162,6 +162,23 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
   // can verify, so the only thing checkable is that the shape admits it.
   AssertTrue(cfg_.input_density == 1 || cfg_.input_density == 2,
              "CoeffLinearLeg: input_density is 1 (dense) or 2 (half density)");
+  AssertTrue(cfg_.output_density == 1 || cfg_.output_density == 2,
+             "CoeffLinearLeg: output_density is 1 (dense) or 2 (half "
+             "density)");
+  if (cfg_.output_density == 2) {
+    AssertTrue(conjugate_invariant_,
+               "CoeffLinearLeg: a half-density OUTPUT is a "
+               "conjugate-invariant contract; on the ordinary ring every "
+               "output component is live");
+    AssertTrue(!descent_.Enabled(),
+               "CoeffLinearLeg: a half-density output is not wired for the "
+               "ring-switched descent yet -- there the live components fall "
+               "entirely in the first half of the PARTS, so whole ModPack "
+               "calls disappear rather than shrinking, and that is a "
+               "different change");
+    AssertTrue(rank_ % 2 == 0,
+               "CoeffLinearLeg: a half-density output needs an even rank");
+  }
   if (cfg_.input_density == 2) {
     AssertTrue(conjugate_invariant_,
                "CoeffLinearLeg: half density is a conjugate-invariant "
@@ -242,12 +259,13 @@ void CoeffLinearLeg<word>::GatherWeights(std::vector<double> &values,
   // The dead half of a half-density input is not a column of zeros here -- it
   // is not a column at all. See `Config::input_density`.
   const int live = LiveColumns();
+  const int rows = LiveRows();
   const int cols = num_parents * live;
-  values.assign(static_cast<size_t>(rank_) * cols, 0.0);
+  values.assign(static_cast<size_t>(rows) * cols, 0.0);
   // `Component` is the identity on the direct route and the two-stride
   // reindexing on the ring-switched one; the channel map itself is the same
   // sentence either way, which is the point of putting the difference here.
-  for (int r = 0; r < rank_; r++) {
+  for (int r = 0; r < rows; r++) {
     const int out_channel =
         group * rank_ +
         static_cast<int>(BitReverseInt(Component(r), log_rank));
@@ -280,6 +298,7 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
   // mismatch, so it is read from the product's own.
   const double scale = product_param_->GetScale(level);
   const int cols = num_parents * LiveColumns();
+  const int rows = LiveRows();
   std::vector<double> values;
   for (int g = 0; g < groups; g++) {
     GatherWeights(values, w, in_channels, out_channels, g, w_scale,
@@ -287,13 +306,13 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
     if (use_blas_) {
 #ifdef USE_CUBLAS
       typename PcmmBlasHandler<word>::SplitMatrix s;
-      product_blas_->SplitMatrixFrom(s, level, scale, values, rank_, cols);
+      product_blas_->SplitMatrixFrom(s, level, scale, values, rows, cols);
       res.bytes += PcmmBlasHandler<word>::SplitBytes(s);
       res.split.push_back(std::move(s));
 #endif
     } else {
       PlainMatrix<word> u;
-      product_pcmm_->EncodeMatrix(u, level, scale, values, rank_, cols);
+      product_pcmm_->EncodeMatrix(u, level, scale, values, rows, cols);
       res.bytes += static_cast<size_t>(u.data_.size()) * sizeof(word);
       res.u.push_back(std::move(u));
     }
@@ -565,11 +584,15 @@ void CoeffLinearLeg<word>::RunProjection(
       // `sub_rank_`. Without the descent there is one run and it is all of
       // them, which is the old code exactly.
       NvtxScope _n("pcmm: ModPack");
+      // At half density the product produced `rank_/2` components and
+      // `ModPack` recomposes the rest as the zeros they are; without the
+      // descent that is one call and `sub_live` is the whole of it.
+      const int sub_live = sub_rank_ / cfg_.output_density;
       for (int i = 0; i < ring_rank_; i++) {
         std::vector<MlweCiphertext<word>> component;
-        component.reserve(sub_rank_);
-        for (int n = 0; n < sub_rank_; n++) {
-          component.push_back(std::move(product[i * sub_rank_ + n]));
+        component.reserve(sub_live);
+        for (int n = 0; n < sub_live; n++) {
+          component.push_back(std::move(product[i * sub_live + n]));
         }
         Ct repacked;
         product_mlwe_->ModPack(product_context_, repacked, component,
