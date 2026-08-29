@@ -251,10 +251,20 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
       worst = std::max(worst, std::abs(a[j] - b[j]));
       mx = std::max(mx, std::abs(a[j]));
     }
+    // `Ledger::Mark` leaves `std::fixed << setprecision(1)` on `std::cout` and
+    // those are sticky, so the first run of this check printed a 6e-4 message
+    // as "0.0" -- and "max diff 0.0 against |.| <= 0.0" is a check that cannot
+    // fail. Hence both the scientific format and, more to the point, the
+    // ASSERT_GT: a comparison whose reference magnitude is zero passes
+    // whatever the code does.
+    const auto flags = std::cout.flags();
     std::cout << "\n  [check] HalfBoot through the leg's own CoeffToSlot vs "
-                 "the FFN's adopted one: max diff "
-              << worst << " against |.| <= " << mx << std::endl;
-    EXPECT_LT(worst, 1e-12 * (mx + 1.0))
+                 "the FFN's adopted one: max diff " << std::scientific
+              << std::setprecision(3) << worst << " against |.| <= " << mx
+              << std::endl;
+    std::cout.flags(flags);
+    ASSERT_GT(mx, 1e-6) << "nothing came back to compare; the check is vacuous";
+    EXPECT_LT(worst, 1e-12 * mx)
         << "the adopted CoeffToSlot tables are not the leg's";
   }
 
