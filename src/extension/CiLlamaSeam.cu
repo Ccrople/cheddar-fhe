@@ -12,8 +12,8 @@ namespace cheddar {
 
 namespace {
 
-using Complex = std::complex<double>;
-
+// Complex is cheddar::Complex, from core/Type.h via StripedMatrix.h. A local
+// alias would be ambiguous with it at every use site inside this namespace.
 int Rev(int v, int bits) {
   int r = 0;
   for (int i = 0; i < bits; i++) {
