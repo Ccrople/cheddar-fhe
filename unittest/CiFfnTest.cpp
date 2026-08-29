@@ -4154,3 +4154,192 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
             << (t >> 20) << std::endl;
   EXPECT_LT(worst / want_absmax, 0.05);
 }
+
+// ---------------------------------------------------------------------------
+// WHERE [SYLPH] 3.2's DESCENT PUTS A CHANNEL IN THE SLOT DOMAIN, MEASURED.
+//
+// The switched descent is worth 17.3 s -> 7.35 s on a full-width layer's seven
+// projection rows (1.5dd) and the only thing between the pipeline and it is
+// the packing: `Component()` returns the identity on R+ so the leg NAMES a
+// channel by its two-stage index, and 1.5cq says that channel then "appears at
+// TWO coefficient addresses, ring_rank*n + j and |ring_rank*n - j|, ADDED".
+// 1.5df worked out what that implies -- addresses receive the pairs
+// (m, r) and (m+1, ring_rank - r), the live set is the same contiguous prefix
+// `input_density` already implements, and the live slots interleave every
+// `ring_rank` instead of splitting at rank/2 -- but that derivation came from
+// one sentence of prose, and a layer run costs a quarter of an hour to
+// disagree with it.
+//
+// This pins it in three minutes instead. One projection, descent on, an
+// identity-in-the-live-half weight, a HalfBoot, and then a search: for every
+// output channel the host predicts, WHICH slot actually carries it. The map is
+// printed and checked against the direct route's, so a difference is named
+// rather than inferred.
+TEST(CiFfn, TheSwitchedDescentSlotLayoutIsPinned) {
+  constexpr int kSlack = 9;
+  Ring boot(Param(), {}, kSlack);
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int num_slots = boot.param->MaxNumSlots();
+  const int product_level = 1;
+  ASSERT_EQ(boot.Degree() / kTokens, kRank);
+
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  cheddar::SylphSchedule<word> sched(bctx, num_slots);
+
+  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+
+  // ---- the two routes ---------------------------------------------------
+  std::unique_ptr<Ring> swtch(new Ring("ci_ringswitch16_35_boot.json",
+                                       boot.ui->GetSecretCoeffs()));
+  std::unique_ptr<Ring> small(new Ring("ci12_35_boot.json"));
+  const int ring_rank = boot.Degree() / small->Degree();
+  const int sub_rank = small->Degree() / kTokens;
+  swtch->ui->PrepareRingSwitchKey(small->Degree(),
+                                  small->ui->GetSecretCoeffs(), product_level);
+  swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
+                                         small->ui->GetSecretCoeffs(),
+                                         product_level);
+  small->ui->PrepareModPackKeys(kTokens, product_level);
+  typename cheddar::CoeffLinearLeg<word>::Descent descent;
+  descent.switch_context = swtch->context;
+  descent.small_context = small->context;
+  descent.forward = &swtch->ui->GetRingSwitchKey(ring_rank);
+  descent.inverse = &swtch->ui->GetInverseRingSwitchKey(ring_rank);
+  for (int j = 0; j < sub_rank; j++) {
+    descent.modpack_keys.push_back(&small->ui->GetModPackKey(sub_rank, j));
+  }
+  std::cout << "  descent " << boot.Degree() << " -> " << small->Degree()
+            << " (" << ring_rank << " parts) -> rank " << sub_rank << std::endl;
+
+  // ---- one parent, one output group, a diagonal weight ------------------
+  //
+  // Live only at even declared channels on both axes, and the weight is the
+  // identity there, so output channel c is input channel c and the host
+  // prediction is the input itself. Distinct values per channel are what makes
+  // the search below unambiguous.
+  // MARKERS, NOT SAMPLES. The first version drew the channels from a Gaussian
+  // and matched each output against the nearest of 512 slot values -- and the
+  // DIRECT route then located only 44 of 223 at its own address, because
+  // nearest-value matching over 512 draws from one distribution is mostly
+  // coincidence. Distinct, evenly spaced values make the match exact: the gap
+  // between neighbouring markers is 400x the crossing's noise.
+  //
+  // Only position 0 carries anything, so `rec[p*rank + I] = comp_I[p] +
+  // comp_{rank-I}[p+1]` is nonzero only at `p = 0` and each address holds
+  // exactly one marker with no duplicate to confuse the search.
+  std::vector<std::vector<double>> comp(kRank,
+                                        std::vector<double>(kTokens, 0.0));
+  std::vector<double> want(kRank, 0.0);  // by declared channel, at position 0
+  for (int c = 0; c < kRank; c += 2) {
+    comp[Rev(c, 9)][Rev(0, 7)] = (c / 2 + 1) / 256.0;
+    want[c] = comp[Rev(c, 9)][Rev(0, 7)];
+  }
+  auto coeffs = CiRecompose(comp, kRank, kTokens);
+  double m = 0.0;
+  for (double v : coeffs) m = std::max(m, std::abs(v));
+  const double beta = 0.2 / std::max(m, 1e-12);
+  for (double &v : coeffs) v *= beta;
+  for (double &v : want) v *= beta;
+  Plaintext<word> pt;
+  boot.context->encoder_.EncodeCoeff(pt, product_level,
+                                     boot.param->GetScale(product_level),
+                                     coeffs);
+  std::vector<Ciphertext<word>> ins(1);
+  boot.ui->Encrypt(ins[0], pt);
+  ins[0].SetNumSlots(num_slots);
+
+  std::vector<double> w(static_cast<size_t>(kRank) * kRank, 0.0);
+  for (int c = 0; c < kRank; c += 2) w[static_cast<size_t>(c) * kRank + c] = 1.0;
+
+  // ---- run it both ways, HalfBoot, and find where each channel went ------
+  auto probe = [&](bool switched, const char *name) {
+    typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+    lcfg.num_tokens = kTokens;
+    lcfg.product_level = product_level;
+    lcfg.parents_per_tile = 0;
+    typename cheddar::CoeffLinearLeg<word>::Descent d;
+    if (switched) d = descent;
+    ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys, d);
+    std::vector<Ciphertext<word>> res;
+    leg.Project(res, ins, kRank, kRank, w, 1.0, name);
+    EXPECT_EQ(res.size(), 1u);
+    Ciphertext<word> up;
+    sched.ToSlot(up, res[0], boot.ui->GetEvkMap());
+    Plaintext<word> p;
+    boot.ui->Decrypt(p, up);
+    std::vector<Complex> raw;
+    boot.context->encoder_.Decode(raw, p);
+
+    // The scale the crossing carries, fitted on whichever address family
+    // turns out to hold the data; taken from the largest |slot| so it does not
+    // assume a layout.
+    double best = 0.0;
+    for (int a = 0; a < kRank; a++) {
+      best = std::max(best, std::abs(raw[static_cast<size_t>(a) * kTokens].real()));
+    }
+    double wmax = 0.0;
+    for (int c = 0; c < kRank; c += 2) wmax = std::max(wmax, std::abs(want[c]));
+    const double k = best / std::max(wmax, 1e-30);
+
+    // For each live output channel, the address whose slot value matches.
+    std::vector<int> where(kRank, -1);
+    int matched = 0, identity = 0;
+    // The markers are `wmax/256` apart, so a quarter of that is a wide margin
+    // and an ambiguous match is impossible rather than merely unlikely.
+    const double gap = wmax / 256.0;
+    for (int c = 0; c < kRank; c += 2) {
+      double bestd = 1e300;
+      int besta = -1;
+      for (int a = 0; a < kRank; a++) {
+        const double got = raw[static_cast<size_t>(a) * kTokens].real() / k;
+        const double d = std::abs(got - want[c]);
+        if (d < bestd) { bestd = d; besta = a; }
+      }
+      if (bestd < 0.25 * gap) {
+        where[c] = besta;
+        matched++;
+        if (besta == c) identity++;
+      }
+    }
+    std::cout << "  [" << name << "] carried " << k << ", located " << matched
+              << " live channels, " << identity
+              << " of them at the DIRECT route's own address" << std::endl;
+    // The first few, and the residues, which is what the layout question is.
+    std::cout << "    c -> slot address:";
+    int shown = 0;
+    for (int c = 0; c < kRank && shown < 10; c += 2) {
+      if (where[c] < 0) continue;
+      std::cout << "  " << c << "->" << where[c];
+      shown++;
+    }
+    std::cout << std::endl;
+    std::set<int> live_res, dead_res;
+    for (int c = 0; c < kRank; c += 2) {
+      if (where[c] >= 0) live_res.insert(where[c] % ring_rank);
+    }
+    std::cout << "    live addresses hit residues mod " << ring_rank << ": ";
+    for (int r : live_res) std::cout << r << " ";
+    std::cout << std::endl;
+    return matched;
+  };
+
+  const int direct = probe(false, "pin_direct");
+  const int sw = probe(true, "pin_switched");
+  EXPECT_GT(direct, 200)
+      << "the direct route's own channel map is not what the rest of this "
+         "file assumes, so nothing below it can be trusted";
+  std::cout << "  switched located " << sw << " of the direct route's "
+            << direct << std::endl;
+}
