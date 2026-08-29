@@ -85,10 +85,12 @@ namespace cheddar {
  * 4.99e+47. Stacking the seam on whatever StC reports cannot come apart that
  * way, and the constructor asserts the zone.
  *
- * **The window convention and its closing rotation.** `LinearTransform`'s
- * `DetermineStride` cannot see negative offsets, so each matrix is compiled
- * with `pre_rotation = -w` for the window `w` that minimises the BSGS span,
- * and the caller owes one rotation by `w` afterwards. `Apply` does it.
+ * **The window convention and its closing rotation.** `DetermineStride`
+ * reduces every offset as `(i - pre_rotation) mod degree`, so each matrix is
+ * compiled with `pre_rotation = +w` for the window `w` that minimises the
+ * span, `additional_pt_rot = -w`, and the caller owes one rotation by `w`
+ * afterwards. `Apply` does it. The signs the other way round do not give a
+ * wrong answer, they refuse outright.
  *
  * ## Memory: T1 is per half and deliberately not in the constructor
  *

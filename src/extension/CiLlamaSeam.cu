@@ -188,12 +188,16 @@ typename CiLlamaSeam<word>::Stage CiLlamaSeam<word>::Compile(
 
   Stage st;
   st.level = level;
-  // THE WINDOW CONVENTION. `DetermineStride` cannot see negative offsets, so
-  // the matrix is compiled shifted by `-w` and the caller owes one rotation by
-  // `w` afterwards; `RunStage` pays it.
+  // THE WINDOW CONVENTION, AND ITS SIGN. `DetermineStride` reduces every
+  // offset as `(i - pre_rotation) mod degree`, which is exactly what
+  // `BestWindow` minimises over, so `pre_rotation` is `+w` and the plaintext
+  // rotation that undoes it is `-w`. Compiling with the signs the other way
+  // round does not produce a wrong answer -- it refuses, with "Incompatible
+  // matrix and LinearTransform parameters", because the offsets are then
+  // spread over the whole ring instead of a window.
   st.transform = std::make_unique<LinearTransform<word>>(
-      context_, m, level, PtScale(level), bs, gs, /*pre_rotation=*/-w,
-      /*additional_pt_rot=*/w);
+      context_, m, level, PtScale(level), bs, gs, /*pre_rotation=*/w,
+      /*additional_pt_rot=*/-w);
   st.back = ((w % degree_) + degree_) % degree_;
   return st;
 }
