@@ -50,8 +50,11 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
       product_pcmm_{&pcmm_},
       product_context_{context},
       pack_keys_{&modpack_keys_},
-      cache_weights_{EnvOn("CHEDDAR_WEIGHT_CACHE", true)},
+      cache_weights_{true},
       use_blas_{false} {
+  // The environment wins over the Config, as elsewhere in this tree.
+  cfg_.residency = ResolveResidency(cfg.residency);
+  cache_weights_ = cfg_.residency != Config::WeightResidency::kNone;
   const int degree = context_->param_.degree_;
   const int num_slots = context_->param_.MaxNumSlots();
 
@@ -366,8 +369,112 @@ CoeffLinearLeg<word>::GetOperands(const char *name,
             << out_channels << ") into " << built.tiles << " x " << groups
             << " operands, " << built.bytes / 1048576 << " MiB on the device"
             << std::endl;
+  // Under kHost the bytes move off the device now, before anything else has a
+  // chance to need the room. Under the other two this does nothing.
+  MirrorOperands(built);
   auto ins = operands_.emplace(key, std::move(built));
   return ins.first->second;
+}
+
+// ---------------------------------------------------------------------------
+// WEIGHT RESIDENCY. The whole model's converted projections are ~105 GiB --
+// measured, not estimated: `gate` at the model's width is 892 MiB and the
+// seven rows of a layer come to ~3.28 GiB, so 32 layers do not fit on an
+// 80 GB card before a single evaluation key exists. `kHost` is the way out:
+// convert once, keep the bytes where there is room for them, and lend the
+// device only the projection it is running.
+//
+// The mirror is of the BUFFERS ALONE. Shapes, scale and NPInfo stay in the
+// `PlainMatrix` / `SplitMatrix` throughout, which is what makes staging a
+// memcpy instead of a re-encode -- and re-encoding is the thing being avoided,
+// at 31% of a layer.
+// ---------------------------------------------------------------------------
+
+template <typename word>
+typename CoeffLinearLeg<word>::Config::WeightResidency
+CoeffLinearLeg<word>::ResolveResidency(
+    typename Config::WeightResidency fallback) {
+  const char *v = std::getenv("CHEDDAR_WEIGHT_RESIDENCY");
+  if (v != nullptr) {
+    const std::string name(v);
+    if (name == "device") return Config::WeightResidency::kDevice;
+    if (name == "host") return Config::WeightResidency::kHost;
+    if (name == "none") return Config::WeightResidency::kNone;
+    // Not a silent fallback: the three differ by whether ~105 GiB of converted
+    // weights live on the card, in host memory, or nowhere.
+    Fail("CHEDDAR_WEIGHT_RESIDENCY must be device, host or none, not \"" +
+         name + "\"");
+  }
+  if (!EnvOn("CHEDDAR_WEIGHT_CACHE", true)) return Config::WeightResidency::kNone;
+  return fallback;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::MirrorOperands(Operands &ops) const {
+  if (cfg_.residency != Config::WeightResidency::kHost) return;
+#ifdef USE_CUBLAS
+  if (use_blas_) {
+    ops.host_split.resize(ops.split.size());
+    for (size_t i = 0; i < ops.split.size(); i++) {
+      CopyDeviceToHost(ops.host_split[i], ops.split[i].data);
+    }
+  }
+#endif
+  if (!use_blas_) {
+    ops.host_u.resize(ops.u.size());
+    for (size_t i = 0; i < ops.u.size(); i++) {
+      CopyDeviceToHost(ops.host_u[i], ops.u[i].data_);
+    }
+  }
+  // The copies are asynchronous; nothing may free the source before they land.
+  cudaStreamSynchronize(cudaStreamLegacy);
+  ops.on_device = true;
+  UnstageOperands(ops);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::StageOperands(const Operands &ops) const {
+  if (cfg_.residency != Config::WeightResidency::kHost || ops.on_device) return;
+  NvtxScope _n("pcmm: stage weights to the device");
+#ifdef USE_CUBLAS
+  if (use_blas_) {
+    for (size_t i = 0; i < ops.split.size(); i++) {
+      CopyHostToDevice(const_cast<DeviceVector<int8_t> &>(ops.split[i].data),
+                       ops.host_split[i]);
+    }
+  }
+#endif
+  if (!use_blas_) {
+    for (size_t i = 0; i < ops.u.size(); i++) {
+      CopyHostToDevice(const_cast<DeviceVector<word> &>(ops.u[i].data_),
+                       ops.host_u[i]);
+    }
+  }
+  cudaStreamSynchronize(cudaStreamLegacy);
+  ops.on_device = true;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::UnstageOperands(const Operands &ops) const {
+  if (cfg_.residency != Config::WeightResidency::kHost || !ops.on_device) {
+    return;
+  }
+  // Move-assigning an empty vector, not `resize(0)`: rmm's resize is free to
+  // keep the allocation, and the point here is to give it back.
+#ifdef USE_CUBLAS
+  if (use_blas_) {
+    for (size_t i = 0; i < ops.split.size(); i++) {
+      const_cast<DeviceVector<int8_t> &>(ops.split[i].data) =
+          DeviceVector<int8_t>(0);
+    }
+  }
+#endif
+  if (!use_blas_) {
+    for (size_t i = 0; i < ops.u.size(); i++) {
+      const_cast<DeviceVector<word> &>(ops.u[i].data_) = DeviceVector<word>(0);
+    }
+  }
+  ops.on_device = false;
 }
 
 template <typename word>
@@ -497,6 +604,8 @@ void CoeffLinearLeg<word>::RunProjection(
     NvtxScope _n("pcmm: convert weights (first call only)");
     cached = &GetOperands(name, w, in_channels, out_channels, w_scale, parents,
                           groups, tile);
+    // Lend the device this projection's operands for as long as it runs.
+    StageOperands(*cached);
   }
 
   // The partial sums, one per output group and -- with the descent -- one per
@@ -643,6 +752,10 @@ void CoeffLinearLeg<word>::RunProjection(
       switcher_->SwitchBack(res[g], rescaled, *descent_.inverse);
     }
   }
+
+  // And take them back. The result is already out, so this frees the largest
+  // object the projection held before the next one asks for its own.
+  if (cached != nullptr) UnstageOperands(*cached);
 }
 
 template class CoeffLinearLeg<uint32_t>;

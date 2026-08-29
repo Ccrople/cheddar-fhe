@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/CiSwitchedCcmm.h"
@@ -117,6 +118,23 @@ class CiSinCAttention {
     //! into the RoPE/restore masks. 1.0 leaves the images as HalfBoot
     //! scaled them.
     double restore = 1.0;
+    //! Directory to cache the three compiled converters in, or empty for no
+    //! cache.
+    //!
+    //! THIS IS THE LAYER'S DOMINANT ONE-TIME COST. Building the converters is
+    //! 728-803 s of host-side matrix construction and encoding, against ~10 s
+    //! of GPU-online arithmetic in the layer they serve -- and all 32 layers
+    //! of the model reuse them unchanged, so it is paid once per PROCESS and
+    //! bought nothing for it.
+    //!
+    //! The archive's identity covers the parameter set only, which is not
+    //! enough here: two converters over the same ring can differ in
+    //! `sub_degree`, the levels, the baby-step split, the chain layout and the
+    //! transport premap, and a cache hit on the wrong one would be silent.
+    //! So the RECIPE goes in the file name (`ConverterCachePath`) and the
+    //! parameter set goes in the header, and between them nothing that changes
+    //! the matrices can be missed.
+    std::string converter_cache_dir = "";
     bool verbose = false;
   };
 
@@ -251,6 +269,16 @@ class CiSinCAttention {
  private:
   void BuildPremaps();
   void BuildTransportPlaintexts();
+
+  //! Where the compiled converter `which` is cached, recipe in the name.
+  //! Empty when `Config::converter_cache_dir` is.
+  std::string ConverterCachePath(const char *which) const;
+
+  //! `which`'s converter: read from the cache when one is there for this
+  //! recipe and parameter set, otherwise built and then written.
+  std::unique_ptr<CiSinCConverter<word>> MakeConverter(
+      const char *which, int inverse_level, const CiSwitchedCcmmLayout &layout,
+      const std::vector<int> *premap) const;
   // RoPE + restore + kill over one tensor's halves (with_angles), or the
   // plain restore + kill (V). In place, land_level -> land_level - 1.
   void RopeAndKill(std::vector<Ct> &a_cts, std::vector<Ct> &b_cts,

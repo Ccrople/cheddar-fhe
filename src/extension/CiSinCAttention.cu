@@ -5,6 +5,7 @@
 #include <iostream>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -96,15 +97,10 @@ CiSinCAttention<word>::CiSinCAttention(
 
   BuildPremaps();
 
-  conv_q_ = std::make_unique<CiSinCConverter<word>>(
-      switch_ctx_, cfg_.sub_degree, cfg_.forward_level,
-      /*inverse_level=*/-1, &layout, &pre_q_, cfg_.converter_baby_steps);
-  conv_k_ = std::make_unique<CiSinCConverter<word>>(
-      switch_ctx_, cfg_.sub_degree, cfg_.forward_level,
-      /*inverse_level=*/-1, &layout, &pre_k_, cfg_.converter_baby_steps);
-  conv_pv_ = std::make_unique<CiSinCConverter<word>>(
-      switch_ctx_, cfg_.sub_degree, cfg_.forward_level, cfg_.inverse_level,
-      &layout, /*forward_premap=*/nullptr, cfg_.converter_baby_steps);
+  conv_q_ = MakeConverter("q", /*inverse_level=*/-1, layout, &pre_q_);
+  conv_k_ = MakeConverter("k", /*inverse_level=*/-1, layout, &pre_k_);
+  conv_pv_ = MakeConverter("pv", cfg_.inverse_level, layout,
+                           /*premap=*/nullptr);
 
   // The 63-diagonal token/head exchange (1.5by), window convention: the
   // negative offsets 127 * [-31, 31] pass DetermineStride's wrap wall as
@@ -134,6 +130,62 @@ CiSinCAttention<word>::CiSinCAttention(
               << ", exchange " << em.GetNumDiag() << " diagonals @"
               << cfg_.exchange_level << std::endl;
   }
+}
+
+template <typename word>
+std::string CiSinCAttention<word>::ConverterCachePath(
+    const char *which) const {
+  if (cfg_.converter_cache_dir.empty()) return std::string();
+  // THE RECIPE GOES IN THE NAME. An archive's identity covers the parameter
+  // set, which is necessary and not sufficient: two converters over the same
+  // ring differ by the sub-degree, the three levels, the baby-step split and
+  // the premap, and a hit on the wrong one would be silent because the
+  // plaintexts decode perfectly well -- into the wrong transform. Everything
+  // that shapes a diagonal is therefore either in this name or in the header.
+  const auto &layout = ccmm_.GetLayout();
+  std::ostringstream os;
+  os << cfg_.converter_cache_dir << "/ci_conv_" << which << "_k"
+     << cfg_.sub_degree << "_f" << cfg_.forward_level << "_i"
+     << cfg_.inverse_level << "_bs" << cfg_.converter_baby_steps << "_r"
+     << layout.rank << "_n" << num_slots_ << "_d" << degree_ << ".bin";
+  return os.str();
+}
+
+template <typename word>
+std::unique_ptr<CiSinCConverter<word>> CiSinCAttention<word>::MakeConverter(
+    const char *which, int inverse_level, const CiSwitchedCcmmLayout &layout,
+    const std::vector<int> *premap) const {
+  const std::string path = ConverterCachePath(which);
+  const auto id = IdentityOf(switch_ctx_->param_);
+
+  if (!path.empty() && ArchiveReader::PeekIdentity(path) == id) {
+    ArchiveReader ar(path, id);
+    auto conv = CiSinCConverter<word>::Load(ar);
+    if (cfg_.verbose) {
+      std::cout << "  converter " << which << ": read "
+                << (ArchiveReader::FileSize(path) >> 20) << " MiB from "
+                << path << std::endl;
+    }
+    return conv;
+  }
+
+  auto conv = std::make_unique<CiSinCConverter<word>>(
+      switch_ctx_, cfg_.sub_degree, cfg_.forward_level, inverse_level, &layout,
+      premap, cfg_.converter_baby_steps);
+
+  if (!path.empty()) {
+    // Written after the build, so a run that dies mid-build leaves no file
+    // rather than a truncated one -- which would then fail at a read that
+    // names the record, but only after the next run had paid to get there.
+    ArchiveWriter ar(path, id);
+    conv->Save(ar);
+    ar.Close();
+    if (cfg_.verbose) {
+      std::cout << "  converter " << which << ": wrote "
+                << (ar.Written() >> 20) << " MiB to " << path << std::endl;
+    }
+  }
+  return conv;
 }
 
 template <typename word>

@@ -172,6 +172,11 @@ template void CopyHostToDevice(DeviceVector<const uint32_t *> &dst,
                                const HostVector<const uint32_t *> &src);
 template void CopyHostToDevice(DeviceVector<const uint64_t *> &dst,
                                const HostVector<const uint64_t *> &src);
+// int8_t only had the host-to-device direction: the split plaintext matrices
+// were built on the host and never read back. Weight streaming reads them back
+// -- that is what a host mirror is -- so the return leg is instantiated too.
+template void CopyDeviceToHost(HostVector<int8_t> &dst,
+                               const DeviceVector<int8_t> &src);
 template void CopyDeviceToHost(HostVector<int32_t> &dst,
                                const DeviceVector<int32_t> &src);
 template void CopyDeviceToHost(HostVector<int64_t> &dst,

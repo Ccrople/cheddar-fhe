@@ -177,6 +177,26 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     //! `MlweHandler::ModPack`). At sixteen parents the mix is 46.5 ms of an
     //! 81.1 ms output ciphertext, so this is the mix's half of that.
     int output_density = 1;
+    //! Where a converted weight matrix lives between the projections that use
+    //! it. `CHEDDAR_WEIGHT_RESIDENCY=device|host|none` overrides it, and the
+    //! older `CHEDDAR_WEIGHT_CACHE=0` still means `kNone`.
+    //!
+    //! **This is what decides whether the 32-layer model runs at all.**
+    //! Measured at the model's own width, one layer's seven converted
+    //! projections are ~3.28 GiB -- `gate` (8704 x 28672 declared) is 892 MiB,
+    //! `up` and `down` the same, `q` and `o` 271 each, `k` and `v` 68 each --
+    //! so the whole model is **~105 GiB**, against 80 GB of A100 before a
+    //! single evaluation key. `kDevice` is therefore a single-layer setting,
+    //! and `kNone` re-converts on every call, which was 31% of a layer.
+    //!
+    //! `kHost` is the one that scales: convert once, keep the bytes in host
+    //! memory, and copy the current projection's operands to the device for
+    //! the projection and no longer. The transfer is ~3.28 GiB a layer against
+    //! ~19 s of arithmetic, so it is a small percentage; holding all 32 layers
+    //! needs ~105 GiB of host RAM, which is what a machine like this has and a
+    //! GPU does not.
+    enum class WeightResidency { kDevice, kHost, kNone };
+    WeightResidency residency = WeightResidency::kDevice;
   };
 
   /**
@@ -314,7 +334,34 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
 #ifdef USE_CUBLAS
     std::vector<typename PcmmBlasHandler<word>::SplitMatrix> split;
 #endif
+
+    //! The host mirror, under `WeightResidency::kHost`. Same bytes, same
+    //! order; the device buffers above are emptied while `on_device` is false
+    //! and everything else in them -- shapes, scale, NPInfo -- is left alone,
+    //! because that is what makes staging a copy rather than a re-encode.
+    std::vector<HostVector<word>> host_u;
+#ifdef USE_CUBLAS
+    std::vector<HostVector<int8_t>> host_split;
+#endif
+    //! Mutable because staging is a property of where the bytes are, not of
+    //! what they mean, and `RunProjection` is const.
+    mutable bool on_device = true;
   };
+
+  //! `CHEDDAR_WEIGHT_RESIDENCY=device|host|none`, with the older
+  //! `CHEDDAR_WEIGHT_CACHE=0` kept as a synonym for `none`. An unrecognised
+  //! value is an error rather than a silent fallback: the three differ by
+  //! whether ~105 GiB of converted weights live on the card, in host memory,
+  //! or nowhere, and a typo that quietly took the default would be expensive.
+  static typename Config::WeightResidency ResolveResidency(
+      typename Config::WeightResidency fallback);
+
+  //! Copy `ops` back to the device. No-op unless it is mirrored and away.
+  void StageOperands(const Operands &ops) const;
+  //! Free `ops`'s device buffers, keeping the host mirror. No-op otherwise.
+  void UnstageOperands(const Operands &ops) const;
+  //! Move a freshly converted `ops` to the host mirror, once.
+  void MirrorOperands(Operands &ops) const;
 
   // Row r of the operand carries output channel `group * rank + BitRev(r)`,
   // and column `p * rank + i` carries input channel
