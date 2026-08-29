@@ -353,12 +353,14 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
     // 1420.5 ms at cap 2, 852.9 at 4, **627.3 / 629.7 at 8**, 647.2 / 648.0 at
     // 16, 649.8 at 32 -- a clean U whose floor is BELOW the cap, so the
     // register limit never bound the split and the 7:1 ratio above is too
-    // large at these phases. But the whole FFN at cap 8 is 19.389 s against
-    // 19.501 (0.6%, the crossing being 5.0 s of 19.4) and **2^-9.047 against
-    // 2^-9.414 -- 0.37 bits**: a narrower baby step means more giant steps and
-    // a giant step pays its own ModDown, ModUp and key multiply, so the
-    // key-switch noise rises with exactly what makes it fast. Read the
-    // accuracy line beside the time. Doing.md 1.5dg.
+    // large at these phases. The whole FFN at cap 8 is 19.389 s against 19.501
+    // -- 0.6%, the crossing being 5.0 s of 19.4 -- and the 0.37 bits once
+    // claimed alongside it (2^-9.047 against 2^-9.414) **does not survive the
+    // spread**: the same test at identical settings has since measured
+    // 2^-9.044 and 2^-9.455, so its accuracy figure ranges over ~0.4 bits run
+    // to run and the precision cost here is simply unmeasured (Doing.md 1.5di).
+    // The default stays at 16 because 0.6% is not worth an unmeasured risk,
+    // not because the risk was quantified. Doing.md 1.5dg.
     static const int cap = [] {
       const char *e = std::getenv("CHEDDAR_CI_BSGS_BS_CAP");
       if (e == nullptr || e[0] == 0) return 16;

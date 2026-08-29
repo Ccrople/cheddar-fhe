@@ -3748,12 +3748,14 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
   // then a cliff to 100.43 at 6 where beta rises above one and ModPack drops
   // off the grouped mod-up (1.5ck's structure, at this shape).
   //
-  // **THE DEFAULT STAYS AT THE SET'S ALPHA**, because the narrowing is a trade
-  // and this test is what measures it: at 7 the whole FFN is 13.72 s against
-  // 14.23 and **2^-8.954 against 2^-9.455**. Half a bit for 3.6% is the wrong
-  // side of a target stated in bits -- the same verdict, for the same reason,
-  // as the baby-step cap in 1.5dg. A narrower basis is fewer limbs to raise
-  // into AND a coarser decomposition; only the first half is a saving.
+  // **THE DEFAULT STAYS AT THE SET'S ALPHA.** At 7 the whole FFN is 13.72 s
+  // against 14.23 -- 3.6%, and the timing spread is 0.3%, so that much is
+  // real. The half-bit cost once claimed beside it (2^-8.954 against
+  // 2^-9.455) is NOT: this test's accuracy figure is a MAX over 126 x 4096
+  // entries and ranges over ~0.4 bits run to run at identical settings
+  // (Doing.md 1.5di), so a single sample cannot resolve it. The default is
+  // conservative because 3.6% is not worth an unmeasured risk, not because
+  // the risk was measured. Several runs at each setting would settle it.
   const int modpack_aux = [] {
     const char *e = std::getenv("CHEDDAR_MODPACK_AUX");
     return (e && e[0]) ? std::atoi(e) : 0;
