@@ -170,14 +170,16 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                "CoeffLinearLeg: a half-density OUTPUT is a "
                "conjugate-invariant contract; on the ordinary ring every "
                "output component is live");
-    AssertTrue(!descent_.Enabled(),
-               "CoeffLinearLeg: a half-density output is not wired for the "
-               "ring-switched descent yet -- there the live components fall "
-               "entirely in the first half of the PARTS, so whole ModPack "
-               "calls disappear rather than shrinking, and that is a "
-               "different change");
     AssertTrue(rank_ % 2 == 0,
                "CoeffLinearLeg: a half-density output needs an even rank");
+    // Under the descent a live flat index `j * sub_rank + n < rank/2` is
+    // exactly `j < ring_rank/2`, so the dead half is whole PARTS: their
+    // `ModPack` disappears rather than shrinking, and the inverse switch is
+    // handed the zeros they stand for. That is why this needs an even part
+    // count where the direct route needs only an even rank.
+    AssertTrue(!descent_.Enabled() || ring_rank_ % 2 == 0,
+               "CoeffLinearLeg: a half-density output needs an even number of "
+               "product-ring parts");
   }
   if (cfg_.input_density == 2) {
     AssertTrue(conjugate_invariant_,
@@ -584,15 +586,17 @@ void CoeffLinearLeg<word>::RunProjection(
       // `sub_rank_`. Without the descent there is one run and it is all of
       // them, which is the old code exactly.
       NvtxScope _n("pcmm: ModPack");
-      // At half density the product produced `rank_/2` components and
-      // `ModPack` recomposes the rest as the zeros they are; without the
-      // descent that is one call and `sub_live` is the whole of it.
-      const int sub_live = sub_rank_ / cfg_.output_density;
-      for (int i = 0; i < ring_rank_; i++) {
+      // At half density the product produced `rank_/2` components; whether
+      // that shrinks each pack or deletes half of them is the one thing the
+      // two routes read differently, and `LivePacks`/`PackSources` is that
+      // sentence.
+      const int packs = LivePacks();
+      const int sources = PackSources();
+      for (int i = 0; i < packs; i++) {
         std::vector<MlweCiphertext<word>> component;
-        component.reserve(sub_live);
-        for (int n = 0; n < sub_live; n++) {
-          component.push_back(std::move(product[i * sub_live + n]));
+        component.reserve(sources);
+        for (int n = 0; n < sources; n++) {
+          component.push_back(std::move(product[i * sources + n]));
         }
         Ct repacked;
         product_mlwe_->ModPack(product_context_, repacked, component,
@@ -623,9 +627,17 @@ void CoeffLinearLeg<word>::RunProjection(
         product_context_->Rescale(res[g], partial[g][0]);
         continue;
       }
+      // The inverse switch composes all `ring_rank_` parts, so a half-density
+      // output has to hand it the zeros its dead parts stand for. They are
+      // built by subtracting a live part from itself rather than default
+      // constructed: the composition needs a ciphertext at the right level and
+      // prime set, and an empty one has neither.
       std::vector<Ct> rescaled(ring_rank_);
-      for (int i = 0; i < ring_rank_; i++) {
+      for (int i = 0; i < LivePacks(); i++) {
         product_context_->Rescale(rescaled[i], partial[g][i]);
+      }
+      for (int i = LivePacks(); i < ring_rank_; i++) {
+        product_context_->Sub(rescaled[i], rescaled[0], rescaled[0]);
       }
       NvtxScope _n2("pcmm: SwitchBack");
       switcher_->SwitchBack(res[g], rescaled, *descent_.inverse);

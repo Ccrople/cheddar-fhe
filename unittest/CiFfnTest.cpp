@@ -4490,6 +4490,25 @@ TEST(CiFfn, TheSwitchedDescentCarriesItsDerivedLiveSet) {
     std::set_intersection(prim.begin(), prim.end(), dup.begin(), dup.end(),
                           std::back_inserter(both));
     EXPECT_TRUE(both.empty()) << both.size() << " addresses are in both bands";
+
+    // AND THE BIT THAT SEPARATES THE TWO BANDS MOVES, which is the part of
+    // this that is not free. A component `i` is read at declared channel
+    // `BitReverseInt(i, log_rank)`, and in `i = ring_rank * n + j` the PART
+    // index `j` occupies the LOW bits, so the reversal is
+    // `Rev(i) = Rev(j) * sub_rank + Rev(n)` -- not the other way round. The
+    // live condition `j < ring_rank/2` is then `Rev(j)` even, i.e. bit
+    // `log2(sub_rank)` of the declared channel is 0, where the direct route
+    // puts the same distinction on bit 0. The first draft of this test
+    // asserted the parity the direct route uses and failed at once on primary
+    // 257; the assertion is why the convention is written down here rather
+    // than discovered in a layer.
+    const int band_bit = cheddar::Log2Ceil(sub_rank);
+    for (int a : prim) {
+      EXPECT_EQ((Rev(a, 9) >> band_bit) & 1, 0) << "primary " << a;
+    }
+    for (int a : dup) {
+      EXPECT_EQ((Rev(a, 9) >> band_bit) & 1, 1) << "duplicate " << a;
+    }
   }
   std::cout << "  descent " << boot.Degree() << " -> " << small->Degree()
             << ": ring_rank " << ring_rank << ", sub_rank " << sub_rank
@@ -4536,14 +4555,39 @@ TEST(CiFfn, TheSwitchedDescentCarriesItsDerivedLiveSet) {
     }
   }
 
-  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
-  lcfg.num_tokens = kTokens;
-  lcfg.product_level = product_level;
-  lcfg.parents_per_tile = 0;
-  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys, descent);
-  std::vector<Ciphertext<word>> res;
-  leg.Project(res, ins, kRank, kRank, w, 1.0, "switched_live");
-  ASSERT_EQ(res.size(), 1u);
+  // Run it dense and at half density. The live set sits entirely below
+  // `rank/2` in the flat index, which under the descent is the first half of
+  // the PARTS, so the skip drops whole `ModPack` calls and whole `ModDecomp`s
+  // -- the thing 1.5dh's output zero-skip could not do here. Both runs are
+  // the same arithmetic on the same operand and the difference between them
+  // is the measurement.
+  auto run = [&](int density, const char *tag) {
+    typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+    lcfg.num_tokens = kTokens;
+    lcfg.product_level = product_level;
+    lcfg.parents_per_tile = 0;
+    lcfg.input_density = density;
+    lcfg.output_density = density;
+    ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys, descent);
+    std::vector<Ciphertext<word>> out;
+    leg.Project(out, ins, kRank, kRank, w, 1.0, tag);  // converts the weights
+    const auto t0 = std::chrono::steady_clock::now();
+    leg.Project(out, ins, kRank, kRank, w, 1.0, tag);
+    cudaDeviceSynchronize();
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    EXPECT_EQ(out.size(), 1u);
+    Plaintext<word> p;
+    boot.ui->Decrypt(p, out[0]);
+    std::vector<double> co;
+    boot.context->encoder_.DecodeCoeff(co, p);
+    std::cout << "  [" << tag << "] density " << density << ": " << ms
+              << " ms/ct" << std::endl;
+    return CiComponentsFfn(co, kRank, kTokens);
+  };
+  const auto got_dense = run(1, "switched_dense");
+  const auto got = run(2, "switched_half");
 
   // ---- what the map predicts, and what the direct addressing would --------
   std::vector<std::vector<double>> dp(kRank, std::vector<double>(kTokens, 0.0));
@@ -4568,13 +4612,8 @@ TEST(CiFfn, TheSwitchedDescentCarriesItsDerivedLiveSet) {
     }
   }
 
-  Plaintext<word> out_pt;
-  boot.ui->Decrypt(out_pt, res[0]);
-  std::vector<double> got_coeffs;
-  boot.context->encoder_.DecodeCoeff(got_coeffs, out_pt);
-  const auto got = CiComponentsFfn(got_coeffs, kRank, kTokens);
-
-  auto score = [&](const std::vector<std::vector<double>> &ref) {
+  auto score = [&](const std::vector<std::vector<double>> &got,
+                   const std::vector<std::vector<double>> &ref) {
     double num = 0.0, den = 0.0, mx = 0.0, err = 0.0;
     for (int i = 0; i < kRank; i++) {
       for (int t = 0; t < kTokens; t++) {
@@ -4591,14 +4630,33 @@ TEST(CiFfn, TheSwitchedDescentCarriesItsDerivedLiveSet) {
     }
     return std::make_pair(err / std::max(mx, 1e-30), k);
   };
-  const auto derived = score(want);
-  const auto control = score(naive);
-  std::cout << "  [derived map] relative " << derived.first << " (carried "
-            << derived.second << ")" << std::endl;
+  const auto derived = score(got, want);
+  const auto dense_derived = score(got_dense, want);
+  const auto control = score(got, naive);
+  std::cout << "  [derived map] half density relative " << derived.first
+            << " (carried " << derived.second << "), dense "
+            << dense_derived.first << std::endl;
   std::cout << "  [direct-addressing control] relative " << control.first
             << std::endl;
   EXPECT_LT(derived.first, 1e-3)
       << "the switched descent does not carry the derived live set";
+  EXPECT_LT(dense_derived.first, 1e-3)
+      << "the dense run does not carry it either, so the map is wrong rather "
+         "than the skip";
   EXPECT_GT(control.first, 0.1)
       << "the control passes too, so this test is not discriminating";
+  // The skip is a claim about work, not about arithmetic: it drops components
+  // that are identically zero, so the two runs must agree to the noise and
+  // not merely to a tolerance.
+  double diff = 0.0, mx = 0.0;
+  for (int i = 0; i < kRank; i++) {
+    for (int t = 0; t < kTokens; t++) {
+      diff = std::max(diff, std::abs(got[i][t] - got_dense[i][t]));
+      mx = std::max(mx, std::abs(got_dense[i][t]));
+    }
+  }
+  std::cout << "  [half vs dense] " << diff / std::max(mx, 1e-30) << std::endl;
+  EXPECT_LT(diff / std::max(mx, 1e-30), 1e-5)
+      << "the half-density skip changed the answer, so it is not skipping "
+         "zeros";
 }

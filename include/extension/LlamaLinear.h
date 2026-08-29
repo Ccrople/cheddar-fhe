@@ -403,6 +403,21 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! full density and half of them when `Config::output_density` is 2.
   int LiveRows() const { return rank_ / cfg_.output_density; }
 
+  //! How the live output components divide into `ModPack` calls, which is the
+  //! one place the two routes read the same live set differently. A live
+  //! output flat index is `j * sub_rank_ + n < rank_ / output_density`.
+  //! Without the descent `ring_rank_` is 1, so that is a prefix of the single
+  //! call's sources and the pack shrinks. With it the condition is exactly
+  //! `j < ring_rank_ / output_density` -- whole PARTS -- so half the calls
+  //! disappear instead, and the inverse ring switch is handed the zeros they
+  //! stand for. `LivePacks() * PackSources()` is `LiveRows()` either way.
+  int LivePacks() const {
+    return descent_.Enabled() ? ring_rank_ / cfg_.output_density : ring_rank_;
+  }
+  int PackSources() const {
+    return descent_.Enabled() ? sub_rank_ : sub_rank_ / cfg_.output_density;
+  }
+
   //! One tile's module components, in `Component()`'s order: `ModDecomp`
   //! straight from the parent, or a ring switch and then `ModDecomp` on each
   //! part. `span * LiveColumns()` of them either way.
