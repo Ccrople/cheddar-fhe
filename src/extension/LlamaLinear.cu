@@ -365,9 +365,12 @@ CoeffLinearLeg<word>::GetOperands(const char *name,
                   groups);
     built.tiles++;
   }
+  const char *where =
+      cfg_.residency == Config::WeightResidency::kHost ? "in host memory"
+                                                       : "on the device";
   std::cout << "weight cache: converted " << name << " (" << in_channels << " x "
             << out_channels << ") into " << built.tiles << " x " << groups
-            << " operands, " << built.bytes / 1048576 << " MiB on the device"
+            << " operands, " << built.bytes / 1048576 << " MiB " << where
             << std::endl;
   // Under kHost the bytes move off the device now, before anything else has a
   // chance to need the room. Under the other two this does nothing.
