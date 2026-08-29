@@ -47,10 +47,20 @@ struct Ring {
    *        `UserInterface(context, secret_coeffs)`.
    * @param boot_slack_levels levels the schedule reserves below the bootstrap;
    *        only read when the JSON says `boot: true`
+   * @param build_user_interface build the `UserInterface` now. Pass false when
+   *        this ring only ever borrows another one's keys: a `UserInterface`
+   *        constructor runs `PrepareBasicEvks`, which is a multiplication key
+   *        and -- under sparse-secret encapsulation -- a dense-to-sparse and a
+   *        sparse-to-dense key at the top np, and a Context that is never
+   *        encrypted to or decrypted from reads none of them. Section 1.5da
+   *        found exactly that in the layer's second BootContext, where
+   *        `grep 'boot_ffn\.ui'` returns nothing. `BuildUserInterface()`
+   *        makes one later, with the secret this constructor was given.
    */
   explicit Ring(const std::string &file,
                 const std::vector<int> &secret_coeffs = {},
-                int boot_slack_levels = 0) {
+                int boot_slack_levels = 0,
+                bool build_user_interface = true) {
     std::ifstream f(std::string(PARAM_DIR) + "/" + file);
     if (!f) throw std::runtime_error("cannot open " + file);
     json j = json::parse(f);
@@ -104,11 +114,18 @@ struct Ring {
 #else
     context = cheddar::Context<word>::Create(*param);
 #endif
-    if (secret_coeffs.empty()) {
+    pending_secret_ = secret_coeffs;
+    if (build_user_interface) BuildUserInterface();
+  }
+
+  //! Build the deferred `UserInterface`, adopting the constructor's secret.
+  void BuildUserInterface() {
+    if (ui) return;
+    if (pending_secret_.empty()) {
       ui = std::make_unique<cheddar::UserInterface<word>>(context);
     } else {
       ui = std::make_unique<cheddar::UserInterface<word>>(context,
-                                                          secret_coeffs);
+                                                          pending_secret_);
     }
   }
 
@@ -174,6 +191,10 @@ struct Ring {
     }
     return max_abs;
   }
+
+ private:
+  //! The constructor's secret, kept for a deferred `BuildUserInterface`.
+  std::vector<int> pending_secret_;
 };
 
 }  // namespace ringfixture

@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -51,6 +52,7 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/MemoryPool.h"
 #include "core/CiSwitchedCcmm.h"
 #include "core/EvkRequest.h"
 #include "core/Mlwe.h"
@@ -8679,15 +8681,51 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   };
 
   // The boot set first: the handler's constructor reads GetStCInputScale.
+  // MIN_KS AS A MEMORY KNOB, not the speed one it is usually filed under.
+  // `MemoryLedger` measures this bootstrap's rotation keys at 7059.0 MiB
+  // against 782.0 under min_ks -- 70 keys against 9, a factor of 9.0 -- while
+  // CLAUDE.md records the CI Boot at 58.2 ms against MinKS's 150.8. The layer
+  // crosses 16 times through `Boot` and dozens more through `HalfBoot`, so the
+  // trade is seconds against gigabytes and which way it goes depends on
+  // whether the layer is short of time or of card. Off by default;
+  // `CHEDDAR_CI_MINKS=1` turns it on, and it has to be one flag for the whole
+  // layer because the key set is shared: a mixed run would need both.
+  const bool min_ks = [] {
+    const char *e = std::getenv("CHEDDAR_CI_MINKS");
+    return e != nullptr && std::strcmp(e, "0") != 0;
+  }();
+  if (min_ks) std::cout << "  min_ks ON (CHEDDAR_CI_MINKS)" << std::endl;
+
   bctx->PrepareEvalMod();
   bctx->PrepareEvalSpecialFFT(num_slots);
   {
     EvkRequest boot_req;
-    bctx->AddRequiredRotations(boot_req, num_slots);
+    bctx->AddRequiredRotations(boot_req, num_slots, min_ks);
     boot.ui->PrepareRotationKey(boot_req);
   }
 
   // ---- the projections: real PC-MM emissions, as in 1.5ca/1.5cb ---------
+  // A MEMORY LEDGER FROM THE TOP, not from the leg's release. 1.5da could
+  // only attribute the stages AFTER the leg, and then found the leg was
+  // 79.1% of the peak -- i.e. the ledger began just past the thing it most
+  // needed to explain. These rows fix that. Under `CHEDDAR_MEM_STATS=1` they
+  // also carry live demand, which is the only number that separates
+  // residency from a transient; without it they are RMM's reservation, which
+  // is a high-water mark and can only go up.
+  auto early = [](const char *tag) {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    std::cout << "  [mem] " << tag << ": " << ((total_b - free_b) >> 20)
+              << " MiB reserved";
+    if (cheddar::MemoryPool::StatisticsEnabled()) {
+      const auto usage = cheddar::MemoryPool::GetUsage();
+      std::cout << ", live " << (usage.current_bytes >> 20) << " MiB, peak "
+                << (usage.peak_bytes >> 20) << " MiB";
+    }
+    std::cout << std::endl;
+  };
+  early("the boot set (EvalMod, CtS/StC, rotations)");
+
   cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
   cheddar::PcmmHandler<word> pcmm(*boot.param);
   boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
@@ -8695,6 +8733,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   for (int j = 0; j < proj_rank; j++) {
     pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
   }
+  early("the projection's 512 ModPack keys");
 
   std::mt19937_64 gen(0xB141);
   std::uniform_real_distribution<double> xd(-1.0, 1.0);
@@ -8858,7 +8897,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     boot.context->Rescale(dropped, packed);
     dropped.SetNumSlots(num_slots);
     const auto e2 = tick();
-    bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap());
+    bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap(), min_ks);
     const auto e3 = tick();
     t_encode += span_ms(e0, e1);
     t_mix += span_ms(e1, e2);
@@ -8912,6 +8951,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   auto attn_p = std::make_unique<cheddar::CiSinCAttention<word>>(
       bctx, swtch->context, small->context, lifted->context, acfg);
   const auto t1 = std::chrono::steady_clock::now();
+  early("CiSinCAttention: its three converters");
   const auto layout = attn_p->GetLayout();  // by value: attn_p dies below
 
   swtch->ui->PrepareRingSwitchKey(small->Degree(), small->ui->GetSecretCoeffs(),
@@ -8932,6 +8972,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
     attn_p->AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  early("the leg's transport, switch and lifted keys");
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch->ui->GetEvkMap();
@@ -9020,7 +9061,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   std::vector<Ciphertext<word>> scores(layout.num_cts);
   for (int bi = 0; bi < layout.num_cts; bi++) {
     s0[bi].SetNumSlots(num_slots);
-    bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
+    bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap(), min_ks);
   }
   ASSERT_EQ(boot.param->NPToLevel(scores[0].GetNP()), attn_p->GetTopLevel());
 
@@ -9069,7 +9110,9 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
 
   const auto t6 = std::chrono::steady_clock::now();
   std::vector<Ciphertext<word>> out;
+  early("the leg run: scores, softmax, before Values");
   attn_p->Values(out, P, v_a, v_b, keys);
+  early("the leg run: Values done");
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const auto t7 = std::chrono::steady_clock::now();
@@ -9109,12 +9152,24 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // but it does see the pool RESERVE, and reservation growth is what actually
   // runs the card out. Printing it at every stage boundary says which stage
   // grows it.
+  //
+  // Run with `CHEDDAR_MEM_STATS=1` and it also prints LIVE DEMAND, which is
+  // the number reservation cannot give: a stage that spikes and frees leaves
+  // the reserve raised for everything after it, so a reserve ledger reads a
+  // freed gigabyte as a permanent one. The statistics adaptor costs a lock per
+  // allocation, so it is not the default; `MemoryLedger` is where the
+  // per-object numbers are taken.
   auto ledger = [](const char *tag) {
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::cout << "  [mem] " << tag << ": " << ((total_b - free_b) >> 20)
-              << " MiB reserved, " << (free_b >> 20) << " MiB free"
-              << std::endl;
+              << " MiB reserved, " << (free_b >> 20) << " MiB free";
+    if (cheddar::MemoryPool::StatisticsEnabled()) {
+      const auto usage = cheddar::MemoryPool::GetUsage();
+      std::cout << ", live " << (usage.current_bytes >> 20) << " MiB, peak "
+                << (usage.peak_bytes >> 20) << " MiB";
+    }
+    std::cout << std::endl;
   };
   ledger("leg released");
 
@@ -9201,8 +9256,17 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   // `err * carried` came out 16426 both before and after the token map was
   // fixed. Everything the FFN needs still fits at nine: RMSNorm leaves 11
   // against StC's 10, and `GetCoeffLevel()` is 7, well above the product.
+  //
+  // AND NO `UserInterface` OF ITS OWN. `grep 'boot_ffn\.ui'` over this file
+  // returns nothing -- every FFN key lookup goes through `boot.ui`'s EvkMap,
+  // which is the point of the two Contexts sharing a secret -- while a
+  // `UserInterface` constructor runs `PrepareBasicEvks` regardless: a
+  // multiplication key plus, under sparse-secret encapsulation, a
+  // dense-to-sparse and a sparse-to-dense key at the top np.
+  // `MemoryLedger.TheLayersBootstrapSetIsPricedPerObject` prices that at
+  // **272.0 MiB** on this preset, built and read by nothing.
   Ring boot_ffn(kBootParam, boot.ui->GetSecretCoeffs(),
-                /*boot_slack_levels=*/9);
+                /*boot_slack_levels=*/9, /*build_user_interface=*/false);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
   ASSERT_NE(fctx, nullptr);
 ledger("before the FFN context");
@@ -9210,7 +9274,7 @@ ledger("before the FFN context");
   fctx->PrepareEvalSpecialFFT(num_slots);
   {
     EvkRequest req;
-    fctx->AddRequiredRotations(req, num_slots);
+    fctx->AddRequiredRotations(req, num_slots, min_ks);
     boot.ui->PrepareRotationKey(req);
   }
 
@@ -9455,12 +9519,25 @@ ledger("before the FFN context");
   // Boot the attention output, run the seam, come back to coefficients.
   std::vector<Ciphertext<word>> booted(layout.num_cts);
   for (int bi = 0; bi < layout.num_cts; bi++) {
-    bctx->Boot(booted[bi], out[bi], boot.ui->GetEvkMap());
+    bctx->Boot(booted[bi], out[bi], boot.ui->GetEvkMap(), min_ks);
   }
   ledger("the eight Boots done");
   stage("the 8 Boots before the seam");
   out.clear();
   out.shrink_to_fit();
+
+  // THE LEG'S BOOTSTRAP TABLES ARE NOW DEAD, and they are the largest single
+  // object either Context owns. Everything below this line bootstraps through
+  // `boot_ffn`; the only later use of `bctx` is the scalar
+  // `GetLogMessageRatio()` in the crossing constant. But `bctx` cannot simply
+  // be dropped -- `boot.ui` holds the same Context and owns the EvkMap every
+  // remaining key lookup goes through -- so the Context stays and its tables
+  // go. `MemoryLedger` prices them at **6408.5 MiB**, against 7059.0 MiB of
+  // rotation keys and 61.1 MiB for the Context itself, which is why this is
+  // one line and not a restructuring.
+  ASSERT_TRUE(bctx->ReleaseEvalSpecialFFT(num_slots))
+      << "the leg's CoeffToSlot and SlotToCoeff tables were already gone";
+  ledger("the leg's CtS/StC tables released");
   std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
   for (int half = 0; half < 2; half++) {
     make_t1(half);
@@ -9514,7 +9591,7 @@ ledger("before the FFN context");
       boot_ffn.context->Mult(live, a2, one);
       boot_ffn.context->Rescale(live, live);
       boot_ffn.context->Add(sum, live, dup);
-      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap());
+      sched.ToCoeff(h_cts[bi * 2 + half], sum, boot.ui->GetEvkMap(), min_ks);
     }
     stage("the seam over one half's eight ciphertexts");
     seam_t1_cur.clear();
@@ -9908,7 +9985,7 @@ ledger("before the FFN context");
   Ciphertext<word> normed;
   {
     Ciphertext<word> up;
-    sched.ToSlot(up, h_ct, boot.ui->GetEvkMap());
+    sched.ToSlot(up, h_ct, boot.ui->GetEvkMap(), min_ks);
     {
       Plaintext<word> rp;
       boot.ui->Decrypt(rp, up);
@@ -9985,7 +10062,7 @@ ledger("before the FFN context");
     rms.Apply(outv, in, wts, boot.ui->GetEvkMap());
     cudaDeviceSynchronize();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    sched.ToCoeff(normed, outv[0], boot.ui->GetEvkMap());
+    sched.ToCoeff(normed, outv[0], boot.ui->GetEvkMap(), min_ks);
   }
   std::cout << "  RMSNorm(ffn) done, coefficients at level "
             << boot_ffn.param->NPToLevel(normed.GetNP()) << std::endl;
@@ -10062,8 +10139,8 @@ ledger("before the FFN context");
     cheddar::SiLuHandler<word> silu(boot_ffn.context, silu_range, op_level, 31);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> g_up, u_up, sv, u_low;
-      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap());
-      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap());
+      sched.ToSlot(g_up, gate[i], boot.ui->GetEvkMap(), min_ks);
+      sched.ToSlot(u_up, upv[i], boot.ui->GetEvkMap(), min_ks);
       // IS THE BOUNDARY CONSTANT THE SAME FOR EVERY CROSSING? It is measured
       // once, on the residual's crossing, and then divided out of the gate's
       // and the up's. Doing.md 1.5bz says it is a property of the BootParameter and
@@ -10168,7 +10245,7 @@ ledger("before the FFN context");
     std::vector<Ciphertext<word>> ins(2);
     for (int i = 0; i < 2; i++) {
       Ciphertext<word> c2;
-      sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap());
+      sched.ToCoeff(c2, prod[i], boot.ui->GetEvkMap(), min_ks);
       {
         std::vector<double> slice(
             static_cast<size_t>(proj_small) * proj_rank, 0.0);

@@ -134,6 +134,35 @@ class BootContext : public Context<word>,
   void PrepareEvalSpecialFFT(int num_slots,
                              BootVariant variant = BootVariant::kNormal);
 
+  /**
+   * @brief Drop the CoeffToSlot and SlotToCoeff plaintext diagonals compiled
+   *        for `num_slots`, keeping everything else this Context holds.
+   *
+   * They are the largest single object a BootContext owns and they are dead
+   * the moment a pipeline stops bootstrapping. `MemoryLedger` measures them at
+   * **6408.5 MiB** on `ci16_35` at 65536 slots, against 7059.0 MiB of rotation
+   * keys and 61.1 MiB for the Context itself.
+   *
+   * A conjugate-invariant layer holds two BootContexts over one secret -- the
+   * leg's at slack zero and the FFN's at slack nine, because SlotToCoeff is
+   * compiled at `GetStCStartLevel()` and the softmax walk needs `GetEndLevel()`
+   * at 16 (1.5ct) -- and the leg's is dead after its eight Boots. Dropping it
+   * outright is not available: a `ContextPtr` is a `shared_ptr` and the
+   * EvkMap every later key lookup goes through lives in a `UserInterface` that
+   * holds one. So the Context has to stay and its tables have to go, which is
+   * this call and nothing more.
+   *
+   * After it, `IsBootPrepared(num_slots)` is false again and every entry point
+   * that reads the tables -- `Boot`, `HalfBoot`, `CoeffToSlot`, `SlotToCoeff`,
+   * `AddRequiredRotations`, the SinC family -- throws at `eval_fft_.at` until
+   * `PrepareEvalSpecialFFT` runs again. Rotation keys are the caller's and are
+   * untouched, so a re-prepare needs no new key material.
+   *
+   * @param num_slots the slot count the tables were compiled for
+   * @return whether anything was dropped
+   */
+  bool ReleaseEvalSpecialFFT(int num_slots);
+
   // 2. Retrieve required rotation distances for performing bootstrapping.
 
   /**

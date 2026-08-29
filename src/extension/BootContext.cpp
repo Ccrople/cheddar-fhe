@@ -208,6 +208,19 @@ void BootContext<word>::PrepareEvalSpecialFFT(int num_slots,
 }
 
 template <typename word>
+bool BootContext<word>::ReleaseEvalSpecialFFT(int num_slots) {
+  // A plain erase. The tables are the map's mapped_type, so this is the whole
+  // release; everything that reads them goes through `eval_fft_.at`, which
+  // then throws with the slot count in the message rather than reading freed
+  // memory.
+  // The variant goes with them. `PrepareEvalSpecialFFT` emplaces both with
+  // `try_emplace`, so leaving the variant behind would make a re-prepare at a
+  // different variant silently keep the old one.
+  boot_variant_.erase(num_slots);
+  return eval_fft_.erase(num_slots) != 0;
+}
+
+template <typename word>
 bool BootContext<word>::IsBootPrepared(int num_slots) const {
   return (eval_mod_ != nullptr) &&
          (eval_fft_.find(num_slots) != eval_fft_.end());
