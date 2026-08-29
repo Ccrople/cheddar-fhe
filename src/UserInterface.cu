@@ -383,8 +383,8 @@ void UserInterface<word>::PrepareRotationKey(const EvkRequest &evk_request) {
 }
 
 template <typename word>
-void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
-                                             int num_aux) {
+int UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
+                                            int num_aux) {
   const int degree = context_->param_.degree_;
   const int L = context_->param_.L_;
   AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
@@ -414,7 +414,10 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
   if (num_aux < 0) {
     num_aux = Min(context_->param_.alpha_, np.GetNumQ());
   }
-  if (num_aux > 0 && num_aux != context_->param_.alpha_) {
+  // Zero has always meant `alpha_`; naming it here makes the return value the
+  // number a second Context should be given, whichever way it was asked for.
+  if (num_aux == 0) num_aux = context_->param_.alpha_;
+  if (num_aux != context_->param_.alpha_) {
     // A narrower extended basis for these keys alone. The evaluation side
     // needs a mod-switch handler and a P product to match, and neither exists
     // until it is asked for.
@@ -493,6 +496,7 @@ void UserInterface<word>::PrepareModPackKeys(int small_degree, int max_level,
     PrepareEvk(EvkMap<word>::ModPackKeyIndex(rank, j), np, main_secret_,
                embedded);
   }
+  return num_aux;
 }
 
 template <typename word>

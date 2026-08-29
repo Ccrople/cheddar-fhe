@@ -288,6 +288,27 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
   }
   led.Mark("released");
 
+  // ---- and what a narrow auxiliary basis would buy those 4864 MiB -------
+  //
+  // `PrepareModPackKeys` takes a `num_aux`, and -1 asks for the narrowest
+  // basis that keeps `beta` at 1 -- the floor 1.5ck measured in TIME (22.36
+  // ms per emission at 12 aux primes, 18.29 at 7, 42.48 at 6, where it drops
+  // off the grouped mod-up). A key's size is its np, so the same narrowing
+  // has to show up in bytes, and that half was never taken. The layer builds
+  // these with the default 0, i.e. `alpha_`.
+  std::cout << "\n  [mem] the ModPack keys under a narrow auxiliary basis\n";
+  led.Sync();
+  int64_t narrow_pack = 0;
+  {
+    Ring alt2(kParam, std::vector<int>{}, kLegSlack);
+    led.Mark("a fresh Context and its UserInterface");
+    const int64_t before = MemoryPool::GetUsage().current_bytes;
+    alt2.ui->PrepareModPackKeys(kProjSmall, kPcmmLevel, /*num_aux=*/-1);
+    led.Mark("PrepareModPackKeys, narrowest beta-1 basis");
+    narrow_pack = MemoryPool::GetUsage().current_bytes - before;
+  }
+  led.Mark("released");
+
   const auto usage = MemoryPool::GetUsage();
   std::cout << "\n  peak live demand " << std::fixed << std::setprecision(1)
             << MiB(usage.peak_bytes) << " MiB over "
@@ -314,6 +335,8 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
             << "  a duplicate UserInterface       " << MiB(ui_cost)
             << " MiB\n"
             << "  the projection's ModPack keys   " << MiB(pack_cost)
+            << " MiB\n"
+            << "    (narrowest beta-1 basis)      " << MiB(narrow_pack)
             << " MiB\n"
             << "  freed by dropping the Ring      " << MiB(ring_released)
             << " MiB\n"

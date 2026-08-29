@@ -487,6 +487,15 @@ class Context {
    * Call once, before any switch that uses such a key; the keys themselves are
    * made by asking `UserInterface` for that `num_aux`. Idempotent.
    *
+   * **This is per-Context state.** The handler and P product built here live
+   * in this Context, so a key made with a narrow basis and then switched
+   * through a DIFFERENT Context over the same primes fails at
+   * `MultKeyNoModDown` with "Invalid setting" -- not at the call that made the
+   * key, and not with the narrow basis named in the message. A pipeline
+   * holding two Contexts over one secret has to prepare both;
+   * `UserInterface::PrepareModPackKeys` returns the count it chose for exactly
+   * that reason.
+   *
    * ## What the caller is responsible for
    *
    * The narrow P must still exceed the key-switch digit, or the switch adds

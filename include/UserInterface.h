@@ -161,10 +161,25 @@ class UserInterface {
    * measured floor: below it ModPack drops off the grouped mod-up and nearly
    * doubles (22.36 ms at 12 aux primes, 18.29 at 7, 42.48 at 6 -- Doing.md
    * 1.5ck). The number that decides it is this KEY's `num_q`, not the pack
-   * level's, so it is computed here rather than asked of the caller.
+   * level's, so it is computed here rather than asked of the caller. In bytes
+   * the same narrowing takes the CI layer's 512 keys from 4864.0 MiB to
+   * 3584.0 (`MemoryLedger`), so it is smaller as well as faster.
+   *
+   * **A NARROW BASIS IS PER-CONTEXT STATE, AND THIS ONLY PREPARES ITS OWN.**
+   * `Context::PrepareNarrowKeySwitch` builds a mod-switch handler and a P
+   * product that live in the Context, and a key with a narrow basis used
+   * through a Context that has not been told about it fails at
+   * `MultKeyNoModDown` with "Invalid setting", not at the call that made the
+   * key. The CI layer holds two Contexts over one secret and switched its Q,
+   * K and V projections through one and its O projection through the other,
+   * which is exactly how that was found. Hence the return value: a caller with
+   * a second Context calls `PrepareNarrowKeySwitch(max_level, returned)` on it.
+   *
+   * @return the auxiliary count actually used, which is `alpha_` unless a
+   * narrow basis was asked for
    */
-  void PrepareModPackKeys(int small_degree, int max_level = -1,
-                          int num_aux = 0);
+  int PrepareModPackKeys(int small_degree, int max_level = -1,
+                         int num_aux = 0);
 
   /**
    * @brief Prepare the key that switches a ciphertext of this ring onto a

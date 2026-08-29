@@ -8728,7 +8728,24 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
 
   cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
   cheddar::PcmmHandler<word> pcmm(*boot.param);
-  boot.ui->PrepareModPackKeys(proj_small, pcmm_level);
+  // THE NARROWEST AUXILIARY BASIS THAT KEEPS BETA AT 1, which `num_aux = -1`
+  // asks for. It is free on both axes and neither half was taken with the
+  // other: 1.5ck measured the TIME (22.36 ms an emission at 12 aux primes,
+  // 18.29 at 7, then a cliff to 42.48 at 6 where ModPack drops off the
+  // grouped mod-up) and left the bytes, and `MemoryLedger` now measures those
+  // at **4864.0 MiB against 3584.0** for these 512 keys -- 1280 MiB, 26.3%.
+  // 1.5ck also found the emission error flat at 1.2-1.5e-08 across every
+  // width, so the narrowing costs no noise either.
+  //
+  // AND THE SECOND CONTEXT HAS TO BE TOLD. A narrow basis is per-Context
+  // state -- `PrepareNarrowKeySwitch` builds a mod-switch handler and a P
+  // product that live in the Context -- and this layer switches Q, K and V
+  // through `boot.context` but the O projection through `boot_ffn.context`.
+  // Preparing only the first gets all the way to the O projection and then
+  // dies with `ERROR: Invalid setting for MultKeyNoModDown`, which names
+  // neither the basis nor the Context. Hence the return value.
+  const int pack_aux =
+      boot.ui->PrepareModPackKeys(proj_small, pcmm_level, /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
   for (int j = 0; j < proj_rank; j++) {
     pack_keys.push_back(&boot.ui->GetModPackKey(proj_rank, j));
@@ -9269,6 +9286,11 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
                 /*boot_slack_levels=*/9, /*build_user_interface=*/false);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
   ASSERT_NE(fctx, nullptr);
+
+  // The narrow ModPack basis, on this Context too: the O projection switches
+  // through it and the handler is per-Context. See the comment where the keys
+  // are made.
+  boot_ffn.context->PrepareNarrowKeySwitch(pcmm_level, pack_aux);
 ledger("before the FFN context");
   fctx->PrepareEvalMod();
   fctx->PrepareEvalSpecialFFT(num_slots);
