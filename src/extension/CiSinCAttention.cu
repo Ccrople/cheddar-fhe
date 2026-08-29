@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -184,15 +185,26 @@ std::unique_ptr<CiSinCConverter<word>> CiSinCAttention<word>::MakeConverter(
       premap, cfg_.converter_baby_steps);
 
   if (!path.empty()) {
-    // Written after the build, so a run that dies mid-build leaves no file
-    // rather than a truncated one -- which would then fail at a read that
-    // names the record, but only after the next run had paid to get there.
-    ArchiveWriter ar(path, id);
-    conv->Save(ar);
-    ar.Close();
+    // WRITTEN ASIDE AND RENAMED. Writing after the build already means a run
+    // that dies mid-build leaves no file; the remaining hole is a run killed
+    // mid-WRITE, which leaves a valid header over a truncated body -- and a
+    // valid header is exactly what the next run checks before committing to
+    // read. `rename` is atomic within a filesystem, so the cache only ever
+    // holds whole converters.
+    const std::string tmp = path + ".tmp";
+    int64_t written = 0;
+    {
+      ArchiveWriter ar(tmp, id);
+      conv->Save(ar);
+      ar.Close();
+      written = ar.Written();
+    }
+    AssertTrue(std::rename(tmp.c_str(), path.c_str()) == 0,
+               "CiSinCAttention: could not move the converter cache into "
+               "place at " + path);
     if (cfg_.verbose) {
-      std::cout << "  converter " << which << ": wrote "
-                << (ar.Written() >> 20) << " MiB to " << path << std::endl;
+      std::cout << "  converter " << which << ": wrote " << (written >> 20)
+                << " MiB to " << path << std::endl;
     }
   }
   return conv;
