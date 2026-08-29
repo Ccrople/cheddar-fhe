@@ -327,6 +327,14 @@ if (ENABLE_EXTENSION)
   add_executable(llama_block_test LlamaBlockTest.cpp)
   target_link_libraries(llama_block_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # [32] section 5.1's three claims for the conjugate-invariant ring -- same
+  # ciphertext, twice the slots, same arithmetic -- checked on ci16_35 against
+  # bootparam_35, which differ in nothing but the ring. Two Contexts in one
+  # process, so it cannot use Testbed.
+  add_executable(ci_parity_test CiParityTest.cpp)
+  target_link_libraries(ci_parity_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 configure_file(${CMAKE_SOURCE_DIR}/parameters/bootparam_30.json
