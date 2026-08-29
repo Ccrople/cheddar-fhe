@@ -336,7 +336,36 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
   // deliberately left on the split below -- its baselines and evk footprints
   // are measured, and retuning it is its own change.
   if (conjugate_invariant_) {
-    bs = Min(16, 1 << DivCeil(Log2Ceil(7 * num_diag), 2));
+    // THE 16 IS A CHOICE, NOT A COMPILE CONSTRAINT, AND IT IS THE LARGEST
+    // ROW IN A FULL-WIDTH LAYER (Doing.md 1.5de). `GSFusedComplexPAccum`
+    // instantiates the kernel up to `num_bs = 32` and asserts only there, so
+    // the cap above is the measured register residency and not the ceiling.
+    // It matters because CoeffToSlot is 78% of a HalfBoot (29.6 ms of 38.0)
+    // and a layer pays 170 of them, and because 1.5cj measured an unrelated
+    // conjugate-invariant transform's optimum at **256** baby steps -- twice
+    // as fast as the balanced split while doing MORE key switches, mechanism
+    // unidentified. `CHEDDAR_CI_BSGS_BS_CAP` is how that gets tested here
+    // without a rebuild; the default is unchanged, and 32 is what the fused
+    // kernel can take.
+    //
+    // MEASURED, and it is a TRADE rather than a win, which is why 16 stays.
+    // HalfBoot x 17 on the full-width FFN, one process per point, an A100:
+    // 1420.5 ms at cap 2, 852.9 at 4, **627.3 / 629.7 at 8**, 647.2 / 648.0 at
+    // 16, 649.8 at 32 -- a clean U whose floor is BELOW the cap, so the
+    // register limit never bound the split and the 7:1 ratio above is too
+    // large at these phases. But the whole FFN at cap 8 is 19.389 s against
+    // 19.501 (0.6%, the crossing being 5.0 s of 19.4) and **2^-9.047 against
+    // 2^-9.414 -- 0.37 bits**: a narrower baby step means more giant steps and
+    // a giant step pays its own ModDown, ModUp and key multiply, so the
+    // key-switch noise rises with exactly what makes it fast. Read the
+    // accuracy line beside the time. Doing.md 1.5dg.
+    static const int cap = [] {
+      const char *e = std::getenv("CHEDDAR_CI_BSGS_BS_CAP");
+      if (e == nullptr || e[0] == 0) return 16;
+      const int v = std::atoi(e);
+      return (v < 2) ? 2 : ((v > 32) ? 32 : v);
+    }();
+    bs = Min(cap, 1 << DivCeil(Log2Ceil(7 * num_diag), 2));
     // Never let the split collapse to a single giant step. At gs == 1 the
     // HoistHandler constructor swaps baby for giant, and the swapped layout
     // answers EvaluateBabyStep with a bare no-aux copy -- a shape the fused
