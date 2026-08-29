@@ -183,6 +183,13 @@ class BootContext : public Context<word>,
    * `PrepareEvalSpecialFFT` runs again. Rotation keys are the caller's and are
    * untouched, so a re-prepare needs no new key material.
    *
+   * If another BootContext adopted these CoeffToSlot tables (see
+   * `PrepareEvalSpecialFFT`'s `cts_donor`), this drops the SlotToCoeff half and
+   * this Context's reference to the CtS half, and the CtS itself lives on for
+   * the borrower -- so the bytes returned are the ~1 GiB of StC rather than the
+   * ~6.4 GiB of both, and the layer's ledger row shrinks by exactly the amount
+   * the donation already saved earlier.
+   *
    * @param num_slots the slot count the tables were compiled for
    * @return whether anything was dropped
    */

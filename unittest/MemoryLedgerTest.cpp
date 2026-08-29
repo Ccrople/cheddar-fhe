@@ -220,9 +220,14 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
     std::vector<double> coeffs(leg->param->degree_);
     for (double &c : coeffs) c = dist(rng);
 
+    // At CtS's own start level, not at level 0: this calls the transform
+    // directly rather than through `HalfBoot`, so there is no ModRaise in
+    // front of it and the input has to arrive where the first phase's
+    // plaintexts are encoded.
+    const int cts_level = lctx->GetBootParameter().GetCtSStartLevel();
     cheddar::Plaintext<word> ptxt;
-    leg->context->encoder_.EncodeCoeff(ptxt, 0, leg->param->GetScale(0),
-                                       coeffs);
+    leg->context->encoder_.EncodeCoeff(ptxt, cts_level,
+                                       leg->param->GetScale(cts_level), coeffs);
     cheddar::Ciphertext<word> ct;
     leg->ui->Encrypt(ct, ptxt);
     ct.SetNumSlots(num_slots);
