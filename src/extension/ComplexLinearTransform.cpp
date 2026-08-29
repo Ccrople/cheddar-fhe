@@ -1,5 +1,7 @@
 #include "extension/ComplexLinearTransform.h"
 
+#include <utility>
+
 #include "common/Assert.h"
 
 namespace cheddar {
@@ -116,6 +118,27 @@ void ComplexLinearTransform<word>::EvaluateToReal(
   LinearTransform<word>::EvaluateGiantStepComplex(context, res,
                                                   /*res_im=*/nullptr, re_, im_,
                                                   bs_re, &bs_im, evk_map);
+}
+
+template <typename word>
+ComplexLinearTransform<word>::ComplexLinearTransform(LinearTransform<word> &&re,
+                                                     LinearTransform<word> &&im)
+    : re_(std::move(re)), im_(std::move(im)) {}
+
+template <typename word>
+void ComplexLinearTransform<word>::Save(ArchiveWriter &ar) const {
+  ar.Tag("cxlintrans");
+  re_.Save(ar);
+  im_.Save(ar);
+}
+
+template <typename word>
+ComplexLinearTransform<word> ComplexLinearTransform<word>::Load(
+    ArchiveReader &ar) {
+  ar.Tag("cxlintrans");
+  auto re = LinearTransform<word>::Load(ar);
+  auto im = LinearTransform<word>::Load(ar);
+  return ComplexLinearTransform<word>(std::move(re), std::move(im));
 }
 
 template class ComplexLinearTransform<uint32_t>;

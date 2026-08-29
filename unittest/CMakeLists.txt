@@ -336,6 +336,15 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_parity_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # Keys, ciphertexts and compiled transforms written to disk and read back.
+  # Every case decrypts through to a message and compares it with a value
+  # computed on the host -- the rotation case uses the LOADED map in isolation,
+  # so a key that survived the bytes but not its index cannot pass. Small
+  # rings; the subject is the format, not the arithmetic.
+  add_executable(serialization_test SerializationTest.cpp)
+  target_link_libraries(serialization_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Per-object device memory for the CI layer's bootstrap sets, through RMM's
   # statistics adaptor. Alone in its binary on purpose: the adaptor has to be
   # installed before the first Context, so a second test in the process would

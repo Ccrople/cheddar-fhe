@@ -86,6 +86,12 @@ class ComplexLinearTransform {
 
   static StripedMatrix TakePart(const StripedMatrix &matrix, bool imaginary);
 
+  // Deserializing constructor. `LinearTransform` has no default constructor,
+  // so `Load` reads the two halves into named locals -- argument evaluation
+  // order is unspecified and these are read from a sequential stream -- and
+  // hands them over here.
+  ComplexLinearTransform(LinearTransform<word> &&re, LinearTransform<word> &&im);
+
  public:
   ComplexLinearTransform(ConstContextPtr<word> context,
                          const StripedMatrix &matrix, int pt_level,
@@ -95,6 +101,12 @@ class ComplexLinearTransform {
   ComplexLinearTransform(const ComplexLinearTransform &) = delete;
   ComplexLinearTransform &operator=(const ComplexLinearTransform &) = delete;
   ComplexLinearTransform(ComplexLinearTransform &&) = default;
+
+  /** @brief Write both halves, real first. */
+  void Save(ArchiveWriter &ar) const;
+
+  /** @brief Rebuild a transform written by `Save`. */
+  static ComplexLinearTransform Load(ArchiveReader &ar);
 
   int GetBS() const { return re_.GetBS(); }
   int GetGS() const { return re_.GetGS(); }

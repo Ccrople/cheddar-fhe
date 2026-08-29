@@ -60,6 +60,7 @@ set(CKKS_GPU_SOURCES
   src/core/MemoryPool.cpp
   src/core/MultiLevelCiphertext.cpp
   src/core/NPInfo.cpp
+  src/core/Serialization.cpp
   src/core/ElementWise.cu
   src/core/ModSwitch.cu
   src/core/NTT.cu

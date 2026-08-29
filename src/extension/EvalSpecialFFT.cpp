@@ -1628,6 +1628,37 @@ void CiSinCConverter<word>::SinCToSlot(ConstContextPtr<word> context, Ct &res,
   inverse_.front().Evaluate(context, res, input, evk_map);
 }
 
+template <typename word>
+void CiSinCConverter<word>::Save(ArchiveWriter &ar) const {
+  ar.Tag("cisincconv");
+  ar.Pod<int32_t>(sub_degree_);
+  ar.Pod<uint8_t>(forward_.empty() ? 0 : 1);
+  if (!forward_.empty()) forward_.front().Save(ar);
+  ar.Pod<uint8_t>(inverse_.empty() ? 0 : 1);
+  if (!inverse_.empty()) inverse_.front().Save(ar);
+}
+
+template <typename word>
+CiSinCConverter<word>::CiSinCConverter(FromArchive, ArchiveReader &ar) {
+  ar.Tag("cisincconv");
+  sub_degree_ = ar.Pod<int32_t>();
+  if (ar.Pod<uint8_t>() != 0) {
+    forward_.push_back(LinearTransform<word>::Load(ar));
+  }
+  if (ar.Pod<uint8_t>() != 0) {
+    inverse_.push_back(LinearTransform<word>::Load(ar));
+  }
+}
+
+template <typename word>
+std::unique_ptr<CiSinCConverter<word>> CiSinCConverter<word>::Load(
+    ArchiveReader &ar) {
+  // Not make_unique: the deserializing constructor is private, and it is
+  // private for the same reason the compiling one is the only public way in.
+  return std::unique_ptr<CiSinCConverter<word>>(
+      new CiSinCConverter<word>(FromArchive{}, ar));
+}
+
 template class CiSinCConverter<uint32_t>;
 template class CiSinCConverter<uint64_t>;
 

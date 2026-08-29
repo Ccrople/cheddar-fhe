@@ -327,6 +327,10 @@ class CiSinCConverter {
   std::vector<LinearTransform<word>> forward_;
   std::vector<LinearTransform<word>> inverse_;
 
+  // Deserializing constructor; see Save/Load.
+  struct FromArchive {};
+  CiSinCConverter(FromArchive, ArchiveReader &ar);
+
  public:
   /**
    * @param context a conjugate-invariant Context
@@ -387,6 +391,33 @@ class CiSinCConverter {
   // disable copying (or moving also)
   CiSinCConverter(const CiSinCConverter &) = delete;
   CiSinCConverter &operator=(const CiSinCConverter &) = delete;
+
+  /**
+   * @brief Write the compiled conversions.
+   *
+   * This is the single most expensive object the Llama leg builds. The
+   * constructor's work is host-side: composing the SinC stage matrices with
+   * the chain layout's block maps and the transport premap, folding the copy-
+   * add and its inverse into the diagonals, and then encoding 2048 diagonals
+   * per direction. The leg's three converters are 728-803 s of it, against
+   * ~10 s of GPU-online arithmetic in the layer they serve -- and every one of
+   * the model's 32 layers reuses them unchanged.
+   *
+   * What is NOT written is the recipe: the sub-degree and the levels are
+   * recorded, but the chain layout and the premap that shaped the matrices are
+   * not, because they are already baked into the diagonals. A caller who
+   * changes either must invalidate its cache; the archive identity only sees
+   * the parameter set, so it cannot catch that.
+   */
+  void Save(ArchiveWriter &ar) const;
+
+  /**
+   * @brief Rebuild a converter written by `Save`.
+   *
+   * Returns a `unique_ptr` because this class is neither copyable nor
+   * movable, which is also how `CiSinCAttention` already holds its three.
+   */
+  static std::unique_ptr<CiSinCConverter> Load(ArchiveReader &ar);
 
   int GetSubDegree() const { return sub_degree_; }
 

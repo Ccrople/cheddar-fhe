@@ -1393,6 +1393,52 @@ void HoistHandler<word>::AddRequiredRotations(EvkRequest &req,
   }
 }
 
+template <typename word>
+void HoistHandler<word>::Save(ArchiveWriter &ar) const {
+  ar.Tag("hoist");
+  ar.Pod<int32_t>(pt_level_);
+  ar.Pod<double>(pt_scale_);
+  ar.IntSet(bs_indices_);
+  ar.Vec(gs_indices_);
+
+  ar.Pod<uint64_t>(static_cast<uint64_t>(hoist_pt_map_.size()));
+  for (const auto &[gs_idx, inner] : hoist_pt_map_) {
+    ar.Pod<int32_t>(gs_idx);
+    ar.Pod<uint64_t>(static_cast<uint64_t>(inner.size()));
+    for (const auto &[bs_idx, pt] : inner) {
+      ar.Pod<int32_t>(bs_idx);
+      SaveContainer(ar, pt);
+    }
+  }
+}
+
+template <typename word>
+HoistHandler<word>::HoistHandler(FromArchive, ArchiveReader &ar) {
+  ar.Tag("hoist");
+  pt_level_ = ar.Pod<int32_t>();
+  pt_scale_ = ar.Pod<double>();
+  bs_indices_ = ar.IntSet();
+  gs_indices_ = ar.Vec<int>();
+
+  const auto num_gs = ar.Pod<uint64_t>();
+  for (uint64_t g = 0; g < num_gs; g++) {
+    const int gs_idx = ar.Pod<int32_t>();
+    const auto num_bs = ar.Pod<uint64_t>();
+    auto &inner = hoist_pt_map_[gs_idx];
+    for (uint64_t b = 0; b < num_bs; b++) {
+      const int bs_idx = ar.Pod<int32_t>();
+      Pt pt;
+      LoadContainer(ar, pt);
+      inner.emplace(bs_idx, std::move(pt));
+    }
+  }
+}
+
+template <typename word>
+HoistHandler<word> HoistHandler<word>::Load(ArchiveReader &ar) {
+  return HoistHandler<word>(FromArchive{}, ar);
+}
+
 template class HoistHandler<uint32_t>;
 template class HoistHandler<uint64_t>;
 

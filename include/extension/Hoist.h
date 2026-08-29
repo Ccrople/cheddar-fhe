@@ -9,6 +9,7 @@
 #include "core/Context.h"
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
+#include "core/Serialization.h"
 
 namespace cheddar {
 
@@ -54,6 +55,12 @@ class HoistHandler {
                          const PlainHoistMap &hoist_map);
   std::pair<int, int> CheckStrideMinKS() const;
 
+  // Deserializing constructor. A tag type rather than an overload because the
+  // members it fills are exactly the ones the compiling constructor derives,
+  // and the two must not be confusable at a call site.
+  struct FromArchive {};
+  HoistHandler(FromArchive, ArchiveReader &ar);
+
   // optimization-related methods
   void GSFusedPAccum(ConstContextPtr<word> context, std::map<int, Ct> &results,
                      const std::vector<int> &gs_indices,
@@ -96,6 +103,24 @@ class HoistHandler {
   HoistHandler(const HoistHandler &) = delete;
   HoistHandler &operator=(const HoistHandler &) = delete;
   HoistHandler(HoistHandler &&) = default;
+
+  /**
+   * @brief Write the compiled plaintexts and the baby/giant structure.
+   *
+   * A compiled handler is already in RNS form, so nothing here needs a
+   * Context: what the constructor spends its time on -- `CompilePlaintexts`,
+   * which encodes every diagonal of the matrix at `pt_level` -- is exactly
+   * what is being cached, and the caller who reads it back is by construction
+   * running against the parameter set the archive's identity names.
+   *
+   * This is the expensive half of the Llama leg's preparation. The three
+   * `CiSinCConverter`s are ~730 s of it, and every second of that is host-side
+   * matrix construction and encoding into these plaintexts.
+   */
+  void Save(ArchiveWriter &ar) const;
+
+  /** @brief Rebuild a handler written by `Save`. */
+  static HoistHandler Load(ArchiveReader &ar);
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 

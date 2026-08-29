@@ -7,6 +7,7 @@
 
 #include "core/Context.h"
 #include "core/EvkMap.h"
+#include "core/Serialization.h"
 #include "extension/Hoist.h"
 #include "extension/StripedMatrix.h"
 
@@ -42,10 +43,44 @@ class LinearTransform {
   PlainHoistMap ConstructPlainHoistMap(const StripedMatrix &matrix);
   static std::set<int> ExtractDiagOffsets(const StripedMatrix &matrix);
 
+  // Everything a compiled transform holds except the plaintexts, read before
+  // `hoist_` is constructed. `hoist_` has no default constructor and must be
+  // the last member, so a deserializing constructor cannot read the scalars in
+  // its own body; passing them in makes the archive's read order explicit
+  // instead of leaving it to member-initialiser evaluation order.
+  struct FromArchive {
+    int pt_level = 0;
+    double pt_scale = 0.0;
+    int bs = 0;
+    int gs = 0;
+    int pre_rotation = 0;
+    int additional_pt_rot = 0;
+    int stride = 0;
+    std::set<int> diag_offsets;
+  };
+  LinearTransform(FromArchive &&head, ArchiveReader &ar);
+
  public:
   LinearTransform(ConstContextPtr<word> context, const StripedMatrix &matrix,
                   int pt_level, double pt_scale, int bs, int gs = 1,
                   int pre_rotation = 0, int additional_pt_rot = 0);
+
+  LinearTransform(const LinearTransform &) = delete;
+  LinearTransform &operator=(const LinearTransform &) = delete;
+  LinearTransform(LinearTransform &&) = default;
+
+  /**
+   * @brief Write the compiled transform: its BSGS structure and every
+   * plaintext diagonal.
+   *
+   * What this caches is `CompilePlaintexts` and the host-side matrix
+   * construction that feeds it -- for the Llama leg's converters, minutes per
+   * transform.
+   */
+  void Save(ArchiveWriter &ar) const;
+
+  /** @brief Rebuild a transform written by `Save`. */
+  static LinearTransform Load(ArchiveReader &ar);
 
   bool IsUsingBSGS() const;
   int GetBS() const;

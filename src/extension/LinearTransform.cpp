@@ -1,5 +1,7 @@
 #include "extension/LinearTransform.h"
 
+#include <utility>
+
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 
@@ -161,6 +163,47 @@ void LinearTransform<word>::EvaluateGiantStepComplex(
   HoistHandler<word>::EvaluateGiantStepComplex(context, res_re, res_im,
                                                re_t.hoist_, im_t.hoist_, bs_re,
                                                bs_im, evk_map);
+}
+
+template <typename word>
+void LinearTransform<word>::Save(ArchiveWriter &ar) const {
+  ar.Tag("lintrans");
+  ar.Pod<int32_t>(pt_level_);
+  ar.Pod<double>(pt_scale_);
+  ar.Pod<int32_t>(bs_);
+  ar.Pod<int32_t>(gs_);
+  ar.Pod<int32_t>(pre_rotation_);
+  ar.Pod<int32_t>(additional_pt_rot_);
+  ar.Pod<int32_t>(stride_);
+  ar.IntSet(diag_offsets_);
+  hoist_.Save(ar);
+}
+
+template <typename word>
+LinearTransform<word>::LinearTransform(FromArchive &&head, ArchiveReader &ar)
+    : pt_level_(head.pt_level),
+      pt_scale_(head.pt_scale),
+      bs_(head.bs),
+      gs_(head.gs),
+      pre_rotation_(head.pre_rotation),
+      additional_pt_rot_(head.additional_pt_rot),
+      stride_(head.stride),
+      diag_offsets_(std::move(head.diag_offsets)),
+      hoist_(HoistHandler<word>::Load(ar)) {}
+
+template <typename word>
+LinearTransform<word> LinearTransform<word>::Load(ArchiveReader &ar) {
+  ar.Tag("lintrans");
+  FromArchive head;
+  head.pt_level = ar.Pod<int32_t>();
+  head.pt_scale = ar.Pod<double>();
+  head.bs = ar.Pod<int32_t>();
+  head.gs = ar.Pod<int32_t>();
+  head.pre_rotation = ar.Pod<int32_t>();
+  head.additional_pt_rot = ar.Pod<int32_t>();
+  head.stride = ar.Pod<int32_t>();
+  head.diag_offsets = ar.IntSet();
+  return LinearTransform<word>(std::move(head), ar);
 }
 
 template class LinearTransform<uint32_t>;
