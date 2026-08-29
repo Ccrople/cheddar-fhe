@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -94,6 +95,15 @@ CiSinCAttention<word>::CiSinCAttention(
              "CiSinCAttention: PrepareEvalMod must run before construction; "
              "the canonicalising gamma reads GetStCInputScale()");
   gamma_ = std::sqrt(boot_->param_.GetScale(cfg_.cross_level) / stc);
+
+  // THE CACHE DIRECTORY IS RESOLVED HERE, not at the three call sites, so that
+  // every caller -- the layer test, the leg test, a 32-layer driver -- gets it
+  // from one place and none of them can forget. The environment wins over the
+  // Config, as elsewhere in this tree.
+  if (cfg_.converter_cache_dir.empty()) {
+    const char *dir = std::getenv("CHEDDAR_CONVERTER_CACHE");
+    if (dir != nullptr && dir[0] != 0) cfg_.converter_cache_dir = dir;
+  }
 
   BuildPremaps();
 
