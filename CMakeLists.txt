@@ -91,6 +91,7 @@ if(ENABLE_EXTENSION)
     src/extension/AttentionPacking.cpp
     src/extension/BootContext.cpp
     src/extension/CiSinCAttention.cu
+    src/extension/CiLlamaSeam.cu
     src/extension/BootParameter.cpp
     src/extension/ComplexLinearTransform.cpp
     src/extension/EvalMod.cpp

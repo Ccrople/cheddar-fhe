@@ -336,6 +336,16 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_parity_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # `CiLlamaSeam` -- the promotion of the seam that the layer and three cases in
+  # CiFfnTest each wrote out inline. Checked the way its consumer reads it:
+  # coefficients out, then the banded scan ModDecomp inverts, live band and
+  # dead band apart, with the one-token-out reading as a control that must
+  # fail. About two and a half minutes, against a quarter of an hour for the
+  # layer.
+  add_executable(ci_seam_test CiSeamTest.cpp)
+  target_link_libraries(ci_seam_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Keys, ciphertexts and compiled transforms written to disk and read back.
   # Every case decrypts through to a message and compares it with a value
   # computed on the host -- the rotation case uses the LOADED map in isolation,
