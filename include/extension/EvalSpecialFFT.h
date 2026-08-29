@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -38,10 +39,39 @@ class EvalSpecialFFT {
   // Exactly one of the two pairs of vectors below is populated.
   const bool conjugate_invariant_;
 
-  std::vector<LinearTransform<word>> cts_phases_;
+ public:
+  /**
+   * @brief The CoeffToSlot plaintext diagonals, held apart from the rest so
+   *        two `BootContext`s over one parameter set can share one copy.
+   *
+   * **CtS does not depend on the slack and StC does.** `GetCtSStartLevel()` is
+   * `max_level_` and `GetEvalModStartLevel()`/`GetEvalModEndLevel()` are
+   * measured down from it; the slack enters only at
+   * `GetStCStartLevel() = GetEvalModEndLevel() - num_slack_levels_`, and
+   * `stc_const_` reads `GetEndLevel()` below that. So two BootContexts that
+   * differ in nothing but the slack -- which is exactly the pair a
+   * conjugate-invariant Llama layer holds, the leg's at slack zero for the
+   * softmax walk and the FFN's at slack nine so `SlotToCoeff` compiles above
+   * the `num_accum == 1` zone (Doing.md 1.5ct) -- compile CtS at the same
+   * levels, from the same stage matrices, against the same constant, and
+   * produce bit-identical plaintexts. `MemoryLedger` prices the pair at
+   * 6408.5 and 5426.5 MiB, of which the 982.0 MiB difference is all the StC
+   * has ever been: **the CtS is ~4.4 GiB, built and held twice.**
+   *
+   * The vectors are the two possible phase types and exactly one is populated,
+   * as for StC below.
+   */
+  struct CtSTables {
+    std::vector<LinearTransform<word>> phases;
+    std::vector<ComplexLinearTransform<word>> ci_phases;
+  };
+
+ private:
+  // Never null after construction: either built here or adopted from a donor
+  // whose parameters this one's constructor checked.
+  std::shared_ptr<CtSTables> cts_;
   std::vector<LinearTransform<word>> stc_phases_;
 
-  std::vector<ComplexLinearTransform<word>> cts_ci_phases_;
   std::vector<ComplexLinearTransform<word>> stc_ci_phases_;
 
   std::vector<StripedMatrix> plain_fft_stages_;
@@ -73,12 +103,26 @@ class EvalSpecialFFT {
   void PreparePlaintexts(ConstContextPtr<word> context);
 
  public:
+  /**
+   * @param shared_cts when non-null, the CoeffToSlot tables to adopt instead
+   *        of building. **The caller owes the check**: the donor must have
+   *        been compiled for the same `num_slots`, the same `cts_const`, the
+   *        same `GetCtSStartLevel()` and `num_cts_levels_`, and against a
+   *        Context with the same primes, because a plaintext is a device
+   *        buffer of RNS limbs and nothing inside it records which parameter
+   *        set it belongs to. `BootContext::PrepareEvalSpecialFFT` does that
+   *        checking; going through it is the supported route.
+   */
   EvalSpecialFFT(ConstContextPtr<word> context, const BootParameter &boot_param,
-                 int num_slots, double cts_const, double stc_const);
+                 int num_slots, double cts_const, double stc_const,
+                 std::shared_ptr<CtSTables> shared_cts = nullptr);
 
   EvalSpecialFFT(const EvalSpecialFFT &) = delete;
   EvalSpecialFFT &operator=(const EvalSpecialFFT &) = delete;
   EvalSpecialFFT(EvalSpecialFFT &&) = default;
+
+  /// The CoeffToSlot tables, for another EvalSpecialFFT to adopt. Never null.
+  std::shared_ptr<CtSTables> GetCtSTables() const { return cts_; }
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 

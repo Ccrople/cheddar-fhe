@@ -1,6 +1,9 @@
 #include "extension/BootContext.h"
 
 #include <cmath>
+#include <memory>
+#include <string>
+#include <utility>
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
@@ -189,8 +192,9 @@ void BootContext<word>::PrepareEvalMod() {
 }
 
 template <typename word>
-void BootContext<word>::PrepareEvalSpecialFFT(int num_slots,
-                                              BootVariant variant) {
+void BootContext<word>::PrepareEvalSpecialFFT(
+    int num_slots, BootVariant variant,
+    const BootContext<word> *cts_donor) {
   AssertTrue(IsPowOfTwo(num_slots), "Only power-of-two slots are supported");
   // Both non-default variants are statements about an imaginary part: one
   // removes it after StC, the other packs two real messages into one complex
@@ -201,9 +205,42 @@ void BootContext<word>::PrepareEvalSpecialFFT(int num_slots,
              "PrepareEvalSpecialFFT: kImaginaryRemoving and kMergeTwoReal are "
              "statements about an imaginary part the real subring does not "
              "have");
+  // A CoeffToSlot plaintext is a device buffer of RNS limbs and carries no
+  // record of the parameter set it was encoded against, so every condition
+  // that makes the donor's tables the same tables is checked HERE rather than
+  // left to the caller's judgement. The list is exactly what `PreparePlaintexts`
+  // reads on the CtS side: the slot count, the stage matrices (degree and
+  // ring), the compile levels, the phase count and the constant.
+  std::shared_ptr<typename EvalSpecialFFT<word>::CtSTables> shared_cts;
+  if (cts_donor != nullptr) {
+    AssertTrue(cts_donor != this,
+               "PrepareEvalSpecialFFT: a BootContext cannot donate to itself");
+    const auto &dparam = cts_donor->param_;
+    const auto &dboot = cts_donor->boot_param_;
+    AssertTrue(dparam.log_degree_ == this->param_.log_degree_ &&
+                   dparam.conjugate_invariant_ ==
+                       this->param_.conjugate_invariant_ &&
+                   dparam.main_primes_ == this->param_.main_primes_ &&
+                   dparam.ter_primes_ == this->param_.ter_primes_ &&
+                   dparam.aux_primes_ == this->param_.aux_primes_ &&
+                   dparam.level_config_ == this->param_.level_config_,
+               "PrepareEvalSpecialFFT: the CtS donor's Parameter differs from "
+               "this one's; the tables are encoded against its primes");
+    AssertTrue(dboot.GetCtSStartLevel() == boot_param_.GetCtSStartLevel() &&
+                   dboot.num_cts_levels_ == boot_param_.num_cts_levels_,
+               "PrepareEvalSpecialFFT: the CtS donor compiles CoeffToSlot at a "
+               "different level or across a different number of phases");
+    AssertTrue(cts_donor->GetCtSConst() == GetCtSConst(),
+               "PrepareEvalSpecialFFT: the CtS donor's cts_const differs");
+    AssertTrue(cts_donor->eval_fft_.count(num_slots) != 0,
+               "PrepareEvalSpecialFFT: the CtS donor has no tables for " +
+                   std::to_string(num_slots) + " slots");
+    shared_cts = cts_donor->eval_fft_.at(num_slots).GetCtSTables();
+  }
   // TODO: Implement PrepareBootConversionMatrices
   eval_fft_.try_emplace(num_slots, GetContext(), boot_param_, num_slots,
-                        GetCtSConst(), GetStCConst(variant));
+                        GetCtSConst(), GetStCConst(variant),
+                        std::move(shared_cts));
   boot_variant_.try_emplace(num_slots, variant);
 }
 

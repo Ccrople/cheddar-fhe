@@ -9293,7 +9293,15 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
   boot_ffn.context->PrepareNarrowKeySwitch(pcmm_level, pack_aux);
 ledger("before the FFN context");
   fctx->PrepareEvalMod();
-  fctx->PrepareEvalSpecialFFT(num_slots);
+  // AND NO CoeffToSlot OF ITS OWN EITHER. The two Contexts differ in the
+  // slack and the slack moves only `GetStCStartLevel()` and everything read
+  // below it, so CtS compiles here at the same levels from the same stage
+  // matrices against the same constant -- the same plaintexts, ~4.4 GiB of
+  // them, which this Context used to build a second time and then hold beside
+  // the leg's until the leg released. `PrepareEvalSpecialFFT` asserts every
+  // condition that makes the donation sound; see its header.
+  fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
+                              /*cts_donor=*/bctx.get());
   {
     EvkRequest req;
     fctx->AddRequiredRotations(req, num_slots, min_ks);

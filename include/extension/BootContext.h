@@ -130,9 +130,34 @@ class BootContext : public Context<word>,
    * @param num_slots number of slots in the ciphertext to be bootstrapped
    * @param variant boot variant (BootVariant::kNormal (default) /
    * BootVariant::kImaginaryRemoving / BootVariant::kMergeTwoReal)
+   * @param cts_donor when non-null, another BootContext whose CoeffToSlot
+   *        tables this one adopts instead of building its own.
+   *
+   * **Only StC depends on the slack.** `GetCtSStartLevel()` is `max_level_`
+   * and EvalMod's start and end are measured down from it; the slack enters at
+   * `GetStCStartLevel()` and nowhere above it, and `cts_const_` reads only
+   * levels above it. So a pair of BootContexts differing in nothing but the
+   * slack -- which is what a conjugate-invariant Llama layer holds, the leg's
+   * at slack zero for the softmax walk and the FFN's at slack nine so that
+   * `SlotToCoeff` compiles clear of the `num_accum == 1` zone (Doing.md
+   * 1.5ct) -- builds the SAME CoeffToSlot plaintexts twice. `MemoryLedger`
+   * prices the pair of table sets at 6408.5 and 5426.5 MiB and the whole of
+   * the 982.0 MiB between them is StC, so the duplicate is **~4.4 GiB** and
+   * about forty seconds of build.
+   *
+   * Adoption is by `shared_ptr`, so the order the two Contexts are released in
+   * does not matter: `ReleaseEvalSpecialFFT` on the donor drops its StC and
+   * its reference, and the CtS survives for as long as a borrower holds one.
+   *
+   * Every condition that makes the donor's tables *these* tables is asserted
+   * here -- primes, degree, ring, level configuration, CtS compile level,
+   * phase count, constant -- because a plaintext is a device buffer of RNS
+   * limbs and carries no record of what it was encoded against. A donor from
+   * an unrelated parameter set would decode as noise, silently.
    */
   void PrepareEvalSpecialFFT(int num_slots,
-                             BootVariant variant = BootVariant::kNormal);
+                             BootVariant variant = BootVariant::kNormal,
+                             const BootContext<word> *cts_donor = nullptr);
 
   /**
    * @brief Drop the CoeffToSlot and SlotToCoeff plaintext diagonals compiled

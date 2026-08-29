@@ -26,9 +26,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -149,11 +152,25 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
   fctx->PrepareEvalMod();
   led.Mark("PrepareEvalMod");
 
+  // PRICED BOTH WAYS IN ONE RUN, because the difference between the two rows
+  // IS the duplicate and inferring it from two numbers taken in two processes
+  // is how 1.5da got the reservation figures it could not attribute. The first
+  // prepare is what the layer used to do; the second is what it does now.
   const int64_t ffn_before_fft = MemoryPool::GetUsage().current_bytes;
   fctx->PrepareEvalSpecialFFT(num_slots);
-  led.Mark("PrepareEvalSpecialFFT (CtS + StC diagonals)");
-  const int64_t ffn_fft =
+  led.Mark("PrepareEvalSpecialFFT, building its own CtS + StC");
+  const int64_t ffn_fft_own =
       MemoryPool::GetUsage().current_bytes - ffn_before_fft;
+
+  ASSERT_TRUE(fctx->ReleaseEvalSpecialFFT(num_slots));
+  led.Mark("dropped again, to re-prepare against a donor");
+
+  const int64_t ffn_before_shared = MemoryPool::GetUsage().current_bytes;
+  fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
+                              /*cts_donor=*/lctx.get());
+  led.Mark("PrepareEvalSpecialFFT, the leg's CtS adopted: StC only");
+  const int64_t ffn_fft =
+      MemoryPool::GetUsage().current_bytes - ffn_before_shared;
 
   // AND ITS ROTATIONS, INTO THE SAME EvkMap. 1.5da removed a verbatim
   // duplicate here by having both Contexts share one map, but a key is per
@@ -169,17 +186,14 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
   }
   led.Mark("its rotations, added to the leg's EvkMap");
 
-  // AND ITS CoeffToSlot HALF IS A BYTE-FOR-BYTE DUPLICATE OF THE LEG'S.
+  // AND ITS CoeffToSlot HALF WAS A BYTE-FOR-BYTE DUPLICATE OF THE LEG'S.
   // `BootParameter::GetCtSStartLevel()` is `max_level_` and
   // `GetEvalModStartLevel()` / `GetEvalModEndLevel()` are derived from it and
   // from `num_cts_levels_`; the slack enters only at `GetStCStartLevel()`,
   // which is `GetEvalModEndLevel() - num_slack_levels_`. So two BootContexts
   // over the same primes that differ only in slack compile CoeffToSlot at the
-  // same levels from the same constants, and one of the two copies is dead
-  // weight. `PrepareEvalSpecialFFT` builds the pair together, so this is a
-  // statement about the code rather than a row in the table above -- but it
-  // is the largest duplicate left in the layer, and it is what a shareable
-  // CtS would buy.
+  // same levels from the same constants. These two expectations are the whole
+  // premise of the donation above: CtS the same, StC not.
   EXPECT_EQ(lctx->GetBootParameter().GetCtSStartLevel(),
             fctx->GetBootParameter().GetCtSStartLevel())
       << "CoeffToSlot is supposed to be slack-independent";
@@ -188,6 +202,54 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
       << "the two Contexts exist precisely because SlotToCoeff is not";
   const int64_t ffn_keys =
       MemoryPool::GetUsage().current_bytes - ffn_before_keys;
+
+  // ---- and the adopted tables ARE the tables ---------------------------
+  //
+  // The premise above is algebra about level accessors, and the assertions
+  // inside `PrepareEvalSpecialFFT` check the inputs to that algebra. Neither
+  // checks the conclusion. This does, and it is the cheapest decisive form:
+  // CoeffToSlot is the whole of what the two Contexts now share, so running it
+  // on one input through the leg's own tables and through the FFN's adopted
+  // ones has to agree EXACTLY -- the transform is deterministic and the keys
+  // are one map. A wrong donation is not a small error here; the plaintexts
+  // would be encoded at other levels against another constant and the two
+  // sides would disagree at O(1).
+  {
+    std::mt19937 rng(20260829);
+    std::uniform_real_distribution<double> dist(-0.5, 0.5);
+    std::vector<double> coeffs(leg->param->degree_);
+    for (double &c : coeffs) c = dist(rng);
+
+    cheddar::Plaintext<word> ptxt;
+    leg->context->encoder_.EncodeCoeff(ptxt, 0, leg->param->GetScale(0),
+                                       coeffs);
+    cheddar::Ciphertext<word> ct;
+    leg->ui->Encrypt(ct, ptxt);
+    ct.SetNumSlots(num_slots);
+
+    cheddar::Ciphertext<word> from_leg, from_ffn;
+    lctx->CoeffToSlot(from_leg, num_slots, ct, leg->ui->GetEvkMap());
+    fctx->CoeffToSlot(from_ffn, num_slots, ct, leg->ui->GetEvkMap());
+
+    std::vector<cheddar::Complex> a, b;
+    cheddar::Plaintext<word> pa, pb;
+    leg->ui->Decrypt(pa, from_leg);
+    leg->ui->Decrypt(pb, from_ffn);
+    leg->context->encoder_.Decode(a, pa);
+    leg->context->encoder_.Decode(b, pb);
+    ASSERT_EQ(a.size(), b.size());
+
+    double worst = 0.0, mx = 0.0;
+    for (size_t j = 0; j < a.size(); j++) {
+      worst = std::max(worst, std::abs(a[j] - b[j]));
+      mx = std::max(mx, std::abs(a[j]));
+    }
+    std::cout << "\n  [check] CoeffToSlot through the leg's own tables vs the "
+                 "FFN's adopted ones: max diff "
+              << worst << " against |.| <= " << mx << std::endl;
+    EXPECT_LT(worst, 1e-9 * (mx + 1.0))
+        << "the adopted CoeffToSlot tables are not the leg's";
+  }
 
   const int64_t ffn_total = MemoryPool::GetUsage().current_bytes - ffn_start;
 
@@ -328,8 +390,12 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
             << " MiB\n"
             << "  the FFN's second boot set       " << MiB(ffn_total)
             << " MiB\n"
-            << "    of which CtS + StC            " << MiB(ffn_fft)
+            << "    of which StC, CtS adopted     " << MiB(ffn_fft)
             << " MiB\n"
+            << "    (its own CtS + StC, unshared) " << MiB(ffn_fft_own)
+            << " MiB\n"
+            << "    so the CtS duplicate was      "
+            << MiB(ffn_fft_own - ffn_fft) << " MiB\n"
             << "    of which NEW rotation keys    " << MiB(ffn_keys)
             << " MiB\n"
             << "  a duplicate UserInterface       " << MiB(ui_cost)
@@ -355,6 +421,10 @@ TEST(MemoryLedger, TheLayersBootstrapSetIsPricedPerObject) {
   //  - and the two steps together return essentially the whole set, so nothing
   //    here is an accounting artefact.
   EXPECT_GT(leg_total, 0) << "the statistics adaptor counted nothing";
+  EXPECT_LT(ffn_fft, ffn_fft_own * 2 / 3)
+      << "adopting the leg's CoeffToSlot is supposed to leave the FFN paying "
+         "for SlotToCoeff alone; if these two rows are close, the donation "
+         "silently did not happen";
   EXPECT_GT(ui_cost, 0) << "PrepareBasicEvks is supposed to allocate";
   EXPECT_GT(ctx_released, leg_fft / 2)
       << "the CtS/StC diagonals are supposed to be owned by the Context";

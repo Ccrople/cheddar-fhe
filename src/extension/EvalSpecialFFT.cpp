@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -291,13 +293,15 @@ template <typename word>
 EvalSpecialFFT<word>::EvalSpecialFFT(ConstContextPtr<word> context,
                                      const BootParameter &boot_param,
                                      int num_slots, double cts_const,
-                                     double stc_const)
+                                     double stc_const,
+                                     std::shared_ptr<CtSTables> shared_cts)
     : num_slots_{num_slots},
       boot_param_{boot_param},
       cts_const_{cts_const},
       stc_const_{stc_const},
       full_slot_{num_slots == context->param_.MaxNumSlots()},
-      conjugate_invariant_{context->param_.conjugate_invariant_} {
+      conjugate_invariant_{context->param_.conjugate_invariant_},
+      cts_{std::move(shared_cts)} {
   AssertTrue(num_slots >= 256,
              "Currently only high number of slots are supported");
   AssertTrue(IsPowOfTwo(num_slots), "Number of slots must be a power of 2");
@@ -567,7 +571,25 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
   }
   cts_scale = std::pow(cts_scale, 1.0 / num_cts_phases);
 
-  for (int i = 0; i < num_cts_phases; i++) {
+  // A donor's CoeffToSlot tables are adopted rather than rebuilt. Nothing in
+  // this loop feeds the StC section below it -- the two carry their own
+  // `stages_left`/`stages_cumul` -- so skipping it wholesale is safe, and
+  // guarding the loop bound rather than wrapping the body keeps the diff to
+  // the two lines that decide.
+  const bool build_cts = (cts_ == nullptr);
+  if (build_cts) {
+    cts_ = std::make_shared<CtSTables>();
+  } else {
+    const int adopted = static_cast<int>(conjugate_invariant_
+                                             ? cts_->ci_phases.size()
+                                             : cts_->phases.size());
+    AssertTrue(adopted == num_cts_phases,
+               "EvalSpecialFFT: the adopted CoeffToSlot tables have " +
+                   std::to_string(adopted) + " phases against this boot "
+                   "parameter's " + std::to_string(num_cts_phases));
+  }
+
+  for (int i = 0; build_cts && i < num_cts_phases; i++) {
     std::cout << "CtS preparation phase " << i << std::endl;
     // CtS: high strides (num_slots / 2) --> low strides (1)
     int num_stages;
@@ -624,11 +646,11 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
     const double cts_pt_scale =
         context->param_.GetRescalePrimeProd(cts_level - i);
     if (conjugate_invariant_) {
-      cts_ci_phases_.emplace_back(context, phase_matrix, cts_level - i,
+      cts_->ci_phases.emplace_back(context, phase_matrix, cts_level - i,
                                   cts_pt_scale, bs, gs, pre_rotation,
                                   additional_pt_rot);
     } else {
-      cts_phases_.emplace_back(context, phase_matrix, cts_level - i,
+      cts_->phases.emplace_back(context, phase_matrix, cts_level - i,
                                cts_pt_scale, bs, gs, pre_rotation,
                                additional_pt_rot);
     }
@@ -725,13 +747,13 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
 template <typename word>
 void EvalSpecialFFT<word>::AddRequiredRotations(EvkRequest &req,
                                                 bool min_ks) const {
-  for (const auto &cts_phase : cts_phases_) {
+  for (const auto &cts_phase : cts_->phases) {
     cts_phase.AddRequiredRotations(req, min_ks);
   }
   for (const auto &stc_phase : stc_phases_) {
     stc_phase.AddRequiredRotations(req, min_ks);
   }
-  for (const auto &cts_phase : cts_ci_phases_) {
+  for (const auto &cts_phase : cts_->ci_phases) {
     cts_phase.AddRequiredRotations(req, min_ks);
   }
   for (const auto &stc_phase : stc_ci_phases_) {
@@ -756,23 +778,23 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
     // input to a pair, the last drops the imaginary half it does not need, and
     // what comes back is the coefficient vector in bit-reversed order -- the
     // same thing the ordinary path returns, only real.
-    int num_phases = static_cast<int>(cts_ci_phases_.size());
+    int num_phases = static_cast<int>(cts_->ci_phases.size());
     Ct im;
-    cts_ci_phases_.at(0).EvaluateFromReal(context, res, im, input, evk_map,
+    cts_->ci_phases.at(0).EvaluateFromReal(context, res, im, input, evk_map,
                                           min_ks);
     for (int i = 1; i < num_phases - 1; i++) {
-      cts_ci_phases_.at(i).EvaluatePair(context, res, im, res, im, evk_map,
+      cts_->ci_phases.at(i).EvaluatePair(context, res, im, res, im, evk_map,
                                         min_ks);
     }
-    cts_ci_phases_.at(num_phases - 1)
+    cts_->ci_phases.at(num_phases - 1)
         .EvaluateToReal(context, res, res, im, evk_map, min_ks);
     res.SetNumSlots(num_slots_);
     return;
   }
-  int num_cts_phases = cts_phases_.size();
-  cts_phases_.at(0).Evaluate(context, res, input, evk_map, min_ks);
+  int num_cts_phases = cts_->phases.size();
+  cts_->phases.at(0).Evaluate(context, res, input, evk_map, min_ks);
   for (int i = 1; i < num_cts_phases; i++) {
-    cts_phases_.at(i).Evaluate(context, res, res, evk_map, min_ks);
+    cts_->phases.at(i).Evaluate(context, res, res, evk_map, min_ks);
   }
   if (!full_slot_) {
     res.SetNumSlots(num_slots_ * 2);
