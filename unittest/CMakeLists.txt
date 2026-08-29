@@ -294,6 +294,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(half_boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # What HalfBoot leaves on the message, against the level-zero prime ratio it
+  # is derived from. Three presets, because the nominal power of two is out by
+  # a different amount on each.
+  add_executable(crossing_constant_test CrossingConstantTest.cpp)
+  target_link_libraries(crossing_constant_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # [SYLPH] 3.2's attention packing layout, and the GPU measurement of the
   # coefficient-to-slot permutation it is built around. The host tests need no
   # GPU; the measurement runs 17 HalfBoots, so filter to it deliberately.

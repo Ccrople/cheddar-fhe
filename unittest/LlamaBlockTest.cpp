@@ -179,11 +179,19 @@ constexpr int kSinCPhases = 3;
 constexpr int kProductLevel = 1;
 
 // The constant HalfBoot and the StC prefix leave when the magnitude is 1.
-// Measured on sylphflow16_35 with slack 8 by SinCAttentionTest, which prints
-// it; see SinCLinearLeg::Config::chain_constant for why it cannot be derived.
+//
+// It was a hard-coded 0.0298533 here, fitted on `sylphflow16_35` by
+// `SinCAttentionTest`, and handed to every preset. Only `Mode::kFull` reaches
+// the SinC leg and it skips off `sylphflow16_35`, so the mismatch was latent
+// rather than live -- but `bootparam_35`'s own constant is 0.0309496 and
+// `bootparam_30`'s is 0.0370370, 3.7% and 19% away, and the skip is the only
+// thing that was keeping them apart. Zero now means "derive it" and the leg
+// reads `BootContext::GetMessageRatio()`; the environment variable is kept so
+// the old fit can still be put back for an A/B, which is how 4.73998 bits
+// derived against 4.74336 fitted was measured.
 double ChainConstant() {
   const char *env = std::getenv("CHEDDAR_CHAIN_CONSTANT");
-  return env ? std::atof(env) : 0.0298533;
+  return env ? std::atof(env) : 0.0;
 }
 
 // THE SINKS, AND WHY THEY ARE NOT MERELY SKIPPED.
@@ -1561,7 +1569,9 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
                 << acfg.swap_level - 2 << ", SinC at " << prob_level << ".."
                 << prob_level - kSinCPhases + 1 << ", product at "
                 << kProductLevel << ", HalfBoot lands at " << acfg.prefix_level
-                << ", chain constant " << scfg.chain_constant << std::endl;
+                << ", chain constant " << sinc_leg->GetChainConstant()
+                << (scfg.chain_constant == 0.0 ? " (derived)" : " (override)")
+                << std::endl;
     }
   }
 

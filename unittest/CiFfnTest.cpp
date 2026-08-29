@@ -3934,6 +3934,20 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
     std::cout << "  HalfBoot boundary " << boundary << " (2^"
               << std::log2(std::abs(boundary)) << "), a turn carries " << kappa
               << std::endl;
+    // THE FIT IS NOW A CHECK, NOT THE SOURCE OF THE NUMBER. `boundary` is
+    // `level_zero_scale / q0` -- `BootContext::GetMessageRatio()` -- and the
+    // rounding in `log_scaleup_` is the whole of why it is not the nominal
+    // 2^-5 (Doing.md 1.5dk). `CrossingConstantTest` pins the identity to five
+    // digits on three ordinary presets; this is the conjugate-invariant one,
+    // fitted through the leg's own noise rather than on clean coefficients,
+    // so the tolerance is looser and the agreement is still the claim.
+    const double derived = bctx->GetMessageRatio();
+    std::cout << "    against the derived " << derived << " (2^"
+              << std::log2(derived) << "), fit/derived " << boundary / derived
+              << ", and kappa against q0_prod / 2^round(log2 q0_prod)"
+              << std::endl;
+    EXPECT_NEAR(boundary / derived, 1.0, 5e-3)
+        << "the level-zero prime ratio is not what this crossing applies";
   }
   const auto t_norm0 = tick();
   for (int k = 0; k < num_h; k++) canonicalise(slots[k], 1.0 / (boundary * beta));

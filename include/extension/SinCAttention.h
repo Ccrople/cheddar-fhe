@@ -185,19 +185,23 @@ class SinCAttention {
   /**
    * @brief Recompile the two prefixes with new constants.
    *
-   * The constant the whole chain leaves is a property of the parameter set and
-   * **has to be measured**, not derived: `HalfBoot` declares its output at
-   * `eval_mod_->end_scale_` and says so in its own comment -- "what the
-   * remaining constant is gets measured rather than derived through
-   * cts_const_, stc_const_ and q0". Measured here on `sylphflow16_35` it is
-   * **0.02985**, which is `2^-5.07` against the `2^-log_message_ratio = 2^-5`
-   * the design intends; the 5% is the part that does not cancel because this
-   * leg has no `ToCoeff` to cancel against.
+   * The constant the whole chain leaves is a property of the parameter set,
+   * and it is `BootContext::GetMessageRatio()` -- `level_zero_scale / q0`.
+   * On `sylphflow16_35` that is **0.0298525**, which is `2^-5.066` against
+   * the `2^-log_message_ratio = 2^-5` the design intends; the 1.3% is the
+   * part that does not cancel because this leg has no `ToCoeff` to cancel
+   * against. It says 5% above the line in older notes because the fit and
+   * the nominal were being compared rather than the fit and the ratio.
    *
-   * So the sequence is: run once with 1, read the constant off the result,
-   * and set its inverse. Only the two prefixes are rebuilt -- 31 diagonals
-   * each -- and **no new rotation keys are needed**, because a constant does
-   * not change a transform's diagonal structure.
+   * This used to read "has to be measured, not derived". It was measured for
+   * a long time -- run once with 1, read the constant off the result, set its
+   * inverse -- and the fit came back 0.0298533 against the 0.0298629 the
+   * ratio gives. `SinCAttentionTest` still prints its fit, which is now a
+   * check on the derivation rather than the source of the number.
+   *
+   * Only the two prefixes are rebuilt -- 31 diagonals each -- and **no new
+   * rotation keys are needed**, because a constant does not change a
+   * transform's diagonal structure.
    */
   void SetMagnitudes(double score_magnitude, double value_magnitude);
 

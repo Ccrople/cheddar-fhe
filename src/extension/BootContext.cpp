@@ -76,6 +76,13 @@ BootContext<word>::BootContext(const Parameter<word> &param,
   AssertTrue(log_q0_prod <= 62, "Invalid q0_prod");
   AssertTrue(log_level_zero_scale <= 62, "Invalid level_zero_scale");
 
+  // THE CROSSING CONSTANT, DERIVED. See the header: this is the factor
+  // `HalfBoot` leaves on the message, and it is a property of the level-zero
+  // primes rather than something to fit. `log_scaleup_` above is built out of
+  // *rounded* logarithms, so the ratio it lands on is `2^-log_message_ratio`
+  // only to the extent that `q0_prod` is a power of two -- which it is not.
+  message_ratio_ = level_zero_scale / q0_prod;
+
   int log_eval_mod_start_scale =
       Log2Scale(param.GetRescalePrimeProd(boot_param.GetEvalModStartLevel()));
   int actual_K = (1 << boot_param.num_double_angle_) * boot_param.initial_K_;

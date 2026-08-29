@@ -46,6 +46,7 @@ class BootContext : public Context<word>,
 
   double cts_const_;
   double stc_const_;
+  double message_ratio_;
 
   DeviceVector<word> mod_max_intt_const_;
 
@@ -181,6 +182,58 @@ class BootContext : public Context<word>,
    * scale, not the data.
    */
   double GetStCInputScale() const;
+
+  /**
+   * @brief What `HalfBoot` leaves on the message, exactly.
+   *
+   * `ModRaise` reads the level-zero ciphertext modulo `q0`, so `EvalMod` acts
+   * on `m * level_zero_scale / q0`: the crossing multiplies the message by
+   * that ratio, and a caller that stops at slots -- which is every caller of
+   * `HalfBoot` -- owes its inverse to whatever reads the result.
+   *
+   * `BootParameter::GetLogMessageRatio()` is the ratio the design ASKS for and
+   * `log_scaleup_` is built from rounded logarithms, so what the crossing
+   * actually applies is `2^-log_message_ratio` divided by
+   * `q0_prod / 2^round(log2 q0_prod)` -- and a product of NTT-friendly primes
+   * is not a power of two. Every bootstrappable preset here, as
+   * `nominal / actual`:
+   *
+   *     bootparam_30        0.843752    2^-4.7549
+   *     ci16_35, ci16_40    0.988037    2^-4.9826
+   *     bootparam_35, _40   1.009705    2^-5.0139
+   *     sylphflow16_35      1.046448    2^-5.0655
+   *     bootparam_40_64bit  1.000000    2^-5.0000
+   *
+   * The last row is why the nominal was ever plausible: its `q0` is the SINGLE
+   * 64-bit prime `2^50 + 14337`, so the ratio is right to ten digits. Every
+   * 32-bit preset needs two primes to reach the same modulus and their product
+   * lands wherever it lands.
+   *
+   * Two headers used to say this "has to be measured, not derived".
+   * `CrossingConstantTest` measures it against this accessor on three of those
+   * presets and agrees to **five digits** -- 0.999986, 0.999991, 0.999991 --
+   * while the nominal power of two is out by 15.6%, 0.97% and 4.6%
+   * respectively, so the test is not passing on a coincidence. The two fits
+   * the tree carried agree too: the SinC leg's 0.0298533 on `sylphflow16_35`
+   * against 0.0298629, and the conjugate-invariant FFN, which now checks its
+   * own in-run fit against this accessor and reports **fit/derived 0.999998**
+   * -- six digits, through the leg's own noise rather than on clean
+   * coefficients.
+   *
+   * The fit that this replaces was carried in `LlamaBlockTest` for EVERY
+   * preset and is consumed only by `Mode::kFull`, which skips off
+   * `sylphflow16_35` -- so it was latent rather than live, and it stays
+   * latent exactly as long as that skip does. On `bootparam_35` the same
+   * literal is 3.7% wrong and on `bootparam_30` it is 19% wrong, with
+   * nothing in the pipeline able to say so.
+   *
+   * It does NOT appear in a full turn of `SylphSchedule`'s cycle: `ToCoeff`
+   * scales down by the nominal ratio and `SlotToCoeff` scales up by this one,
+   * so the pair cancels and the coefficient leg simply runs at `nominal /
+   * actual` of what the caller believes. Only a leg that crosses one way --
+   * `SinCLinearLeg`, which has no `ToCoeff` to cancel against -- pays it.
+   */
+  double GetMessageRatio() const { return message_ratio_; }
 
   double GetCtSConst() const;
   double GetStCConst(BootVariant variant = BootVariant::kNormal) const;

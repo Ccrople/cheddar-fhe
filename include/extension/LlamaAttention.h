@@ -43,10 +43,9 @@ namespace cheddar {
  *
  * **The chain's constant.** `SinCAttention`'s route ends in `HalfBoot` and a
  * transform standing in for `Canonicalise`, and what that leaves is a constant
- * the parameter set fixes and **which has to be measured** -- HalfBoot says so
- * in its own comment. `Config::chain_constant` is where the measurement goes;
- * the leg divides it out so the block's `magnitude` means what the block
- * thinks it means. See `Config::chain_constant` for how to obtain one.
+ * the parameter set fixes: `BootContext::GetMessageRatio()`, which the leg
+ * divides out so the block's `magnitude` means what the block thinks it means.
+ * It used to say here that the constant had to be measured. It does not.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -64,23 +63,28 @@ class SinCLinearLeg : public CoeffLinearLeg<word> {
                            //!< group
 
     /**
-     * @brief What the chain leaves when `magnitude` is 1, measured.
+     * @brief What the chain leaves when `magnitude` is 1; 0 derives it.
      *
-     * `HalfBoot` declares its output at `eval_mod_->end_scale_` and its own
-     * comment says the remaining constant "gets measured rather than derived
-     * through cts_const_, stc_const_ and q0". On `sylphflow16_35` with slack 8
-     * it is **0.0298533 = 2^-5.066**, against the `2^-log_message_ratio = 2^-5`
-     * the design intends; the few percent it misses by is the part that does
-     * not cancel because this leg has no `ToCoeff` to cancel against.
+     * The crossing multiplies the message by `level_zero_scale / q0`, which is
+     * `BootContext::GetMessageRatio()` and is what the default asks for. The
+     * few percent it differs from `2^-log_message_ratio` by is the part that
+     * does not cancel, because this leg has no `ToCoeff` to cancel against.
      *
-     * To measure one on a set that has not been measured: run `Scores` with
-     * this at 1.0 on operands whose product is known, fit the constant, and
-     * put its value here. `SinCAttentionTest` does exactly that and prints it.
-     * Leaving it at 1.0 is not an error, it is a different circuit: everything
-     * downstream then sees a message 33x too small, and the first thing to
-     * notice will be SoftMax's polynomial being evaluated near zero.
+     * It was a hand-measured **0.0298533** here, fitted on `sylphflow16_35`
+     * with slack 8 by `SinCAttentionTest`, against the 0.0298629 the ratio
+     * gives. `LlamaBlockTest` handed that literal to every preset, and only
+     * `sylphflow16_35` ever reached this leg -- so the mismatch was latent,
+     * not live. `bootparam_35`'s own ratio is 0.0309496 and `bootparam_30`'s
+     * is 0.0370370, 3.7% and 19% away, and nothing downstream can tell.
+     * Deriving it costs nothing and cannot be ported to the wrong preset.
+     *
+     * A non-zero value overrides, which is how to A/B a fit against the
+     * derivation. Setting it to 1.0 is not an error, it is a different
+     * circuit: everything downstream then sees a message 33x too small, and
+     * the first thing to notice will be SoftMax's polynomial being evaluated
+     * near zero.
      */
-    double chain_constant = 1.0;
+    double chain_constant = 0.0;
   };
 
   /**

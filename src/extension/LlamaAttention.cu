@@ -67,6 +67,12 @@ SinCLinearLeg<word>::SinCLinearLeg(
   AssertTrue(IsPowOfTwo(num_cts_) && IsPowOfTwo(num_src_cts_),
              "SinCLinearLeg: both ciphertext counts must be powers of two");
 
+  // A chain constant of zero means "derive it", which is what every caller
+  // should do: it is the crossing's own ratio and the parameter set knows it.
+  // The alternative is a fitted number in the caller, which is what was here,
+  // and a fitted number cannot tell which preset it was fitted on.
+  if (cfg_.chain_constant == 0.0) cfg_.chain_constant = boot->GetMessageRatio();
+
   score_magnitude_ = attn_cfg.score_magnitude;
   value_magnitude_ = attn_cfg.value_magnitude;
 }
