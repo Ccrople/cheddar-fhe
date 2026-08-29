@@ -44,6 +44,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <set>
@@ -4396,4 +4397,208 @@ TEST(CiFfn, TheSwitchedDescentSlotLayoutIsPinned) {
          "file assumes, so nothing below it can be trusted";
   std::cout << "  switched located " << sw << " of the direct route's "
             << direct << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// [SYLPH] 3.2's DESCENT, WITH ITS LIVE SET DERIVED RATHER THAN SEARCHED FOR.
+//
+// `TheSwitchedDescentSlotLayoutIsPinned` above found the switched route
+// putting no channel at the direct route's address and locating only 23 of
+// 256 anywhere. The reason is now known, and it came off
+// `reference/switched_descent_layout.py` in a minute rather than off another
+// quarter hour of device time: the switched route puts channel
+// `f = j * sub_rank + n` at TWO coefficient addresses,
+//
+//     A1 = ring_rank * n + j        A2 = |ring_rank * n - j|
+//
+// ADDED, each with coefficient exactly +1 and at the SAME token position.
+// A probe that looks for one channel's own value at one address cannot see a
+// sum, so its 23 was a count of coincidences, not a layout.
+//
+// The map is composed on the host as `inv(M_direct) @ M_switch` from the two
+// module decompositions and holds exactly at every size checked, N = 32..1024.
+// It also NAMES THE LIVE SET. Writing `i = ring_rank * q + r`, the two
+// addresses are `(q, r) = (n, j)` and `(n - 1, ring_rank - j)`, so confining
+// `j` to `[1, ring_rank/2)` puts every primary at `r < ring_rank/2` and every
+// duplicate at `r > ring_rank/2` -- disjoint bands, which is the shape the
+// direct route's half density already has. `n = 0` has to go as well: there
+// `A1 = A2 = j`, so such a channel is its own duplicate and the duplicate band
+// comes out short, which is 1.5cu's "component zero has no partner" one size
+// up and cost seven bits when it was one channel in 256. What is left is
+// `(ring_rank/2 - 1) * (sub_rank - 1)` = 217 live channels of 512, against the
+// direct route's 255.
+//
+// This checks the derivation where it has to hold: a random plaintext matrix
+// confined to that live set, its output components predicted on the host from
+// the map, and the same product read as if the direct route's addressing
+// applied as the control.
+TEST(CiFfn, TheSwitchedDescentCarriesItsDerivedLiveSet) {
+  constexpr int kSlack = 9;
+  Ring boot(Param(), {}, kSlack);
+  ASSERT_TRUE(boot.param->conjugate_invariant_);
+  const int product_level = 1;
+  ASSERT_EQ(boot.Degree() / kTokens, kRank);
+
+  boot.ui->PrepareModPackKeys(kTokens, product_level);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+
+  std::unique_ptr<Ring> swtch(new Ring("ci_ringswitch16_35_boot.json",
+                                       boot.ui->GetSecretCoeffs()));
+  std::unique_ptr<Ring> small(new Ring("ci12_35_boot.json"));
+  const int ring_rank = boot.Degree() / small->Degree();
+  const int sub_rank = small->Degree() / kTokens;
+  ASSERT_EQ(ring_rank * sub_rank, kRank);
+  swtch->ui->PrepareRingSwitchKey(small->Degree(),
+                                  small->ui->GetSecretCoeffs(), product_level);
+  swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
+                                         small->ui->GetSecretCoeffs(),
+                                         product_level);
+  small->ui->PrepareModPackKeys(kTokens, product_level);
+  typename cheddar::CoeffLinearLeg<word>::Descent descent;
+  descent.switch_context = swtch->context;
+  descent.small_context = small->context;
+  descent.forward = &swtch->ui->GetRingSwitchKey(ring_rank);
+  descent.inverse = &swtch->ui->GetInverseRingSwitchKey(ring_rank);
+  for (int j = 0; j < sub_rank; j++) {
+    descent.modpack_keys.push_back(&small->ui->GetModPackKey(sub_rank, j));
+  }
+
+  // ---- the derived live set, and the two addresses each member occupies ----
+  auto addr = [&](int f, int &a1, int &a2) {
+    const int j = f / sub_rank, n = f % sub_rank;
+    a1 = ring_rank * n + j;
+    a2 = std::abs(ring_rank * n - j);
+  };
+  std::vector<int> live;
+  for (int j = 1; j < ring_rank / 2; j++) {
+    for (int n = 1; n < sub_rank; n++) live.push_back(j * sub_rank + n);
+  }
+  const int num_live = static_cast<int>(live.size());
+  EXPECT_EQ(num_live, (ring_rank / 2 - 1) * (sub_rank - 1));
+  {  // the bands really are disjoint, checked here and not only on the host
+    std::set<int> prim, dup;
+    for (int f : live) {
+      int a1 = 0, a2 = 0;
+      addr(f, a1, a2);
+      EXPECT_TRUE(prim.insert(a1).second) << "two live channels share " << a1;
+      dup.insert(a2);
+    }
+    std::vector<int> both;
+    std::set_intersection(prim.begin(), prim.end(), dup.begin(), dup.end(),
+                          std::back_inserter(both));
+    EXPECT_TRUE(both.empty()) << both.size() << " addresses are in both bands";
+  }
+  std::cout << "  descent " << boot.Degree() << " -> " << small->Degree()
+            << ": ring_rank " << ring_rank << ", sub_rank " << sub_rank
+            << ", live " << num_live << " of " << kRank << std::endl;
+
+  // ---- an operand supported on the live set, built through the map ---------
+  std::mt19937_64 gen(0x5717);
+  std::normal_distribution<double> xd(0.0, 1.0);
+  std::vector<std::vector<double>> d(kRank, std::vector<double>(kTokens, 0.0));
+  for (int f : live) {
+    for (int t = 0; t < kTokens; t++) d[f][t] = xd(gen);
+  }
+  std::vector<std::vector<double>> comp(kRank,
+                                        std::vector<double>(kTokens, 0.0));
+  for (int f : live) {
+    int a1 = 0, a2 = 0;
+    addr(f, a1, a2);
+    for (int t = 0; t < kTokens; t++) {
+      comp[a1][t] += d[f][t];
+      if (a2 != a1) comp[a2][t] += d[f][t];
+    }
+  }
+  auto coeffs = CiRecompose(comp, kRank, kTokens);
+  double m = 0.0;
+  for (double v : coeffs) m = std::max(m, std::abs(v));
+  const double beta = 0.2 / std::max(m, 1e-12);
+  for (double &v : coeffs) v *= beta;
+  Plaintext<word> pt;
+  boot.context->encoder_.EncodeCoeff(pt, product_level,
+                                     boot.param->GetScale(product_level),
+                                     coeffs);
+  std::vector<Ciphertext<word>> ins(1);
+  boot.ui->Encrypt(ins[0], pt);
+  ins[0].SetNumSlots(boot.param->MaxNumSlots());
+
+  // ---- a random mix inside the live set -----------------------------------
+  std::vector<std::vector<double>> u(kRank, std::vector<double>(kRank, 0.0));
+  std::vector<double> w(static_cast<size_t>(kRank) * kRank, 0.0);
+  for (int fo : live) {
+    for (int fi : live) {
+      const double v = xd(gen) / std::sqrt(static_cast<double>(num_live));
+      u[fo][fi] = v;
+      w[static_cast<size_t>(Rev(fi, 9)) * kRank + Rev(fo, 9)] = v;
+    }
+  }
+
+  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = kTokens;
+  lcfg.product_level = product_level;
+  lcfg.parents_per_tile = 0;
+  ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys, descent);
+  std::vector<Ciphertext<word>> res;
+  leg.Project(res, ins, kRank, kRank, w, 1.0, "switched_live");
+  ASSERT_EQ(res.size(), 1u);
+
+  // ---- what the map predicts, and what the direct addressing would --------
+  std::vector<std::vector<double>> dp(kRank, std::vector<double>(kTokens, 0.0));
+  for (int fo : live) {
+    for (int fi : live) {
+      const double c = u[fo][fi];
+      if (c == 0.0) continue;
+      for (int t = 0; t < kTokens; t++) dp[fo][t] += c * d[fi][t] * beta;
+    }
+  }
+  std::vector<std::vector<double>> want(kRank,
+                                        std::vector<double>(kTokens, 0.0));
+  std::vector<std::vector<double>> naive(kRank,
+                                         std::vector<double>(kTokens, 0.0));
+  for (int fo : live) {
+    int a1 = 0, a2 = 0;
+    addr(fo, a1, a2);
+    for (int t = 0; t < kTokens; t++) {
+      want[a1][t] += dp[fo][t];
+      if (a2 != a1) want[a2][t] += dp[fo][t];
+      naive[fo][t] += dp[fo][t];  // the direct route's own addressing
+    }
+  }
+
+  Plaintext<word> out_pt;
+  boot.ui->Decrypt(out_pt, res[0]);
+  std::vector<double> got_coeffs;
+  boot.context->encoder_.DecodeCoeff(got_coeffs, out_pt);
+  const auto got = CiComponentsFfn(got_coeffs, kRank, kTokens);
+
+  auto score = [&](const std::vector<std::vector<double>> &ref) {
+    double num = 0.0, den = 0.0, mx = 0.0, err = 0.0;
+    for (int i = 0; i < kRank; i++) {
+      for (int t = 0; t < kTokens; t++) {
+        num += got[i][t] * ref[i][t];
+        den += ref[i][t] * ref[i][t];
+        mx = std::max(mx, std::abs(ref[i][t]));
+      }
+    }
+    const double k = den > 0 ? num / den : 0.0;
+    for (int i = 0; i < kRank; i++) {
+      for (int t = 0; t < kTokens; t++) {
+        err = std::max(err, std::abs(got[i][t] - k * ref[i][t]));
+      }
+    }
+    return std::make_pair(err / std::max(mx, 1e-30), k);
+  };
+  const auto derived = score(want);
+  const auto control = score(naive);
+  std::cout << "  [derived map] relative " << derived.first << " (carried "
+            << derived.second << ")" << std::endl;
+  std::cout << "  [direct-addressing control] relative " << control.first
+            << std::endl;
+  EXPECT_LT(derived.first, 1e-3)
+      << "the switched descent does not carry the derived live set";
+  EXPECT_GT(control.first, 0.1)
+      << "the control passes too, so this test is not discriminating";
 }
