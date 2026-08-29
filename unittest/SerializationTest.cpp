@@ -199,7 +199,10 @@ TEST(Serialization, ALoadedKeyRotatesWithoutTheOneThatWroteIt) {
   ring.context->encoder_.Encode(pt, level, ring.param->GetScale(level), msg);
   Ciphertext<word> ct, out;
   ring.ui->Encrypt(ct, pt);
-  ring.context->HRot(out, ct, rot, loaded_map);
+  // `GetRotationKey` on the LOADED map, so the key that does the work is
+  // the one that came out of the file and the generated one is unreachable
+  // from here.
+  ring.context->HRot(out, ct, loaded_map.GetRotationKey(rot), rot);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
