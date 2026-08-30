@@ -203,6 +203,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const int num_layers = EnvInt("CHEDDAR_CI_LAYERS", 1);
   const double ride = EnvDouble("CHEDDAR_CI_RIDE", 0.2);
   const bool min_ks = EnvInt("CHEDDAR_CI_MINKS", 0) != 0;
+  const bool kRevCol = EnvInt("CHEDDAR_CI_REVCOL", 0) != 0;
+  const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
 
   json calib_all;
   {
@@ -431,10 +433,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // cosh(d arccosh(v)): the first run of this test came back at |.| ~ 400
     // against a reference of 0.37, with a NEGATIVE fitted factor. The window
     // is a RATIO and so needs no such correction.
-    const double s2 = stream_scale * stream_scale;
-    cal.attn_alpha = cj["attn_alpha"].get<double>() / s2;
+    const double alpha_div = EnvDouble("CHEDDAR_CI_ALPHA_DIV", 1.0);
+    cal.attn_alpha = cj["attn_alpha"].get<double>() / alpha_div;
     cal.attn_norm_window = cj["attn_norm_window"].get<double>();
-    cal.alpha = cj["alpha"].get<double>() / s2;
+    cal.alpha = cj["alpha"].get<double>() / alpha_div;
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
 
@@ -447,6 +449,68 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::vector<Ciphertext<word>> normed;
     layer.AttentionNorm(normed, stream, an_dec, cal, boot.ui->GetEvkMap());
     const auto t_norm = Tick();
+
+    // ---- STAGE 1: the pre-attention norm, against the host ---------------
+    //
+    // A staged check, because guessing at the closing number costs a run of
+    // several minutes each time and this tree has paid that bill repeatedly.
+    // `CHEDDAR_CI_STOP_AFTER=1` stops here.
+    {
+      std::vector<double> want(static_cast<size_t>(kT) * kH, 0.0);
+      std::vector<double> hin;
+      if (L == 0) {
+        hin = x0;
+      } else {
+        ASSERT_TRUE(ReadF64(rdir + "/h_L" + (L < 11 ? "0" : "") +
+                                std::to_string(L - 1) + ".f64",
+                            static_cast<size_t>(kT) * kH, hin));
+      }
+      for (int t = 0; t < kT; t++) {
+        double sq = 0.0;
+        for (int c = 0; c < kH; c++) {
+          const double v = hin[static_cast<size_t>(t) * kH + c];
+          sq += v * v;
+        }
+        const double inv = 1.0 / std::sqrt(sq / kH + 1e-5);
+        for (int c = 0; c < kH; c++) {
+          want[static_cast<size_t>(t) * kH + c] =
+              hin[static_cast<size_t>(t) * kH + c] * inv * an_f[c];
+        }
+      }
+      double n2 = 0.0, d2 = 0.0, mx2 = 0.0;
+      std::vector<std::vector<std::vector<double>>> g2(kNumH);
+      for (int k = 0; k < kNumH; k++) {
+        Plaintext<word> pt;
+        boot.ui->Decrypt(pt, normed[k]);
+        std::vector<double> co;
+        boot_ffn.context->encoder_.DecodeCoeff(co, pt);
+        g2[k] = Components(co);
+      }
+      for (int m = 0; m < kH; m++) {
+        const int k = m / kPerModel;
+        const int c = ModelSlot(m) - k * kRank;
+        for (int t = kSinkTokens; t < kT; t++) {
+          const double wv = want[static_cast<size_t>(t) * kH + m];
+          n2 += g2[k][Rev(c, 9)][Rev(t, 7)] * wv;
+          d2 += wv * wv;
+          mx2 = std::max(mx2, std::abs(wv));
+        }
+      }
+      const double f2 = n2 / d2;
+      double e2 = 0.0;
+      for (int m = 0; m < kH; m++) {
+        const int k = m / kPerModel;
+        const int c = ModelSlot(m) - k * kRank;
+        for (int t = kSinkTokens; t < kT; t++) {
+          e2 = std::max(e2, std::abs(g2[k][Rev(c, 9)][Rev(t, 7)] / f2 -
+                                     want[static_cast<size_t>(t) * kH + m]));
+        }
+      }
+      std::cout << "  [stage 1] RMSNorm(attn): " << e2 << " against |.| <= "
+                << mx2 << " (relative " << (e2 / mx2) << " = 2^"
+                << std::log2(e2 / mx2) << "), carried " << f2 << std::endl;
+      if (stop_after == 1) return;
+    }
 
     // ---- Q, K and V: the real PC-MM at full width -------------------------
     std::vector<cheddar::MlweCiphertext<word>> x_parts;
@@ -514,7 +578,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
             // that go through it; a raw `PcmmHandler` does not.
             const int dc = ModelSlot(c);
             const int k = dc / kRank;
-            const int col_idx = k * kRank + Rev(dc % kRank, 9);
+            const int col_idx =
+                kRevCol ? k * kRank + Rev(dc % kRank, 9) : dc;
             vals[static_cast<size_t>(row) * kDeclaredH + col_idx] =
                 scale * w[static_cast<size_t>(c) * width + o];
           }
