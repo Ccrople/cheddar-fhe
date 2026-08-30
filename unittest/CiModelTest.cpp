@@ -309,6 +309,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   lcfg.hidden_declared = kDeclaredHid;
   lcfg.model_live = kH;
   lcfg.product_level = kPcmmLevel;
+  // SIXTEEN PARENTS A TILE, which is what the full-width cost model prescribes
+  // for the direct route (Doing.md 1.5dc: 228.2 ms per output ciphertext at
+  // tile 4 against 130.5 at 16). Four was the correctness-width layer's
+  // setting, forced by memory at rank 512 and full density; half density
+  // halves exactly that, so the two changes pay for each other. A tile costs
+  // one extra ModPack per output group -- `rank` key switches -- and the down
+  // projection has 56 parents, so at tile 4 it pays fourteen of them.
+  lcfg.parents_per_tile = EnvInt("CHEDDAR_PARENTS_PER_TILE", 16);
   lcfg.ride = ride;
   // The ciphertext's epsilon, not the model's; see the calibration below.
   lcfg.eps = 1e-5;   // the MODEL's: the stream factor is divided out first
