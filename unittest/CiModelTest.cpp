@@ -310,8 +310,22 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   lcfg.model_live = kH;
   lcfg.product_level = kPcmmLevel;
   lcfg.ride = ride;
+  // The ciphertext's epsilon, not the model's; see the calibration below.
+  lcfg.eps = 1e-5;   // replaced once `stream_scale` is known
   lcfg.min_ks = min_ks;
   lcfg.verbose = true;
+  // `stream_scale` is derived below from the reference, but the layer needs
+  // the ciphertext's epsilon at construction, so it is computed here.
+  {
+    double sa = 0.0;
+    for (double v : x0) sa = std::max(sa, std::abs(v));
+    for (int L = 0; L < num_layers; L++) {
+      sa = std::max(sa, calib_all["layers"][L]["out_absmax"].get<double>());
+      sa = std::max(sa, calib_all["layers"][L]["resid_absmax"].get<double>());
+    }
+    const double sc = ride / std::max(sa, 1e-12);
+    lcfg.eps = 1e-5 * sc * sc;
+  }
   cheddar::CiLlamaLayer<word> layer(fctx, layout, pack_keys, lcfg);
   {
     EvkRequest req;
@@ -433,10 +447,23 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // cosh(d arccosh(v)): the first run of this test came back at |.| ~ 400
     // against a reference of 0.37, with a NEGATIVE fitted factor. The window
     // is a RATIO and so needs no such correction.
-    const double alpha_div = EnvDouble("CHEDDAR_CI_ALPHA_DIV", 1.0);
-    cal.attn_alpha = cj["attn_alpha"].get<double>() / alpha_div;
+    // ALPHA AND EPS ARE BOTH ABOUT THE CIPHERTEXT, AND THEY MOVE TOGETHER.
+    // `RmsNormHandler` evaluates `1/sqrt(alpha * (S/n + eps))` on the `x` it
+    // is handed, and the stream carries `stream_scale`, so `S` is `s^2` times
+    // the model's. `alpha / s^2` puts the argument back at 1 -- and `eps` is
+    // an ADDITIVE term in the same bracket, so it has to be `s^2 * eps_model`
+    // or `alpha/s^2` inflates it by `1/s^2` (260x here) and it dominates the
+    // bracket outright. Scaling alpha alone measured relative 829; leaving
+    // both alone measured 0.246 at the norm, with the invsqrt evaluated at
+    // 0.0038 where its window is [0.77, 1.3] and a Chebyshev fit does
+    // whatever it likes.
+    //
+    // The OUTPUT stays in model units either way: the weight carries
+    // `sqrt(alpha)` and the bracket `alpha`, so they cancel exactly.
+    const double s2 = stream_scale * stream_scale;
+    cal.attn_alpha = cj["attn_alpha"].get<double>() / s2;
     cal.attn_norm_window = cj["attn_norm_window"].get<double>();
-    cal.alpha = cj["alpha"].get<double>() / alpha_div;
+    cal.alpha = cj["alpha"].get<double>() / s2;
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
 
