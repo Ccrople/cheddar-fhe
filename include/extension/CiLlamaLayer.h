@@ -282,6 +282,19 @@ class CiLlamaLayer {
   //! The projection leg, for a caller that wants its own `Project` calls.
   CoeffLinearLeg<word> &GetProjectionLeg() { return *leg_; }
 
+  /**
+   * @brief Host seconds spent PREPARING this layer's slot operators, which is
+   * per-layer work and not arithmetic.
+   *
+   * `RmsNormHandler` compiles its polynomial at construction and encodes its
+   * weight plaintexts on first use -- 1308.8 ms against 31.9 ms for the second
+   * call (1.5dd) -- and a layer calls it twice, with two different weights, so
+   * nothing inside a layer amortises it. Like the projection leg's model
+   * conversion it belongs beside the weights, not in the online row.
+   */
+  double GetPrepareSeconds() const { return prepare_seconds_; }
+  void ResetPrepareTimer() const { prepare_seconds_ = 0.0; }
+
  private:
   //! The RMSNorm weight plaintexts for one layer, duplicates included: at an
   //! ODD declared channel the weight carries the PARTNER channel's gain,
@@ -320,6 +333,8 @@ class CiLlamaLayer {
   SylphSchedule<word> sched_;
   std::unique_ptr<CiLlamaSeam<word>> seam_;
   std::unique_ptr<CoeffLinearLeg<word>> leg_;
+  //! Per-layer operator preparation; see `GetPrepareSeconds`.
+  mutable double prepare_seconds_ = 0.0;
 };
 
 }  // namespace cheddar

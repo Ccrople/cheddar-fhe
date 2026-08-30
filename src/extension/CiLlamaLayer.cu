@@ -1,6 +1,7 @@
 #include "extension/CiLlamaLayer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -264,12 +265,22 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   // sixth of the data outside the fitted window (1.5dd, measured 2^-5.09).
   const double ratio =
       static_cast<double>(cfg_.model_declared) / cfg_.model_live;
+  // The handler compiles its polynomial here and encodes its weight
+  // plaintexts in `Prepare`; both are per-layer preparation, so they are
+  // timed apart from the arithmetic below. `Apply` would do the encode on its
+  // own at first use, which is what hid it inside the online row.
+  const auto prep0 = std::chrono::steady_clock::now();
   RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
                            alpha * ratio, op_level_, cfg_.eps / ratio, window,
                            NormDegree(window), /*channel_stride=*/2);
   AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
              "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
   const auto wts = NormWeights(gain, alpha);
+  rms.Prepare(wts);
+  cudaDeviceSynchronize();
+  prepare_seconds_ +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - prep0)
+          .count();
   std::vector<Ct> outv;
   rms.Apply(outv, slots, wts, evk);
   res.resize(num_model_cts_);

@@ -73,6 +73,7 @@
 #include "core/Pcmm.h"
 #include "extension/CiLlamaLayer.h"
 #include "extension/CiSinCAttention.h"
+#include "extension/RmsNorm.h"
 
 using word = uint32_t;
 using Ring = ringfixture::Ring<word>;
@@ -480,6 +481,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // build; [SYLPH] 5.3 does it offline and 5.1 keeps the result resident.
     // The leg times it for itself so the ledger below can subtract it.
     layer.GetProjectionLeg().ResetProjectionTimers();
+    layer.ResetPrepareTimer();
+    double seam_prep_ms = 0.0;
     const json &cj = calib_all["layers"][L];
     std::cout << "\n================ layer " << L << " ================"
               << std::endl;
@@ -642,6 +645,47 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         std::cout << "    [stage 1] without the scan: live " << (lo / mx2)
                   << " = 2^" << std::log2(lo / mx2) << ", duplicate "
                   << (du / mx2) << " = 2^" << std::log2(du / mx2) << std::endl;
+      }
+      // THE FIT ALONE, in double, against the library's OWN compiled
+      // polynomial -- `CiFfn.TheFitsAloneExplainTheFfnError`'s method (1.5cu),
+      // which capped that test before any ciphertext existed. If the encrypted
+      // norm sits at this number the answer is the window and the degree; if
+      // it sits well above it, the answer is the circuit and no calibration
+      // will move it. The handler is built with the layer's own parameters.
+      {
+        const double ratio =
+            static_cast<double>(kDeclaredH) / static_cast<double>(kH);
+        cheddar::RmsNormHandler<word> probe(
+            fctx, kT, kDeclaredH, cal.attn_alpha * ratio,
+            boot_ffn.param->max_level_ - 1, 1e-5 / ratio,
+            cal.attn_norm_window,
+            cal.attn_norm_window <= 2.5 ? 9
+                                        : (cal.attn_norm_window <= 12.0 ? 15
+                                                                        : 31),
+            /*channel_stride=*/2);
+        const double root_alpha = std::sqrt(cal.attn_alpha);
+        double q = 0.0, d = 0.0;
+        for (int t = kSinkTokens; t < kT; t++) {
+          double s2 = 0.0;
+          for (int c = 0; c < kH; c++) {
+            const double v = hin[static_cast<size_t>(t) * kH + c];
+            s2 += v * v;
+          }
+          // The circuit's own bracket: the declared width, the scaled epsilon.
+          const double u = cal.attn_alpha * ratio * (s2 / kDeclaredH + 1e-5 / ratio);
+          const double inv = root_alpha * probe.PlainInvSqrt(u);
+          for (int c = 0; c < kH; c++) {
+            const double got =
+                hin[static_cast<size_t>(t) * kH + c] * inv * an_f[c];
+            const double w = want[static_cast<size_t>(t) * kH + c];
+            q += (got - w) * (got - w);
+            d += w * w;
+          }
+        }
+        std::cout << "    [stage 1] the FIT ALONE, in double, against the "
+                  << "library's own polynomial: rms 2^"
+                  << 0.5 * std::log2(q / d) << " (window "
+                  << cal.attn_norm_window << ")" << std::endl;
       }
       if (stop_after == 1) return;
     }
@@ -870,7 +914,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     attn_out.clear();
     std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
     for (int half = 0; half < 2; half++) {
+      // T1's three stages are compiled per half and dropped, so this is one
+      // more piece of per-layer preparation sitting inside an online row --
+      // the same stages every layer, held apart only because each is the
+      // largest object the seam owns.
+      const auto sp0 = Tick();
       layer.PrepareSeamHalf(half);
+      seam_prep_ms += Ms(sp0, Tick());
       for (int bi = 0; bi < layout.num_cts; bi++) {
         layer.Seam(h_cts[bi * 2 + half], booted[bi], boot.ui->GetEvkMap());
       }
@@ -1078,11 +1128,15 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << ", seam " << Ms(t_leg, t_seam) << ", FFN "
               << Ms(t_seam, t_ffn) << ", layer "
               << Ms(t_layer0, t_ffn) / 1000.0 << " s" << std::endl;
-    std::cout << "  [time] of which ONE-TIME model conversion " << conv_ms
-              << " ms and host staging " << stage_ms << " ms, so the layer's "
-              << "own arithmetic is "
-              << (Ms(t_layer0, t_ffn) - conv_ms - stage_ms) / 1000.0 << " s"
-              << std::endl;
+    const double prep_ms = 1000.0 * layer.GetPrepareSeconds() + seam_prep_ms;
+    std::cout << "  [time] of which PER-LAYER PREPARATION: model conversion "
+              << conv_ms << " ms, host staging " << stage_ms
+              << " ms, the seam's T1 stages " << seam_prep_ms
+              << " ms, the two RMSNorm handlers "
+              << 1000.0 * layer.GetPrepareSeconds() << " ms -- so the layer's "
+              << "own ARITHMETIC is "
+              << (Ms(t_layer0, t_ffn) - conv_ms - stage_ms - prep_ms) / 1000.0
+              << " s" << std::endl;
     {
       size_t free_b = 0, total_b = 0;
       cudaMemGetInfo(&free_b, &total_b);
