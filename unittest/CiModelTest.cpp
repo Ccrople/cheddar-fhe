@@ -422,9 +422,19 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
     // ---- the pre-attention norm, encrypted --------------------------------
     typename cheddar::CiLlamaLayer<word>::Calibration cal;
-    cal.attn_alpha = cj["attn_alpha"].get<double>();
+    // ALPHA IS ABOUT THE CIPHERTEXT'S MAGNITUDE, NOT THE MODEL'S.
+    // `RmsNormHandler` wants `alpha * mean(x^2)` near 1 for the `x` it is
+    // handed, and the stream carries `stream_scale`, so its mean square is
+    // `stream_scale^2` smaller than the model's. Left alone the invsqrt's
+    // argument lands at `stream_scale^2` -- 0.0038 here -- which is far
+    // outside any window, and outside its interval a Chebyshev fit grows like
+    // cosh(d arccosh(v)): the first run of this test came back at |.| ~ 400
+    // against a reference of 0.37, with a NEGATIVE fitted factor. The window
+    // is a RATIO and so needs no such correction.
+    const double s2 = stream_scale * stream_scale;
+    cal.attn_alpha = cj["attn_alpha"].get<double>() / s2;
     cal.attn_norm_window = cj["attn_norm_window"].get<double>();
-    cal.alpha = cj["alpha"].get<double>();
+    cal.alpha = cj["alpha"].get<double>() / s2;
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
 
