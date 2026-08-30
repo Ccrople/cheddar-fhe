@@ -484,7 +484,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           const int row = hh * 16 + cp;
           const int head = fam * 16 + hh;
           const int chan = l * 16 + cp;
-          const int o = (head % heads_w) * kD + chan;
+          // GQA IS `head / 4`, NOT `head % 8`. Llama-3-8B has 32 query heads
+          // over 8 key/value heads, and each key/value head serves four
+          // CONSECUTIVE query heads. The modulus reads the right number of
+          // heads and the wrong ones, which is a layer that decrypts and is
+          // wrong -- measured at relative 55.8 with a NEGATIVE fitted factor,
+          // which is what an essentially random reindexing looks like.
+          const int o = (heads_w == kHeads ? head : head / (kHeads / heads_w)) *
+                            kD + chan;
           for (int c = 0; c < kH; c++) {
             vals[static_cast<size_t>(row) * kDeclaredH + ModelSlot(c)] =
                 scale * w[static_cast<size_t>(c) * width + o];
