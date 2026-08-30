@@ -284,6 +284,25 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   /// N1 / small_degree, the ModDecomp rank. `rank_` without the descent.
   int GetSubRank() const { return sub_rank_; }
 
+  /**
+   * @brief Host seconds spent on MODEL CONVERSION since the last reset.
+   *
+   * A projection's weight matrix becomes `tiles * groups` plaintext operands,
+   * and every input to that work is a constant of the model. [SYLPH] section
+   * 5.3 does it once, offline. A layer that runs each weight once cannot
+   * amortise it inside itself, so a ledger that does not separate it reports
+   * model preparation as inference: measured on the full-width feed-forward,
+   * 68 s of conversion against 14.2 s of online arithmetic. `GetStageSeconds`
+   * is the other half of the same question -- what `WeightResidency::kHost`
+   * pays to move an operand onto the card for the projection that needs it.
+   */
+  double GetConvertSeconds() const { return convert_seconds_; }
+  double GetStageSeconds() const { return stage_seconds_; }
+  void ResetProjectionTimers() const {
+    convert_seconds_ = 0.0;
+    stage_seconds_ = 0.0;
+  }
+
   void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
                int out_channels, const std::vector<double> &w, double w_scale,
                const char *name) const override;
@@ -507,6 +526,10 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! in a build without USE_CUBLAS.
   bool use_blas_;
   mutable std::map<std::string, Operands> operands_;
+  //! Model conversion and host-to-device staging, kept apart from the online
+  //! rows; see `GetConvertSeconds`.
+  mutable double convert_seconds_ = 0.0;
+  mutable double stage_seconds_ = 0.0;
 #ifdef USE_CUBLAS
   std::unique_ptr<PcmmBlasHandler<word>> blas_;
   std::unique_ptr<PcmmBlasHandler<word>> small_blas_;

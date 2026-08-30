@@ -1,8 +1,7 @@
 #include "extension/LlamaLinear.h"
 
-#include "extension/Profile.h"
-
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +11,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "extension/Profile.h"
 
 namespace cheddar {
 
@@ -605,10 +605,15 @@ void CoeffLinearLeg<word>::RunProjection(
   const Operands *cached = nullptr;
   if (cache_weights_) {
     NvtxScope _n("pcmm: convert weights (first call only)");
+    const auto c0 = std::chrono::steady_clock::now();
     cached = &GetOperands(name, w, in_channels, out_channels, w_scale, parents,
                           groups, tile);
+    const auto c1 = std::chrono::steady_clock::now();
     // Lend the device this projection's operands for as long as it runs.
     StageOperands(*cached);
+    const auto c2 = std::chrono::steady_clock::now();
+    convert_seconds_ += std::chrono::duration<double>(c1 - c0).count();
+    stage_seconds_ += std::chrono::duration<double>(c2 - c1).count();
   }
 
   // The partial sums, one per output group and -- with the descent -- one per

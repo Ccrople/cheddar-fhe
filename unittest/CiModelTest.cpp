@@ -475,6 +475,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // The weight-cache name. A repeated tag with different weights is a wrong
     // layer that still decrypts, so it carries the layer index.
     const std::string tag = "L" + std::to_string(L);
+    // MODEL CONVERSION IS NOT INFERENCE. A layer runs each of its seven
+    // weights once, so nothing inside it can amortise the plaintext-operand
+    // build; [SYLPH] 5.3 does it offline and 5.1 keeps the result resident.
+    // The leg times it for itself so the ledger below can subtract it.
+    layer.GetProjectionLeg().ResetProjectionTimers();
     const json &cj = calib_all["layers"][L];
     std::cout << "\n================ layer " << L << " ================"
               << std::endl;
@@ -1064,11 +1069,20 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << bl.half << " | FFN Context full " << bf.full << ", half "
               << bf.half << " | total " << (bl.Total() + bf.Total())
               << std::endl;
+    const double conv_ms =
+        1000.0 * layer.GetProjectionLeg().GetConvertSeconds();
+    const double stage_ms =
+        1000.0 * layer.GetProjectionLeg().GetStageSeconds();
     std::cout << "  [time] norm " << Ms(t_layer0, t_norm) << " ms, Q/K/V "
               << Ms(t_norm, t_proj) << ", leg " << Ms(t_proj, t_leg)
               << ", seam " << Ms(t_leg, t_seam) << ", FFN "
               << Ms(t_seam, t_ffn) << ", layer "
               << Ms(t_layer0, t_ffn) / 1000.0 << " s" << std::endl;
+    std::cout << "  [time] of which ONE-TIME model conversion " << conv_ms
+              << " ms and host staging " << stage_ms << " ms, so the layer's "
+              << "own arithmetic is "
+              << (Ms(t_layer0, t_ffn) - conv_ms - stage_ms) / 1000.0 << " s"
+              << std::endl;
     {
       size_t free_b = 0, total_b = 0;
       cudaMemGetInfo(&free_b, &total_b);
