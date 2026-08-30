@@ -493,7 +493,19 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           const int o = (heads_w == kHeads ? head : head / (kHeads / heads_w)) *
                             kD + chan;
           for (int c = 0; c < kH; c++) {
-            vals[static_cast<size_t>(row) * kDeclaredH + ModelSlot(c)] =
+            // THE COLUMN IS A MODULE COMPONENT, NOT A DECLARED CHANNEL, and
+            // the two differ by a bit reversal. `ModDecomp` sends coefficient
+            // `i + rank*t` to position `t` of component `i`, and this stream
+            // was encoded with `comp[Rev(c, 9)][Rev(t, 7)]` because it has to
+            // read correctly in SLOTS -- `SlotToCoeff` sends slot `t + 128 c`
+            // to coefficient `rev7(t) * rank + rev9(c)`. So component `i` of
+            // ciphertext `k` carries declared channel `k * rank + Rev(i, 9)`.
+            // `CoeffLinearLeg::GatherWeights` does this for the projections
+            // that go through it; a raw `PcmmHandler` does not.
+            const int dc = ModelSlot(c);
+            const int k = dc / kRank;
+            const int col_idx = k * kRank + Rev(dc % kRank, 9);
+            vals[static_cast<size_t>(row) * kDeclaredH + col_idx] =
                 scale * w[static_cast<size_t>(c) * width + o];
           }
         }
