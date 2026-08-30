@@ -9514,7 +9514,7 @@ ledger("before the FFN context");
   for (int t = 0; t < proj_small; t++) {
     for (int c = 0; c < model_declared; c += 2) {
       res_max = std::max(res_max,
-                         std::abs(x_comp[rev(c, 9)][rev(t, 7)]) +
+                         std::abs(x_comp[rev(c, 9)][t]) +
                              std::abs(o_unit[static_cast<size_t>(t) *
                                              model_declared + c]));
     }
@@ -9608,7 +9608,7 @@ ledger("before the FFN context");
       for (int t = 0; t < proj_small; t++) {
         const double want =
             o_host[static_cast<size_t>(t) * model_declared + c];
-        num += comp[rev(c, 9)][rev(t, 7)] * want;
+        num += comp[rev(c, 9)][t] * want;
         den += want * want;
         mx = std::max(mx, std::abs(want));
       }
@@ -9618,7 +9618,7 @@ ledger("before the FFN context");
     double err = 0.0;
     for (int c = 0; c < model_declared; c += 2) {
       for (int t = 0; t < proj_small; t++) {
-        const double got = comp[rev(c, 9)][rev(t, 7)] / fit;
+        const double got = comp[rev(c, 9)][t] / fit;
         err = std::max(err, std::abs(got - o_host[static_cast<size_t>(t) *
                                                   model_declared + c]));
       }
@@ -9679,7 +9679,7 @@ ledger("before the FFN context");
       // host residual is `x + O`, and the factor rides through to the
       // boundary constant the next crossing measures.
       h_host[static_cast<size_t>(t) * model_declared + c] =
-          x_comp[rev(c, 9)][rev(t, 7)] * res_scale +
+          x_comp[rev(c, 9)][t] * res_scale +
           o_host[static_cast<size_t>(t) * model_declared + c];
     }
   }
@@ -10089,7 +10089,7 @@ ledger("before the FFN context");
     for (int c = 0; c < model_declared; c += 2) {
       for (int t = 0; t < proj_small; t++) {
         const double want = y_host[static_cast<size_t>(t) * model_declared + c];
-        num += comp[rev(c, 9)][rev(t, 7)] * want;
+        num += comp[rev(c, 9)][t] * want;
         den += want * want;
         mx = std::max(mx, std::abs(want));
       }
@@ -10098,7 +10098,7 @@ ledger("before the FFN context");
     double err = 0.0;
     for (int c = 0; c < model_declared; c += 2) {
       for (int t = 0; t < proj_small; t++) {
-        const double got = comp[rev(c, 9)][rev(t, 7)] / fit;
+        const double got = comp[rev(c, 9)][t] / fit;
         err = std::max(err, std::abs(
             got - y_host[static_cast<size_t>(t) * model_declared + c]));
       }

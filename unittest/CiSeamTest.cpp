@@ -195,7 +195,7 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
       const int I = Rev(chan_of(col, lh), 9);
       for (int row = 0; row < kRows; row++) {
         const double want = v[row][col][lane];
-        num += comp[I][Rev(row, 7)] * want;
+        num += comp[I][row] * want;
         den += want * want;
         absmax = std::max(absmax, std::abs(want));
       }
@@ -211,7 +211,7 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
       const int I = Rev(chan_of(col, lh), 9);
       for (int row = 0; row < kRows; row++) {
         live_err = std::max(live_err,
-                            std::abs(comp[I][Rev(row, 7)] / carried -
+                            std::abs(comp[I][row] / carried -
                                      v[row][col][lane]));
       }
     }
@@ -235,10 +235,12 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
       << "the dead half is not dead, so the image is not half density";
 
   // A CONTROL THAT MUST FAIL. Reading the live band one token position out is
-  // the mistake the tree actually made -- the banded convention is about
-  // COEFFICIENT positions and `p = rev7(t)`, so the step is a bit-reversed
-  // decrement, not `row - 1`. If this passes too, the check above is not
-  // testing what it claims.
+  // the mistake the tree actually made twice: once as a duplicate written at
+  // `row - 1` when the image sat at position `rev7(row)`, and once as a whole
+  // image at position `rev7(row)` when the leg's doorstep needs position
+  // `row`. The seam now reverses the token field last, so the position IS the
+  // row. If this control passes too, the check above is not testing what it
+  // claims.
   double shifted_err = 0.0;
   for (int col = 0; col < kCols; col++) {
     for (int lh = 0; lh < 16; lh++) {
@@ -246,7 +248,7 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
       const int I = Rev(chan_of(col, lh), 9);
       for (int row = 1; row < kRows; row++) {
         shifted_err = std::max(
-            shifted_err, std::abs(comp[I][Rev(row, 7)] / carried -
+            shifted_err, std::abs(comp[I][row] / carried -
                                   v[row - 1][col][lane]));
       }
     }

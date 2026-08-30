@@ -279,6 +279,15 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
 }
 
 template <typename word>
+void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
+                                 const std::vector<Ct> &x, int in_declared,
+                                 int out_declared,
+                                 const std::vector<double> &w, double w_scale,
+                                 const char *tag) const {
+  leg_->Project(res, x, in_declared, out_declared, w, w_scale, tag);
+}
+
+template <typename word>
 void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const std::vector<Ct> &stream,
                                        const std::vector<double> &gain,

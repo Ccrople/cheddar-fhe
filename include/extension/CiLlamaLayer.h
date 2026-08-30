@@ -226,6 +226,34 @@ class CiLlamaLayer {
    * @param stream the residual stream at level 0
    * @param gain the RMSNorm weights at DECLARED channels
    */
+  /**
+   * @brief One projection through the layer's own leg, DECLARED at both ends.
+   *
+   * The Q, K and V emissions are the same operator as O, gate, up and down --
+   * a banded half-density coefficient image contracted against a weight whose
+   * two axes are declared channels -- and running them through a raw
+   * `PcmmHandler` instead costs FOUR TIMES the work: `Config::input_density`
+   * skips the dead half of every parent, `output_density` skips the dead half
+   * of every weight operand, and `parents_per_tile` stops repeating a ModPack
+   * per output group. Measured at the model's width, 1.5dd: 228.2 ms per
+   * output ciphertext at tile 4 with neither skip, 49.8 with both at tile 16.
+   *
+   * `w` is indexed `[in_declared][out_declared]` and the leg does the
+   * bit reversal on both axes: module component `i` of parent `p` is declared
+   * input `p * rank + rev(i)`, and module row `r` of group `g` is declared
+   * output `g * rank + rev(r)`. So the caller states the map in the same
+   * declared indices `ModelSlot` and the seam use, and never writes a
+   * reversal of its own.
+   *
+   * @param res one ciphertext per group, at the level a `HalfBoot` takes
+   * @param x the parents, at `Config::product_level`
+   * @param tag the weight-cache name; a repeated tag with different weights is
+   *        a wrong layer that still decrypts
+   */
+  void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
+               int out_declared, const std::vector<double> &w, double w_scale,
+               const char *tag) const;
+
   void AttentionNorm(std::vector<Ct> &res, const std::vector<Ct> &stream,
                      const std::vector<double> &gain, const Calibration &c,
                      const EvkMap<word> &evk);

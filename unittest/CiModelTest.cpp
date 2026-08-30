@@ -116,6 +116,20 @@ int Rev(int v, int bits) {
   return r;
 }
 
+// THE STREAM'S COEFFICIENT POSITION FOR TOKEN `t`, which is the one thing the
+// two halves of this tree had never had to agree on. A PC-MM preserves the
+// coefficient position, and the leg's doorstep (`CiSinCAttention`'s `Door`)
+// puts `rev7(token)` in the slot's low seven bits, so a projection whose input
+// sits at position `p` emits a doorstep whose low seven bits are `rev7(p)`:
+// the leg needs `p = t`. The FFN, the seam and every `CiFfnTest` encode were
+// built on `p = rev7(t)`, which is equally self-consistent -- RMSNorm, SiLU
+// and the projections are all per-token, so nothing there can see a permuted
+// token axis -- and the model layer is the first place where the leg's
+// convention and the seam's output meet. `CHEDDAR_CI_TOKPOS=0` restores the
+// old one, for bisection against the tests that still carry it.
+int g_tok_pos = 1;
+int Pos(int t) { return g_tok_pos != 0 ? t : Rev(t, 7); }
+
 int ModelSlot(int m) { return (m / kPerModel) * kRank + 2 * (m % kPerModel + 1); }
 int HiddenSlot(int j) { return (j / kPerHidden) * kRank + 2 * (j % kPerHidden); }
 
@@ -203,14 +217,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const int num_layers = EnvInt("CHEDDAR_CI_LAYERS", 1);
   const double ride = EnvDouble("CHEDDAR_CI_RIDE", 0.2);
   const bool min_ks = EnvInt("CHEDDAR_CI_MINKS", 0) != 0;
-  // THE PC-MM'S COLUMN IS A MODULE COMPONENT, NOT A DECLARED CHANNEL.
-  // `ModDecomp` sends coefficient `i + rank*p` to position `p` of component
-  // `i`, and stage 1 reads the norm's output correctly at
-  // `Components(co)[Rev(c, 9)][Rev(t, 7)]` -- so component `i` carries
-  // declared channel `Rev(i, 9)` and the weight's column for declared channel
-  // `dc` is `Rev(dc mod rank, 9)`. `CoeffLinearLeg::GatherWeights` does this
-  // for the projections that go through it; a raw `PcmmHandler` does not.
-  const bool kRevCol = EnvInt("CHEDDAR_CI_REVCOL", 1) != 0;
+  g_tok_pos = EnvInt("CHEDDAR_CI_TOKPOS", 1);
   const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
 
   json calib_all;
@@ -246,8 +253,6 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     boot.ui->PrepareRotationKey(req);
   }
 
-  cheddar::MlweHandler<word> mlwe(*boot.param, boot.context->ntt_handler_);
-  cheddar::PcmmHandler<word> pcmm(*boot.param);
   const int pack_aux = boot.ui->PrepareModPackKeys(kSmall, kPcmmLevel,
                                                    /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
@@ -403,7 +408,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       for (int m = k * kPerModel; m < std::min(kH, (k + 1) * kPerModel); m++) {
         const int c = ModelSlot(m) - k * kRank;
         for (int t = 0; t < kT; t++) {
-          comp[Rev(c, 9)][Rev(t, 7)] =
+          comp[Rev(c, 9)][Pos(t)] =
               scale * x[static_cast<size_t>(t) * kH + m];
         }
       }
@@ -439,7 +444,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       const int c = ModelSlot(m) - k * kRank;
       for (int t = 0; t < kT; t++) {
         const double wv = stream_scale * x0[static_cast<size_t>(t) * kH + m];
-        n0 += g0[k][Rev(c, 9)][Rev(t, 7)] * wv;
+        n0 += g0[k][Rev(c, 9)][Pos(t)] * wv;
         d0 += wv * wv;
         m0 = std::max(m0, std::abs(wv));
       }
@@ -450,7 +455,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       const int c = ModelSlot(m) - k * kRank;
       for (int t = 0; t < kT; t++) {
         e0 = std::max(e0,
-                      std::abs(g0[k][Rev(c, 9)][Rev(t, 7)] / f0 -
+                      std::abs(g0[k][Rev(c, 9)][Pos(t)] / f0 -
                                stream_scale * x0[static_cast<size_t>(t) * kH + m]));
       }
     }
@@ -467,6 +472,9 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   for (int L = 0; L < num_layers; L++) {
     const auto t_layer0 = Tick();
     const std::string ld = wdir + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
+    // The weight-cache name. A repeated tag with different weights is a wrong
+    // layer that still decrypts, so it carries the layer index.
+    const std::string tag = "L" + std::to_string(L);
     const json &cj = calib_all["layers"][L];
     std::cout << "\n================ layer " << L << " ================"
               << std::endl;
@@ -564,24 +572,33 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         const int c = ModelSlot(m) - k * kRank;
         for (int t = kSinkTokens; t < kT; t++) {
           const double wv = want[static_cast<size_t>(t) * kH + m];
-          n2 += g2[k][Rev(c, 9)][Rev(t, 7)] * wv;
+          n2 += g2[k][Rev(c, 9)][Pos(t)] * wv;
           d2 += wv * wv;
           mx2 = std::max(mx2, std::abs(wv));
         }
       }
       const double f2 = n2 / d2;
-      double e2 = 0.0;
+      double e2 = 0.0, q2 = 0.0;
       for (int m = 0; m < kH; m++) {
         const int k = m / kPerModel;
         const int c = ModelSlot(m) - k * kRank;
         for (int t = kSinkTokens; t < kT; t++) {
-          e2 = std::max(e2, std::abs(g2[k][Rev(c, 9)][Rev(t, 7)] / f2 -
-                                     want[static_cast<size_t>(t) * kH + m]));
+          const double d = g2[k][Rev(c, 9)][Pos(t)] / f2 -
+                           want[static_cast<size_t>(t) * kH + m];
+          e2 = std::max(e2, std::abs(d));
+          q2 += d * d;
         }
       }
+      // BOTH METRICS, because they say different things. A max over
+      // 126 x 4096 entries against a max reference is dominated by the one
+      // outlier channel at both ends; the rms ratio is what an operator
+      // downstream actually receives, and it is what [SYLPH]'s per-operation
+      // bar is stated against.
       std::cout << "  [stage 1] RMSNorm(attn): " << e2 << " against |.| <= "
                 << mx2 << " (relative " << (e2 / mx2) << " = 2^"
-                << std::log2(e2 / mx2) << "), carried " << f2 << std::endl;
+                << std::log2(e2 / mx2) << ", rms 2^"
+                << 0.5 * std::log2(q2 / d2) << "), carried " << f2
+                << std::endl;
       // AND THE SAME READ WITHOUT THE SCAN. `Components` is an alternating
       // suffix sum, so it mixes the live band with the duplicate band and
       // walks any error the length of the ring. Reading the two bands
@@ -601,13 +618,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
             const int I = Rev(c, 9);
             const int Id = kRank - I;
             for (int t = kSinkTokens; t < kT; t++) {
-              const int p = Rev(t, 7);
+              const int p = Pos(t);
               const double wv = want[static_cast<size_t>(t) * kH + m];
               lo = std::max(lo, std::abs(co[static_cast<size_t>(p) * kRank + I] /
                                              f2 - wv));
-              if (p + 1 < kSmall) {
+              // THE DUPLICATE IS ONE POSITION BELOW, NOT ABOVE.
+              // `rec[p*rank + I] = comp_I[p] + [I!=0] comp_{rank-I}[p+1]`, so
+              // `comp_I[p]` appears a second time at `(p - 1, rank - I)` --
+              // which is exactly where `CiLlamaSeam`'s T2 writes it.
+              if (p >= 1) {
                 du = std::max(
-                    du, std::abs(co[static_cast<size_t>(p + 1) * kRank + Id] /
+                    du, std::abs(co[static_cast<size_t>(p - 1) * kRank + Id] /
                                      f2 - wv));
               }
             }
@@ -619,17 +640,6 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
       if (stop_after == 1) return;
     }
-
-    // ---- Q, K and V: the real PC-MM at full width -------------------------
-    std::vector<cheddar::MlweCiphertext<word>> x_parts;
-    for (int k = 0; k < kNumH; k++) {
-      Ciphertext<word> low;
-      boot_ffn.context->LevelDown(low, normed[k], kPcmmLevel);
-      std::vector<cheddar::MlweCiphertext<word>> parts;
-      mlwe.ModDecomp(parts, low, kSmall);
-      for (auto &p : parts) x_parts.push_back(std::move(p));
-    }
-    ASSERT_EQ(static_cast<int>(x_parts.size()), kDeclaredH);
 
     // The sizing, from the clear model's own maxima: the HalfBoot image bound
     // first, then the cap on the chain-unit score message.
@@ -652,66 +662,72 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const double cv = std::min(1.0, img_max / vmax);
     const double cqk = cq * ck;
 
-    const double w_scale = boot.param->GetRescalePrimeProd(kPcmmLevel);
-    // The projections' declared-index weights. `w[head][chan][declared in]`
-    // is what an emission reads: row `hh*16 + cp` of half `(l, fam)` is head
-    // `fam*16 + hh`, channel `l*16 + cp`. GQA is a weight slice: key/value
-    // head `head / 4`.
-    auto emit = [&](const std::vector<double> &w, int width, double scale,
-                    int l, int fam, Ciphertext<word> &out) {
-      std::vector<double> vals(static_cast<size_t>(kRank) * kDeclaredH, 0.0);
+    // ---- Q, K and V, through the layer's own projection leg ---------------
+    //
+    // THE SAME OPERATOR AS O, GATE, UP AND DOWN. A raw `PcmmHandler` here
+    // contracts 8704 components against 512 output rows where 4352 and 256 are
+    // live and repeats a ModPack per output group -- four times the work
+    // `CoeffLinearLeg` does with `input_density = output_density = 2` and one
+    // tile (1.5dd: 228.2 ms an output ciphertext against 49.8). It also has to
+    // restate the module/declared bit reversal by hand, which is where this
+    // test's own first version went wrong.
+    //
+    // `w[in_declared][out_declared]`, and the leg reverses both axes: module
+    // row `r` of group `g` is declared output `g * rank + rev(r)`. Group
+    // `g = 2*l + fam` is half-image (channel group `l`, heads `16*fam ..`), so
+    // row `hh*16 + cp` carries head `16*fam + hh`, channel `16*l + cp` --
+    // exactly the doorstep `CiSinCAttention` reads. GQA is a weight slice:
+    // key/value head `head / 4`.
+    std::vector<Ciphertext<word>> ins(kNumH);
+    for (int k = 0; k < kNumH; k++) {
+      boot_ffn.context->LevelDown(ins[k], normed[k], kPcmmLevel);
+    }
+    const int kQkvOut = 16 * kRank;
+    auto declare_qkv = [&](const std::vector<double> &w, int width,
+                           std::vector<double> &out) {
+      out.assign(static_cast<size_t>(kDeclaredH) * kQkvOut, 0.0);
       const int heads_w = width / kD;
-      for (int hh = 0; hh < 16; hh++) {
-        for (int cp = 0; cp < 16; cp++) {
-          const int row = hh * 16 + cp;
-          const int head = fam * 16 + hh;
-          const int chan = l * 16 + cp;
-          // GQA IS `head / 4`, NOT `head % 8`. Llama-3-8B has 32 query heads
-          // over 8 key/value heads, and each key/value head serves four
-          // CONSECUTIVE query heads. The modulus reads the right number of
-          // heads and the wrong ones, which is a layer that decrypts and is
-          // wrong -- measured at relative 55.8 with a NEGATIVE fitted factor,
-          // which is what an essentially random reindexing looks like.
-          const int o = (heads_w == kHeads ? head : head / (kHeads / heads_w)) *
-                            kD + chan;
-          for (int c = 0; c < kH; c++) {
-            // THE COLUMN IS A MODULE COMPONENT, NOT A DECLARED CHANNEL, and
-            // the two differ by a bit reversal. `ModDecomp` sends coefficient
-            // `i + rank*t` to position `t` of component `i`, and this stream
-            // was encoded with `comp[Rev(c, 9)][Rev(t, 7)]` because it has to
-            // read correctly in SLOTS -- `SlotToCoeff` sends slot `t + 128 c`
-            // to coefficient `rev7(t) * rank + rev9(c)`. So component `i` of
-            // ciphertext `k` carries declared channel `k * rank + Rev(i, 9)`.
-            // `CoeffLinearLeg::GatherWeights` does this for the projections
-            // that go through it; a raw `PcmmHandler` does not.
-            const int dc = ModelSlot(c);
-            const int k = dc / kRank;
-            const int col_idx =
-                kRevCol ? k * kRank + Rev(dc % kRank, 9) : dc;
-            vals[static_cast<size_t>(row) * kDeclaredH + col_idx] =
-                scale * w[static_cast<size_t>(c) * width + o];
+      for (int g = 0; g < 16; g++) {
+        const int l = g / 2, fam = g % 2;
+        for (int hh = 0; hh < 16; hh++) {
+          for (int cp = 0; cp < 16; cp++) {
+            const int row = hh * 16 + cp;
+            const int head = fam * 16 + hh;
+            const int chan = l * 16 + cp;
+            const int o =
+                (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD +
+                chan;
+            const int oc = g * kRank + Rev(row, 9);
+            for (int c = 0; c < kH; c++) {
+              out[static_cast<size_t>(ModelSlot(c)) * kQkvOut + oc] =
+                  w[static_cast<size_t>(c) * width + o];
+            }
           }
         }
       }
-      cheddar::PlainMatrix<word> u;
-      pcmm.EncodeMatrix(u, kPcmmLevel, w_scale, vals, kRank, kDeclaredH);
-      std::vector<cheddar::MlweCiphertext<word>> mixed;
-      pcmm.Multiply(mixed, u, x_parts);
-      Ciphertext<word> packed, dropped;
-      mlwe.ModPack(boot.context, packed, mixed, pack_keys);
-      boot.context->Rescale(dropped, packed);
-      dropped.SetNumSlots(num_slots);
-      bctx->HalfBoot(out, dropped, boot.ui->GetEvkMap(), min_ks);
     };
 
     std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8), v_b(8);
-    for (int l = 0; l < 8; l++) {
-      emit(wq_f, kH, cq, l, 0, q_a[l]);
-      emit(wq_f, kH, cq, l, 1, q_b[l]);
-      emit(wk_f, kKv, ck, l, 0, k_a[l]);
-      emit(wk_f, kKv, ck, l, 1, k_b[l]);
-      emit(wv_f, kKv, cv, l, 0, v_a[l]);
-      emit(wv_f, kKv, cv, l, 1, v_b[l]);
+    {
+      const char *names[3] = {".q", ".k", ".v"};
+      const std::vector<double> *srcs[3] = {&wq_f, &wk_f, &wv_f};
+      const int widths[3] = {kH, kKv, kKv};
+      const double scales[3] = {cq, ck, cv};
+      std::vector<Ciphertext<word>> *dst[3][2] = {
+          {&q_a, &q_b}, {&k_a, &k_b}, {&v_a, &v_b}};
+      for (int j = 0; j < 3; j++) {
+        std::vector<double> wdec;
+        declare_qkv(*srcs[j], widths[j], wdec);
+        std::vector<Ciphertext<word>> raw;
+        layer.Project(raw, ins, kDeclaredH, kQkvOut, wdec, scales[j],
+                      (tag + names[j]).c_str());
+        ASSERT_EQ(static_cast<int>(raw.size()), 16);
+        for (int g = 0; g < 16; g++) {
+          raw[g].SetNumSlots(num_slots);
+          bctx->HalfBoot((*dst[j][g % 2])[g / 2], raw[g],
+                         boot.ui->GetEvkMap(), min_ks);
+        }
+      }
     }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_proj = Tick();
@@ -773,7 +789,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
       ASSERT_GT(dq, 1e-30) << "the Q reference is zero";
       const double fq = nq / dq;
-      double eq = 0.0;
+      double eq = 0.0, qq = 0.0;
       for (int cp = 0; cp < 16; cp++) {
         for (int hh = 0; hh < 16; hh++) {
           const int head = hh, chan = l * 16 + cp;
@@ -784,13 +800,16 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                    wq_f[static_cast<size_t>(c) * kH + head * kD + chan];
             }
             const int slot = (Rev(cp, 4) << 12) | (Rev(hh, 5) << 7) | Rev(t, 7);
-            eq = std::max(eq, std::abs(sl[slot].real() / fq - cq * q));
+            const double d = sl[slot].real() / fq - cq * q;
+            eq = std::max(eq, std::abs(d));
+            qq += d * d;
           }
         }
       }
       std::cout << "  [stage 1.5] Q half-image 0 at the doorstep: "
-                << (eq / mq) << " = 2^" << std::log2(eq / mq) << ", carried "
-                << fq << " (the crossing is " << crossing << ")" << std::endl;
+                << (eq / mq) << " = 2^" << std::log2(eq / mq) << ", rms 2^"
+                << 0.5 * std::log2(qq / dq) << ", carried " << fq
+                << " (the crossing is " << crossing << ")" << std::endl;
       if (stop_after == 15) return;
     }
 
@@ -888,7 +907,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
             for (int t = kSinkTokens; t < kT; t++) {
               const double wv =
                   cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
-              na += ga[k][Rev(cc, 9)][Rev(t, 7)] * wv;
+              na += ga[k][Rev(cc, 9)][Pos(t)] * wv;
               da += wv * wv;
               ma = std::max(ma, std::abs(wv));
             }
@@ -897,7 +916,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
       ASSERT_GT(da, 1e-20) << "the attention reference is zero";
       o_carried = na / da;
-      double ea = 0.0;
+      double ea = 0.0, qa = 0.0;
       for (int bi = 0; bi < layout.num_cts; bi++) {
         for (int col = 0; col < layout.rank; col++) {
           for (int lane = 0; lane < layout.lanes; lane++) {
@@ -906,17 +925,19 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
             const int head = Rev(lane, 5);
             const int chan = bi * layout.rank + col;
             for (int t = kSinkTokens; t < kT; t++) {
-              ea = std::max(
-                  ea, std::abs(ga[k][Rev(cc, 9)][Rev(t, 7)] / o_carried -
-                               cv * av[static_cast<size_t>(t) * kH +
-                                       head * kD + chan]));
+              const double d =
+                  ga[k][Rev(cc, 9)][Pos(t)] / o_carried -
+                  cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+              ea = std::max(ea, std::abs(d));
+              qa += d * d;
             }
           }
         }
       }
       std::cout << "  [stage 2] the seam's images vs the clear attention: "
-                << (ea / ma) << " = 2^" << std::log2(ea / ma)
-                << ", carried " << o_carried << std::endl;
+                << (ea / ma) << " = 2^" << std::log2(ea / ma) << ", rms 2^"
+                << 0.5 * std::log2(qa / da) << ", carried " << o_carried
+                << std::endl;
       if (stop_after == 2) return;
     }
 
@@ -986,7 +1007,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     lw.up = &wu_dec;
     lw.down = &wd_dec;
     lw.ffn_norm = &fn_dec;
-    lw.tag = "L" + std::to_string(L);
+    lw.tag = tag;
 
     std::vector<Ciphertext<word>> next;
     layer.FeedForward(next, h_cts, stream, lw, cal, boot.ui->GetEvkMap());
@@ -1014,27 +1035,31 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       const int c = ModelSlot(m) - k * kRank;
       for (int t = kSinkTokens; t < kT; t++) {
         const double want = ref[static_cast<size_t>(t) * kH + m];
-        num += got[k][Rev(c, 9)][Rev(t, 7)] * want;
+        num += got[k][Rev(c, 9)][Pos(t)] * want;
         den += want * want;
         absmax = std::max(absmax, std::abs(want));
       }
     }
     ASSERT_GT(den, 1e-12) << "the reference is zero";
     const double fit = num / den;
-    double err = 0.0;
+    double err = 0.0, qerr = 0.0;
     for (int m = 0; m < kH; m++) {
       const int k = m / kPerModel;
       const int c = ModelSlot(m) - k * kRank;
       for (int t = kSinkTokens; t < kT; t++) {
-        const double v = got[k][Rev(c, 9)][Rev(t, 7)] / fit;
-        err = std::max(err, std::abs(v - ref[static_cast<size_t>(t) * kH + m]));
+        const double v = got[k][Rev(c, 9)][Pos(t)] / fit;
+        const double d = v - ref[static_cast<size_t>(t) * kH + m];
+        err = std::max(err, std::abs(d));
+        qerr += d * d;
       }
     }
     const auto bl = bctx->GetBootCounts();
     const auto bf = fctx->GetBootCounts();
     std::cout << "LAYER " << L << ": " << err << " against |h| <= " << absmax
               << " (relative " << (err / absmax) << " = 2^"
-              << std::log2(err / absmax) << "), carried " << fit << std::endl;
+              << std::log2(err / absmax) << ", rms 2^"
+              << 0.5 * std::log2(qerr / den) << "), carried " << fit
+              << std::endl;
     std::cout << "  [boot] leg Context full " << bl.full << ", half "
               << bl.half << " | FFN Context full " << bf.full << ", half "
               << bf.half << " | total " << (bl.Total() + bf.Total())

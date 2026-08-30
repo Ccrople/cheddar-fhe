@@ -60,20 +60,34 @@ namespace cheddar {
  * is a product over the bits it moves, so it falls geometrically per stage
  * while levels rise by one.*
  *
- * **The TOKEN MAP is a bit-reversed decrement, not a slot rotation.** The
- * banded convention is a statement about COEFFICIENT positions -- coefficient
- * `p * rank + I` carries `comp_I[p] + comp_{rank-I}[p+1]` -- and `SlotToCoeff`
- * sends slot `t + 128 c` to coefficient `rev7(t) * 512 + rev9(c)`, so a step of
- * one in `p` is a step of one in `rev7(t)`, NOT in `t`. Shifting by one slot
- * instead reads back through `BandedComponents` at max error 38.56 against
- * `|v| <= 4.16`; `rev7(rev7(t) - 1)` gives exactly zero. A decrement in
- * bit-reversed order is a carry, so it has just 7 distinct offsets.
- *
  * **T2 creates the duplicates**, one block-permutation copy-add on clean
- * slots. **Component zero has no partner**: `rank - 0` wraps to channel 0,
- * which is even and so live, and the banded recomposition excludes `i == 0` --
- * so taking the formula literally writes a duplicate over a live value, and
- * that alone held the live half at 2.54 while T1 was exact at 2.9e-05.
+ * slots, AND carries the token step. **Component zero has no partner**:
+ * `rank - 0` wraps to channel 0, which is even and so live, and the banded
+ * recomposition excludes `i == 0` -- so taking the formula literally writes a
+ * duplicate over a live value, and that alone held the live half at 2.54 while
+ * T1 was exact at 2.9e-05.
+ *
+ * **THE TOKEN REVERSAL is last, and that is what makes the token step free.**
+ * The banded convention is a statement about COEFFICIENT positions --
+ * coefficient `p * rank + I` carries `comp_I[p] + comp_{rank-I}[p+1]` -- and
+ * `SlotToCoeff` sends slot `t + 128 c` to coefficient `rev7(t) * 512 +
+ * rev9(c)`. So an image whose low slot field is the ROW sits at position
+ * `rev7(row)`, which is not what the next projection's consumer needs: a
+ * PC-MM preserves the coefficient position, and `CiSinCAttention`'s doorstep
+ * puts `rev7(token)` in the low seven slot bits, so a projection reading an
+ * image at position `rev7(row)` emits a doorstep at `rev7(rev7(row))` and the
+ * token axis is transposed once per layer. Nothing before the full-width model
+ * test could see it: RMSNorm, SiLU and the projections are per-token, and this
+ * class's own test reads back with whatever convention it writes, so the leg
+ * half of the tree and the FFN half were each self-consistent and disagreed
+ * with each other.
+ *
+ * Reversing the low field AFTER the duplicates are in place costs one level
+ * and 7 diagonals, and it BUYS one: before the reversal a step of one in `p`
+ * is a step of one slot, so the token step is a `+1` inside T2's own offset
+ * and needs no transform of its own. Reversing before instead would need a
+ * fourth T1 stage and leave the token step a seven-diagonal bit-reversed
+ * decrement -- one level worse, for the same map.
  *
  * ## Two things that are derived, not written down
  *
@@ -196,13 +210,13 @@ class CiLlamaSeam {
   int log_proj_rank_ = 0;
   int log_dim_ = 0;
 
-  // The derived ladder. T1's stages sit above the token map, which sits above
-  // T2, which sits two levels above SlotToCoeff.
+  // The derived ladder. T1's stages sit above T2, which sits above the token
+  // reversal, whose output is SlotToCoeff's own level.
+  int rev_level_ = 0;
   int t2_level_ = 0;
-  int tokmap_level_ = 0;
   int t1_top_ = 0;
 
-  Stage t2_, tokmap_;
+  Stage t2_, rev_;
   std::vector<Stage> t1_;
   int prepared_half_ = -1;
 };

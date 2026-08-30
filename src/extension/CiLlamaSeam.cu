@@ -60,18 +60,18 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
   // THE LADDER IS DERIVED FROM StC, NOT WRITTEN DOWN. See the class comment:
   // the same constants were once correct and then silently wrong when the
   // slack moved, and the symptom was coefficients at 4.99e+47.
-  t2_level_ = stc_level + 2;
-  tokmap_level_ = t2_level_ + 1;
-  t1_top_ = tokmap_level_ + static_cast<int>(cfg_.t1_stages.size());
+  rev_level_ = stc_level + 1;
+  t2_level_ = rev_level_ + 1;
+  t1_top_ = t2_level_ + static_cast<int>(cfg_.t1_stages.size());
 
   AssertTrue(t1_top_ <= context_->param_.max_level_,
              "CiLlamaSeam: the seam does not fit above SlotToCoeff at this "
              "slack (needs level " +
                  std::to_string(t1_top_) + " of " +
                  std::to_string(context_->param_.max_level_) + ")");
-  AssertTrue(t2_level_ - 1 > stc_level,
-             "CiLlamaSeam: the seam has to leave the ciphertext above StC's "
-             "level with a rescale to spare");
+  AssertTrue(rev_level_ - 1 >= stc_level,
+             "CiLlamaSeam: the seam has to leave the ciphertext at StC's own "
+             "level");
   // 1.5bt's zone, asserted rather than remembered: a LinearTransform is a
   // hoisted transform and ci16_35 returns 1e25..1e47 below level 7.
   AssertTrue(t2_level_ > 7,
@@ -98,7 +98,12 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
         // Taking the formula literally writes a duplicate over a live value.
         if (I == 0) continue;
         const int cd = Rev(cfg_.proj_rank - I, log_proj_rank_);
-        const int off = ((dim * (c - cd)) % degree_ + degree_) % degree_;
+        // THE TOKEN STEP IS PART OF THIS MAP, and it is a step of ONE because
+        // the reversal below has not happened yet: T1 leaves the token in the
+        // slot's low field in ROW order, so `p - 1` is `row - 1` is a single
+        // slot. The offset is a bijection of `dim * (c - cd)`, so absorbing it
+        // costs no diagonal and saves the level a separate token map took.
+        const int off = ((1 + dim * (c - cd)) % degree_ + degree_) % degree_;
         m2.try_emplace(off, degree_, Complex(0.0, 0.0));
         for (int row = 1; row < dim; row++) {
           m2[off][slot_block(row - 1, cd)] = Complex(1.0, 0.0);
@@ -112,28 +117,39 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
     }
   }
 
-  // ---- the token map: a bit-reversed decrement ---------------------------
+  // ---- the token reversal, which is what closes the loop -----------------
+  //
+  // Everything above leaves the token in the slot's low `log_dim` bits in ROW
+  // order, and `SlotToCoeff` sends slot `t + dim*c` to coefficient
+  // `rev(t) * rank + rev9(c)` -- so that image sits at coefficient position
+  // `rev(row)`. A PC-MM preserves the coefficient position and the leg's
+  // doorstep puts `rev(token)` in the slot's low bits, so the projection that
+  // reads this image emits `rev(rev(row))`: the leg needs position `row`, and
+  // an image at position `rev(row)` transposes the token axis once per layer.
+  // Nothing before this test could see it -- RMSNorm, SiLU and the projections
+  // are per-token, and the seam's own test reads back with whatever convention
+  // it writes -- so the two halves of the tree were each self-consistent and
+  // disagreed with each other.
+  //
+  // Reversing the low field AFTER the duplicates are in place is what makes it
+  // free: the duplicate band moves with the live band, `row -> rev(row)` and
+  // `row - 1 -> rev(row - 1)`, which is exactly the banded relation at
+  // position `row`. Doing it before would cost a fourth T1 stage AND leave the
+  // token step a seven-diagonal bit-reversed decrement.
   {
-    StripedMatrix mt(degree_, degree_);
-    for (int col = 0; col < cols; col++) {
-      for (int lh = 0; lh < lanes_per_half; lh++) {
-        const int c = chan_of(col, lh);
-        for (int t = 0; t < dim; t++) {
-          const int pos = Rev(t, log_dim_);
-          if (pos == 0) continue;  // nothing sits one position below it
-          const int td = Rev(pos - 1, log_dim_);
-          const int dst = slot_block(td, c);
-          const int off = ((slot_block(t, c) - dst) % degree_ + degree_) %
-                          degree_;
-          mt.try_emplace(off, degree_, Complex(0.0, 0.0));
-          mt[off][dst] = Complex(1.0, 0.0);
-        }
+    StripedMatrix mr(degree_, degree_);
+    for (int x = 0; x < dim; x++) {
+      const int y = Rev(x, log_dim_);
+      const int off = ((x - y) % degree_ + degree_) % degree_;
+      mr.try_emplace(off, degree_, Complex(0.0, 0.0));
+      for (int c = 0; c < cfg_.proj_rank; c++) {
+        mr[off][slot_block(y, c)] = Complex(1.0, 0.0);
       }
     }
-    tokmap_ = Compile(mt, tokmap_level_);
+    rev_ = Compile(mr, rev_level_);
     if (cfg_.verbose) {
-      std::cout << "  seam token map: " << mt.GetNumDiag()
-                << " diagonals at level " << tokmap_level_ << std::endl;
+      std::cout << "  seam token reversal: " << mr.GetNumDiag()
+                << " diagonals at level " << rev_level_ << std::endl;
     }
   }
 }
@@ -204,8 +220,8 @@ typename CiLlamaSeam<word>::Stage CiLlamaSeam<word>::Compile(
 
 template <typename word>
 void CiLlamaSeam<word>::AddRequiredRotations(EvkRequest &req) const {
-  tokmap_.transform->AddRequiredRotations(req);
-  req.AddRequest(tokmap_.back, tokmap_level_ - 1);
+  rev_.transform->AddRequiredRotations(req);
+  req.AddRequest(rev_.back, rev_level_ - 1);
   t2_.transform->AddRequiredRotations(req);
   req.AddRequest(t2_.back, t2_level_ - 1);
   // The live half is brought onto the duplicates' level with a constant
@@ -329,17 +345,16 @@ void CiLlamaSeam<word>::Apply(Ct &res, const Ct &booted,
     live = std::move(next);
   }
 
-  // The duplicates come off the TOKEN-SHIFTED image, and the live half is T1's
-  // own output -- the shift belongs to the duplicate band alone.
-  Ct shifted, dup;
-  RunStage(shifted, live, tokmap_, evk);
-  RunStage(dup, shifted, t2_, evk);
+  // The duplicates come off T1's output directly: T2 carries the token step
+  // as well as the channel move, because before the reversal a step of one in
+  // the coefficient position is a step of one slot.
+  Ct dup;
+  RunStage(dup, live, t2_, evk);
 
   const auto &p = context_->param_;
   const int dl = p.NPToLevel(dup.GetNP());
-  // The live half sits two levels above `dup`, because the token map took one;
-  // bring it to `dl + 1` so the constant multiply below lands both at the same
-  // level AND the same scale.
+  // The live half sits one level above `dup`; bring it to `dl + 1` so the
+  // constant multiply below lands both at the same level AND the same scale.
   if (p.NPToLevel(live.GetNP()) != dl + 1) {
     Ct down;
     context_->LevelDown(down, live, dl + 1);
@@ -354,7 +369,12 @@ void CiLlamaSeam<word>::Apply(Ct &res, const Ct &booted,
 
   Ct sum;
   context_->Add(sum, live, dup);
-  sched.ToCoeff(res, sum, evk, min_ks);
+  // And the token axis, last: both bands move together, so the banded relation
+  // that holds at `row`/`row - 1` holds at `rev(row)`/`rev(row - 1)`, which is
+  // the same relation read at coefficient position `row`.
+  Ct flipped;
+  RunStage(flipped, sum, rev_, evk);
+  sched.ToCoeff(res, flipped, evk, min_ks);
 }
 
 template class CiLlamaSeam<uint32_t>;
