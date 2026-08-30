@@ -168,6 +168,29 @@ void CiLlamaLayer<word>::Seam(Ct &res, const Ct &booted,
 }
 
 template <typename word>
+int CiLlamaLayer<word>::SiLuDegree(double range) const {
+  if (cfg_.silu_degree > 0) return cfg_.silu_degree;
+  // Chebyshev's error on an analytic function falls as rho^-degree, where rho
+  // is the Bernstein ellipse the nearest singularity sits on. SiLU is
+  // x*sigmoid(x), whose poles are at x = i*pi*(2k+1), so on [-r, r]
+  //     rho = (pi + sqrt(pi^2 + r^2)) / r
+  // and the degree that reaches a given number of bits is linear in 1/log rho.
+  // Sixteen bits is the target because that is where 1.5cv measured SiLU's
+  // CIRCUIT (2^-15.2 to 2^-16.0 on a fresh encryption at every level), and a
+  // fit below the circuit is a fit that costs nothing. Checked against four
+  // fits computed in double: range 4.46 gives 31 (3.0e-9) and range 18.30
+  // gives 63 (7.2e-5), where the shipped 31 gave 1.69e-2.
+  const double r = std::max(range, 1e-9);
+  const double rho = (M_PI + std::sqrt(M_PI * M_PI + r * r)) / r;
+  const double want = 16.0 * std::log(2.0) / std::log(rho);
+  // The evaluator's tree is a power of two deep, so only 2^k - 1 is free.
+  for (int d : {15, 31, 63}) {
+    if (d >= want) return d;
+  }
+  return 63;
+}
+
+template <typename word>
 int CiLlamaLayer<word>::NormDegree(double window) const {
   if (cfg_.rms_degree > 0) return cfg_.rms_degree;
   // A Chebyshev fit's error is uniform over its interval, so the degree has to
@@ -346,6 +369,14 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
           .count();
   std::vector<Ct> outv;
   rms.Apply(outv, slots, wts, evk);
+  if (cfg_.keep_norm_slots) {
+    // `Ciphertext` is non-copyable on purpose -- it owns device buffers -- so
+    // the diagnostic copy has to go through the library's own.
+    norm_slots_.resize(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->Copy(norm_slots_[k], outv[k]);
+    }
+  }
   res.resize(num_model_cts_);
   for (int k = 0; k < num_model_cts_; k++) {
     sched_.ToCoeff(res[k], outv[k], evk, cfg_.min_ks);
@@ -460,7 +491,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   // ---- SiLU and the gate multiply ----------------------------------------
   std::vector<Ct> prod(num_hidden_cts_);
   {
-    SiLuHandler<word> silu(boot_, c.silu_range, op_level_, cfg_.silu_degree);
+    SiLuHandler<word> silu(boot_, c.silu_range, op_level_,
+                           SiLuDegree(c.silu_range));
     for (int i = 0; i < num_hidden_cts_; i++) {
       Ct g_up, u_up, sv, u_low;
       sched_.ToSlot(g_up, gate[i], evk, cfg_.min_ks);
@@ -470,7 +502,15 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       // -- see the class comment.
       Canonicalise(g_up,
                    1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range));
-      Canonicalise(u_up, 1.0 / (kappa_ * crossing_ * c.gate_scale));
+      if (c.up_sink.empty()) {
+        Canonicalise(u_up, 1.0 / (kappa_ * crossing_ * c.gate_scale));
+      } else {
+        if (i == 0) {
+          up_pt_ = CrossingPlaintext(1.0 / (kappa_ * crossing_ * c.gate_scale),
+                                     c.up_sink, u_up.GetScale());
+        }
+        Canonicalise(u_up, up_pt_);
+      }
       silu.Apply(sv, g_up, evk);
       boot_->LevelDown(u_low, u_up, p.NPToLevel(sv.GetNP()));
       boot_->HMult(prod[i], sv, u_low, evk.GetMultiplicationKey());

@@ -219,6 +219,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const bool min_ks = EnvInt("CHEDDAR_CI_MINKS", 0) != 0;
   g_tok_pos = EnvInt("CHEDDAR_CI_TOKPOS", 1);
   const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
+  const int first_layer = EnvInt("CHEDDAR_CI_FIRST_LAYER", 0);
 
   json calib_all;
   {
@@ -226,11 +227,77 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_TRUE(f.good()) << "cannot open " << rdir << "/calib.json";
     f >> calib_all;
   }
-  ASSERT_GE(static_cast<int>(calib_all["layers"].size()), num_layers);
+  ASSERT_GE(static_cast<int>(calib_all["layers"].size()),
+            first_layer + num_layers);
 
+  // WHERE THE RUN STARTS. Normally the model's own input, but a run can be
+  // begun at any layer from the reference's CLEAN residual stream, which is
+  // the only way to separate a layer's own noise from what it inherited: the
+  // three-layer run lands at 2^-6.45 / 2^-3.05 / 2^-2.92, and a float64
+  // perturbation study (`reference/layer_gain.py`) puts a real layer's gain
+  // on a relative input perturbation at 0.73 to 0.92 -- CONTRACTING -- so the
+  // jump at layer 1 is this pipeline's, not the model's, and it has to be
+  // asked of layer 1 alone.
   std::vector<double> x0;
-  ASSERT_TRUE(ReadF32(wdir + "/input_nosink.f32",
-                      static_cast<size_t>(kT) * kH, x0));
+  if (first_layer > 0) {
+    ASSERT_TRUE(ReadF64(rdir + "/h_L" + (first_layer < 11 ? "0" : "") +
+                            std::to_string(first_layer - 1) + ".f64",
+                        static_cast<size_t>(kT) * kH, x0));
+    std::cout << "STARTING AT LAYER " << first_layer
+              << " from the reference's clean stream" << std::endl;
+  } else {
+    ASSERT_TRUE(ReadF32(wdir + "/input_nosink.f32",
+                        static_cast<size_t>(kT) * kH, x0));
+  }
+
+  // AN A/B ON THE SINKS, AND STAGES 1, 1.5 AND 2 ARE VALID UNDER IT.
+  //
+  // CKKS error is absolute, so a ciphertext's relative precision at an entry
+  // is set by the LARGEST entry it holds -- and from layer 1 on the residual
+  // stream carries 11.07 at its two sink rows against 0.10 to 1.93 at the 126
+  // user rows (`reference/streampeak.py`), because layer 1's feed-forward
+  // output is 194x bigger there (`reference/whererows.py`). [SYLPH] 3.1.1
+  // removes the sink prefix from the encrypted path for exactly this reason;
+  // this tree keeps it at full magnitude and only rescales the norm's
+  // ARGUMENT, so `stream_scale = ride / |stream|_max` is set by rows that are
+  // not the answer and the user tokens ride at `ride / 78`.
+  //
+  // DIVIDING the sink rows by a public factor -- not replacing them -- leaves
+  // every downstream comparison valid without touching the reference, because
+  // RMSNorm is scale invariant PER TOKEN: the norm's output at a sink row is
+  // the true one whatever the row was scaled by, so the sink keys and values
+  // the attention reads are unchanged, and so is every user row. The norm's
+  // own sink rescale absorbs the factor (its argument must not move). The
+  // stream is then sized on its own peak, which is the point: dropping the
+  // sinks without re-riding measures nothing, since every user row keeps
+  // exactly the value it had.
+  //
+  // The LAYER's closing number is NOT valid under this, because `o` and `y`
+  // are not suppressed to match and the residual add would mix conventions.
+  // That is what the mechanism has to fix; this measures whether it is worth
+  // building.
+  double sink_suppress = 1.0;
+  if (EnvInt("CHEDDAR_CI_SINK_SUPPRESS", 0) != 0) {
+    double smax = 0.0, umax = 0.0;
+    for (int t = 0; t < kSinkTokens; t++) {
+      for (int c = 0; c < kH; c++) {
+        smax = std::max(smax, std::abs(x0[static_cast<size_t>(t) * kH + c]));
+      }
+    }
+    for (int t = kSinkTokens; t < kT; t++) {
+      for (int c = 0; c < kH; c++) {
+        umax = std::max(umax, std::abs(x0[static_cast<size_t>(t) * kH + c]));
+      }
+    }
+    sink_suppress = std::max(1.0, smax / std::max(umax, 1e-30));
+    for (int t = 0; t < kSinkTokens; t++) {
+      for (int c = 0; c < kH; c++) {
+        x0[static_cast<size_t>(t) * kH + c] /= sink_suppress;
+      }
+    }
+    std::cout << "SINKS SUPPRESSED by " << sink_suppress << " (they were "
+              << smax << " against the user rows' " << umax << ")" << std::endl;
+  }
 
   // ---- the four rings, one secret -----------------------------------------
   Ring boot(kBootParam);  // the leg: slack zero, the softmax walk needs it
@@ -333,6 +400,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // The ciphertext's epsilon, not the model's; see the calibration below.
   lcfg.eps = 1e-5;   // the MODEL's: the stream factor is divided out first
   lcfg.min_ks = min_ks;
+  // Split the norm from the conversion under it. `[stage 0.5]` puts the
+  // crossing at 2^-18 to 2^-21 while the norm's coefficient read is 2^-9.3,
+  // so ten bits are made between them -- and `SlotToCoeff` is seven hoisted
+  // key-switch layers standing right there.
+  lcfg.keep_norm_slots = EnvInt("CHEDDAR_CI_NORM_SLOTS", 0) != 0;
   lcfg.verbose = true;
   // `stream_scale` is derived below from the reference, but the layer needs
   // the ciphertext's epsilon at construction, so it is computed here.
@@ -393,7 +465,12 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   double x_absmax = 0.0;
   for (double v : x0) x_absmax = std::max(x_absmax, std::abs(v));
   double stream_absmax = x_absmax;
-  for (int L = 0; L < num_layers; L++) {
+  // With the sinks replaced the reference's peaks describe a different
+  // stream, and the RIDE is the whole point: dropping them without raising
+  // the ride leaves every user row at exactly the value it had, so it would
+  // measure nothing. The stream is sized on its own peak instead.
+  const bool sinks_suppressed = sink_suppress != 1.0;
+  for (int L = first_layer; L < first_layer + num_layers && !sinks_suppressed; L++) {
     stream_absmax = std::max(
         stream_absmax, calib_all["layers"][L]["out_absmax"].get<double>());
     stream_absmax = std::max(
@@ -521,7 +598,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << 0.5 * std::log2(q / d) << ", carried " << f
               << " against the message ratio " << crossing << std::endl;
     std::cout << "             ride: the stream reaches "
-              << (stream_scale * in_absmax) << std::endl;
+              << (stream_scale * x_absmax) << std::endl;
     return;
   }
 
@@ -530,7 +607,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   fctx->ResetBootCounts();
   const auto t_run0 = Tick();
 
-  for (int L = 0; L < num_layers; L++) {
+  for (int L = first_layer; L < first_layer + num_layers; L++) {
     const auto t_layer0 = Tick();
     const std::string ld = wdir + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
     // The weight-cache name. A repeated tag with different weights is a wrong
@@ -606,6 +683,27 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         cal.ffn_sink[i] = v[i];
       }
     }
+    // The stream's sink rows were divided by `sink_suppress`, so the norm's
+    // rescale has to multiply it back or the polynomial's argument moves --
+    // and the whole point is that it does not.
+    for (int t = 0; t < kSinkTokens && L == first_layer; t++) {
+      cal.attn_sink[t] *= sink_suppress;
+    }
+    // SUPPRESS THE FEED-FORWARD'S OWN SINK ROWS. `CHEDDAR_CI_SINK_SUPPRESS`
+    // rescales what the layer is HANDED and measured nothing (131x of ride,
+    // 0.001 bits); this rescales what the layer MAKES, which at layer 1 is
+    // 194x bigger at the sinks than at the user rows. The two decide between
+    // the only two models left -- noise made per token, or noise sized by the
+    // ciphertext's largest entry -- and the layer's closing number is on the
+    // user rows either way.
+    const double y_sup = EnvDouble("CHEDDAR_CI_Y_SUPPRESS", 1.0);
+    if (y_sup != 1.0) {
+      cal.up_sink.assign(kT, 1.0);
+      for (int t = 0; t < kSinkTokens; t++) cal.up_sink[t] = 1.0 / y_sup;
+      if (L == first_layer) {
+        std::cout << "THE FFN's SINK ROWS SUPPRESSED by " << y_sup << std::endl;
+      }
+    }
 
     std::vector<double> an_dec(kDeclaredH, 0.0), fn_dec(kDeclaredH, 0.0);
     for (int c = 0; c < kH; c++) {
@@ -634,9 +732,12 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
       // The norm's input is the SINK-RESCALED stream: the factor rides the
       // crossing's own multiply, so the host reference has to carry it too.
+      // `attn_sink` already carries `sink_suppress` where that is in play,
+      // and `hin` is the UNSUPPRESSED reference, so this is the same product.
       for (int t = 0; t < kSinkTokens; t++) {
         for (int c = 0; c < kH; c++) {
-          hin[static_cast<size_t>(t) * kH + c] *= cal.attn_sink[t];
+          hin[static_cast<size_t>(t) * kH + c] *=
+              cal.attn_sink[t] / (L == first_layer ? sink_suppress : 1.0);
         }
       }
       for (int t = 0; t < kT; t++) {
@@ -692,6 +793,45 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                 << std::log2(e2 / mx2) << ", rms 2^"
                 << 0.5 * std::log2(q2 / d2) << "), carried " << f2
                 << std::endl;
+      // AND THE SAME NORM ONE CONVERSION EARLIER, IN SLOTS. Whatever the
+      // difference between this and the coefficient reads below is, it was
+      // made by `SlotToCoeff` and by nothing else.
+      if (!layer.GetNormSlots().empty()) {
+        double n = 0.0, dd = 0.0, mm = 0.0, ee = 0.0, qq = 0.0;
+        std::vector<std::vector<Complex>> sv(kNumH);
+        for (int k = 0; k < kNumH; k++) {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, layer.GetNormSlots()[k]);
+          boot.context->encoder_.Decode(sv[k], pt);
+        }
+        for (int m = 0; m < kH; m++) {
+          const int k = m / kPerModel;
+          const int c = ModelSlot(m) - k * kRank;
+          for (int t = kSinkTokens; t < kT; t++) {
+            const size_t sx = static_cast<size_t>(c) * kT + Rev(Pos(t), 7);
+            const double wv = want[static_cast<size_t>(t) * kH + m];
+            n += sv[k][sx].real() * wv;
+            dd += wv * wv;
+            mm = std::max(mm, std::abs(wv));
+          }
+        }
+        const double ff = n / dd;
+        for (int m = 0; m < kH; m++) {
+          const int k = m / kPerModel;
+          const int c = ModelSlot(m) - k * kRank;
+          for (int t = kSinkTokens; t < kT; t++) {
+            const size_t sx = static_cast<size_t>(c) * kT + Rev(Pos(t), 7);
+            const double dv = sv[k][sx].real() / ff -
+                              want[static_cast<size_t>(t) * kH + m];
+            ee = std::max(ee, std::abs(dv));
+            qq += dv * dv;
+          }
+        }
+        std::cout << "    [stage 1] IN SLOTS, before SlotToCoeff: " << (ee / mm)
+                  << " = 2^" << std::log2(ee / mm) << ", rms 2^"
+                  << 0.5 * std::log2(qq / dd) << ", carried " << ff
+                  << std::endl;
+      }
       // AND THE SAME READ WITHOUT THE SCAN. `Components` is an alternating
       // suffix sum, so it mixes the live band with the duplicate band and
       // walks any error the length of the ring. Reading the two bands
@@ -881,9 +1021,12 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
       // The norm's input is the SINK-RESCALED stream: the factor rides the
       // crossing's own multiply, so the host reference has to carry it too.
+      // `attn_sink` already carries `sink_suppress` where that is in play,
+      // and `hin` is the UNSUPPRESSED reference, so this is the same product.
       for (int t = 0; t < kSinkTokens; t++) {
         for (int c = 0; c < kH; c++) {
-          hin[static_cast<size_t>(t) * kH + c] *= cal.attn_sink[t];
+          hin[static_cast<size_t>(t) * kH + c] *=
+              cal.attn_sink[t] / (L == first_layer ? sink_suppress : 1.0);
         }
       }
       std::vector<double> nrm(static_cast<size_t>(kT) * kH, 0.0);

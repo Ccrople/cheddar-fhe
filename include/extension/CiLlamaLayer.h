@@ -116,7 +116,19 @@ class CiLlamaLayer {
     //! How hot the message rides into HalfBoot. See the class comment: this
     //! is the bottom of a U, not a ceiling to sit under.
     double ride = 0.2;
-    int silu_degree = 31;
+    //! 0 derives SiLU's degree from its RANGE, which is the rule 1.5cw states
+    //! and the tree owed here: a Chebyshev error is uniform in ABSOLUTE terms
+    //! over its interval, so a range set by rows that are not the answer puts
+    //! the whole of it on the rows that are. Layer 1 of Llama-3-8B is the
+    //! model's massive-activation layer and its gate reaches 15.25 at the two
+    //! sink rows against 3.71 at the 126 user rows, so `1.2 * gate_absmax` is
+    //! 18.30 and degree 31 fits SiLU there to 1.69e-2 -- measured in float64,
+    //! that ALONE puts the layer at 2^-2.97 against the encrypted run's
+    //! 2^-3.06, i.e. it is the entire error and every ciphertext stage is
+    //! invisible behind it. Narrowing the range instead is not available: the
+    //! sink gate would sit outside the interval, where a degree-31 Chebyshev
+    //! is cosh(31 arccosh(3.42)) ~ 1e25 and takes the ciphertext with it.
+    int silu_degree = 0;
     //! 0 derives the invsqrt degree from the window, as a Chebyshev fit's
     //! uniform error requires: 9 up to 2.5, 15 up to 12, 31 beyond.
     int rms_degree = 0;
@@ -125,6 +137,12 @@ class CiLlamaLayer {
     bool keep_component_zero = false;
     bool min_ks = false;
     bool verbose = false;
+    //! Keep `RmsNormHandler`'s output in SLOTS, before `SlotToCoeff`, so a
+    //! caller can read it. Diagnostic only: the coefficient read cannot say
+    //! whether an error was made by the norm or by the conversion under it,
+    //! and the two are separated by ten bits of the layer's budget. Costs
+    //! `num_model_cts` ciphertexts of residency while it is on.
+    bool keep_norm_slots = false;
   };
 
   /** @brief One layer's plaintext weights, at the DECLARED widths. */
@@ -195,6 +213,21 @@ class CiLlamaLayer {
     //! cost NO level and no operation -- `Canonicalise` becomes a plaintext
     //! multiply instead of a constant one.
     std::vector<double> attn_sink, ffn_sink;
+
+    //! THE FEED-FORWARD'S OWN SINK ROWS, suppressed by a public per-token
+    //! factor. Layer 1 is the model's massive-activation layer: its
+    //! `down` output is 194x bigger at the two sink rows than at the 126 user
+    //! rows (`reference/whererows.py`), and no rescale of the layer's INPUT
+    //! reaches that, because the layer makes it. The factor folds into the
+    //! `up` crossing's restore multiply, which is a constant multiply already,
+    //! so it costs nothing: `gu = SiLU(g) * (u * s)` and the gate -- the one
+    //! operand SiLU makes non-linear use of -- is untouched, so `y` comes out
+    //! row-scaled exactly.
+    //!
+    //! One entry per token, 1.0 at the user tokens. Empty means no
+    //! suppression. A run that uses it must suppress the residual stream to
+    //! match, or the two conventions meet at the second residual add.
+    std::vector<double> up_sink;
   };
 
   /**
@@ -346,6 +379,9 @@ class CiLlamaLayer {
   //! implies when it is zero.
   int NormDegree(double window) const;
 
+  //! SiLU's degree from its range; see `Config::silu_degree`.
+  int SiLuDegree(double range) const;
+
   //! HalfBoot into slots, canonicalise by the crossing, RMSNorm, and back to
   //! coefficients. The two RMSNorms of a layer differ only in their gains and
   //! their calibration, so they are one function.
@@ -359,6 +395,12 @@ class CiLlamaLayer {
   //! it is a uniform constant, not a mask.
   void Canonicalise(Ct &ct, double factor) const;
 
+ public:
+  //! The last `NormTurn`'s output in SLOTS, empty unless
+  //! `Config::keep_norm_slots`.
+  const std::vector<Ct> &GetNormSlots() const { return norm_slots_; }
+
+ private:
   //! The same multiply with a per-TOKEN factor instead of a scalar, which is
   //! what carries the sink rescale for free. Duplicate-preserving, but NOT by
   //! being uniform across channels: the banded convention puts a channel's
@@ -384,11 +426,16 @@ class CiLlamaLayer {
   SylphSchedule<word> sched_;
   std::unique_ptr<CiLlamaSeam<word>> seam_;
   std::unique_ptr<CoeffLinearLeg<word>> leg_;
+  //! `Config::keep_norm_slots`: the last norm's output before the conversion.
+  mutable std::vector<Ct> norm_slots_;
+
   //! Per-layer operator preparation; see `GetPrepareSeconds`.
   mutable double prepare_seconds_ = 0.0;
   //! The crossing's plaintext when it carries a sink rescale; built once per
   //! `NormTurn` off the first ciphertext's scale.
   Plaintext<word> crossing_pt_;
+  //! The `up` crossing's, when `Calibration::up_sink` is in play.
+  Plaintext<word> up_pt_;
 };
 
 }  // namespace cheddar
