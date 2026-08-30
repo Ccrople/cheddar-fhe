@@ -292,6 +292,26 @@ class CiLlamaLayer {
    * nothing inside a layer amortises it. Like the projection leg's model
    * conversion it belongs beside the weights, not in the online row.
    */
+  /**
+   * @brief The library's OWN compiled inverse square root, in double.
+   *
+   * `CiFfn.TheFitsAloneExplainTheFfnError` capped the feed-forward at 8.95
+   * bits before any ciphertext existed by running it against `PlainInvSqrt`
+   * and `PlainSiLu` (1.5cu). The same question for a layer's RMSNorm needs the
+   * handler built at the LAYER's own level, window and degree, and a caller
+   * that reconstructs those from the outside gets one of them wrong -- the
+   * first attempt passed `max_level_ - 1` for the operator level and the
+   * library answered `GetScale: Invalid level`. So the layer answers it.
+   *
+   * @param alpha the calibration `alpha`, unscaled -- the declared-width
+   *        correction is applied here, exactly as `NormTurn` applies it
+   * @param window the invsqrt window, which fixes the degree
+   * @param mean_square one per token, over the LIVE channels
+   */
+  std::vector<double> PlainNormInvSqrt(
+      double alpha, double window,
+      const std::vector<double> &mean_square) const;
+
   double GetPrepareSeconds() const { return prepare_seconds_; }
   void ResetPrepareTimer() const { prepare_seconds_ = 0.0; }
 

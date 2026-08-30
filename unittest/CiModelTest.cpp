@@ -73,7 +73,6 @@
 #include "core/Pcmm.h"
 #include "extension/CiLlamaLayer.h"
 #include "extension/CiSinCAttention.h"
-#include "extension/RmsNorm.h"
 
 using word = uint32_t;
 using Ring = ringfixture::Ring<word>;
@@ -651,29 +650,24 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       // which capped that test before any ciphertext existed. If the encrypted
       // norm sits at this number the answer is the window and the degree; if
       // it sits well above it, the answer is the circuit and no calibration
-      // will move it. The handler is built with the layer's own parameters.
+      // will move it. The layer answers it, because the handler has to be
+      // built at the layer's own operator level and a caller that reassembles
+      // that from the outside gets it wrong.
       {
-        const double ratio =
-            static_cast<double>(kDeclaredH) / static_cast<double>(kH);
-        cheddar::RmsNormHandler<word> probe(
-            fctx, kT, kDeclaredH, cal.attn_alpha * ratio,
-            boot_ffn.param->max_level_ - 1, 1e-5 / ratio,
-            cal.attn_norm_window,
-            cal.attn_norm_window <= 2.5 ? 9
-                                        : (cal.attn_norm_window <= 12.0 ? 15
-                                                                        : 31),
-            /*channel_stride=*/2);
-        const double root_alpha = std::sqrt(cal.attn_alpha);
-        double q = 0.0, d = 0.0;
-        for (int t = kSinkTokens; t < kT; t++) {
+        std::vector<double> msq(kT, 0.0);
+        for (int t = 0; t < kT; t++) {
           double s2 = 0.0;
           for (int c = 0; c < kH; c++) {
             const double v = hin[static_cast<size_t>(t) * kH + c];
             s2 += v * v;
           }
-          // The circuit's own bracket: the declared width, the scaled epsilon.
-          const double u = cal.attn_alpha * ratio * (s2 / kDeclaredH + 1e-5 / ratio);
-          const double inv = root_alpha * probe.PlainInvSqrt(u);
+          msq[t] = s2 / kH;
+        }
+        const auto invs = layer.PlainNormInvSqrt(
+            cal.attn_alpha, cal.attn_norm_window, msq);
+        double q = 0.0, d = 0.0;
+        for (int t = kSinkTokens; t < kT; t++) {
+          const double inv = invs[t];
           for (int c = 0; c < kH; c++) {
             const double got =
                 hin[static_cast<size_t>(t) * kH + c] * inv * an_f[c];

@@ -290,6 +290,30 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
 }
 
 template <typename word>
+std::vector<double> CiLlamaLayer<word>::PlainNormInvSqrt(
+    double alpha, double window,
+    const std::vector<double> &mean_square) const {
+  const double ratio =
+      static_cast<double>(cfg_.model_declared) / cfg_.model_live;
+  RmsNormHandler<word> probe(boot_, cfg_.num_tokens, cfg_.model_declared,
+                             alpha * ratio, op_level_, cfg_.eps / ratio,
+                             window, NormDegree(window),
+                             /*channel_stride=*/2);
+  // The bracket the circuit evaluates: the DECLARED width and the scaled
+  // epsilon, whose two corrections cancel (see `NormTurn`).
+  const double root = std::sqrt(alpha);
+  std::vector<double> res(mean_square.size());
+  for (size_t i = 0; i < mean_square.size(); i++) {
+    const double u =
+        alpha * ratio *
+        (mean_square[i] * cfg_.model_live / cfg_.model_declared +
+         cfg_.eps / ratio);
+    res[i] = root * probe.PlainInvSqrt(u);
+  }
+  return res;
+}
+
+template <typename word>
 void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
                                  const std::vector<Ct> &x, int in_declared,
                                  int out_declared,
