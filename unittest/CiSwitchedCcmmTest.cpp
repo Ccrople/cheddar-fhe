@@ -170,10 +170,15 @@ CoeffError CoeffDomainError(const std::vector<double> &coeffs,
   int lb = 0, lt = 0;
   while ((1 << lb) < rank) lb++;
   while ((1 << lt) < tokens) lt++;
+  // THE COEFFICIENT POSITION IS THE TOKEN. `CiLlamaSeam` reverses the token
+  // field last, so an image that has been through it -- which is every image
+  // in the layer, the residual stream included -- sits at position `t` and
+  // reads in slots at `channel * tokens + rev(t)`. See 1.5du.
+  (void)lt;
   std::vector<std::vector<double>> cw(rank, std::vector<double>(tokens, 0.0));
   for (int t = 0; t < tokens; t++) {
     for (int c = 0; c < declared; c += 2) {
-      cw[brv(c, lb)][brv(t, lt)] = want[static_cast<size_t>(t) * declared + c];
+      cw[brv(c, lb)][t] = want[static_cast<size_t>(t) * declared + c];
     }
   }
   const auto rec = HostRecompose(cw, rank, tokens);
@@ -9724,7 +9729,7 @@ ledger("before the FFN context");
     for (int t = 0; t < proj_small; t++) {
       for (int c = 0; c < declared; c += 2) {
         const double w = want[static_cast<size_t>(t) * declared + c];
-        num += comp[rev9(c, 9)][rev9(t, 7)] * w;
+        num += comp[rev9(c, 9)][t] * w;
         den += w * w;
         absmax = std::max(absmax, std::abs(w));
       }
@@ -9733,7 +9738,7 @@ ledger("before the FFN context");
     double err = 0.0;
     for (int t = 0; t < proj_small; t++) {
       for (int c = 0; c < declared; c += 2) {
-        const double v = comp[rev9(c, 9)][rev9(t, 7)] / fit;
+        const double v = comp[rev9(c, 9)][t] / fit;
         err = std::max(
             err, std::abs(v - want[static_cast<size_t>(t) * declared + c]));
       }
@@ -9805,7 +9810,7 @@ ledger("before the FFN context");
       for (int c = 0; c < model_declared; c += 2) {
         for (int t = 0; t < proj_small; t++) {
           const double w = h_host[static_cast<size_t>(t) * model_declared + c];
-          num += raw[c * proj_small + t].real() * w;
+          num += raw[c * proj_small + rev(t, 7)].real() * w;
           den += w * w;
         }
       }
@@ -9969,7 +9974,7 @@ ledger("before the FFN context");
           for (int t = 0; t < proj_small; t++) {
             const double w =
                 proj_size * g_host[static_cast<size_t>(t) * hidden_declared + c];
-            num += raw[c * proj_small + t].real() * w;
+            num += raw[c * proj_small + rev(t, 7)].real() * w;
             den += w * w;
             wmx = std::max(wmx, std::abs(w));
           }
@@ -9980,7 +9985,7 @@ ledger("before the FFN context");
             const double w =
                 proj_size * g_host[static_cast<size_t>(t) * hidden_declared + c];
             res = std::max(res,
-                           std::abs(raw[c * proj_small + t].real() - gb * w));
+                           std::abs(raw[c * proj_small + rev(t, 7)].real() - gb * w));
           }
         }
         std::cout << "  the GATE's crossing constant " << gb
@@ -10015,7 +10020,7 @@ ledger("before the FFN context");
             const double g =
                 g_host[static_cast<size_t>(t) * hidden_declared + c];
             const double w = g / (1.0 + std::exp(-g));
-            num += raw[c * proj_small + t].real() * w;
+            num += raw[c * proj_small + rev(t, 7)].real() * w;
             den += w * w;
             mx = std::max(mx, std::abs(w));
           }
@@ -10028,7 +10033,7 @@ ledger("before the FFN context");
                 g_host[static_cast<size_t>(t) * hidden_declared + c];
             const double w = g / (1.0 + std::exp(-g));
             err = std::max(err,
-                           std::abs(raw[c * proj_small + t].real() / fit - w));
+                           std::abs(raw[c * proj_small + rev(t, 7)].real() / fit - w));
           }
         }
         std::cout << "  SiLU(gate) in slots: carried " << fit << ", relative "
