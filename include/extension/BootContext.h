@@ -48,6 +48,14 @@ class BootContext : public Context<word>,
   double stc_const_;
   double message_ratio_;
 
+  // Mutable because counting a crossing does not change what the Context
+  // means, and every crossing entry point is const.
+  mutable struct BootCountsStore {
+    int64_t full = 0;
+    int64_t half = 0;
+    int64_t pair = 0;
+  } counts_;
+
   DeviceVector<word> mod_max_intt_const_;
 
   std::map<int, EvalSpecialFFT<word>> eval_fft_;
@@ -381,6 +389,35 @@ class BootContext : public Context<word>,
   void AddRequiredSinCPrefixRotations(EvkRequest &req, int num_slots) const;
   void SinCPrefix(Ct &res, int num_slots, const Ct &input,
                   const EvkMap<word> &evk_map) const;
+
+  /**
+   * @brief How many times each crossing has run since the last reset.
+   *
+   * ## Why the library counts, and not the caller
+   *
+   * A bootstrap is the unit this pipeline is priced in. [SYLPH] Table 6 has
+   * no bootstrap row because its crossings are folded into the projection
+   * rows, and the only way to compare is to count: the paper's own shapes put
+   * a layer at 12 + 8 + 56 + 8 = **84** crossings while this leg's half
+   * density puts it at **170** (Doing.md 1.5dj/1.5cr). A count taken by the
+   * caller is a count of the calls it remembered to instrument; a count taken
+   * here is a count of the crossings that happened.
+   *
+   * `pair` counts `HalfBootPair` and `HalfBootSplit`, which cross TWO
+   * payloads for one EvalMod -- the merge of 2026-08-27 -- so `half + 2*pair`
+   * is the number of payloads that crossed by a half bootstrap.
+   */
+  struct BootCounts {
+    int64_t full = 0;  //!< `Boot`
+    int64_t half = 0;  //!< `HalfBoot`
+    int64_t pair = 0;  //!< `HalfBootPair` / `HalfBootSplit`
+    int64_t Total() const { return full + half + pair; }
+  };
+
+  BootCounts GetBootCounts() const {
+    return BootCounts{counts_.full, counts_.half, counts_.pair};
+  }
+  void ResetBootCounts() const { counts_ = BootCountsStore{}; }
 
   void Boot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
             bool min_ks = false) const;

@@ -59,12 +59,23 @@ CiLlamaLayer<word>::CiLlamaLayer(
   num_slots_ = boot_->param_.MaxNumSlots();
   attn_channels_ = 2 * layout.num_cts * cfg_.proj_rank;
 
-  AssertTrue(cfg_.model_declared == cfg_.proj_rank,
-             "CiLlamaLayer: the residual stream is one half-density "
-             "ciphertext, so its declared width is the projection rank");
-  AssertTrue(cfg_.hidden_declared % cfg_.proj_rank == 0,
-             "CiLlamaLayer: the FFN's declared width must be a whole number "
-             "of ciphertexts");
+  AssertTrue(cfg_.model_declared % cfg_.proj_rank == 0 &&
+                 cfg_.hidden_declared % cfg_.proj_rank == 0,
+             "CiLlamaLayer: both declared widths must be a whole number of "
+             "half-density ciphertexts");
+  num_model_cts_ = cfg_.model_declared / cfg_.proj_rank;
+  num_hidden_cts_ = cfg_.hidden_declared / cfg_.proj_rank;
+  // A half-density ciphertext carries `rank/2 - 1` live model channels --
+  // component zero has no partner -- and `rank/2` hidden ones, because
+  // nothing reduces over the hidden axis. Seventeen of the first hold Llama's
+  // 4096; sixteen do not.
+  AssertTrue(num_model_cts_ * (cfg_.proj_rank / 2 - 1) >= cfg_.model_live,
+             "CiLlamaLayer: " + std::to_string(num_model_cts_) +
+                 " half-density ciphertexts carry " +
+                 std::to_string(num_model_cts_ * (cfg_.proj_rank / 2 - 1)) +
+                 " live model channels, short of " +
+                 std::to_string(cfg_.model_live) +
+                 " -- component zero has no partner");
 
   // THE CROSSING CONSTANT IS DERIVED, NOT FITTED. `HalfBoot` multiplies the
   // message by `level_zero_scale / q0` and `BootContext` computes both halves
@@ -144,6 +155,16 @@ void CiLlamaLayer<word>::Seam(Ct &res, const Ct &booted,
 }
 
 template <typename word>
+int CiLlamaLayer<word>::NormDegree(double window) const {
+  if (cfg_.rms_degree > 0) return cfg_.rms_degree;
+  // A Chebyshev fit's error is uniform over its interval, so the degree has to
+  // follow the window rather than be typed beside it.
+  if (window <= 2.5) return 9;
+  if (window <= 12.0) return 15;
+  return 31;
+}
+
+template <typename word>
 std::vector<std::vector<Complex>> CiLlamaLayer<word>::NormWeights(
     const std::vector<double> &gain, double alpha) const {
   const int rank = cfg_.proj_rank;
@@ -152,17 +173,21 @@ std::vector<std::vector<Complex>> CiLlamaLayer<word>::NormWeights(
   (void)log_t;
   const double root_alpha = std::sqrt(alpha);
 
-  std::vector<std::vector<Complex>> wts(1);
-  wts[0].assign(num_slots_, Complex(0.0, 0.0));
-  for (int c = 0; c < cfg_.model_declared; c++) {
-    const int I = Rev(c, log_rank);
-    // AT AN ODD DECLARED CHANNEL THE WEIGHT IS THE PARTNER'S. The duplicate
-    // band at channel `c` (odd) holds component `rank - I`, whose live
-    // address is `Rev(rank - I)`; the reduction at `channel_stride = 2` sums
-    // the two parities apart, so it must see the same gain at both.
-    const int src = (c % 2 == 0) ? c : Rev(rank - I, log_rank);
-    for (int t = 0; t < cfg_.num_tokens; t++) {
-      wts[0][c * cfg_.num_tokens + t] = Complex(gain[src] * root_alpha, 0.0);
+  std::vector<std::vector<Complex>> wts(num_model_cts_);
+  for (int k = 0; k < num_model_cts_; k++) {
+    wts[k].assign(num_slots_, Complex(0.0, 0.0));
+    for (int c = 0; c < rank; c++) {
+      const int I = Rev(c, log_rank);
+      // AT AN ODD DECLARED CHANNEL THE WEIGHT IS THE PARTNER'S. The duplicate
+      // band at channel `c` (odd) holds component `rank - I`, whose live
+      // address is `Rev(rank - I)`; the reduction at `channel_stride = 2` sums
+      // the two parities apart, so it must see the same gain at both.
+      const int src = (c % 2 == 0) ? c : Rev(rank - I, log_rank);
+      const double v = gain[static_cast<size_t>(k) * rank + src];
+      for (int t = 0; t < cfg_.num_tokens; t++) {
+        wts[k][static_cast<size_t>(c) * cfg_.num_tokens + t] =
+            Complex(v * root_alpha, 0.0);
+      }
     }
   }
   return wts;
@@ -181,9 +206,10 @@ void CiLlamaLayer<word>::Canonicalise(Ct &ct, double factor) const {
 }
 
 template <typename word>
-void CiLlamaLayer<word>::FeedForward(Ct &res, const std::vector<Ct> &h_cts,
-                                     const Ct &stream, const Weights &w,
-                                     const Calibration &c,
+void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
+                                     const std::vector<Ct> &h_cts,
+                                     const std::vector<Ct> &stream,
+                                     const Weights &w, const Calibration &c,
                                      const EvkMap<word> &evk) {
   AssertTrue(w.o != nullptr && w.gate != nullptr && w.up != nullptr &&
                  w.down != nullptr && w.ffn_norm != nullptr,
@@ -195,12 +221,14 @@ void CiLlamaLayer<word>::FeedForward(Ct &res, const std::vector<Ct> &h_cts,
   AssertTrue(static_cast<int>(h_cts.size()) * cfg_.proj_rank == attn_channels_,
              "CiLlamaLayer: the seam did not hand over the whole attention "
              "output");
+  AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
+             "CiLlamaLayer: the residual stream is " +
+                 std::to_string(num_model_cts_) + " ciphertexts");
 
   const auto &p = boot_->param_;
-  const int hidden_cts = cfg_.hidden_declared / cfg_.proj_rank;
 
-  // ---- the O projection --------------------------------------------------
-  Ct o_out;
+  // ---- the O projection, then the residual -------------------------------
+  std::vector<Ct> h_ct(num_model_cts_);
   {
     std::vector<Ct> ins(h_cts.size());
     for (size_t k = 0; k < h_cts.size(); k++) {
@@ -209,67 +237,78 @@ void CiLlamaLayer<word>::FeedForward(Ct &res, const std::vector<Ct> &h_cts,
     std::vector<Ct> out;
     leg_->Project(out, ins, attn_channels_, cfg_.model_declared, *w.o,
                   c.res_scale, (w.tag + ".o").c_str());
-    AssertTrue(out.size() == 1,
-               "CiLlamaLayer: the O projection must land in one ciphertext");
-    o_out = std::move(out[0]);
+    AssertTrue(static_cast<int>(out.size()) == num_model_cts_,
+               "CiLlamaLayer: the O projection did not land in " +
+                   std::to_string(num_model_cts_) + " ciphertexts");
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->Add(h_ct[k], stream[k], out[k]);
+    }
   }
 
-  // ---- the residual ------------------------------------------------------
-  Ct h_ct;
-  boot_->Add(h_ct, stream, o_out);
-
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
-  Ct normed;
+  std::vector<Ct> normed(num_model_cts_);
   {
-    Ct up;
-    sched_.ToSlot(up, h_ct, evk, cfg_.min_ks);
-    // The residual carries the O projection's own factor at BOTH ends -- the
-    // stream was encrypted with it and the O output already has it -- so what
-    // has to be divided out here is the crossing alone. Using a fit measured
-    // on this ciphertext instead would be right here and wrong at the gate's
-    // crossing, which carries no such factor (1.5cu).
-    Canonicalise(up, 1.0 / crossing_);
+    std::vector<Ct> slots(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      sched_.ToSlot(slots[k], h_ct[k], evk, cfg_.min_ks);
+      // The residual carries the O projection's own factor at BOTH ends -- the
+      // stream was encrypted with it and the O output already has it -- so
+      // what is divided out here is the crossing ALONE. A fit measured on this
+      // ciphertext instead would be right here and wrong at the gate's
+      // crossing, which carries no such factor (1.5cu).
+      Canonicalise(slots[k], 1.0 / crossing_);
+    }
 
+    // RMSNorm DIVIDES BY THE WIDTH IT IS TOLD, and that is the declared one.
+    // Llama divides by `model_live`, so the two scalings below cancel exactly:
+    // `eps * live / declared` makes the bracket `(live/declared)(S/live + eps)`
+    // and `alpha * declared / live` puts its geometric mean back at 1. The
+    // leftover `sqrt(declared/live)` is taken out by the weight, which already
+    // carries `sqrt(alpha)`.
+    const double ratio =
+        static_cast<double>(cfg_.model_declared) / cfg_.model_live;
     RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
-                             c.alpha, op_level_, 1e-5, c.norm_window,
-                             cfg_.rms_degree, /*channel_stride=*/2);
-    AssertTrue(rms.GetNumCiphertexts() == 1,
-               "CiLlamaLayer: the residual stream is one ciphertext");
+                             c.alpha * ratio, op_level_, cfg_.eps / ratio,
+                             c.norm_window, NormDegree(c.norm_window),
+                             /*channel_stride=*/2);
+    AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
+               "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
     const auto wts = NormWeights(*w.ffn_norm, c.alpha);
-    std::vector<Ct> in(1), outv;
-    in[0] = std::move(up);
-    rms.Apply(outv, in, wts, evk);
-    sched_.ToCoeff(normed, outv[0], evk, cfg_.min_ks);
+    std::vector<Ct> outv;
+    rms.Apply(outv, slots, wts, evk);
+    for (int k = 0; k < num_model_cts_; k++) {
+      sched_.ToCoeff(normed[k], outv[k], evk, cfg_.min_ks);
+    }
   }
 
   // ---- gate and up -------------------------------------------------------
   std::vector<Ct> gate, upv;
   {
-    Ct low;
-    boot_->LevelDown(low, normed, cfg_.product_level);
-    std::vector<Ct> ins(1);
-    ins[0] = std::move(low);
+    std::vector<Ct> ins(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->LevelDown(ins[k], normed[k], cfg_.product_level);
+    }
     leg_->Project(gate, ins, cfg_.model_declared, cfg_.hidden_declared,
                   *w.gate, c.gate_scale, (w.tag + ".gate").c_str());
     leg_->Project(upv, ins, cfg_.model_declared, cfg_.hidden_declared, *w.up,
                   c.gate_scale, (w.tag + ".up").c_str());
   }
-  AssertTrue(static_cast<int>(gate.size()) == hidden_cts &&
-                 static_cast<int>(upv.size()) == hidden_cts,
-             "CiLlamaLayer: the gate and up projections did not land in the "
-             "expected number of ciphertexts");
+  AssertTrue(static_cast<int>(gate.size()) == num_hidden_cts_ &&
+                 static_cast<int>(upv.size()) == num_hidden_cts_,
+             "CiLlamaLayer: the gate and up projections did not land in " +
+                 std::to_string(num_hidden_cts_) + " ciphertexts");
 
   // ---- SiLU and the gate multiply ----------------------------------------
-  std::vector<Ct> prod(hidden_cts);
+  std::vector<Ct> prod(num_hidden_cts_);
   {
     SiLuHandler<word> silu(boot_, c.silu_range, op_level_, cfg_.silu_degree);
-    for (int i = 0; i < hidden_cts; i++) {
+    for (int i = 0; i < num_hidden_cts_; i++) {
       Ct g_up, u_up, sv, u_low;
       sched_.ToSlot(g_up, gate[i], evk, cfg_.min_ks);
       sched_.ToSlot(u_up, upv[i], evk, cfg_.min_ks);
-      // `crossing_`, NOT a fit taken on the residual: these carry no O
-      // factor. And `kappa_` beside it, which is the same mistake one turn
-      // further out -- see the class comment.
+      // `crossing_`, NOT a fit taken on the residual: these carry no O factor.
+      // And `kappa_` beside it, which is the same mistake one turn further out
+      // -- see the class comment.
       Canonicalise(g_up,
                    1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range));
       Canonicalise(u_up, 1.0 / (kappa_ * crossing_ * c.gate_scale));
@@ -281,19 +320,17 @@ void CiLlamaLayer<word>::FeedForward(Ct &res, const std::vector<Ct> &h_cts,
 
   // ---- the down projection ------------------------------------------------
   {
-    std::vector<Ct> ins(hidden_cts);
-    for (int i = 0; i < hidden_cts; i++) {
+    std::vector<Ct> ins(num_hidden_cts_);
+    for (int i = 0; i < num_hidden_cts_; i++) {
       Ct c2;
       sched_.ToCoeff(c2, prod[i], evk, cfg_.min_ks);
       boot_->LevelDown(ins[i], c2, cfg_.product_level);
     }
-    std::vector<Ct> out;
-    leg_->Project(out, ins, cfg_.hidden_declared, cfg_.model_declared, *w.down,
+    leg_->Project(res, ins, cfg_.hidden_declared, cfg_.model_declared, *w.down,
                   1.0, (w.tag + ".down").c_str());
-    AssertTrue(out.size() == 1,
-               "CiLlamaLayer: the down projection must land in one "
-               "ciphertext");
-    res = std::move(out[0]);
+    AssertTrue(static_cast<int>(res.size()) == num_model_cts_,
+               "CiLlamaLayer: the down projection did not land in " +
+                   std::to_string(num_model_cts_) + " ciphertexts");
   }
 }
 

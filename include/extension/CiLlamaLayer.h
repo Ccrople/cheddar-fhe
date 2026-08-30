@@ -98,8 +98,16 @@ class CiLlamaLayer {
     //! dimension. Declared, not live: half density means a ciphertext carries
     //! `proj_rank / 2 - 1` live model channels and `proj_rank / 2` hidden
     //! ones, because nothing reduces over the hidden axis.
-    int model_declared = 512;
-    int hidden_declared = 1024;
+    int model_declared = 8704;
+    int hidden_declared = 28672;
+    //! The model's own channel count, which is NOT the declared one. RMSNorm
+    //! divides by the width it is told and Llama divides by 4096, so feeding
+    //! it 8704 puts the polynomial's argument at 0.47 instead of 1 and the
+    //! bottom sixth of the data outside the fitted window -- 1.5cv's silent
+    //! failure, measured at 2^-5.09. Both halves cancel exactly when `eps` and
+    //! `alpha` are scaled by the ratio, which is what `FeedForward` does.
+    int model_live = 4096;
+    double eps = 1e-5;
     int product_level = 1;
     //! Input ciphertexts decomposed at once, on the direct route. Sixteen
     //! parents at rank 512 and five limbs is 10.7 GB standing at once; four
@@ -109,7 +117,9 @@ class CiLlamaLayer {
     //! is the bottom of a U, not a ceiling to sit under.
     double ride = 0.2;
     int silu_degree = 31;
-    int rms_degree = 9;
+    //! 0 derives the invsqrt degree from the window, as a Chebyshev fit's
+    //! uniform error requires: 9 up to 2.5, 15 up to 12, 31 beyond.
+    int rms_degree = 0;
     //! Leave channel zero of the model dimension empty. See the class
     //! comment; false is the wrong contract and exists only to reproduce it.
     bool keep_component_zero = false;
@@ -189,16 +199,17 @@ class CiLlamaLayer {
   /**
    * @brief The O projection, the residual, and the whole feed-forward network.
    *
-   * @param res the next residual stream, half-density coefficients at level 0
+   * @param res the next residual stream, `model_declared / proj_rank`
+   *        half-density coefficient ciphertexts at level 0
    * @param h_cts the seam's `2 * num_cts` half-density images
    * @param stream the residual stream coming in, at level 0, already carrying
    *        whatever factor the O projection's output will carry
    * @param w this layer's weights
    * @param c this layer's calibration
    */
-  void FeedForward(Ct &res, const std::vector<Ct> &h_cts, const Ct &stream,
-                   const Weights &w, const Calibration &c,
-                   const EvkMap<word> &evk);
+  void FeedForward(std::vector<Ct> &res, const std::vector<Ct> &h_cts,
+                   const std::vector<Ct> &stream, const Weights &w,
+                   const Calibration &c, const EvkMap<word> &evk);
 
   //! The crossing constant, derived from the BootParameter (1.5dk).
   double GetCrossing() const { return crossing_; }
@@ -217,6 +228,10 @@ class CiLlamaLayer {
   std::vector<std::vector<Complex>> NormWeights(const std::vector<double> &gain,
                                                 double alpha) const;
 
+  //! The invsqrt degree `Config::rms_degree` asks for, or the one the window
+  //! implies when it is zero.
+  int NormDegree(double window) const;
+
   //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
   //! result canonical one level below. Duplicate-preserving by construction:
   //! it is a uniform constant, not a mask.
@@ -226,6 +241,8 @@ class CiLlamaLayer {
   Config cfg_;
   int num_slots_ = 0;
   int attn_channels_ = 0;
+  int num_model_cts_ = 0;
+  int num_hidden_cts_ = 0;
   double crossing_ = 0.0;
   double kappa_ = 1.0;
   int slot_level_ = 0;

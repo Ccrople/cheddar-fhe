@@ -517,6 +517,7 @@ template <typename word>
 void BootContext<word>::HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
                                      const Ct &hi, const EvkMap<word> &evk_map,
                                      bool min_ks) const {
+  counts_.pair++;
   AssertTrue(!this->param_.conjugate_invariant_,
              "HalfBootPair: the real subring's CtS lands real slots, so there "
              "is no second axis to fill and no pair to make");
@@ -558,6 +559,7 @@ template <typename word>
 void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
                                       const EvkMap<word> &evk_map,
                                       bool min_ks) const {
+  counts_.pair++;
   AssertTrue(!this->param_.conjugate_invariant_,
              "HalfBootSplit: the real subring's CtS lands real slots, so there "
              "is no second axis to split");
@@ -600,6 +602,7 @@ void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
 template <typename word>
 void BootContext<word>::Boot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
+  counts_.full++;
   int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
   int num_slots = GetBootEnabledNumSlots(input_num_slots);
@@ -688,6 +691,7 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
 template <typename word>
 void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
+  counts_.half++;
   int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
   int num_slots = GetBootEnabledNumSlots(input_num_slots);
