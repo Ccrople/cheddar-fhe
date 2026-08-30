@@ -536,6 +536,41 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       std::cout << "  [stage 1] RMSNorm(attn): " << e2 << " against |.| <= "
                 << mx2 << " (relative " << (e2 / mx2) << " = 2^"
                 << std::log2(e2 / mx2) << "), carried " << f2 << std::endl;
+      // AND THE SAME READ WITHOUT THE SCAN. `Components` is an alternating
+      // suffix sum, so it mixes the live band with the duplicate band and
+      // walks any error the length of the ring. Reading the two bands
+      // straight out of the coefficients says which one is wrong -- and the
+      // duplicates are not decoration here, they are what makes the image
+      // correctly banded for the next `ModDecomp` (1.5cs).
+      {
+        double lo = 0.0, du = 0.0;
+        for (int k = 0; k < kNumH; k++) {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, normed[k]);
+          std::vector<double> co;
+          boot_ffn.context->encoder_.DecodeCoeff(co, pt);
+          for (int m = k * kPerModel;
+               m < std::min(kH, (k + 1) * kPerModel); m++) {
+            const int c = ModelSlot(m) - k * kRank;
+            const int I = Rev(c, 9);
+            const int Id = kRank - I;
+            for (int t = kSinkTokens; t < kT; t++) {
+              const int p = Rev(t, 7);
+              const double wv = want[static_cast<size_t>(t) * kH + m];
+              lo = std::max(lo, std::abs(co[static_cast<size_t>(p) * kRank + I] /
+                                             f2 - wv));
+              if (p + 1 < kSmall) {
+                du = std::max(
+                    du, std::abs(co[static_cast<size_t>(p + 1) * kRank + Id] /
+                                     f2 - wv));
+              }
+            }
+          }
+        }
+        std::cout << "    [stage 1] without the scan: live " << (lo / mx2)
+                  << " = 2^" << std::log2(lo / mx2) << ", duplicate "
+                  << (du / mx2) << " = 2^" << std::log2(du / mx2) << std::endl;
+      }
       if (stop_after == 1) return;
     }
 
