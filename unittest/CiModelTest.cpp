@@ -379,7 +379,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       for (int c = 0; c < kH; c++) x[static_cast<size_t>(t) * kH + c] *= f;
     }
   };
-  rescale_sinks(x0);
+  // NOT HERE ANY MORE. Layer 0's `attn_sink` does it at the crossing, exactly
+  // as every other layer's does, so the stream this test encrypts is the raw
+  // model quantity and the rescale happens in one place. Doing both applies
+  // the factor twice.
+  (void)rescale_sinks;
 
   // ONE FACTOR FOR THE WHOLE RUN, sized on the largest residual any layer
   // reaches. The residual add forces the stream and the two projections that
@@ -464,6 +468,63 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     if (stop_after == -1) return;
   }
 
+  // ---- STAGE 0.5: THE CROSSING, ALONE AND AT THE MODEL'S OWN WIDTH ---------
+  //
+  // Doing.md 1.5cs measured RMSNorm at 2^-10.78 through a crossing against
+  // 2^-13.47 with no bootstrap in front of it, showed the gap does not move
+  // across 3.85 bits of bootstrap precision (`ci16_40` against `ci16_35`),
+  // called it deterministic and left it unattributed. This asks the crossing
+  // the question directly: HalfBoot the stream that stage 0 just verified at
+  // 2^-21 and read it back in SLOTS, fitting one global factor. Nothing at
+  // all is between the two reads, so what this prints is the crossing's own
+  // error on this data at this ride -- and the norm's 2^-9.3 is either
+  // explained by it or is not.
+  //
+  // The slot address is the one the whole branch runs on: a coefficient at
+  // (position p, component I) is slot `Rev(I, 9) * num_tokens + Rev(p, 7)`,
+  // and `Pos(t)` is the position convention of 1.5du.
+  if (EnvInt("CHEDDAR_CI_CROSSING_PROBE", 0) != 0) {
+    std::vector<std::vector<Complex>> sl(kNumH);
+    for (int k = 0; k < kNumH; k++) {
+      Ciphertext<word> cx;
+      bctx->HalfBoot(cx, stream[k], boot.ui->GetEvkMap(), min_ks);
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, cx);
+      boot.context->encoder_.Decode(sl[k], pt);
+    }
+    double n = 0.0, d = 0.0, mx = 0.0, e = 0.0, q = 0.0;
+    for (int m = 0; m < kH; m++) {
+      const int k = m / kPerModel;
+      const int c = ModelSlot(m) - k * kRank;
+      for (int t = 0; t < kT; t++) {
+        const size_t sx = static_cast<size_t>(c) * kT + Rev(Pos(t), 7);
+        const double wv = stream_scale * x0[static_cast<size_t>(t) * kH + m];
+        n += sl[k][sx].real() * wv;
+        d += wv * wv;
+        mx = std::max(mx, std::abs(wv));
+      }
+    }
+    const double f = n / d;
+    for (int m = 0; m < kH; m++) {
+      const int k = m / kPerModel;
+      const int c = ModelSlot(m) - k * kRank;
+      for (int t = 0; t < kT; t++) {
+        const size_t sx = static_cast<size_t>(c) * kT + Rev(Pos(t), 7);
+        const double dv = sl[k][sx].real() / f -
+                          stream_scale * x0[static_cast<size_t>(t) * kH + m];
+        e = std::max(e, std::abs(dv));
+        q += dv * dv;
+      }
+    }
+    std::cout << "  [stage 0.5] the crossing ALONE, in slots: " << (e / mx)
+              << " = 2^" << std::log2(e / mx) << ", rms 2^"
+              << 0.5 * std::log2(q / d) << ", carried " << f
+              << " against the message ratio " << crossing << std::endl;
+    std::cout << "             ride: the stream reaches "
+              << (stream_scale * in_absmax) << std::endl;
+    return;
+  }
+
   // ---- the layers ----------------------------------------------------------
   bctx->ResetBootCounts();
   fctx->ResetBootCounts();
@@ -527,6 +588,24 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
     cal.stream_scale = stream_scale;
+    // [SYLPH] 3.1.1, at BOTH norms. Without it a 32-layer run dies at layer 1:
+    // the sink rows leave layer 1 at 74327x the user rows' mean square and the
+    // invsqrt is handed an argument no window contains (measured: relative
+    // 94.5, `carried 1693` against a stream scale of 0.019).
+    cal.attn_sink.assign(kT, 1.0);
+    cal.ffn_sink.assign(kT, 1.0);
+    if (cj.contains("attn_sink")) {
+      const auto v = cj["attn_sink"].get<std::vector<double>>();
+      for (size_t i = 0; i < v.size() && i < cal.attn_sink.size(); i++) {
+        cal.attn_sink[i] = v[i];
+      }
+    }
+    if (cj.contains("ffn_sink")) {
+      const auto v = cj["ffn_sink"].get<std::vector<double>>();
+      for (size_t i = 0; i < v.size() && i < cal.ffn_sink.size(); i++) {
+        cal.ffn_sink[i] = v[i];
+      }
+    }
 
     std::vector<double> an_dec(kDeclaredH, 0.0), fn_dec(kDeclaredH, 0.0);
     for (int c = 0; c < kH; c++) {
@@ -552,6 +631,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         ASSERT_TRUE(ReadF64(rdir + "/h_L" + (L < 11 ? "0" : "") +
                                 std::to_string(L - 1) + ".f64",
                             static_cast<size_t>(kT) * kH, hin));
+      }
+      // The norm's input is the SINK-RESCALED stream: the factor rides the
+      // crossing's own multiply, so the host reference has to carry it too.
+      for (int t = 0; t < kSinkTokens; t++) {
+        for (int c = 0; c < kH; c++) {
+          hin[static_cast<size_t>(t) * kH + c] *= cal.attn_sink[t];
+        }
       }
       for (int t = 0; t < kT; t++) {
         double sq = 0.0;
@@ -792,6 +878,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         ASSERT_TRUE(ReadF64(rdir + "/h_L" + (L < 11 ? "0" : "") +
                                 std::to_string(L - 1) + ".f64",
                             static_cast<size_t>(kT) * kH, hin));
+      }
+      // The norm's input is the SINK-RESCALED stream: the factor rides the
+      // crossing's own multiply, so the host reference has to carry it too.
+      for (int t = 0; t < kSinkTokens; t++) {
+        for (int c = 0; c < kH; c++) {
+          hin[static_cast<size_t>(t) * kH + c] *= cal.attn_sink[t];
+        }
       }
       std::vector<double> nrm(static_cast<size_t>(kT) * kH, 0.0);
       for (int t = 0; t < kT; t++) {

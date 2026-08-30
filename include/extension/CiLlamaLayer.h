@@ -176,6 +176,25 @@ class CiLlamaLayer {
     //! stream that is. The down projection's weight puts it back, for
     //! nothing, exactly as the O projection's does for the attention half.
     double stream_scale = 1.0;
+
+    //! THE SINK RESCALE, PER TOKEN, AT EACH OF THE TWO NORMS.
+    //!
+    //! [SYLPH] 3.1.1: a prefix of beginning-of-sequence tokens is
+    //! prompt-independent, so its hidden state is a constant of the model and
+    //! rescaling it is a PUBLIC per-token multiplier -- which is the only
+    //! reason it can be done at all under encryption. It has to happen at
+    //! EVERY norm, not once at the model's input: measured on the rotated
+    //! model, layer 1's OUTPUT carries sink rows at mean square 26.72 against
+    //! the user rows' 1.2e-04 to 6.2e-04, a ratio of 74327, and an invsqrt
+    //! handed that grows like cosh(d arccosh(v)). Without it a 32-layer run
+    //! dies at layer 1 with `carried 1693` against a stream scale of 0.019.
+    //!
+    //! One entry per token, 1.0 at the user tokens. Empty means no rescale,
+    //! which is right only for a single layer whose input was rescaled by the
+    //! caller. The factors ride the crossing's own constant multiply, so they
+    //! cost NO level and no operation -- `Canonicalise` becomes a plaintext
+    //! multiply instead of a constant one.
+    std::vector<double> attn_sink, ffn_sink;
   };
 
   /**
@@ -332,12 +351,24 @@ class CiLlamaLayer {
   //! their calibration, so they are one function.
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain, double alpha, double window,
-                double stream_scale, const EvkMap<word> &evk);
+                double stream_scale, const std::vector<double> &sink,
+                const EvkMap<word> &evk);
 
   //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
   //! result canonical one level below. Duplicate-preserving by construction:
   //! it is a uniform constant, not a mask.
   void Canonicalise(Ct &ct, double factor) const;
+
+  //! The same multiply with a per-TOKEN factor instead of a scalar, which is
+  //! what carries the sink rescale for free. Duplicate-preserving, but NOT by
+  //! being uniform across channels: the banded convention puts a channel's
+  //! duplicate one token position BACK from its live copy, so the two bands
+  //! need the same factor at different slot addresses. `at_scale` is the
+  //! scale of the ciphertexts it will meet.
+  Plaintext<word> CrossingPlaintext(double factor,
+                                    const std::vector<double> &sink,
+                                    double at_scale) const;
+  void Canonicalise(Ct &ct, const Plaintext<word> &pt) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   Config cfg_;
@@ -355,6 +386,9 @@ class CiLlamaLayer {
   std::unique_ptr<CoeffLinearLeg<word>> leg_;
   //! Per-layer operator preparation; see `GetPrepareSeconds`.
   mutable double prepare_seconds_ = 0.0;
+  //! The crossing's plaintext when it carries a sink rescale; built once per
+  //! `NormTurn` off the first ciphertext's scale.
+  Plaintext<word> crossing_pt_;
 };
 
 }  // namespace cheddar

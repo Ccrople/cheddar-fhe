@@ -207,6 +207,52 @@ std::vector<std::vector<Complex>> CiLlamaLayer<word>::NormWeights(
 }
 
 template <typename word>
+Plaintext<word> CiLlamaLayer<word>::CrossingPlaintext(
+    double factor, const std::vector<double> &sink, double at_scale) const {
+  AssertTrue(static_cast<int>(sink.size()) == cfg_.num_tokens,
+             "CiLlamaLayer: the sink rescale needs one factor per token");
+  // The stream's slot address is `channel * num_tokens + rev(token)` (1.5du),
+  // so a per-token factor is a stride-`num_tokens` pattern -- but it is NOT
+  // the same pattern on both bands. The banded convention is
+  // `rec[p*rank + I] = comp_I[p] + [I!=0] comp_{rank-I}[p+1]`, so a DEAD
+  // component (declared channel odd, the duplicate half) at position `p`
+  // carries its partner's value at position `p + 1`: a token's duplicate sits
+  // one position BACK from its live copy. Applied uniformly, this multiply
+  // scales token `t`'s duplicate by `sink[t-1]` -- which leaves the live band
+  // right and corrupts the duplicate of the first user token by the last
+  // sink's factor, measured as live 2^-5.99 against duplicate 2^-1.06 and a
+  // layer at relative 265. Token 0 has no duplicate (position -1 is off the
+  // image), exactly as the last position has no partner.
+  const int log_t = Log2Ceil(cfg_.num_tokens);
+  std::vector<Complex> vals(num_slots_, Complex(factor, 0.0));
+  for (int t = 0; t < cfg_.num_tokens; t++) {
+    if (sink[t] == 1.0) continue;
+    const int p = static_cast<int>(BitReverseInt(t, log_t));
+    for (int c = 0; p + c * cfg_.num_tokens < num_slots_; c += 2) {
+      vals[p + c * cfg_.num_tokens] = Complex(factor * sink[t], 0.0);
+    }
+    if (t == 0) continue;
+    const int q = static_cast<int>(BitReverseInt(t - 1, log_t));
+    for (int c = 1; q + c * cfg_.num_tokens < num_slots_; c += 2) {
+      vals[q + c * cfg_.num_tokens] = Complex(factor * sink[t], 0.0);
+    }
+  }
+  Plaintext<word> pt;
+  boot_->encoder_.Encode(pt, slot_level_,
+                         boot_->param_.GetScale(op_level_) *
+                             boot_->param_.GetRescalePrimeProd(slot_level_) /
+                             at_scale,
+                         vals);
+  return pt;
+}
+
+template <typename word>
+void CiLlamaLayer<word>::Canonicalise(Ct &ct, const Plaintext<word> &pt) const {
+  boot_->Mult(ct, ct, pt);
+  boot_->Rescale(ct, ct);
+}
+
+template <typename word>
 void CiLlamaLayer<word>::Canonicalise(Ct &ct, double factor) const {
   Constant<word> k;
   boot_->encoder_.EncodeConstant(
@@ -224,6 +270,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
                                   const std::vector<double> &gain,
                                   double alpha, double window,
                                   double stream_scale,
+                                  const std::vector<double> &sink,
                                   const EvkMap<word> &evk) {
   AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
              "CiLlamaLayer: the residual stream is " +
@@ -252,7 +299,23 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
     // Everything downstream of RMSNorm is then in MODEL units, because
     // RMSNorm is scale invariant. The two projections that write the stream
     // back -- O and down -- put the factor on again through their weights.
-    Canonicalise(slots[k], 1.0 / (crossing_ * stream_scale));
+    // THE SINK RESCALE RIDES THIS MULTIPLY. [SYLPH] 3.1.1's prefix is
+    // prompt-independent and so public, which is what makes a per-token
+    // factor legal here; and it has to happen at EVERY norm, because the
+    // stream's sink rows do not stay in range on their own -- layer 1's
+    // output carries them at 74327x the user rows' mean square. Folding the
+    // factors into the constant this crossing already pays costs no level and
+    // no operation. The plaintext is built once, off the first ciphertext's
+    // scale, because `ToSlot` leaves all of them at the same one.
+    if (sink.empty()) {
+      Canonicalise(slots[k], 1.0 / (crossing_ * stream_scale));
+    } else {
+      if (k == 0) {
+        crossing_pt_ = CrossingPlaintext(1.0 / (crossing_ * stream_scale),
+                                         sink, slots[0].GetScale());
+      }
+      Canonicalise(slots[k], crossing_pt_);
+    }
   }
 
   // RMSNorm DIVIDES BY THE WIDTH IT IS TOLD, and that is the DECLARED one.
@@ -329,7 +392,7 @@ void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const Calibration &c,
                                        const EvkMap<word> &evk) {
   NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window,
-           c.stream_scale, evk);
+           c.stream_scale, c.attn_sink, evk);
 }
 
 template <typename word>
@@ -375,7 +438,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
   std::vector<Ct> normed;
   NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window,
-           c.stream_scale, evk);
+           c.stream_scale, c.ffn_sink, evk);
 
   // ---- gate and up -------------------------------------------------------
   std::vector<Ct> gate, upv;
