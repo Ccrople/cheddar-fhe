@@ -167,6 +167,15 @@ class CiLlamaLayer {
     double silu_range = 1.0;
     //! The factor the gate and up weights carry, sizing their crossing.
     double gate_scale = 1.0;
+    //! THE FACTOR THE RESIDUAL STREAM CARRIES, and the down projection's
+    //! weight scale.
+    //!
+    //! RMSNorm is scale invariant, so everything downstream of it is in the
+    //! MODEL's own units however the stream was scaled -- which means the
+    //! feed-forward output comes back unscaled and cannot be added to a
+    //! stream that is. The down projection's weight puts it back, for
+    //! nothing, exactly as the O projection's does for the attention half.
+    double stream_scale = 1.0;
   };
 
   /**

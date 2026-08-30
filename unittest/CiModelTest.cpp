@@ -355,11 +355,24 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   };
   rescale_sinks(x0);
 
+  // ONE FACTOR FOR THE WHOLE RUN, sized on the largest residual any layer
+  // reaches. The residual add forces the stream and the two projections that
+  // write it to agree, and RMSNorm makes everything downstream scale free, so
+  // a per-layer factor would have to be re-derived at every add for nothing.
+  // The reference already knows every layer's magnitude.
   double x_absmax = 0.0;
   for (double v : x0) x_absmax = std::max(x_absmax, std::abs(v));
-  const double stream_scale = ride / std::max(x_absmax, 1e-12);
-  std::cout << "input |x| <= " << x_absmax << ", stream carries "
-            << stream_scale << std::endl;
+  double stream_absmax = x_absmax;
+  for (int L = 0; L < num_layers; L++) {
+    stream_absmax = std::max(
+        stream_absmax, calib_all["layers"][L]["out_absmax"].get<double>());
+    stream_absmax = std::max(
+        stream_absmax, calib_all["layers"][L]["resid_absmax"].get<double>());
+  }
+  const double stream_scale = ride / std::max(stream_absmax, 1e-12);
+  std::cout << "input |x| <= " << x_absmax << ", the stream reaches "
+            << stream_absmax << " over " << num_layers
+            << " layers, so it carries " << stream_scale << std::endl;
 
   auto encrypt_stream = [&](const std::vector<double> &x, double scale) {
     std::vector<Ciphertext<word>> out(kNumH);
@@ -618,13 +631,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
     // The O projection's factor: divide out V's sizing, then put the residual
     // at the ride. The incoming stream already carries `stream_scale`.
+    // The O weight takes V's own sizing back out and puts the result on the
+    // stream's factor, so the residual add sees two quantities that agree.
     cal.res_scale = stream_scale / cv;
-    cal.gate_scale = ride / std::max(cj["gate_absmax"].get<double>() *
-                                         stream_scale / 1.0,
-                                     1e-12);
-    // The gate's own magnitude scales with the stream, so its ride is set on
-    // the scaled quantity.
+    // The gate and up are read off a NORMALISED stream, so they are in the
+    // model's own units and their ride is set on those.
     cal.gate_scale = ride / std::max(cj["gate_absmax"].get<double>(), 1e-12);
+    cal.stream_scale = stream_scale;
     lw.o = &wo_dec;
     lw.gate = &wg_dec;
     lw.up = &wu_dec;

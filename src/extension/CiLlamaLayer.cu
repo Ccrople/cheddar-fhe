@@ -107,6 +107,15 @@ CiLlamaLayer<word>::CiLlamaLayer(
   lcfg.num_tokens = cfg_.num_tokens;
   lcfg.product_level = cfg_.product_level;
   lcfg.parents_per_tile = cfg_.parents_per_tile;
+  // HALF DENSITY ON BOTH AXES, which is a statement about these operands and
+  // not a tuning choice. Every parent here is a banded half-density image, so
+  // its live module components are a contiguous prefix and the descent stops
+  // there; every output is one too, so half of `GatherWeights`'s rows are
+  // exact zeros that the operand would store, the GEMM would multiply and
+  // `ModPack` would recompose. Measured exact at both settings and 1.9991x /
+  // 1.69x apart in work (Doing.md 1.5db/1.5dh).
+  lcfg.input_density = 2;
+  lcfg.output_density = 2;
   leg_ = std::make_unique<CiProjectionLeg<word>>(boot_, lcfg,
                                                  std::move(modpack_keys));
 
@@ -351,11 +360,23 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       sched_.ToCoeff(c2, prod[i], evk, cfg_.min_ks);
       boot_->LevelDown(ins[i], c2, cfg_.product_level);
     }
-    leg_->Project(res, ins, cfg_.hidden_declared, cfg_.model_declared, *w.down,
-                  1.0, (w.tag + ".down").c_str());
-    AssertTrue(static_cast<int>(res.size()) == num_model_cts_,
+    std::vector<Ct> y;
+    // `stream_scale`, not 1: RMSNorm is scale invariant, so `y` comes back in
+    // the model's own units while `h_ct` carries the stream's factor, and the
+    // two cannot be added until they agree. The weight is a plaintext, so
+    // putting it back costs nothing.
+    leg_->Project(y, ins, cfg_.hidden_declared, cfg_.model_declared, *w.down,
+                  c.stream_scale, (w.tag + ".down").c_str());
+    AssertTrue(static_cast<int>(y.size()) == num_model_cts_,
                "CiLlamaLayer: the down projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");
+    // THE SECOND RESIDUAL. The correctness-width layer test stopped at the
+    // down projection and compared against the down projection, so it never
+    // needed this; a layer that feeds its successor does.
+    res.resize(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->Add(res[k], h_ct[k], y[k]);
+    }
   }
 }
 
