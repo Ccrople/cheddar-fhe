@@ -928,6 +928,33 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           }
           msq[t] = s2 / kH;
         }
+        // DOES THE WINDOW CONTAIN THE ARGUMENT? A Chebyshev fit outside its
+        // interval does not fail, it returns a plausible wrong number -- and
+        // the window rule that stood here covered the argument's RATIO, which
+        // is only the same as its REACH when the sample is log-symmetric
+        // around `alpha`'s geometric mean. Llama's per-token mean squares are
+        // not: measured across the 32 real layers, THIRTEEN ran outside the
+        // interval, where the fit goes from ~2^-28 to ~2^-5. One line, at the
+        // first stage of the run, is what that class of failure costs to
+        // catch.
+        {
+          const double a = 0.5 * (std::sqrt(cal.attn_norm_window) -
+                                  1.0 / std::sqrt(cal.attn_norm_window));
+          const double b = 0.5 * (std::sqrt(cal.attn_norm_window) +
+                                  1.0 / std::sqrt(cal.attn_norm_window));
+          double reach = 0.0;
+          for (int t = kSinkTokens; t < kT; t++) {
+            reach = std::max(
+                reach,
+                std::abs((cal.attn_alpha * (msq[t] + 1e-5) - b) / a));
+          }
+          std::cout << "    [stage 1] the invsqrt argument reaches " << reach
+                    << " of its window (" << cal.attn_norm_window << ")"
+                    << std::endl;
+          EXPECT_LE(reach, 1.0)
+              << "the inverse square root is evaluated outside the interval "
+              << "it was fitted on, where its error is not the fit's";
+        }
         const auto invs = layer.PlainNormInvSqrt(
             cal.attn_alpha, cal.attn_norm_window, msq);
         double q = 0.0, d = 0.0;
@@ -1176,9 +1203,64 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const auto t_leg = Tick();
 
     // ---- the seam ---------------------------------------------------------
+    //
+    // STAGE 1.75: WHAT THE EIGHT BOOTS COST. 1.5cw named this the one element
+    // between the leg and the banded image that nobody had measured -- the
+    // leg's own figure is 2^-9.5 at full width and the seam's own path is
+    // 2^-14.4, and stage 2 below sits far under both, so the difference is
+    // either here or in the composition. It needs no layout knowledge at all:
+    // `Boot` is message preserving, so the same ciphertext before and after
+    // is the same message and one fitted factor covers the scale. The read is
+    // in COEFFICIENTS because that is the form the leg leaves and the seam
+    // takes.
     std::vector<Ciphertext<word>> booted(layout.num_cts);
-    for (int bi = 0; bi < layout.num_cts; bi++) {
-      bctx->Boot(booted[bi], attn_out[bi], boot.ui->GetEvkMap(), min_ks);
+    {
+      double n = 0.0, d = 0.0, mx = 0.0, e = 0.0, q = 0.0, in_mx = 0.0;
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        std::vector<double> before, after;
+        {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, attn_out[bi]);
+          boot.context->encoder_.DecodeCoeff(before, pt);
+        }
+        bctx->Boot(booted[bi], attn_out[bi], boot.ui->GetEvkMap(), min_ks);
+        {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, booted[bi]);
+          boot.context->encoder_.DecodeCoeff(after, pt);
+        }
+        ASSERT_EQ(before.size(), after.size());
+        for (size_t i = 0; i < before.size(); i++) {
+          n += after[i] * before[i];
+          d += before[i] * before[i];
+          mx = std::max(mx, std::abs(before[i]));
+          in_mx = std::max(in_mx, std::abs(after[i]));
+        }
+      }
+      const double f = n / d;
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        std::vector<double> before, after;
+        {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, attn_out[bi]);
+          boot.context->encoder_.DecodeCoeff(before, pt);
+        }
+        {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, booted[bi]);
+          boot.context->encoder_.DecodeCoeff(after, pt);
+        }
+        for (size_t i = 0; i < before.size(); i++) {
+          const double dv = after[i] / f - before[i];
+          e = std::max(e, std::abs(dv));
+          q += dv * dv;
+        }
+      }
+      std::cout << "  [stage 1.75] the eight Boots on the attention output: "
+                << (e / mx) << " = 2^" << std::log2(e / mx) << ", rms 2^"
+                << 0.5 * std::log2(q / d) << ", carried " << f
+                << " -- the leg leaves |.| <= " << mx << ", Boot returns |.| <= "
+                << in_mx << std::endl;
     }
     attn_out.clear();
     std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);

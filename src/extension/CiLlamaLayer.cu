@@ -194,10 +194,37 @@ template <typename word>
 int CiLlamaLayer<word>::NormDegree(double window) const {
   if (cfg_.rms_degree > 0) return cfg_.rms_degree;
   // A Chebyshev fit's error is uniform over its interval, so the degree has to
-  // follow the window rather than be typed beside it.
-  if (window <= 2.5) return 9;
-  if (window <= 12.0) return 15;
-  return 31;
+  // follow the window rather than be typed beside it -- and for THIS function
+  // the relation is closed form. `1/sqrt(a v + b)` on [-1, 1] with
+  // `lo = 1/sqrt(W)`, `hi = sqrt(W)` has its singularity at `v = -b/a`, so the
+  // Bernstein parameter is
+  //
+  //     rho = b/a + sqrt((b/a)^2 - 1) = (sqrt(W) + 1) / (sqrt(W) - 1)
+  //
+  // and the error falls as `rho^-degree`. Sixteen bits is the target because
+  // that is where 1.5cv measured SiLU's CIRCUIT, and there is no point fitting
+  // below the circuit that evaluates the fit. The three-way table this
+  // replaces was right at the bottom of its range and two degrees short at the
+  // top: it returned 15 at a window of 12, where `rho` is 1.81 and 15 buys
+  // only 12.5 bits.
+  //
+  // AND IT IS CAPPED AT 15, WHICH IS A LEVEL BUDGET AND NOT A FIT. The
+  // polynomial lands at `poly_level - ceil(log2(degree+1))` and the weight
+  // multiply one below that with NO rescale, so degree 15 leaves the norm's
+  // output at `stc_level + 1` and degree 31 at `stc_level` -- where
+  // `SylphSchedule::ToCoeff` refuses outright, because the pending rescale it
+  // has to settle needs a level and there is none. At the widest window the
+  // real 32 layers reach (12.7, layer 1) degree 15 still buys 12.5 bits,
+  // which is below this operator's own circuit, so the cap costs nothing
+  // measurable here -- but it is the reason a window wider than ~13 would
+  // need the schedule changed, not just the degree.
+  const double w = std::max(window, 1.0 + 1e-9);
+  const double rho = (std::sqrt(w) + 1.0) / (std::sqrt(w) - 1.0);
+  const double want = 16.0 * std::log(2.0) / std::log(rho);
+  for (int d : {9, 15}) {
+    if (d >= want) return d;
+  }
+  return 15;
 }
 
 template <typename word>
@@ -298,6 +325,19 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
              "CiLlamaLayer: the residual stream is " +
                  std::to_string(num_model_cts_) + " ciphertexts");
+  // THE OPERATOR'S INPUT RIDES AT THE MODEL'S OWN MAGNITUDE, AND THAT IS
+  // WHERE ITS PRECISION GOES. RMSNorm is scale invariant, so feeding it
+  // `beta * x` with `alpha / beta^2` in place of `alpha` and `beta^2 * eps` in
+  // place of `eps` computes exactly the same function -- `RmsNormTest` has
+  // said so since it was written ("beta = sqrt(alpha) puts |x| near one") and
+  // the layer never adopted it. What changes is not the answer but the
+  // magnitude every noisy step carries it at: a ciphertext's added error is
+  // ABSOLUTE, so a message riding at the model's own 0.0076 rms takes the
+  // square, the eight-rotation reduction and the closing multiply at
+  // `1 / alpha` of the precision the same circuit gets at rms one.
+  // `beta = sqrt(alpha)` is exactly the constant that puts it there, and it
+  // folds into the crossing's own multiply -- no level, no operation, no key.
+  const double beta = std::sqrt(alpha);
   std::vector<Ct> slots(num_model_cts_);
   for (int k = 0; k < num_model_cts_; k++) {
     sched_.ToSlot(slots[k], stream[k], evk, cfg_.min_ks);
@@ -331,10 +371,10 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
     // no operation. The plaintext is built once, off the first ciphertext's
     // scale, because `ToSlot` leaves all of them at the same one.
     if (sink.empty()) {
-      Canonicalise(slots[k], 1.0 / (crossing_ * stream_scale));
+      Canonicalise(slots[k], beta / (crossing_ * stream_scale));
     } else {
       if (k == 0) {
-        crossing_pt_ = CrossingPlaintext(1.0 / (crossing_ * stream_scale),
+        crossing_pt_ = CrossingPlaintext(beta / (crossing_ * stream_scale),
                                          sink, slots[0].GetScale());
       }
       Canonicalise(slots[k], crossing_pt_);
@@ -356,12 +396,19 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   // timed apart from the arithmetic below. `Apply` would do the encode on its
   // own at first use, which is what hid it inside the online row.
   const auto prep0 = std::chrono::steady_clock::now();
+  // `beta` above scaled the input, so the bracket has to be told: the handler
+  // sees `S = beta^2 * sum(x^2)`, and `u = L * (S/n + e)` is the same `u` as
+  // before exactly when `L = alpha * ratio / beta^2` and `e = beta^2 * eps /
+  // ratio`. The weight then carries `sqrt(L)` by the handler's own contract,
+  // which at `beta = sqrt(alpha)` is `sqrt(ratio)` -- the declared-width
+  // leftover the comment above names, and nothing else.
+  const double b2 = beta * beta;
   RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
-                           alpha * ratio, op_level_, cfg_.eps / ratio, window,
-                           NormDegree(window), /*channel_stride=*/2);
+                           alpha * ratio / b2, op_level_, b2 * cfg_.eps / ratio,
+                           window, NormDegree(window), /*channel_stride=*/2);
   AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
              "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
-  const auto wts = NormWeights(gain, alpha);
+  const auto wts = NormWeights(gain, alpha / b2);
   rms.Prepare(wts);
   cudaDeviceSynchronize();
   prepare_seconds_ +=
@@ -394,9 +441,13 @@ std::vector<double> CiLlamaLayer<word>::PlainNormInvSqrt(
     const std::vector<double> &mean_square) const {
   const double ratio =
       static_cast<double>(cfg_.model_declared) / cfg_.model_live;
+  // The same constants the circuit runs on, `beta` included: `u` is identical
+  // either way, but a probe that does not reproduce the shipped handler is
+  // measuring itself.
+  const double b2 = alpha;
   RmsNormHandler<word> probe(boot_, cfg_.num_tokens, cfg_.model_declared,
-                             alpha * ratio, op_level_, cfg_.eps / ratio,
-                             window, NormDegree(window),
+                             alpha * ratio / b2, op_level_,
+                             b2 * cfg_.eps / ratio, window, NormDegree(window),
                              /*channel_stride=*/2);
   // The bracket the circuit evaluates: the DECLARED width and the scaled
   // epsilon, whose two corrections cancel (see `NormTurn`).
@@ -404,9 +455,9 @@ std::vector<double> CiLlamaLayer<word>::PlainNormInvSqrt(
   std::vector<double> res(mean_square.size());
   for (size_t i = 0; i < mean_square.size(); i++) {
     const double u =
-        alpha * ratio *
-        (mean_square[i] * cfg_.model_live / cfg_.model_declared +
-         cfg_.eps / ratio);
+        (alpha * ratio / b2) *
+        (b2 * mean_square[i] * cfg_.model_live / cfg_.model_declared +
+         b2 * cfg_.eps / ratio);
     res[i] = root * probe.PlainInvSqrt(u);
   }
   return res;
