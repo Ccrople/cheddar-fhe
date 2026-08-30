@@ -413,6 +413,47 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   };
   std::vector<Ciphertext<word>> stream = encrypt_stream(x0, stream_scale);
 
+  // ---- STAGE 0: the stream, read back the way its consumer reads it -------
+  //
+  // Before anything else runs. `Components` is the banded inverse that
+  // `ModDecomp` performs and that every downstream read here uses, so if the
+  // encoding and this read do not agree on a freshly encrypted ciphertext
+  // nothing measured further along means anything.
+  {
+    double n0 = 0.0, d0 = 0.0, m0 = 0.0, e0 = 0.0;
+    std::vector<std::vector<std::vector<double>>> g0(kNumH);
+    for (int k = 0; k < kNumH; k++) {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, stream[k]);
+      std::vector<double> co;
+      boot_ffn.context->encoder_.DecodeCoeff(co, pt);
+      g0[k] = Components(co);
+    }
+    for (int m = 0; m < kH; m++) {
+      const int k = m / kPerModel;
+      const int c = ModelSlot(m) - k * kRank;
+      for (int t = 0; t < kT; t++) {
+        const double wv = stream_scale * x0[static_cast<size_t>(t) * kH + m];
+        n0 += g0[k][Rev(c, 9)][Rev(t, 7)] * wv;
+        d0 += wv * wv;
+        m0 = std::max(m0, std::abs(wv));
+      }
+    }
+    const double f0 = n0 / d0;
+    for (int m = 0; m < kH; m++) {
+      const int k = m / kPerModel;
+      const int c = ModelSlot(m) - k * kRank;
+      for (int t = 0; t < kT; t++) {
+        e0 = std::max(e0,
+                      std::abs(g0[k][Rev(c, 9)][Rev(t, 7)] / f0 -
+                               stream_scale * x0[static_cast<size_t>(t) * kH + m]));
+      }
+    }
+    std::cout << "  [stage 0] the encrypted stream: " << (e0 / m0) << " = 2^"
+              << std::log2(e0 / m0) << ", carried " << f0 << std::endl;
+    if (stop_after == -1) return;
+  }
+
   // ---- the layers ----------------------------------------------------------
   bctx->ResetBootCounts();
   fctx->ResetBootCounts();
