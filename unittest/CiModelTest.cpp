@@ -310,7 +310,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   lcfg.ride = ride;
   lcfg.min_ks = min_ks;
   lcfg.verbose = true;
-  cheddar::CiLlamaLayer<word> layer(boot_ffn.context, layout, pack_keys, lcfg);
+  cheddar::CiLlamaLayer<word> layer(fctx, layout, pack_keys, lcfg);
   {
     EvkRequest req;
     layer.AddRequiredRotations(req);
