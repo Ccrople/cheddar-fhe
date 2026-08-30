@@ -1,0 +1,239 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "core/CiSwitchedCcmm.h"
+#include "core/Container.h"
+#include "core/Context.h"
+#include "core/EvkMap.h"
+#include "core/EvkRequest.h"
+#include "extension/BootContext.h"
+#include "extension/CiLlamaSeam.h"
+#include "extension/LlamaLinear.h"
+#include "extension/RmsNorm.h"
+#include "extension/SiLu.h"
+#include "extension/SylphSchedule.h"
+
+namespace cheddar {
+
+/**
+ * @brief Everything of a Llama-3 decoder layer on R+ that is not the attention
+ * leg: the seam, the O projection, both residuals, RMSNorm, gate and up, SiLU
+ * and the gate multiply, and the down projection.
+ *
+ * ## Where this sits
+ *
+ * `CiSinCAttention` is the leg -- half-images in at the HalfBoot landing,
+ * attention output out in the CC-MM chain's layout. This is the other half,
+ * and between them they are a layer. The split is not arbitrary: the leg runs
+ * on a `BootContext` at slack ZERO because its softmax walk needs
+ * `GetEndLevel()` at 16, and everything here runs on a second `BootContext`
+ * over the same primes and the same secret at slack NINE, because
+ * `SlotToCoeff` is compiled at `GetStCStartLevel()` and an operator eight
+ * levels deep cannot reach it without slack (Doing.md 1.5ct). The two
+ * Contexts are the caller's; this class holds only the second.
+ *
+ *     [caller]  X -> PC-MM emissions -> HalfBoot -> q/k/v half-images
+ *     leg       Scores -> [caller] Boot x8 -> SoftMax -> Values -> 8 chain cts
+ *     [caller]  Boot x8
+ *     THIS      Seam         -> 16 half-density coefficient ciphertexts
+ *     THIS      FeedForward  -> the next residual stream, at level 0
+ *
+ * ## What the caller owns, and what it does not
+ *
+ * The caller owns the Contexts, every key, and the CALIBRATION -- which is
+ * what [SYLPH] section 3.1 says it should be: ranges fitted offline on the
+ * clear model, not measured in the run. What this class will NOT do is
+ * decrypt anything to find a constant. Two constants that earlier code fitted
+ * in-run are derived here instead:
+ *
+ *  - **the crossing constant** is `BootContext::GetMessageRatio()`, exact
+ *    (Doing.md 1.5dk), rather than a fit against a decrypted twin;
+ *  - **kappa**, what a full turn through the coefficient domain carries, is
+ *    `2^-log_message_ratio / crossing` -- `SylphSchedule::ToCoeff` undoes the
+ *    crossing by the NOMINAL ratio, deliberately, so a one-way crossing is
+ *    off by exactly that and SiLU is the only stage that cannot absorb it
+ *    (1.5cv). Folding it in moved the FFN from 2^-8.21 to 2^-12.28.
+ *
+ * ## The contracts, all of which have cost a wrong layer
+ *
+ * - **Half density, with its duplicates.** Every slot-domain operator here is
+ *   duplicate-preserving: the canonicalise is a uniform constant rather than
+ *   a mask, `RmsNormHandler` reduces at `channel_stride = 2` so the two slot
+ *   parities stay apart, and its weight carries the PARTNER channel's value
+ *   at the duplicate slots (1.5cs).
+ * - **Component zero has no partner.** `I -> rank - I` has exactly two fixed
+ *   points, so a half-density ciphertext carries at most `rank/2 - 1` live
+ *   channels. Everything that WRITES the model dimension -- the O projection
+ *   and the down projection -- must leave channel zero empty, or the next
+ *   RMSNorm normalises by a mean square that is short one channel and
+ *   `ModDecomp`'s suffix recursion hands all of it to the next projection's
+ *   live components (1.5cu). `Config::keep_component_zero` exists only to
+ *   reproduce the old, wrong contract in a test.
+ * - **The ride height has an optimum, not a ceiling.** EvalMod's own
+ *   approximation is cubic, so the crossing's relative cost is `a * ride^2`
+ *   with `a = -0.00258` and every doubling costs two bits, until the additive
+ *   floor takes over below ~0.02 (1.5cv). 0.2 is the measured bottom of that
+ *   U for the FFN.
+ * - **A window follows a measured spread.** A Chebyshev fit's error is
+ *   uniform over its interval, so a window wider than the data throws that
+ *   ratio away and a window NARROWER than the data evaluates the polynomial
+ *   where it was never fitted -- silently. Both are invisible end to end,
+ *   which is why the caller supplies them from calibration.
+ *
+ * @tparam word uint32_t or uint64_t
+ */
+template <typename word>
+class CiLlamaLayer {
+ private:
+  using Ct = Ciphertext<word>;
+
+ public:
+  struct Config {
+    int num_tokens = 128;   //!< T; the small degree is 2T
+    int proj_rank = 512;    //!< the module rank the banded convention uses
+    //! Declared channels of the residual stream and of the FFN's inner
+    //! dimension. Declared, not live: half density means a ciphertext carries
+    //! `proj_rank / 2 - 1` live model channels and `proj_rank / 2` hidden
+    //! ones, because nothing reduces over the hidden axis.
+    int model_declared = 512;
+    int hidden_declared = 1024;
+    int product_level = 1;
+    //! Input ciphertexts decomposed at once, on the direct route. Sixteen
+    //! parents at rank 512 and five limbs is 10.7 GB standing at once; four
+    //! is 2.7, paid for in ModPacks (1.5ct).
+    int parents_per_tile = 4;
+    //! How hot the message rides into HalfBoot. See the class comment: this
+    //! is the bottom of a U, not a ceiling to sit under.
+    double ride = 0.2;
+    int silu_degree = 31;
+    int rms_degree = 9;
+    //! Leave channel zero of the model dimension empty. See the class
+    //! comment; false is the wrong contract and exists only to reproduce it.
+    bool keep_component_zero = false;
+    bool min_ks = false;
+    bool verbose = false;
+  };
+
+  /** @brief One layer's plaintext weights, at the DECLARED widths. */
+  struct Weights {
+    //! `attn_channels x model_declared`, indexed `[in * model_declared + out]`.
+    const std::vector<double> *o = nullptr;
+    //! `model_declared x hidden_declared`.
+    const std::vector<double> *gate = nullptr;
+    const std::vector<double> *up = nullptr;
+    //! `hidden_declared x model_declared`.
+    const std::vector<double> *down = nullptr;
+    //! `model_declared` RMSNorm gains, at the declared channels.
+    const std::vector<double> *ffn_norm = nullptr;
+    //! Distinguishes this layer's converted weights in the projection leg's
+    //! cache. MUST differ between layers: the cache is keyed by name and
+    //! asserts the fingerprint, so a repeated name with different weights is
+    //! caught rather than silently answered with the first layer's operands.
+    std::string tag;
+  };
+
+  /** @brief What [SYLPH] 3.1 fits offline on the clear model. */
+  struct Calibration {
+    //! The factor the O projection's weight carries, chosen so the residual
+    //! stream reaches `Config::ride` at the crossing.
+    double res_scale = 1.0;
+    //! RMSNorm's layer constant: `1 / geometric mean of the mean squares`,
+    //! which puts the argument's geometric mean at 1 by construction.
+    double alpha = 1.0;
+    //! The invsqrt window. `(measured argument ratio) * margin`, margin 1.3.
+    double norm_window = 2.0;
+    //! SiLU's fitted range, `margin * max|gate|` with margin ~1.2.
+    double silu_range = 1.0;
+    //! The factor the gate and up weights carry, sizing their crossing.
+    double gate_scale = 1.0;
+  };
+
+  /**
+   * @param boot the FFN's BootContext -- same primes and secret as the leg's,
+   *        slack nine
+   * @param layout the chain layout the attention output arrives in
+   * @param modpack_keys the projection's ModPack keys, on `boot`'s Context
+   * @param cfg the shapes and the two dials
+   */
+  CiLlamaLayer(std::shared_ptr<const BootContext<word>> boot,
+               const CiSwitchedCcmmLayout &layout,
+               std::vector<const EvaluationKey<word> *> modpack_keys,
+               const Config &cfg);
+
+  CiLlamaLayer(const CiLlamaLayer &) = delete;
+  CiLlamaLayer &operator=(const CiLlamaLayer &) = delete;
+
+  /**
+   * @brief Every rotation this class needs except the seam's per-half stages.
+   *
+   * RMSNorm's distances are read off a handler built here for the purpose:
+   * they depend on the shape alone, while the handler's calibration does not
+   * outlive one layer.
+   */
+  void AddRequiredRotations(EvkRequest &req) const;
+
+  //! Build the seam's T1 for `half`; see `CiLlamaSeam`.
+  void PrepareSeamHalf(int half);
+  void AddSeamHalfRotations(EvkRequest &req) const;
+  void DropSeamHalf();
+
+  /**
+   * @brief One booted chain-layout ciphertext to its banded coefficient image,
+   * for the half `PrepareSeamHalf` last built.
+   */
+  void Seam(Ct &res, const Ct &booted, const EvkMap<word> &evk);
+
+  /**
+   * @brief The O projection, the residual, and the whole feed-forward network.
+   *
+   * @param res the next residual stream, half-density coefficients at level 0
+   * @param h_cts the seam's `2 * num_cts` half-density images
+   * @param stream the residual stream coming in, at level 0, already carrying
+   *        whatever factor the O projection's output will carry
+   * @param w this layer's weights
+   * @param c this layer's calibration
+   */
+  void FeedForward(Ct &res, const std::vector<Ct> &h_cts, const Ct &stream,
+                   const Weights &w, const Calibration &c,
+                   const EvkMap<word> &evk);
+
+  //! The crossing constant, derived from the BootParameter (1.5dk).
+  double GetCrossing() const { return crossing_; }
+  //! What a full turn through the coefficient domain carries.
+  double GetKappa() const { return kappa_; }
+  //! `SylphSchedule`'s levels, for a caller placing its own stages.
+  const SylphSchedule<word> &GetSchedule() const { return sched_; }
+  //! The projection leg, for a caller that wants its own `Project` calls.
+  CoeffLinearLeg<word> &GetProjectionLeg() { return *leg_; }
+
+ private:
+  //! The RMSNorm weight plaintexts for one layer, duplicates included: at an
+  //! ODD declared channel the weight carries the PARTNER channel's gain,
+  //! because the duplicate band holds `comp_{rank-I}` and the reduction must
+  //! see the same value there as at the live address (1.5cs).
+  std::vector<std::vector<Complex>> NormWeights(const std::vector<double> &gain,
+                                                double alpha) const;
+
+  //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
+  //! result canonical one level below. Duplicate-preserving by construction:
+  //! it is a uniform constant, not a mask.
+  void Canonicalise(Ct &ct, double factor) const;
+
+  std::shared_ptr<const BootContext<word>> boot_;
+  Config cfg_;
+  int num_slots_ = 0;
+  int attn_channels_ = 0;
+  double crossing_ = 0.0;
+  double kappa_ = 1.0;
+  int slot_level_ = 0;
+  int op_level_ = 0;
+
+  SylphSchedule<word> sched_;
+  std::unique_ptr<CiLlamaSeam<word>> seam_;
+  std::unique_ptr<CoeffLinearLeg<word>> leg_;
+};
+
+}  // namespace cheddar
