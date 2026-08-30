@@ -147,6 +147,39 @@ size_t RmsNormHandler<word>::GetPlaintextBytes() const {
 }
 
 template <typename word>
+void RmsNormHandler<word>::SumOfSquares(Ct &acc, const std::vector<Ct> &x,
+                                        const EvkMap<word> &evk_map) const {
+  AssertTrue(static_cast<int>(x.size()) == num_ct_,
+             "RmsNorm: wrong number of input ciphertexts");
+  const auto &mult_key = evk_map.GetMultiplicationKey();
+
+  // Square, and accumulate across the ciphertexts that hold one token's
+  // channels. This is the only place the channel axis is crossed between
+  // ciphertexts; the rest of the reduction is inside one.
+  Ct sq;
+  for (int i = 0; i < num_ct_; i++) {
+    context_->HMult(sq, x[i], x[i], mult_key);
+    if (i == 0) {
+      context_->Copy(acc, sq);
+    } else {
+      context_->Add(acc, acc, sq);
+    }
+  }
+
+  // All-reduce over the channel axis within the ciphertext. The same sequence
+  // reduces and broadcasts, so afterwards every slot already holds its own
+  // token's sum and nothing has to be redistributed.
+  //
+  // HRotAdd is res = (a << dist) + b, so res must not alias a or b: the
+  // rotation would read words the accumulation has already overwritten.
+  Ct rotated;
+  for (int d : rotation_distances_) {
+    context_->HRotAdd(rotated, acc, acc, evk_map.GetRotationKey(d), d);
+    context_->Copy(acc, rotated);
+  }
+}
+
+template <typename word>
 void RmsNormHandler<word>::Apply(
     std::vector<Ct> &res, const std::vector<Ct> &x,
     const std::vector<std::vector<Complex>> &weight,
@@ -158,30 +191,12 @@ void RmsNormHandler<word>::Apply(
 
   const auto &mult_key = evk_map.GetMultiplicationKey();
 
-  // 1. Square, and accumulate across the ciphertexts that hold one token's
-  //    channels. This is the only place the channel axis is crossed between
-  //    ciphertexts; the rest of the reduction is inside one.
-  Ct acc, sq;
-  for (int i = 0; i < num_ct_; i++) {
-    context_->HMult(sq, x[i], x[i], mult_key);
-    if (i == 0) {
-      context_->Copy(acc, sq);
-    } else {
-      context_->Add(acc, acc, sq);
-    }
-  }
-
-  // 2. All-reduce over the channel axis within the ciphertext. The same
-  //    sequence reduces and broadcasts, so afterwards every slot already holds
-  //    its own token's sum and nothing has to be redistributed.
-  //
-  //    HRotAdd is res = (a << dist) + b, so res must not alias a or b: the
-  //    rotation would read words the accumulation has already overwritten.
-  Ct rotated;
-  for (int d : rotation_distances_) {
-    context_->HRotAdd(rotated, acc, acc, evk_map.GetRotationKey(d), d);
-    context_->Copy(acc, rotated);
-  }
+  // 1 and 2. The channel sum of squares, broadcast back to every slot. Split
+  //          out so it can be READ: everything after it is a fit whose error
+  //          is known in double, and the two halves of this operator have
+  //          never been measured apart.
+  Ct acc;
+  SumOfSquares(acc, x, evk_map);
 
   // 3. Affine map onto the polynomial's domain, folded into one constant
   //    multiply and one constant add:

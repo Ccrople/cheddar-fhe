@@ -832,6 +832,45 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                   << 0.5 * std::log2(qq / dd) << ", carried " << ff
                   << std::endl;
       }
+      // AND THE REDUCTION ON ITS OWN. Everything after it is a Chebyshev
+      // fit whose value is known in double (`the FIT ALONE` below), so if the
+      // sum of squares is already at the norm's own figure the polynomial is
+      // exonerated and the square-and-rotate is where the bits go. The
+      // reduction broadcasts, so every slot of a band carries its token's
+      // sum; channel 2 is the first live one.
+      if (!layer.GetNormSlots().empty()) {
+        Plaintext<word> pt;
+        boot.ui->Decrypt(pt, layer.GetNormAcc());
+        std::vector<Complex> sv;
+        boot.context->encoder_.Decode(sv, pt);
+        std::vector<double> host(kT, 0.0);
+        for (int t = 0; t < kT; t++) {
+          double q = 0.0;
+          for (int cc = 0; cc < kH; cc++) {
+            const double v = hin[static_cast<size_t>(t) * kH + cc];
+            q += v * v;
+          }
+          host[t] = q;
+        }
+        double n = 0.0, dd = 0.0, mm = 0.0, ee = 0.0, qq = 0.0;
+        for (int t = kSinkTokens; t < kT; t++) {
+          const double got = sv[static_cast<size_t>(2) * kT + Rev(Pos(t), 7)].real();
+          n += got * host[t];
+          dd += host[t] * host[t];
+          mm = std::max(mm, host[t]);
+        }
+        const double ff = n / dd;
+        for (int t = kSinkTokens; t < kT; t++) {
+          const double got = sv[static_cast<size_t>(2) * kT + Rev(Pos(t), 7)].real();
+          const double dv = got / ff - host[t];
+          ee = std::max(ee, std::abs(dv));
+          qq += dv * dv;
+        }
+        std::cout << "    [stage 1] THE REDUCTION ALONE (sum of squares): "
+                  << (ee / mm) << " = 2^" << std::log2(ee / mm) << ", rms 2^"
+                  << 0.5 * std::log2(qq / dd) << ", carried " << ff
+                  << std::endl;
+      }
       // AND THE SAME READ WITHOUT THE SCAN. `Components` is an alternating
       // suffix sum, so it mixes the live band with the duplicate band and
       // walks any error the length of the ring. Reading the two bands

@@ -253,6 +253,14 @@ class RmsNormHandler {
    * this circuit and not something a caller should have to track.
    * @param evk_map supplies the rotation and multiplication keys
    */
+  //! The channel sum of squares alone, broadcast to every slot -- the first
+  //! half of `Apply`, which calls this. Exposed because the operator's two
+  //! halves have never been measured apart: the second half's error is a
+  //! Chebyshev fit whose value is known in double, so a read here says which
+  //! of the two makes the difference between them.
+  void SumOfSquares(Ct &acc, const std::vector<Ct> &x,
+                    const EvkMap<word> &evk_map) const;
+
   void Apply(std::vector<Ct> &res, const std::vector<Ct> &x,
              const std::vector<std::vector<Complex>> &weight,
              const EvkMap<word> &evk_map) const;

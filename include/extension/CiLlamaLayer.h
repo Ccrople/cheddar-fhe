@@ -400,6 +400,10 @@ class CiLlamaLayer {
   //! `Config::keep_norm_slots`.
   const std::vector<Ct> &GetNormSlots() const { return norm_slots_; }
 
+  //! The last `NormTurn`'s channel sum of squares, in slots. Only meaningful
+  //! under `Config::keep_norm_slots`.
+  const Ct &GetNormAcc() const { return norm_acc_; }
+
  private:
   //! The same multiply with a per-TOKEN factor instead of a scalar, which is
   //! what carries the sink rescale for free. Duplicate-preserving, but NOT by
@@ -426,6 +430,10 @@ class CiLlamaLayer {
   SylphSchedule<word> sched_;
   std::unique_ptr<CiLlamaSeam<word>> seam_;
   std::unique_ptr<CoeffLinearLeg<word>> leg_;
+  //! `Config::keep_norm_slots`: the last norm's channel sum of squares, which
+  //! is the half of the operator whose error is NOT a fit.
+  mutable Ct norm_acc_;
+
   //! `Config::keep_norm_slots`: the last norm's output before the conversion.
   mutable std::vector<Ct> norm_slots_;
 

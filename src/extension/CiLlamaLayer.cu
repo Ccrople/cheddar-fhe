@@ -367,6 +367,11 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   prepare_seconds_ +=
       std::chrono::duration<double>(std::chrono::steady_clock::now() - prep0)
           .count();
+  // The reduction on its own, before anything fitted touches it. `Apply`
+  // computes the same thing internally; recomputing it here keeps the
+  // measured path untouched and costs one extra reduction, which only runs
+  // when the diagnostic is on.
+  if (cfg_.keep_norm_slots) rms.SumOfSquares(norm_acc_, slots, evk);
   std::vector<Ct> outv;
   rms.Apply(outv, slots, wts, evk);
   if (cfg_.keep_norm_slots) {
