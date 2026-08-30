@@ -206,6 +206,60 @@ void CiLlamaLayer<word>::Canonicalise(Ct &ct, double factor) const {
 }
 
 template <typename word>
+void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
+                                  const std::vector<Ct> &stream,
+                                  const std::vector<double> &gain,
+                                  double alpha, double window,
+                                  const EvkMap<word> &evk) {
+  AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
+             "CiLlamaLayer: the residual stream is " +
+                 std::to_string(num_model_cts_) + " ciphertexts");
+  std::vector<Ct> slots(num_model_cts_);
+  for (int k = 0; k < num_model_cts_; k++) {
+    sched_.ToSlot(slots[k], stream[k], evk, cfg_.min_ks);
+    // What is divided out here is the CROSSING ALONE. A residual carries the
+    // O projection's own factor at both ends -- the stream was encrypted with
+    // it and the O output already has it -- so a fit measured on this
+    // ciphertext would be right here and wrong at the gate's crossing, which
+    // carries no such factor (1.5cu). And RMSNorm is scale invariant, which is
+    // exactly what hid that mistake for a whole increment.
+    Canonicalise(slots[k], 1.0 / crossing_);
+  }
+
+  // RMSNorm DIVIDES BY THE WIDTH IT IS TOLD, and that is the DECLARED one.
+  // Llama divides by `model_live`, so the two scalings below cancel exactly:
+  // `eps * live / declared` makes the bracket `(live/declared)(S/live + eps)`
+  // and `alpha * declared / live` puts its geometric mean back at 1. The
+  // leftover `sqrt(declared/live)` is taken out by the weight, which already
+  // carries `sqrt(alpha)`. Left alone this is not a scale error a fit absorbs:
+  // it puts the polynomial's argument at 0.47 instead of 1 and the bottom
+  // sixth of the data outside the fitted window (1.5dd, measured 2^-5.09).
+  const double ratio =
+      static_cast<double>(cfg_.model_declared) / cfg_.model_live;
+  RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
+                           alpha * ratio, op_level_, cfg_.eps / ratio, window,
+                           NormDegree(window), /*channel_stride=*/2);
+  AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
+             "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
+  const auto wts = NormWeights(gain, alpha);
+  std::vector<Ct> outv;
+  rms.Apply(outv, slots, wts, evk);
+  res.resize(num_model_cts_);
+  for (int k = 0; k < num_model_cts_; k++) {
+    sched_.ToCoeff(res[k], outv[k], evk, cfg_.min_ks);
+  }
+}
+
+template <typename word>
+void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
+                                       const std::vector<Ct> &stream,
+                                       const std::vector<double> &gain,
+                                       const Calibration &c,
+                                       const EvkMap<word> &evk) {
+  NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window, evk);
+}
+
+template <typename word>
 void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
                                      const std::vector<Ct> &h_cts,
                                      const std::vector<Ct> &stream,
@@ -246,40 +300,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   }
 
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
-  std::vector<Ct> normed(num_model_cts_);
-  {
-    std::vector<Ct> slots(num_model_cts_);
-    for (int k = 0; k < num_model_cts_; k++) {
-      sched_.ToSlot(slots[k], h_ct[k], evk, cfg_.min_ks);
-      // The residual carries the O projection's own factor at BOTH ends -- the
-      // stream was encrypted with it and the O output already has it -- so
-      // what is divided out here is the crossing ALONE. A fit measured on this
-      // ciphertext instead would be right here and wrong at the gate's
-      // crossing, which carries no such factor (1.5cu).
-      Canonicalise(slots[k], 1.0 / crossing_);
-    }
-
-    // RMSNorm DIVIDES BY THE WIDTH IT IS TOLD, and that is the declared one.
-    // Llama divides by `model_live`, so the two scalings below cancel exactly:
-    // `eps * live / declared` makes the bracket `(live/declared)(S/live + eps)`
-    // and `alpha * declared / live` puts its geometric mean back at 1. The
-    // leftover `sqrt(declared/live)` is taken out by the weight, which already
-    // carries `sqrt(alpha)`.
-    const double ratio =
-        static_cast<double>(cfg_.model_declared) / cfg_.model_live;
-    RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
-                             c.alpha * ratio, op_level_, cfg_.eps / ratio,
-                             c.norm_window, NormDegree(c.norm_window),
-                             /*channel_stride=*/2);
-    AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
-               "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
-    const auto wts = NormWeights(*w.ffn_norm, c.alpha);
-    std::vector<Ct> outv;
-    rms.Apply(outv, slots, wts, evk);
-    for (int k = 0; k < num_model_cts_; k++) {
-      sched_.ToCoeff(normed[k], outv[k], evk, cfg_.min_ks);
-    }
-  }
+  std::vector<Ct> normed;
+  NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window, evk);
 
   // ---- gate and up -------------------------------------------------------
   std::vector<Ct> gate, upv;

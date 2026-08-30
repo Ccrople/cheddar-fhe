@@ -336,6 +336,15 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_parity_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # Llama-3-8B decoder layers at the MODEL'S OWN WIDTH, encrypted end to end,
+  # one after another: 4096 live channels in seventeen half-density
+  # ciphertexts, the real parameters of a named layer, and the output against
+  # the same layer in float64. Needs LLAMA3_ALL_DIR and LLAMA3_REF_DIR;
+  # CHEDDAR_CI_LAYERS says how many.
+  add_executable(ci_model_test CiModelTest.cpp)
+  target_link_libraries(ci_model_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # `CiLlamaSeam` -- the promotion of the seam that the layer and three cases in
   # CiFfnTest each wrote out inline. Checked the way its consumer reads it:
   # coefficients out, then the banded scan ModDecomp inverts, live band and

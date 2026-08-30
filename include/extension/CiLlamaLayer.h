@@ -150,11 +150,19 @@ class CiLlamaLayer {
     //! The factor the O projection's weight carries, chosen so the residual
     //! stream reaches `Config::ride` at the crossing.
     double res_scale = 1.0;
-    //! RMSNorm's layer constant: `1 / geometric mean of the mean squares`,
-    //! which puts the argument's geometric mean at 1 by construction.
+    //! RMSNorm's layer constant for the FFN's norm: `1 / geometric mean of
+    //! the mean squares`, which puts the argument's geometric mean at 1 by
+    //! construction.
     double alpha = 1.0;
     //! The invsqrt window. `(measured argument ratio) * margin`, margin 1.3.
     double norm_window = 2.0;
+    //! The SAME two, for the PRE-ATTENTION norm. They are different numbers:
+    //! that norm's input is the layer's own input and the FFN's is the
+    //! post-attention residual, and a window fitted on one is not a window for
+    //! the other -- too wide throws away the ratio, too narrow evaluates the
+    //! polynomial where it was never fitted, silently.
+    double attn_alpha = 1.0;
+    double attn_norm_window = 2.0;
     //! SiLU's fitted range, `margin * max|gate|` with margin ~1.2.
     double silu_range = 1.0;
     //! The factor the gate and up weights carry, sizing their crossing.
@@ -197,6 +205,23 @@ class CiLlamaLayer {
   void Seam(Ct &res, const Ct &booted, const EvkMap<word> &evk);
 
   /**
+   * @brief The pre-attention RMSNorm: the residual stream crossed into slots,
+   * normalised, and returned to coefficients for the Q/K/V product.
+   *
+   * The correctness-width layer test never had this -- it projected Q, K and V
+   * straight off a synthetic stream -- and the full-width leg test did it on
+   * the HOST. A layer that feeds its own successor cannot do either.
+   *
+   * @param res `model_declared / proj_rank` coefficient ciphertexts at
+   *        `GetSchedule().GetCoeffLevel()`
+   * @param stream the residual stream at level 0
+   * @param gain the RMSNorm weights at DECLARED channels
+   */
+  void AttentionNorm(std::vector<Ct> &res, const std::vector<Ct> &stream,
+                     const std::vector<double> &gain, const Calibration &c,
+                     const EvkMap<word> &evk);
+
+  /**
    * @brief The O projection, the residual, and the whole feed-forward network.
    *
    * @param res the next residual stream, `model_declared / proj_rank`
@@ -231,6 +256,13 @@ class CiLlamaLayer {
   //! The invsqrt degree `Config::rms_degree` asks for, or the one the window
   //! implies when it is zero.
   int NormDegree(double window) const;
+
+  //! HalfBoot into slots, canonicalise by the crossing, RMSNorm, and back to
+  //! coefficients. The two RMSNorms of a layer differ only in their gains and
+  //! their calibration, so they are one function.
+  void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
+                const std::vector<double> &gain, double alpha, double window,
+                const EvkMap<word> &evk);
 
   //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
   //! result canonical one level below. Duplicate-preserving by construction:
