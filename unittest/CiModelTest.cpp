@@ -203,7 +203,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const int num_layers = EnvInt("CHEDDAR_CI_LAYERS", 1);
   const double ride = EnvDouble("CHEDDAR_CI_RIDE", 0.2);
   const bool min_ks = EnvInt("CHEDDAR_CI_MINKS", 0) != 0;
-  const bool kRevCol = EnvInt("CHEDDAR_CI_REVCOL", 0) != 0;
+  // THE PC-MM'S COLUMN IS A MODULE COMPONENT, NOT A DECLARED CHANNEL.
+  // `ModDecomp` sends coefficient `i + rank*p` to position `p` of component
+  // `i`, and stage 1 reads the norm's output correctly at
+  // `Components(co)[Rev(c, 9)][Rev(t, 7)]` -- so component `i` carries
+  // declared channel `Rev(i, 9)` and the weight's column for declared channel
+  // `dc` is `Rev(dc mod rank, 9)`. `CoeffLinearLeg::GatherWeights` does this
+  // for the projections that go through it; a raw `PcmmHandler` does not.
+  const bool kRevCol = EnvInt("CHEDDAR_CI_REVCOL", 1) != 0;
   const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
 
   json calib_all;
