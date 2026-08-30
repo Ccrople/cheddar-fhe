@@ -1156,6 +1156,83 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                 << 0.5 * std::log2(qq / dq) << ", carried " << fq
                 << " (the crossing is " << crossing << ")" << std::endl;
       if (stop_after == 15) return;
+
+      // SUBSTITUTE EXACT OPERANDS, and see whether the leg still misses.
+      // 1.5ej brackets a five-bit term: at this very layer and against this
+      // very reference tensor, `CiBootSet.TheLegRunsOnTheRealWeights` reads
+      // 2^-9.45 while stage 2 below reads 2^-4.14, and the two things between
+      // them are measured far too small to carry it (the eight Boots 2^-13.4,
+      // the seam's own path 2^-14.4). The difference is what each hands the
+      // leg. This replaces the LIVE doorstep entries of Q, K and V with the
+      // clear values -- every other slot kept exactly as the pipeline left it,
+      // and the per-ciphertext factor FITTED rather than assumed, so no scale
+      // convention is being guessed at -- and leaves the rest of the leg
+      // untouched. If stage 2 then reads ~2^-9.4 the term is the operands; if
+      // it does not, it is the leg's own path in this test.
+      if (EnvInt("CHEDDAR_CI_EXACT_QKV", 0) != 0) {
+        const std::vector<double> *wsrc[3] = {&wq_f, &wk_f, &wv_f};
+        const int wwidth[3] = {kH, kKv, kKv};
+        const double wscale[3] = {cq, ck, cv};
+        std::vector<Ciphertext<word>> *wdst[3][2] = {
+            {&q_a, &q_b}, {&k_a, &k_b}, {&v_a, &v_b}};
+        double worst = 0.0;
+        for (int j = 0; j < 3; j++) {
+          const int heads_w = wwidth[j] / kD;
+          for (int fam = 0; fam < 2; fam++) {
+            for (int li = 0; li < 8; li++) {
+              Ciphertext<word> &ct = (*wdst[j][fam])[li];
+              std::vector<Complex> sv;
+              {
+                Plaintext<word> pt;
+                boot.ui->Decrypt(pt, ct);
+                boot.context->encoder_.Decode(sv, pt);
+              }
+              std::vector<double> want(sv.size(), 0.0);
+              std::vector<int> at;
+              double n = 0.0, d = 0.0;
+              for (int cp = 0; cp < 16; cp++) {
+                for (int hh = 0; hh < 16; hh++) {
+                  const int head = fam * 16 + hh, chan = li * 16 + cp;
+                  const int o =
+                      (heads_w == kHeads ? head : head / (kHeads / heads_w)) *
+                          kD + chan;
+                  for (int t = 0; t < kT; t++) {
+                    double acc = 0.0;
+                    for (int c = 0; c < kH; c++) {
+                      acc += nrm[static_cast<size_t>(t) * kH + c] *
+                             (*wsrc[j])[static_cast<size_t>(c) * wwidth[j] + o];
+                    }
+                    const int slot =
+                        (Rev(cp, 4) << 12) | (Rev(hh, 5) << 7) | Rev(t, 7);
+                    want[slot] = wscale[j] * acc;
+                    at.push_back(slot);
+                    n += sv[slot].real() * want[slot];
+                    d += want[slot] * want[slot];
+                  }
+                }
+              }
+              ASSERT_GT(d, 1e-30) << "the exact operand is zero";
+              const double f = n / d;
+              double e = 0.0, mx = 0.0;
+              for (int slot : at) {
+                e = std::max(e, std::abs(sv[slot].real() / f - want[slot]));
+                mx = std::max(mx, std::abs(want[slot]));
+                sv[slot] = Complex(f * want[slot], 0.0);
+              }
+              worst = std::max(worst, e / mx);
+              const int lv = boot.param->NPToLevel(ct.GetNP());
+              Plaintext<word> npt;
+              boot.context->encoder_.Encode(npt, lv, ct.GetScale(), sv);
+              Ciphertext<word> fresh;
+              boot.ui->Encrypt(fresh, npt);
+              boot.context->Copy(ct, fresh);
+            }
+          }
+        }
+        std::cout << "  [stage 1.5] EXACT Q/K/V substituted at the doorstep; "
+                  << "what they replaced was off by at most " << worst << " = 2^"
+                  << std::log2(worst) << std::endl;
+      }
     }
 
     // ---- the softmax calibration, in chain units --------------------------
