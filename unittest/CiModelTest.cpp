@@ -771,6 +771,70 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_seam = Tick();
 
+    // ---- STAGE 2: the seam's images, against the clear attention output ---
+    //
+    // The leg hands its result back carrying a factor of its own -- the gamma
+    // fold of Doing.md 1.5cb, measured at 2.185 by the correctness-width layer
+    // test, which fitted it in run and called it calibration. It is what sizes
+    // the residual add, so it is fitted here the same way, on the ONE
+    // quantity that cannot be derived from a BootParameter.
+    double o_carried = 1.0;
+    {
+      std::vector<double> av;
+      ASSERT_TRUE(ReadF64(rdir + "/av_L" + (L < 10 ? "0" : "") +
+                              std::to_string(L) + ".f64",
+                          static_cast<size_t>(kT) * kH, av));
+      std::vector<std::vector<std::vector<double>>> ga(h_cts.size());
+      for (size_t k = 0; k < h_cts.size(); k++) {
+        Plaintext<word> pt;
+        boot.ui->Decrypt(pt, h_cts[k]);
+        std::vector<double> co;
+        boot_ffn.context->encoder_.DecodeCoeff(co, pt);
+        ga[k] = Components(co);
+      }
+      double na = 0.0, da = 0.0, ma = 0.0;
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        for (int col = 0; col < layout.rank; col++) {
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            const int k = 2 * bi + lane / 16;
+            const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+            const int head = Rev(lane, 5);
+            const int chan = bi * layout.rank + col;
+            for (int t = kSinkTokens; t < kT; t++) {
+              const double wv =
+                  cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+              na += ga[k][Rev(cc, 9)][Rev(t, 7)] * wv;
+              da += wv * wv;
+              ma = std::max(ma, std::abs(wv));
+            }
+          }
+        }
+      }
+      ASSERT_GT(da, 1e-20) << "the attention reference is zero";
+      o_carried = na / da;
+      double ea = 0.0;
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        for (int col = 0; col < layout.rank; col++) {
+          for (int lane = 0; lane < layout.lanes; lane++) {
+            const int k = 2 * bi + lane / 16;
+            const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+            const int head = Rev(lane, 5);
+            const int chan = bi * layout.rank + col;
+            for (int t = kSinkTokens; t < kT; t++) {
+              ea = std::max(
+                  ea, std::abs(ga[k][Rev(cc, 9)][Rev(t, 7)] / o_carried -
+                               cv * av[static_cast<size_t>(t) * kH +
+                                       head * kD + chan]));
+            }
+          }
+        }
+      }
+      std::cout << "  [stage 2] the seam's images vs the clear attention: "
+                << (ea / ma) << " = 2^" << std::log2(ea / ma)
+                << ", carried " << o_carried << std::endl;
+      if (stop_after == 2) return;
+    }
+
     // ---- the O projection, the residual, the FFN --------------------------
     //
     // The O weight takes V's own sizing back out and puts the residual at the
@@ -828,7 +892,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // at the ride. The incoming stream already carries `stream_scale`.
     // The O weight takes V's own sizing back out and puts the result on the
     // stream's factor, so the residual add sees two quantities that agree.
-    cal.res_scale = stream_scale / cv;
+    cal.res_scale = stream_scale / (cv * o_carried);
     // The gate and up are read off a NORMALISED stream, so they are in the
     // model's own units and their ride is set on those.
     cal.gate_scale = ride / std::max(cj["gate_absmax"].get<double>(), 1e-12);
