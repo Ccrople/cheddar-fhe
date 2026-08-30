@@ -127,8 +127,11 @@ void CiLlamaLayer<word>::AddRequiredRotations(EvkRequest &req) const {
   // `num_channels` at `channel_stride` -- while its `alpha` and window are
   // per-layer calibration that does not outlive one `FeedForward`. So a
   // handler is built here only to be asked what it will rotate by.
+  // A concrete degree, not `cfg_.rms_degree`: zero there means "derive it from
+  // the window", and the window is per-layer calibration that does not exist
+  // yet. The rotation distances do not depend on either.
   RmsNormHandler<word> probe(boot_, cfg_.num_tokens, cfg_.model_declared, 1.0,
-                             op_level_, 1e-5, 2.0, cfg_.rms_degree,
+                             op_level_, 1e-5, 2.0, NormDegree(2.0),
                              /*channel_stride=*/2);
   for (int d : probe.GetRotationDistances()) req.AddRequest(d, op_level_);
 }
