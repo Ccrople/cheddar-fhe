@@ -716,6 +716,84 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_proj = Tick();
 
+    // ---- STAGE 1.5: one Q half-image, at the doorstep addresses ----------
+    //
+    // `CiBootSet.TheLegRunsOnTheRealWeights` passes at full width with the
+    // same handler, so the leg is not what is wrong; what differs here is
+    // where its operands come from -- an ENCRYPTED half-density norm output
+    // rather than a host-normed dense one -- and this is the first place that
+    // difference is visible. The doorstep (Doing.md 1.5bx): entry
+    // (token t, channel c, head i) sits at slot
+    // `rev4(c mod 16) << 12 | rev5(i) << 7 | rev7(t)` of half-image `c / 16`.
+    {
+      std::vector<double> hin;
+      if (L == 0) {
+        hin = x0;
+      } else {
+        ASSERT_TRUE(ReadF64(rdir + "/h_L" + (L < 11 ? "0" : "") +
+                                std::to_string(L - 1) + ".f64",
+                            static_cast<size_t>(kT) * kH, hin));
+      }
+      std::vector<double> nrm(static_cast<size_t>(kT) * kH, 0.0);
+      for (int t = 0; t < kT; t++) {
+        double sq = 0.0;
+        for (int c = 0; c < kH; c++) {
+          const double v = hin[static_cast<size_t>(t) * kH + c];
+          sq += v * v;
+        }
+        const double inv = 1.0 / std::sqrt(sq / kH + 1e-5);
+        for (int c = 0; c < kH; c++) {
+          nrm[static_cast<size_t>(t) * kH + c] =
+              hin[static_cast<size_t>(t) * kH + c] * inv * an_f[c];
+        }
+      }
+      // Q, in the clear, pre-RoPE: the emission carries no RoPE.
+      const int l = 0;
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, q_a[l]);
+      std::vector<Complex> sl;
+      boot.context->encoder_.Decode(sl, pt);
+      double nq = 0.0, dq = 0.0, mq = 0.0;
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const int head = hh, chan = l * 16 + cp;
+          for (int t = 0; t < kT; t++) {
+            double q = 0.0;
+            for (int c = 0; c < kH; c++) {
+              q += nrm[static_cast<size_t>(t) * kH + c] *
+                   wq_f[static_cast<size_t>(c) * kH + head * kD + chan];
+            }
+            const double wv = cq * q;
+            const int slot = (Rev(cp, 4) << 12) | (Rev(hh, 5) << 7) | Rev(t, 7);
+            nq += sl[slot].real() * wv;
+            dq += wv * wv;
+            mq = std::max(mq, std::abs(wv));
+          }
+        }
+      }
+      ASSERT_GT(dq, 1e-30) << "the Q reference is zero";
+      const double fq = nq / dq;
+      double eq = 0.0;
+      for (int cp = 0; cp < 16; cp++) {
+        for (int hh = 0; hh < 16; hh++) {
+          const int head = hh, chan = l * 16 + cp;
+          for (int t = 0; t < kT; t++) {
+            double q = 0.0;
+            for (int c = 0; c < kH; c++) {
+              q += nrm[static_cast<size_t>(t) * kH + c] *
+                   wq_f[static_cast<size_t>(c) * kH + head * kD + chan];
+            }
+            const int slot = (Rev(cp, 4) << 12) | (Rev(hh, 5) << 7) | Rev(t, 7);
+            eq = std::max(eq, std::abs(sl[slot].real() / fq - cq * q));
+          }
+        }
+      }
+      std::cout << "  [stage 1.5] Q half-image 0 at the doorstep: "
+                << (eq / mq) << " = 2^" << std::log2(eq / mq) << ", carried "
+                << fq << " (the crossing is " << crossing << ")" << std::endl;
+      if (stop_after == 15) return;
+    }
+
     // ---- the softmax calibration, in chain units --------------------------
     typename cheddar::CiSinCAttention<word>::SoftMaxCalibration sc;
     sc.m_eff = m_eff;
