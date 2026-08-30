@@ -148,7 +148,7 @@ class CiSinCAttention {
     //! of the row norms themselves.
     double norm_lo = 0.5;
     double norm_hi = 2.0;
-    int exp_degree = 0;   //!< 0 = auto: 7 when causal, 9 when not (1.5cc)
+    int exp_degree = 0;   //!< 0 = derive it from `m_eff` (1.5ef)
     int inv_degree = 15;  //!< the walk has exactly four levels for it
     bool causal = false;
     //! Causal only: each (lane, row)'s calibrated live-key maximum, indexed

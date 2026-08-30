@@ -549,15 +549,69 @@ void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
   }
 }
 
+namespace {
+
+//! Max error of the degree-`deg` Chebyshev interpolant of `exp(hb (v-1))` on
+//! [-1, 1], on a dense grid. Cheap enough to call a few times at setup.
+double ExpFitError(double hb, int deg) {
+  const auto c = chebfit::Interpolate(
+      [hb](double v) { return std::exp(hb * (v - 1.0)); }, deg);
+  double worst = 0.0;
+  const int kGrid = 4001;
+  for (int i = 0; i < kGrid; i++) {
+    const double v = -1.0 + 2.0 * i / (kGrid - 1);
+    double b0 = 0.0, b1 = 0.0;
+    for (size_t j = c.size() - 1; j > 0; j--) {
+      const double t = 2.0 * v * b0 - b1 + c[j];
+      b1 = b0;
+      b0 = t;
+    }
+    worst = std::max(worst, std::abs(v * b0 - b1 + c[0] -
+                                     std::exp(hb * (v - 1.0))));
+  }
+  return worst;
+}
+
+//! The degree that reaches sixteen bits, CAPPED AT 15 -- and the cap is the
+//! level budget, not the fit. Counting the walk: `exp_in = top - 1`, the
+//! polynomial spends `ceil(log2(deg+1))`, the causal mask one, the square one,
+//! the affine one and the inverse square root `ceil(log2(inv_deg+1))`, and
+//! `PrepareSoftMax` then requires `inv_out - 2 >= forward_level`. At the
+//! layer's own numbers (`top` 16, `forward_level` 3, `inv_degree` 7) degree 15
+//! lands that at exactly 3 and degree 31 at 2, so 31 does not fit and would
+//! have to be funded by dropping the inverse square root to degree 3 -- which
+//! is 2^-13 on a window of [0.9, 1.1], against an exp fit at 15 that is
+//! 2^-8.49 on the ONE layer of 32 that wants more. Neither is near stage 2's
+//! 2^-5.70, so the cap costs nothing measurable and the alternative would.
+int ExpDegree(double m_eff) {
+  const double hb = std::max(m_eff, 0.0) / 4.0;
+  for (int d : {7, 9, 15}) {
+    if (ExpFitError(hb, d) < std::pow(2.0, -16.0)) return d;
+  }
+  return 15;
+}
+
+}  // namespace
+
 template <typename word>
 void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   const auto &layout = ccmm_.GetLayout();
   calib_ = calib;
   const int top = GetTopLevel();
   exp_in_ = top - 1;
-  const int exp_degree = (calib_.exp_degree > 0)
-                             ? calib_.exp_degree
-                             : (calib_.causal ? 7 : 9);
+  // THE DEGREE FOLLOWS m_eff, as SiLU's follows its range (1.5ea) and the
+  // norm's its window (1.5ec). `exp(hb (v-1))` on [-1, 1] is entire, so there
+  // is no Bernstein ellipse to read a rate off -- the Chebyshev coefficients
+  // are `2 I_k(hb) e^{-hb}` and only start falling once `k > hb` -- so the
+  // rule is measured rather than derived: interpolate at each candidate and
+  // take the first that reaches sixteen bits, which is where 1.5cv measured
+  // the circuits these fits are evaluated by. The old default (7 when causal,
+  // 9 when not) was set at a correctness-width `m_eff`; 1.5cf then showed 7
+  // is 3.2e-03 at a span of 24.36 and every caller has passed 15 by hand ever
+  // since. At the REAL model's spans, which run 17.1 to 97.3 over the 32
+  // layers, 15 is right for 31 of them and buys only 8.5 bits at layer 31.
+  const int exp_degree =
+      (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(calib_.m_eff);
   // k = 1 (Cho): y = exp(m_eff (u - 1) / 4), squared later by the norm.
   const double hb = calib_.m_eff / 4.0;
   auto exp_coeffs = chebfit::Interpolate(

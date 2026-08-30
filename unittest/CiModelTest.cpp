@@ -1165,7 +1165,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     sc.shift = cqk * s_raw_max;
     sc.norm_lo = 0.9;
     sc.norm_hi = 1.1;
-    sc.exp_degree = 15;
+    // 0 = derive it from `m_eff`, which is per layer and runs 17.1 to 97.3
+    // across the real 32: 15 is right for 31 of them and buys 8.5 bits at
+    // layer 31.
+    sc.exp_degree = 0;
     sc.inv_degree = 7;
     sc.causal = true;
     sc.row_shift.assign(layout.lanes, std::vector<double>(kT, 0.0));
@@ -1343,7 +1346,120 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       std::cout << "  [stage 2] the seam's images vs the clear attention: "
                 << (ea / ma) << " = 2^" << std::log2(ea / ma) << ", rms 2^"
                 << 0.5 * std::log2(qa / da) << ", carried " << o_carried
-                << std::endl;
+                << " (|ref| <= " << ma << ")" << std::endl;
+      // AND THE SAME IMAGES WITHOUT THE SCAN, as stage 1 reads the norm.
+      // `Components` is an alternating suffix sum over the whole ring, so it
+      // mixes the live band with the duplicate band; stage 1 measures 1.3
+      // bits between the two reads. If stage 2's gap against the leg's own
+      // 2^-9.5 is the scan it shows here, and if it is not, the two bands
+      // say whether the image is correctly banded -- two bands failing
+      // IDENTICALLY is a read at the wrong address, not a wrong image
+      // (1.5du).
+      {
+        std::vector<std::vector<double>> raw(h_cts.size());
+        for (size_t k = 0; k < h_cts.size(); k++) {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, h_cts[k]);
+          boot_ffn.context->encoder_.DecodeCoeff(raw[k], pt);
+        }
+        double lo = 0.0, du = 0.0, ql = 0.0, qd = 0.0;
+        for (int bi = 0; bi < layout.num_cts; bi++) {
+          for (int col = 0; col < layout.rank; col++) {
+            for (int lane = 0; lane < layout.lanes; lane++) {
+              const int k = 2 * bi + lane / 16;
+              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int head = Rev(lane, 5);
+              const int chan = bi * layout.rank + col;
+              const int Id = Rev(cc, 9);
+              for (int t = kSinkTokens; t < kT; t++) {
+                const int p = Pos(t);
+                const double wv =
+                    cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+                const double gl =
+                    raw[k][static_cast<size_t>(p) * kRank + Id] / o_carried;
+                lo = std::max(lo, std::abs(gl - wv));
+                ql += (gl - wv) * (gl - wv);
+                // The banded convention puts the duplicate one position BACK
+                // (1.5du): a dead component at `p - 1` carries the partner
+                // whose live copy is at `p`.
+                if (p >= 1 && Id != 0) {
+                  const double gd =
+                      raw[k][static_cast<size_t>(p - 1) * kRank +
+                             (kRank - Id)] / o_carried;
+                  du = std::max(du, std::abs(gd - wv));
+                  qd += (gd - wv) * (gd - wv);
+                }
+              }
+            }
+          }
+        }
+        std::cout << "    [stage 2] without the scan: live " << (lo / ma)
+                  << " = 2^" << std::log2(lo / ma) << " (rms 2^"
+                  << 0.5 * std::log2(ql / da) << "), duplicate " << (du / ma)
+                  << " = 2^" << std::log2(du / ma) << " (rms 2^"
+                  << 0.5 * std::log2(qd / da) << ")" << std::endl;
+      }
+      // IS IT NOISE OR IS IT A CONSTANT? The max and the rms above come out
+      // within 0.07 bits of each other, which noise does not do -- a max over
+      // 126 x 4096 entries is normally several bits above the rms. So the
+      // same residual is refitted with one factor PER HEAD and one PER TOKEN.
+      // If either collapses it, the cause is a calibration constant with that
+      // index (the softmax's `row_norm` is per (lane, row), its `row_shift`
+      // per row), and not the leg's arithmetic.
+      {
+        const int kHeadsN = kH / kD;
+        std::vector<double> nh(kHeadsN, 0.0), dh(kHeadsN, 0.0);
+        std::vector<double> nt(kT, 0.0), dt(kT, 0.0);
+        for (int bi = 0; bi < layout.num_cts; bi++) {
+          for (int col = 0; col < layout.rank; col++) {
+            for (int lane = 0; lane < layout.lanes; lane++) {
+              const int k = 2 * bi + lane / 16;
+              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int head = Rev(lane, 5);
+              const int chan = bi * layout.rank + col;
+              for (int t = kSinkTokens; t < kT; t++) {
+                const double got = ga[k][Rev(cc, 9)][Pos(t)];
+                const double wv =
+                    cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+                nh[head] += got * wv;  dh[head] += wv * wv;
+                nt[t] += got * wv;     dt[t] += wv * wv;
+              }
+            }
+          }
+        }
+        double qh = 0.0, qt = 0.0;
+        for (int bi = 0; bi < layout.num_cts; bi++) {
+          for (int col = 0; col < layout.rank; col++) {
+            for (int lane = 0; lane < layout.lanes; lane++) {
+              const int k = 2 * bi + lane / 16;
+              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int head = Rev(lane, 5);
+              const int chan = bi * layout.rank + col;
+              for (int t = kSinkTokens; t < kT; t++) {
+                const double got = ga[k][Rev(cc, 9)][Pos(t)];
+                const double wv =
+                    cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+                const double eh = got / (nh[head] / dh[head]) - wv;
+                const double et = got / (nt[t] / dt[t]) - wv;
+                qh += eh * eh;  qt += et * et;
+              }
+            }
+          }
+        }
+        double hlo = 1e300, hhi = -1e300, tlo = 1e300, thi = -1e300;
+        for (int i = 0; i < kHeadsN; i++) {
+          hlo = std::min(hlo, nh[i] / dh[i]);
+          hhi = std::max(hhi, nh[i] / dh[i]);
+        }
+        for (int t = kSinkTokens; t < kT; t++) {
+          tlo = std::min(tlo, nt[t] / dt[t]);
+          thi = std::max(thi, nt[t] / dt[t]);
+        }
+        std::cout << "    [stage 2] refitted PER HEAD: rms 2^"
+                  << 0.5 * std::log2(qh / da) << " (factors " << hlo << " .. "
+                  << hhi << "); PER TOKEN: rms 2^" << 0.5 * std::log2(qt / da)
+                  << " (factors " << tlo << " .. " << thi << ")" << std::endl;
+      }
       if (stop_after == 2) return;
     }
 
