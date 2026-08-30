@@ -271,7 +271,7 @@ class CiLlamaLayer {
   //! their calibration, so they are one function.
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain, double alpha, double window,
-                const EvkMap<word> &evk);
+                double stream_scale, const EvkMap<word> &evk);
 
   //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
   //! result canonical one level below. Duplicate-preserving by construction:

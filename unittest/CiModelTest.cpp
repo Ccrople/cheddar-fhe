@@ -311,21 +311,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   lcfg.product_level = kPcmmLevel;
   lcfg.ride = ride;
   // The ciphertext's epsilon, not the model's; see the calibration below.
-  lcfg.eps = 1e-5;   // replaced once `stream_scale` is known
+  lcfg.eps = 1e-5;   // the MODEL's: the stream factor is divided out first
   lcfg.min_ks = min_ks;
   lcfg.verbose = true;
   // `stream_scale` is derived below from the reference, but the layer needs
   // the ciphertext's epsilon at construction, so it is computed here.
-  {
-    double sa = 0.0;
-    for (double v : x0) sa = std::max(sa, std::abs(v));
-    for (int L = 0; L < num_layers; L++) {
-      sa = std::max(sa, calib_all["layers"][L]["out_absmax"].get<double>());
-      sa = std::max(sa, calib_all["layers"][L]["resid_absmax"].get<double>());
-    }
-    const double sc = ride / std::max(sa, 1e-12);
-    lcfg.eps = 1e-5 * sc * sc;
-  }
   cheddar::CiLlamaLayer<word> layer(fctx, layout, pack_keys, lcfg);
   {
     EvkRequest req;
@@ -501,12 +491,12 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     //
     // The OUTPUT stays in model units either way: the weight carries
     // `sqrt(alpha)` and the bracket `alpha`, so they cancel exactly.
-    const double s2 = stream_scale * stream_scale;
-    cal.attn_alpha = cj["attn_alpha"].get<double>() / s2;
+    cal.attn_alpha = cj["attn_alpha"].get<double>();
     cal.attn_norm_window = cj["attn_norm_window"].get<double>();
-    cal.alpha = cj["alpha"].get<double>() / s2;
+    cal.alpha = cj["alpha"].get<double>();
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
+    cal.stream_scale = stream_scale;
 
     std::vector<double> an_dec(kDeclaredH, 0.0), fn_dec(kDeclaredH, 0.0);
     for (int c = 0; c < kH; c++) {
@@ -834,7 +824,6 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // The gate and up are read off a NORMALISED stream, so they are in the
     // model's own units and their ride is set on those.
     cal.gate_scale = ride / std::max(cj["gate_absmax"].get<double>(), 1e-12);
-    cal.stream_scale = stream_scale;
     lw.o = &wo_dec;
     lw.gate = &wg_dec;
     lw.up = &wu_dec;

@@ -222,6 +222,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
                                   const std::vector<Ct> &stream,
                                   const std::vector<double> &gain,
                                   double alpha, double window,
+                                  double stream_scale,
                                   const EvkMap<word> &evk) {
   AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
              "CiLlamaLayer: the residual stream is " +
@@ -235,7 +236,22 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
     // ciphertext would be right here and wrong at the gate's crossing, which
     // carries no such factor (1.5cu). And RMSNorm is scale invariant, which is
     // exactly what hid that mistake for a whole increment.
-    Canonicalise(slots[k], 1.0 / crossing_);
+    // THE STREAM FACTOR GOES OUT HERE, WITH THE CROSSING. The residual
+    // carries a global factor so that its crossing rides at `Config::ride`,
+    // and `RmsNormHandler` wants `alpha * mean(x^2)` near 1 for the `x` it is
+    // handed -- so either this multiply takes the factor out and the
+    // calibration is the MODEL's, or it does not and every alpha and epsilon
+    // downstream has to carry `stream_scale^2`. The first is what the
+    // full-width FFN test does (`1 / (boundary * beta)`) and it is far less
+    // to get wrong: measured, leaving the factor in put the invsqrt's
+    // argument at 0.0038 where its window is [0.77, 1.3], and outside its
+    // interval a Chebyshev fit does whatever it likes -- relative 1.1 at the
+    // norm, with a fitted factor that moved between identical runs.
+    //
+    // Everything downstream of RMSNorm is then in MODEL units, because
+    // RMSNorm is scale invariant. The two projections that write the stream
+    // back -- O and down -- put the factor on again through their weights.
+    Canonicalise(slots[k], 1.0 / (crossing_ * stream_scale));
   }
 
   // RMSNorm DIVIDES BY THE WIDTH IT IS TOLD, and that is the DECLARED one.
@@ -268,7 +284,8 @@ void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const std::vector<double> &gain,
                                        const Calibration &c,
                                        const EvkMap<word> &evk) {
-  NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window, evk);
+  NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window,
+           c.stream_scale, evk);
 }
 
 template <typename word>
@@ -313,7 +330,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
 
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
   std::vector<Ct> normed;
-  NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window, evk);
+  NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window,
+           c.stream_scale, evk);
 
   // ---- gate and up -------------------------------------------------------
   std::vector<Ct> gate, upv;
