@@ -36,7 +36,7 @@
 using word = uint32_t;
 using cheddar::Ciphertext;
 using cheddar::Plaintext;
-using ringfixture::Ring;
+using Ring = ringfixture::Ring<word>;
 
 namespace {
 

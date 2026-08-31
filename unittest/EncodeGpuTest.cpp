@@ -749,8 +749,12 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
   int device = 0;
   cudaGetDevice(&device);
   cudaGetDeviceProperties(&prop, device);
+  // The clock fields left `cudaDeviceProp` in CUDA 13; the attributes did not.
+  int memory_clock_khz = 0, core_clock_khz = 0;
+  cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device);
+  cudaDeviceGetAttribute(&core_clock_khz, cudaDevAttrClockRate, device);
   const double peak_gbps =
-      2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8) / 1e9;
+      2.0 * memory_clock_khz * 1e3 * (prop.memoryBusWidth / 8) / 1e9;
 
   std::cout << std::endl;
   std::cout << "=== " << GetParam() << " on " << prop.name << " ===" << std::endl;
@@ -759,7 +763,7 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
             << " slots" << std::endl;
   std::cout << "  device: " << prop.multiProcessorCount << " SMs, "
             << prop.maxThreadsPerMultiProcessor << " threads/SM, "
-            << prop.clockRate / 1000 << " MHz core, " << std::fixed
+            << core_clock_khz / 1000 << " MHz core, " << std::fixed
             << std::setprecision(1) << peak_gbps << " GB/s theoretical peak"
             << std::endl;
   GpuEncoder<word>::ReportKernelAttributes(
