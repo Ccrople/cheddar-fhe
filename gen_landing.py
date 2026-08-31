@@ -24,6 +24,10 @@ SRC, LAND, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 # Optional 4th argument: CoeffToSlot levels (default 4, the native CtS; 2 is the
 # module-basis CtS in its two-level real form, Doing.md 3.6/3.7).
 NUM_CTS_ARG = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+# Optional 5th argument: EvalMod levels (default 8 = 5 for the degree-30
+# polynomial + 3 double angles, K = 16; 9 is CHEDDAR_BOOT_DOUBLE_ANGLE=4,
+# K = 32, which the module-sparse secret's wrap-around wants, Doing.md 3.9).
+NE_ARG = int(sys.argv[5]) if len(sys.argv) > 5 else 8
 j = json.load(open(SRC, encoding="utf-8"))
 main, term, aux = j["main_primes"], j["terminal_primes"], j["auxiliary_primes"]
 lc = [tuple(x) for x in j["level_config"]]
@@ -31,9 +35,9 @@ bits = lambda p: math.log2(p)
 sizes = [round(bits(p)) for p in main]
 b29 = [i for i, s in enumerate(sizes) if s == 29]
 lo30 = [i for i, s in enumerate(sizes) if s == 30]
-NE, NUM_CTS, NT = 8, NUM_CTS_ARG, len(term)
+NE, NUM_CTS, NT = NE_ARG, NUM_CTS_ARG, len(term)
 first29 = b29[0]
-assert len(b29) == 2 * NE
+assert len(b29) >= 16
 assert 5 <= LAND <= 19, "landing must be in [5,19] (below 5 no room to compute; " \
                         "above 19 the bottom consumes EvalMod's 29-bit primes)"
 m_land, t_land = lc[LAND]
@@ -43,7 +47,7 @@ assert peak <= first29
 ter_to_add = NT - t_land
 ter_levels = (ter_to_add + 1) // 2
 main_levels = NUM_CTS - ter_levels
-total_main = m_land + 16 + 2 * main_levels
+total_main = m_land + 2 * NE + 2 * main_levels
 spare30 = [i for i in lo30 if i >= peak and not (first29 <= i < first29 + 16)]
 spare_needed = total_main - (peak + 16)
 assert len(spare30) >= spare_needed, "not enough spare 30-bit primes"

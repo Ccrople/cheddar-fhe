@@ -461,6 +461,10 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15c2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15c2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19c2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19c2.json COPYONLY)
+# Nine EvalMod levels (CHEDDAR_BOOT_DOUBLE_ANGLE=4, K = 32): the range the
+# module-sparse secret's wrap-around wants (Doing.md 3.9).
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json
