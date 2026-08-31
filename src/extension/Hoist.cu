@@ -276,7 +276,29 @@ void HoistHandler<word>::Unstage() const {
   for (auto &[_, pt_map] : hoist_pt_map_) {
     for (auto &[__, pt] : pt_map) pt.mx_ = DeviceVector<word>(0);
   }
+  if (first) {
+    // PINNED, once: a pageable copy of 5 GiB moves at ~4 GB/s and the leg's
+    // converters are read every layer; registered memory goes at the bus's
+    // ~12. The vectors are never resized after this, so the registration
+    // stands until the handler dies (`~HoistHandler`).
+    for (auto &h : host_pts_) {
+      if (h.empty()) continue;
+      const cudaError_t e = cudaHostRegister(
+          h.data(), h.size() * sizeof(word), cudaHostRegisterDefault);
+      if (e != cudaSuccess) {
+        // Not fatal: the copy still works, only slower.
+        cudaGetLastError();
+        break;
+      }
+      registered_.push_back(h.data());
+    }
+  }
   on_device_ = false;
+}
+
+template <typename word>
+HoistHandler<word>::~HoistHandler() {
+  for (void *p : registered_) cudaHostUnregister(p);
 }
 
 template <typename word>

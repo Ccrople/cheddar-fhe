@@ -54,6 +54,9 @@ class HoistHandler {
   // and kept: a transform that is unstaged twice copies down once.
   mutable std::vector<HostVector<word>> host_pts_;
   mutable bool on_device_ = true;
+  // The host copies' buffers registered with the driver (pinned), to be
+  // unregistered when the handler dies. A moved-from handler keeps none.
+  mutable std::vector<void *> registered_;
 
   // initialization-related methods
   void ExtractBSIndices(const PlainHoistMap &hoist_map);
@@ -109,6 +112,7 @@ class HoistHandler {
   HoistHandler(const HoistHandler &) = delete;
   HoistHandler &operator=(const HoistHandler &) = delete;
   HoistHandler(HoistHandler &&) = default;
+  ~HoistHandler();
 
   /**
    * @brief Write the compiled plaintexts and the baby/giant structure.
