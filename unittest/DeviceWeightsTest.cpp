@@ -103,10 +103,9 @@ Words Read(const Ciphertext<word> &ct) {
 }
 
 void RunBothAndCompare(const char *label) {
+  // On R+ the PC-MM runs at small_degree = T, so the rank is degree / T
+  // (Doing.md 1.5bi); `leg.GetRank()` below is the authority.
   Ring boot(Param());
-  const int rank = boot.Degree() / (2 * kTokens);
-  ASSERT_EQ(rank, kRank);
-
   boot.ui->PrepareModPackKeys(kTokens, kProductLevel);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
   for (int j = 0; j < kRank; j++) {
