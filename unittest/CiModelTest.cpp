@@ -138,6 +138,22 @@ int Rev(int v, int bits) {
 // token axis -- and the model layer is the first place where the leg's
 // convention and the seam's output meet. `CHEDDAR_CI_TOKPOS=0` restores the
 // old one, for bisection against the tests that still carry it.
+
+// THE LIVE DEMAND, from `MemoryPool`'s own accounting when `CHEDDAR_MEM_STATS=1`
+// -- the driver's number is the pool's reservation and says nothing (the class
+// comment in MemoryPool.h). Printed at every stage boundary, so an
+// out-of-memory names the stage that asked and the objects standing under it.
+void MemRow(const char *what) {
+  if (!cheddar::MemoryPool::StatisticsEnabled()) return;
+  const auto u = cheddar::MemoryPool::GetUsage();
+  size_t free_b = 0, total_b = 0;
+  cudaMemGetInfo(&free_b, &total_b);
+  std::cout << "  [mem] " << what << ": live " << (u.current_bytes >> 20)
+            << " MiB, peak " << (u.peak_bytes >> 20) << " MiB, "
+            << u.current_allocations << " allocations; driver "
+            << ((total_b - free_b) >> 20) << " MiB reserved" << std::endl;
+}
+
 int g_tok_pos = 1;
 int Pos(int t) { return g_tok_pos != 0 ? t : Rev(t, 7); }
 
@@ -560,6 +576,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
   layer.DropSeamHalf();
   const auto t_setup1 = Tick();
+  MemRow("after the one-time setup (keys, converters, tables, the layer)");
   std::cout << "[time] ONE-TIME setup (keys, converters, the layer): "
             << Ms(t_setup0, t_setup1) / 1000.0 << " s" << std::endl;
 
@@ -745,6 +762,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
   for (int L = first_layer; L < first_layer + num_layers; L++) {
     const auto t_layer0 = Tick();
+    MemRow("layer start");
     const std::string ld = wdir + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
     // The weight-cache name. A repeated tag with different weights is a wrong
     // layer that still decrypts, so it carries the layer index.
@@ -899,6 +917,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::vector<Ciphertext<word>> normed;
     layer.AttentionNorm(normed, stream, an_dec, cal, fevk);
     const auto t_norm = Tick();
+    MemRow("after the attention norm");
 
     // ---- STAGE 1: the pre-attention norm, against the host ---------------
     //
@@ -1286,6 +1305,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_proj = Tick();
+    MemRow("after the q/k/v emissions and their HalfBoots");
 
     // ---- STAGE 1.5: one Q half-image, at the doorstep addresses ----------
     //
@@ -1597,6 +1617,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     booted.clear();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_seam = Tick();
+    MemRow("after the leg, the Boots and the seam");
 
     // ---- STAGE 2: the seam's images, against the clear attention output ---
     //
@@ -1902,6 +1923,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     layer.FeedForward(next, h_cts, stream, lw, cal, fevk);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_ffn = Tick();
+    MemRow("after the feed-forward");
 
     // ---- against the same layer in float64 --------------------------------
     std::vector<double> ref;
