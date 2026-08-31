@@ -4,7 +4,7 @@
   "boot": true,
   "dense_hamming_weight": 32768,
   "sparse_hamming_weight": 32,
-  "num_cts_levels": 4,
+  "num_cts_levels": 5,
   "num_stc_levels": 3,
   "terminal_primes": [
     29884417,
@@ -45,7 +45,9 @@
     975175681,
     1173618689,
     1045430273,
-    1231552513
+    1231552513,
+    969146369,
+    1053818881
   ],
   "auxiliary_primes": [
     2146959361,
@@ -152,7 +154,11 @@
       4
     ],
     [
-      32,
+      34,
+      4
+    ],
+    [
+      34,
       5
     ]
   ],

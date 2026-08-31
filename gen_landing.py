@@ -8,17 +8,27 @@
 #                 landing (grafting has swapped mains out below the peak) the
 #                 bottom two ride the swapped-out 30-bit mains at 59/60-bit,
 #                 which EvalMod tolerates (measured L9, L15)
-#   4 CtS       : saturate main + bring terminals up to 5. At an EVEN landing
-#                 (5 - t_L odd) one CtS level is a single 25-bit terminal.
+#   CtS         : saturate main + bring terminals up to 5.
 #
-# WHAT WORKS (measured on A6000, all L in [5,19]):
-#   * HalfBoot -- the LAYER's crossing op -- lands at EVERY L. Odd L: residual
-#     ~1.1e-04. Even L: ~3.8e-04 (the 25-bit CtS costs ~2 bits).
-#   * Full Boot (adds StC) is clean only at ODD L >= 11 (residual ~3e-05). At
-#     an even L, StC reads the scale the 25-bit CtS left slightly off and
-#     corrupts; below 11 its StC hits ci16_35's num_accum==1 zone.
-# So for the layer, any L >= 5 is usable; odd L is preferred (full precision,
-# and full Boot available).
+# THE TERMINAL PARITY. Reaching the top's 5 terminals from t_L is a net-odd
+# terminal change when t_L is EVEN, and each rescale is pure-main OR pure-term
+# (ModSwitch forbids dropping both), so ONE CtS level must be a single 25-bit
+# terminal. Device-measured: folding that thin level into a transform phase
+# injects large coefficient noise that HalfBoot's slot comparison hides but
+# SlotToCoeff exposes -- so an even landing's Full Boot corrupted (residual ~5).
+# The fix (EvalSpecialFFT): a thin single-terminal level is consumed by a PURE
+# RESCALE, not a transform phase. This generator therefore places that terminal
+# at the VERY TOP of an even landing (num_cts = 5: 1 thin + 4 thick) so the
+# EvaluateCtS prologue rescales it away before the transform. Odd landings have
+# no thin level (num_cts = 4, byte-identical to the earlier v1, and L=19 == the
+# ci16_35 ladder itself).
+#
+# WHAT WORKS (device-measured, A6000):
+#   * HalfBoot -- the LAYER's crossing op -- lands at EVERY L, residual ~1.1e-4
+#     at both parities (the thin level costs the even landing nothing now).
+#   * Full Boot (adds StC) is clean at EVERY L whose landing clears ci16_35's
+#     num_accum==1 zone -- odd L >= 11 and even L >= 10 (GetEndLevel() >= 7) --
+#     residual ~3e-05 at both parities.
 import json, math, sys
 SRC, LAND, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 j = json.load(open(SRC, encoding="utf-8"))
@@ -28,7 +38,7 @@ bits = lambda p: math.log2(p)
 sizes = [round(bits(p)) for p in main]
 b29 = [i for i, s in enumerate(sizes) if s == 29]
 lo30 = [i for i, s in enumerate(sizes) if s == 30]
-NE, NUM_CTS, NT = 8, 4, len(term)
+NE, NT = 8, len(term)
 first29 = b29[0]
 assert len(b29) == 2 * NE
 assert 5 <= LAND <= 19, "landing must be in [5,19] (below 5 no room to compute; " \
@@ -36,11 +46,22 @@ assert 5 <= LAND <= 19, "landing must be in [5,19] (below 5 no room to compute; 
 m_land, t_land = lc[LAND]
 peak = max(lc[i][0] for i in range(LAND + 1))
 assert peak <= first29
+even = (t_land % 2 == 0)
+NUM_CTS = 5 if even else 4  # even: 1 thin (top) + 4 thick;  odd: 4 thick
 
-ter_to_add = NT - t_land
-ter_levels = (ter_to_add + 1) // 2
-main_levels = NUM_CTS - ter_levels
-total_main = m_land + 16 + 2 * main_levels
+# CtS level layout (going UP from the EvalMod top [m_land+16, t_land]).
+if even:
+    # Reach NT-1 terminals in pairs (net even, since t_land is even), saturate
+    # the mains, then the single top terminal is the THIN level.
+    term_pair_levels = (NT - 1 - t_land) // 2
+    main_pair_levels = (NUM_CTS - 1) - term_pair_levels
+    total_main = m_land + 16 + 2 * main_pair_levels
+else:
+    ter_to_add = NT - t_land
+    ter_levels = (ter_to_add + 1) // 2
+    main_pair_levels = NUM_CTS - ter_levels
+    total_main = m_land + 16 + 2 * main_pair_levels
+
 spare30 = [i for i in lo30 if i >= peak and not (first29 <= i < first29 + 16)]
 spare_needed = total_main - (peak + 16)
 assert len(spare30) >= spare_needed, "not enough spare 30-bit primes"
@@ -49,16 +70,25 @@ assert len(new_main) == total_main
 new_term = term[:]
 
 new_lc = [list(lc[i]) for i in range(LAND + 1)]
-m = m_land
+m, t = m_land, t_land
 for _ in range(NE):
-    m += 2; new_lc.append([m, t_land])
-for _ in range(main_levels):
-    m += 2; new_lc.append([m, t_land])
-assert m == total_main
-t = t_land; rem = ter_to_add
-while rem > 0:
-    s = min(2, rem); t += s; rem -= s; new_lc.append([m, t])
-assert t == NT
+    m += 2; new_lc.append([m, t])          # EvalMod: +2 main each, 58-bit
+if even:
+    for _ in range(term_pair_levels):
+        t += 2; new_lc.append([m, t])      # thick terminal pairs (bottom)
+    for _ in range(main_pair_levels):
+        m += 2; new_lc.append([m, t])      # thick main pairs
+    assert t == NT - 1 and m == total_main
+    t += 1; new_lc.append([m, t])          # THE THIN single-terminal top level
+    assert t == NT
+else:
+    for _ in range(main_pair_levels):
+        m += 2; new_lc.append([m, t])
+    assert m == total_main
+    rem = NT - t
+    while rem > 0:
+        s = min(2, rem); t += s; rem -= s; new_lc.append([m, t])
+    assert t == NT
 max_level = len(new_lc) - 1
 
 def resc(hi, lo):
@@ -72,16 +102,20 @@ for i in range(1, len(new_lc)):
     a, b = new_lc[i-1], new_lc[i]
     ta, tb = a[0]+a[1], b[0]+b[1]
     if not (ta < tb or (ta == tb and a[0] < b[0])): print(f" order L{i}"); ok = False
+    if b[0]-a[0] > 0 and b[1]-a[1] > 0: print(f" MIXED drop L{i}"); ok = False
 if new_lc[-1] != [total_main, NT]: print(" last"); ok = False
 emS, emE = max_level - NUM_CTS, max_level - NUM_CTS - NE
 em = [resc(new_lc[L], new_lc[L-1]) for L in range(emS, emE, -1)]
-ct = [resc(new_lc[L], new_lc[L-1]) for L in range(max_level, emS, -1)]
+ct = [resc(new_lc[L], new_lc[L-1]) for L in range(max_level, emS, -1)]  # top..bottom
 ok = ok and emE == LAND and all(57 <= x <= 61 for x in em)
+# the only sub-30-bit CtS rescale allowed is the even landing's single thin top
+thin = [round(x) for x in ct if round(x) < 49]
+ok = ok and (thin == [25] if even else thin == [])
 logQP = sum(bits(p) for p in new_main+new_term+aux)
 kind = "JUNCTION " if m_land < peak else ""
-kind += "even (HalfBoot-only)" if t_land % 2 == 0 else "odd (HalfBoot+Boot)"
-print(f"L{LAND} t={t_land} [{kind}]: max={max_level} climb#Q={total_main+NT} "
-      f"logQP={logQP:.0f} EvalMod={[round(x) for x in em]} CtS={[round(x) for x in ct]} "
+kind += "even (thin-top, full Boot)" if even else "odd (full Boot)"
+print(f"L{LAND} t={t_land} [{kind}]: max={max_level} num_cts={NUM_CTS} #Q={total_main+NT} "
+      f"logQP={logQP:.0f} EvalMod={[round(x) for x in em]} CtS(top..bot)={[round(x) for x in ct]} "
       f"{'OK' if ok else 'BAD'}")
 if not ok: sys.exit(1)
 json.dump({"log_degree": j["log_degree"], "log_default_scale": j["log_default_scale"],

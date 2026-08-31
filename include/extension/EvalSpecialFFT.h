@@ -72,6 +72,18 @@ class EvalSpecialFFT {
   // Never null after construction: either built here or adopted from a donor
   // whose parameters this one's constructor checked.
   std::shared_ptr<CtSTables> cts_;
+  // A landing ladder whose CoeffToSlot must pass through a single-terminal
+  // (~25-bit) level cannot fold that level into a transform phase without
+  // injecting large coefficient noise (device-measured: the thin phase's
+  // stages amplify it, worst at the top, and SlotToCoeff exposes it). Such a
+  // level is instead consumed by a PURE RESCALE (a constant-1 multiply at the
+  // level's own rescale product, then a rescale) in EvaluateCtS, while the
+  // transform phases are built only for the remaining thick levels. Empty for
+  // every shipped preset (their CtS levels are all >= 2^33), so their path is
+  // byte-identical. The consts are held so `EvaluateCtS`, which is const, can
+  // apply them; their levels descend from cts_level.
+  std::vector<int> cts_thin_levels_;
+  std::vector<Constant<word>> cts_thin_consts_;
   std::vector<LinearTransform<word>> stc_phases_;
 
   std::vector<ComplexLinearTransform<word>> stc_ci_phases_;
