@@ -147,8 +147,20 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
   };
   auto chan_of = [](int col, int lh) { return Rev(col, 4) * 32 + Rev(lh, 5); };
 
+  // THE AMPLITUDE IS PART OF THE MEASUREMENT, because the seam is three
+  // LinearTransforms and a LinearTransform's added error is ABSOLUTE. Encrypted
+  // at sigma = 1 this test has always reported ~2^-14.4, and the LAYER hands
+  // the seam the booted attention output, whose coefficients reach 4.2e-04 --
+  // slot rms of order 0.02, forty times colder. A component validated hot and
+  // run cold is the fault this tree has now found four times (1.5ec's
+  // reduction, 1.5ea's SiLU range, 1.5ec's invsqrt window, and this), so the
+  // amplitude is a knob and the default is unchanged.
+  const double amp = [] {
+    const char *e = std::getenv("CHEDDAR_SEAM_AMP");
+    return (e && e[0]) ? std::atof(e) : 1.0;
+  }();
   std::mt19937_64 gen(0x5EA3);
-  std::normal_distribution<double> xd(0.0, 1.0);
+  std::normal_distribution<double> xd(0.0, amp);
   std::vector<Complex> msg(num_slots, Complex(0.0, 0.0));
   std::vector<std::vector<std::vector<double>>> v(
       kRows, std::vector<std::vector<double>>(
@@ -228,7 +240,8 @@ TEST(CiSeam, TheLibrarySeamHandsTheProjectionAReadableImage) {
 
   std::cout << "THE LIBRARY SEAM, read as components: live " << live_err
             << ", dead " << dead_err << " against |v| <= " << absmax
-            << ", carried " << carried << std::endl;
+            << ", carried " << carried << " (amplitude " << amp
+            << ", live 2^" << std::log2(live_err / absmax) << ")" << std::endl;
   EXPECT_LT(live_err, 5e-2 * absmax)
       << "the seam did not hand the projection a readable banded image";
   EXPECT_LT(dead_err, 5e-2 * absmax)
