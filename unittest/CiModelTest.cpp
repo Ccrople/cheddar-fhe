@@ -418,9 +418,52 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   std::cout << "crossing constant " << crossing << " = 2^"
             << std::log2(std::abs(crossing)) << " (derived)" << std::endl;
 
+  // THE LEG'S LANDING RING. `CHEDDAR_CI_LEG_PARAM` names a landing sub-ladder
+  // (Doing.md 3.9: `ci16_35_land13`, climb to 25) for the 48 q/k/v HalfBoots
+  // -- only RoPE spends a level before `Merge` drops to the exchange at 8 --
+  // and the 8 chain-output Boots, which feed the seam at its input level.
+  // The 8 score Boots stay on ci16_35: the softmax walk needs exactly 16 -> 3.
+  // Same secret, its own keys; ciphertexts cross as they are.
+  const char *leg_env = std::getenv("CHEDDAR_CI_LEG_PARAM");
+  const std::string leg_param = (leg_env && leg_env[0]) ? leg_env : kBootParam;
+  const bool leg_own_ring = leg_param != kBootParam;
+  std::unique_ptr<Ring> leg_land;
+  std::shared_ptr<BootContext<word>> lctx = bctx;
+  const cheddar::EvkMap<word> *levk = &boot.ui->GetEvkMap();
+  if (leg_own_ring) {
+    leg_land = std::make_unique<Ring>(leg_param, boot.ui->GetSecretCoeffs(),
+                                      /*slack=*/0);
+    lctx = std::dynamic_pointer_cast<BootContext<word>>(leg_land->context);
+    ASSERT_NE(lctx, nullptr);
+    lctx->PrepareEvalMod();
+    lctx->PrepareEvalSpecialFFT(num_slots);
+    EvkRequest req;
+    lctx->AddRequiredRotations(req, num_slots, min_ks);
+    leg_land->ui->PrepareRotationKey(req);
+    levk = &leg_land->ui->GetEvkMap();
+    ASSERT_NEAR(lctx->GetMessageRatio() / crossing, 1.0, 1e-9)
+        << "the landing ring's crossing constant differs from ci16_35's";
+    for (int L = 0; L <= leg_land->param->default_encryption_level_; L++) {
+      ASSERT_EQ(boot.param->GetPrimeVector(boot.param->LevelToNP(L)),
+                leg_land->param->GetPrimeVector(leg_land->param->LevelToNP(L)))
+          << "the leg's landing ring differs from ci16_35 at level " << L;
+    }
+    std::cout << "leg landing ring " << leg_param << ": climbs to "
+              << lctx->GetBootParameter().GetMaxLevel() << " ("
+              << leg_land->param
+                     ->LevelToNP(lctx->GetBootParameter().GetMaxLevel())
+                     .GetNumTotal()
+              << " limbs), HalfBoot lands "
+              << lctx->GetBootParameter().GetEvalModEndLevel()
+              << ", Boot lands " << lctx->GetBootParameter().GetEndLevel()
+              << std::endl;
+  }
+
   typename cheddar::CiSinCAttention<word>::Config acfg;
   acfg.restore = 1.0 / crossing;
   acfg.rope_base = kRopeTheta;
+  // Where the q/k/v HalfBoots land, which is where the RoPE masks are encoded.
+  acfg.land_level = lctx->GetBootParameter().GetEvalModEndLevel();
   auto attn = std::make_unique<cheddar::CiSinCAttention<word>>(
       bctx, swtch->context, small->context, lifted->context, acfg);
   const auto layout = attn->GetLayout();
@@ -1237,8 +1280,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         ASSERT_EQ(static_cast<int>(raw.size()), 16);
         for (int g = 0; g < 16; g++) {
           raw[g].SetNumSlots(num_slots);
-          bctx->HalfBoot((*dst[j][g % 2])[g / 2], raw[g],
-                         boot.ui->GetEvkMap(), min_ks);
+          lctx->HalfBoot((*dst[j][g % 2])[g / 2], raw[g], *levk, min_ks);
         }
       }
     }
@@ -1481,7 +1523,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           boot.ui->Decrypt(pt, attn_out[bi]);
           boot.context->encoder_.DecodeCoeff(before, pt);
         }
-        bctx->Boot(booted[bi], attn_out[bi], boot.ui->GetEvkMap(), min_ks);
+        // On the leg's landing ring these land at `GetEndLevel()`, which must
+        // be at or above where the seam starts.
+        lctx->Boot(booted[bi], attn_out[bi], *levk, min_ks);
+        if (bi == 0) {
+          ASSERT_GE(boot.param->NPToLevel(booted[bi].GetNP()),
+                    layer.GetSeamInputLevel())
+              << "the chain-output Boots land below the seam's input level";
+        }
         {
           Plaintext<word> pt;
           boot.ui->Decrypt(pt, booted[bi]);

@@ -427,6 +427,10 @@ class CiLlamaLayer {
   const SylphSchedule<word> &GetSchedule() const { return sched_; }
   //! The projection leg, for a caller that wants its own `Project` calls.
   CoeffLinearLeg<word> &GetProjectionLeg() { return *leg_; }
+  //! The level the seam brings a booted chain-layout ciphertext down to
+  //! before its first stage: a caller landing those Boots elsewhere must land
+  //! them at or above it.
+  int GetSeamInputLevel() const { return seam_->GetInputLevel(); }
 
   /**
    * @brief Host seconds spent PREPARING this layer's slot operators, which is
