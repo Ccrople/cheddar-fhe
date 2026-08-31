@@ -383,6 +383,19 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
       num2 += expected[s] * obtained[s];
       den2 += expected[s] * expected[s];
     }
+    {
+      int over[4] = {0, 0, 0, 0};
+      for (int s = 0; s < n; s++) {
+        const double e = std::abs(obtained[s] / ratio - expected[s]);
+        if (e > 0.05) over[0]++;
+        if (e > 1.0) over[1]++;
+        if (e > 1e3) over[2]++;
+        if (e > 1e6) over[3]++;
+      }
+      std::cout << "[" << name << "] |err| against the derived ratio: > 0.05: "
+                << over[0] << ", > 1: " << over[1] << ", > 1e3: " << over[2]
+                << ", > 1e6: " << over[3] << " of " << n << std::endl;
+    }
     if (outliers > 0 && outliers < n / 2) {
       const double c2 = num2 / den2;
       std::vector<double> e2, o2;
@@ -554,6 +567,45 @@ TEST_P(CiModuleBoot, ModuleLiftCentresTheRepresentatives) {
   };
   lifted(up_native, "native lift");
   const auto coeffs_module = lifted(up_module, "module lift");
+
+  // The same two lifts of the ciphertext the half bootstrap actually lifts:
+  // scaled up by 2^log_scaleup so the message rides at 2^-5 of q0. Encoded
+  // at that scale directly, which is what MultUnsafe(scaleup_const_) makes.
+  {
+    const int log_scaleup = static_cast<int>(std::round(std::log2(q0))) -
+                            static_cast<int>(std::round(std::log2(scale))) - 5;
+    const double up_scale = scale * std::ldexp(1.0, log_scaleup);
+    Plaintext<word> pt_up;
+    context_->encoder_.EncodeCoeff(pt_up, 0, up_scale, image);
+    Ciphertext<word> ct_up, a, b;
+    interface_->Encrypt(ct_up, pt_up);
+    boot->ModUpToLevel(a, ct_up, interface_->GetEvkMap(), top);
+    boot->ModUpToLevel(b, ct_up, interface_->GetEvkMap(), top, T);
+    for (auto pr : {std::make_pair(&a, "native lift, scaled up"),
+                    std::make_pair(&b, "module lift, scaled up")}) {
+      Plaintext<word> out;
+      interface_->Decrypt(out, *pr.first);
+      std::vector<double> coeffs;
+      context_->encoder_.DecodeCoeff(coeffs, out);
+      std::vector<double> wrap(n);
+      double max_native = 0.0;
+      for (int c = 0; c < n; c++) {
+        wrap[c] = (coeffs[c] - image[c]) * up_scale / q0;
+        max_native = std::max(max_native, std::abs(wrap[c]));
+      }
+      const auto module = HostScan(wrap, k, T);
+      double max_module = 0.0;
+      int over16 = 0;
+      for (double v : module) {
+        max_module = std::max(max_module, std::abs(v));
+        if (std::abs(v) > 16.0) over16++;
+      }
+      std::cout << std::fixed << std::setprecision(3) << "[" << pr.second
+                << "] wrap-around: max |native| " << max_native
+                << ", max |module| " << max_module << ", module > 16: "
+                << over16 << std::endl;
+    }
+  }
 
   // 3. the module CtS on the module-lifted ciphertext, boot constant in.
   CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1, top, BootPhases(),
