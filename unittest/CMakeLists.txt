@@ -409,18 +409,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree13_35.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35_l2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci12_35_l2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35_l2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci_ringswitch16_35_l2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35_l2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree13_35_l2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35_l3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci12_35_l3.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35_l3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci_ringswitch16_35_l3.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35_l3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree13_35_l3.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35_boot.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_35_boot.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35_boot.json
