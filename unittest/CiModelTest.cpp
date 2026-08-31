@@ -165,6 +165,26 @@ std::vector<std::vector<double>> Components(const std::vector<double> &co) {
   return comp;
 }
 
+// The blob as the exporter wrote it, for `CoeffLinearLeg::DeviceWeights`.
+bool ReadF32Host(const std::string &path, size_t count,
+                 cheddar::HostVector<float> &out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  out.resize(count);
+  f.read(reinterpret_cast<char *>(out.data()),
+         static_cast<std::streamsize>(count * sizeof(float)));
+  return static_cast<size_t>(f.gcount()) == count * sizeof(float);
+}
+
+// WHICH WEIGHT FORM THE LAYER GETS. Default: the f32 tensors on the device,
+// encoded where they are read (Doing.md 3). `CHEDDAR_CI_HOST_WEIGHTS=1` builds
+// the declared-width double matrices on the host instead -- the form every
+// run before 2026-08-31 used, kept as the A/B for the conversion row.
+bool HostWeightsFromEnv() {
+  const char *e = std::getenv("CHEDDAR_CI_HOST_WEIGHTS");
+  return e != nullptr && !(e[0] == '0' && e[1] == '\0');
+}
+
 bool ReadF32(const std::string &path, size_t count, std::vector<double> &out) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
@@ -635,6 +655,53 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an_f));
     ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, fn_f));
 
+    // The seven projections as the exporter wrote them, on the device. Under
+    // `CHEDDAR_CI_HOST_WEIGHTS` these stay empty and the declared matrices
+    // below are built instead.
+    using Leg = cheddar::CoeffLinearLeg<word>;
+    using DW = typename Leg::DeviceWeights;
+    const bool host_weights = HostWeightsFromEnv();
+    struct Tensor {
+      cheddar::HostVector<float> host;
+      cheddar::DeviceVector<float> dev;
+      int rows = 0, cols = 0;
+    };
+    Tensor tq, tk, tv, to, tg, tu, td;
+    auto load = [&](Tensor &t, const char *name, int rows, int cols) {
+      t.rows = rows;
+      t.cols = cols;
+      if (host_weights) return true;
+      if (!ReadF32Host(ld + "/" + name, static_cast<size_t>(rows) * cols,
+                       t.host)) {
+        return false;
+      }
+      t.dev.resize(static_cast<int>(t.host.size()));
+      cheddar::CopyHostToDevice(t.dev, t.host);
+      return true;
+    };
+    ASSERT_TRUE(load(tq, "wq.f32", kH, kH));
+    ASSERT_TRUE(load(tk, "wk.f32", kH, kKv));
+    ASSERT_TRUE(load(tv, "wv.f32", kH, kKv));
+    ASSERT_TRUE(load(to, "wo.f32", kH, kH));
+    ASSERT_TRUE(load(tg, "wgate.f32", kH, kI));
+    ASSERT_TRUE(load(tu, "wup.f32", kH, kI));
+    ASSERT_TRUE(load(td, "wdown.f32", kI, kH));
+    auto device_weights = [&](const Tensor &t, const std::vector<int> &in_slot,
+                              const std::vector<int> &out_slot, double scale) {
+      DW dw;
+      dw.data = &t.dev;
+      dw.in_live = t.rows;
+      dw.out_live = t.cols;
+      dw.in_slot = &in_slot;
+      dw.out_slot = &out_slot;
+      dw.fingerprint = Leg::Fingerprint(t.host.data(), t.host.size(), scale);
+      return dw;
+    };
+    // The declared -> live maps the layer states once.
+    std::vector<int> model_map, hidden_map;
+    cheddar::CiLlamaLayer<word>::ModelMap(model_map, kDeclaredH, kRank, kH);
+    cheddar::CiLlamaLayer<word>::HiddenMap(hidden_map, kDeclaredHid, kRank, kI);
+
     // ---- the pre-attention norm, encrypted --------------------------------
     typename cheddar::CiLlamaLayer<word>::Calibration cal;
     // ALPHA IS ABOUT THE CIPHERTEXT'S MAGNITUDE, NOT THE MODEL'S.
@@ -1042,20 +1109,49 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       }
     };
 
+    // The same map as `declare_qkv`, as a declared-output -> live-column
+    // vector: this is the whole of what the device form needs.
+    auto qkv_out_map = [&](int width, std::vector<int> &out_slot) {
+      out_slot.assign(kQkvOut, -1);
+      const int heads_w = width / kD;
+      for (int g = 0; g < 16; g++) {
+        const int l = g / 2, fam = g % 2;
+        for (int hh = 0; hh < 16; hh++) {
+          for (int cp = 0; cp < 16; cp++) {
+            const int row = hh * 16 + cp;
+            const int head = fam * 16 + hh;
+            const int chan = l * 16 + cp;
+            out_slot[g * kRank + Rev(row, 9)] =
+                (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD +
+                chan;
+          }
+        }
+      }
+    };
+
     std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8), v_b(8);
     {
       const char *names[3] = {".q", ".k", ".v"};
       const std::vector<double> *srcs[3] = {&wq_f, &wk_f, &wv_f};
+      const Tensor *tens[3] = {&tq, &tk, &tv};
       const int widths[3] = {kH, kKv, kKv};
       const double scales[3] = {cq, ck, cv};
       std::vector<Ciphertext<word>> *dst[3][2] = {
           {&q_a, &q_b}, {&k_a, &k_b}, {&v_a, &v_b}};
       for (int j = 0; j < 3; j++) {
-        std::vector<double> wdec;
-        declare_qkv(*srcs[j], widths[j], wdec);
         std::vector<Ciphertext<word>> raw;
-        layer.Project(raw, ins, kDeclaredH, kQkvOut, wdec, scales[j],
-                      (tag + names[j]).c_str());
+        if (host_weights) {
+          std::vector<double> wdec;
+          declare_qkv(*srcs[j], widths[j], wdec);
+          layer.Project(raw, ins, kDeclaredH, kQkvOut, wdec, scales[j],
+                        (tag + names[j]).c_str());
+        } else {
+          std::vector<int> out_slot;
+          qkv_out_map(widths[j], out_slot);
+          const DW dw = device_weights(*tens[j], model_map, out_slot, scales[j]);
+          layer.Project(raw, ins, kDeclaredH, kQkvOut, dw, scales[j],
+                        (tag + names[j]).c_str());
+        }
         ASSERT_EQ(static_cast<int>(raw.size()), 16);
         for (int g = 0; g < 16; g++) {
           raw[g].SetNumSlots(num_slots);
@@ -1593,47 +1689,45 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const double resid_absmax = cj["resid_absmax"].get<double>();
     (void)o_absmax;
     typename cheddar::CiLlamaLayer<word>::Weights lw;
-    std::vector<double> wo_dec(static_cast<size_t>(2 * layout.num_cts * kRank) *
-                                   kDeclaredH,
-                               0.0);
-    std::vector<double> wg_dec(static_cast<size_t>(kDeclaredH) * kDeclaredHid,
-                               0.0);
-    std::vector<double> wu_dec = wg_dec;
-    std::vector<double> wd_dec(static_cast<size_t>(kDeclaredHid) * kDeclaredH,
-                               0.0);
     // The attention output's declared channel: half ciphertext
     // `2*bi + lane/16`, channel `rev4(col)*32 + rev5(lane%16)`, which is
     // exactly `CiLlamaSeam`'s `chan_of` and the order `CoeffLinearLeg` numbers
-    // a parent's channels in.
-    {
-      const int attn_declared = 2 * layout.num_cts * kRank;
-      for (int bi = 0; bi < layout.num_cts; bi++) {
-        for (int col = 0; col < layout.rank; col++) {
-          for (int lane = 0; lane < layout.lanes; lane++) {
-            const int k = 2 * bi + lane / 16;
-            const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
-            const int in_declared = k * kRank + cc;
-            // head = rev5(lane), channel-in-head = bi*16 + col
-            const int head = Rev(lane, 5);
-            const int chan = bi * layout.rank + col;
-            const int o_in = head * kD + chan;
-            for (int c = 0; c < kH; c++) {
-              wo_dec[static_cast<size_t>(in_declared) * kDeclaredH +
-                     ModelSlot(c)] =
-                  wo_f[static_cast<size_t>(o_in) * kH + c];
-            }
-          }
+    // a parent's channels in; its live row of `wo` is `head*128 + chan` with
+    // head = rev5(lane), chan = bi*16 + col.
+    const int attn_declared = 2 * layout.num_cts * kRank;
+    std::vector<int> attn_map(attn_declared, -1);
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      for (int col = 0; col < layout.rank; col++) {
+        for (int lane = 0; lane < layout.lanes; lane++) {
+          const int k = 2 * bi + lane / 16;
+          const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+          attn_map[k * kRank + cc] = Rev(lane, 5) * kD + bi * layout.rank + col;
         }
       }
-      (void)attn_declared;
     }
-    for (int c = 0; c < kH; c++) {
-      const size_t dc = ModelSlot(c);
-      for (int j = 0; j < kI; j++) {
-        const size_t dj = HiddenSlot(j);
-        wg_dec[dc * kDeclaredHid + dj] = wg_f[static_cast<size_t>(c) * kI + j];
-        wu_dec[dc * kDeclaredHid + dj] = wu_f[static_cast<size_t>(c) * kI + j];
-        wd_dec[dj * kDeclaredH + dc] = wd_f[static_cast<size_t>(j) * kH + c];
+    std::vector<double> wo_dec, wg_dec, wu_dec, wd_dec;
+    DW dw_o, dw_g, dw_u, dw_d;
+    if (host_weights) {
+      wo_dec.assign(static_cast<size_t>(attn_declared) * kDeclaredH, 0.0);
+      wg_dec.assign(static_cast<size_t>(kDeclaredH) * kDeclaredHid, 0.0);
+      wu_dec = wg_dec;
+      wd_dec.assign(static_cast<size_t>(kDeclaredHid) * kDeclaredH, 0.0);
+      for (int in_declared = 0; in_declared < attn_declared; in_declared++) {
+        const int o_in = attn_map[in_declared];
+        if (o_in < 0) continue;
+        for (int c = 0; c < kH; c++) {
+          wo_dec[static_cast<size_t>(in_declared) * kDeclaredH + ModelSlot(c)] =
+              wo_f[static_cast<size_t>(o_in) * kH + c];
+        }
+      }
+      for (int c = 0; c < kH; c++) {
+        const size_t dc = ModelSlot(c);
+        for (int j = 0; j < kI; j++) {
+          const size_t dj = HiddenSlot(j);
+          wg_dec[dc * kDeclaredHid + dj] = wg_f[static_cast<size_t>(c) * kI + j];
+          wu_dec[dc * kDeclaredHid + dj] = wu_f[static_cast<size_t>(c) * kI + j];
+          wd_dec[dj * kDeclaredH + dc] = wd_f[static_cast<size_t>(j) * kH + c];
+        }
       }
     }
 
@@ -1645,10 +1739,21 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // The gate and up are read off a NORMALISED stream, so they are in the
     // model's own units and their ride is set on those.
     cal.gate_scale = ride / std::max(cj["gate_absmax"].get<double>(), 1e-12);
-    lw.o = &wo_dec;
-    lw.gate = &wg_dec;
-    lw.up = &wu_dec;
-    lw.down = &wd_dec;
+    if (host_weights) {
+      lw.o.host = &wo_dec;
+      lw.gate.host = &wg_dec;
+      lw.up.host = &wu_dec;
+      lw.down.host = &wd_dec;
+    } else {
+      dw_o = device_weights(to, attn_map, model_map, cal.res_scale);
+      dw_g = device_weights(tg, model_map, hidden_map, cal.gate_scale);
+      dw_u = device_weights(tu, model_map, hidden_map, cal.gate_scale);
+      dw_d = device_weights(td, hidden_map, model_map, stream_scale);
+      lw.o.device = &dw_o;
+      lw.gate.device = &dw_g;
+      lw.up.device = &dw_u;
+      lw.down.device = &dw_d;
+    }
     lw.ffn_norm = &fn_dec;
     lw.tag = tag;
 

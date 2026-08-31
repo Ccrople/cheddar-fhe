@@ -473,6 +473,28 @@ void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
 }
 
 template <typename word>
+void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
+                                 const std::vector<Ct> &x, int in_declared,
+                                 int out_declared, const DeviceWeights &w,
+                                 double w_scale, const char *tag) const {
+  leg_->Project(res, x, in_declared, out_declared, w, w_scale, tag);
+}
+
+template <typename word>
+void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
+                                 const std::vector<Ct> &x, int in_declared,
+                                 int out_declared, const ProjectionWeight &w,
+                                 double w_scale, const char *tag) const {
+  AssertTrue(w.Given(), std::string("CiLlamaLayer::Project(") + tag +
+                            "): the weight must be given in exactly one form");
+  if (w.device != nullptr) {
+    leg_->Project(res, x, in_declared, out_declared, *w.device, w_scale, tag);
+  } else {
+    leg_->Project(res, x, in_declared, out_declared, *w.host, w_scale, tag);
+  }
+}
+
+template <typename word>
 void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const std::vector<Ct> &stream,
                                        const std::vector<double> &gain,
@@ -488,9 +510,9 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
                                      const std::vector<Ct> &stream,
                                      const Weights &w, const Calibration &c,
                                      const EvkMap<word> &evk) {
-  AssertTrue(w.o != nullptr && w.gate != nullptr && w.up != nullptr &&
-                 w.down != nullptr && w.ffn_norm != nullptr,
-             "CiLlamaLayer: every weight must be given");
+  AssertTrue(w.o.Given() && w.gate.Given() && w.up.Given() &&
+                 w.down.Given() && w.ffn_norm != nullptr,
+             "CiLlamaLayer: every weight must be given, in exactly one form");
   AssertTrue(!w.tag.empty(),
              "CiLlamaLayer: a layer's weights need a tag -- the projection "
              "leg caches by name and a repeated name with different weights "
@@ -512,8 +534,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->LevelDown(ins[k], h_cts[k], cfg_.product_level);
     }
     std::vector<Ct> out;
-    leg_->Project(out, ins, attn_channels_, cfg_.model_declared, *w.o,
-                  c.res_scale, (w.tag + ".o").c_str());
+    Project(out, ins, attn_channels_, cfg_.model_declared, w.o, c.res_scale,
+            (w.tag + ".o").c_str());
     AssertTrue(static_cast<int>(out.size()) == num_model_cts_,
                "CiLlamaLayer: the O projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");
@@ -534,10 +556,10 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
     for (int k = 0; k < num_model_cts_; k++) {
       boot_->LevelDown(ins[k], normed[k], cfg_.product_level);
     }
-    leg_->Project(gate, ins, cfg_.model_declared, cfg_.hidden_declared,
-                  *w.gate, c.gate_scale, (w.tag + ".gate").c_str());
-    leg_->Project(upv, ins, cfg_.model_declared, cfg_.hidden_declared, *w.up,
-                  c.gate_scale, (w.tag + ".up").c_str());
+    Project(gate, ins, cfg_.model_declared, cfg_.hidden_declared, w.gate,
+            c.gate_scale, (w.tag + ".gate").c_str());
+    Project(upv, ins, cfg_.model_declared, cfg_.hidden_declared, w.up,
+            c.gate_scale, (w.tag + ".up").c_str());
   }
   AssertTrue(static_cast<int>(gate.size()) == num_hidden_cts_ &&
                  static_cast<int>(upv.size()) == num_hidden_cts_,
@@ -586,8 +608,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
     // the model's own units while `h_ct` carries the stream's factor, and the
     // two cannot be added until they agree. The weight is a plaintext, so
     // putting it back costs nothing.
-    leg_->Project(y, ins, cfg_.hidden_declared, cfg_.model_declared, *w.down,
-                  c.stream_scale, (w.tag + ".down").c_str());
+    Project(y, ins, cfg_.hidden_declared, cfg_.model_declared, w.down,
+            c.stream_scale, (w.tag + ".down").c_str());
     AssertTrue(static_cast<int>(y.size()) == num_model_cts_,
                "CiLlamaLayer: the down projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");

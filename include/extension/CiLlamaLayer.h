@@ -145,15 +145,34 @@ class CiLlamaLayer {
     bool keep_norm_slots = false;
   };
 
-  /** @brief One layer's plaintext weights, at the DECLARED widths. */
+  using DeviceWeights = typename CoeffLinearLeg<word>::DeviceWeights;
+
+  /**
+   * @brief One projection's weight, in one of the leg's two forms.
+   *
+   * `host` is the matrix at the DECLARED widths, `[in * out_declared + out]`,
+   * built by the caller from the model's tensor and the slot maps -- four
+   * times the tensor and mostly zeros, converted on the host (a layer's whole
+   * `pcmm: convert weights` row, 87 s). `device` is the tensor itself on the
+   * GPU with the two slot maps, encoded by the leg where it is read
+   * (`CoeffLinearLeg::DeviceWeights`). Exactly one is set; the leg's
+   * `device_weights_test` shows the two project to the same words.
+   */
+  struct ProjectionWeight {
+    const std::vector<double> *host = nullptr;
+    const DeviceWeights *device = nullptr;
+    bool Given() const { return (host != nullptr) != (device != nullptr); }
+  };
+
+  /** @brief One layer's plaintext weights. */
   struct Weights {
-    //! `attn_channels x model_declared`, indexed `[in * model_declared + out]`.
-    const std::vector<double> *o = nullptr;
+    //! `attn_channels x model_declared`.
+    ProjectionWeight o;
     //! `model_declared x hidden_declared`.
-    const std::vector<double> *gate = nullptr;
-    const std::vector<double> *up = nullptr;
+    ProjectionWeight gate;
+    ProjectionWeight up;
     //! `hidden_declared x model_declared`.
-    const std::vector<double> *down = nullptr;
+    ProjectionWeight down;
     //! `model_declared` RMSNorm gains, at the declared channels.
     const std::vector<double> *ffn_norm = nullptr;
     //! Distinguishes this layer's converted weights in the projection leg's
@@ -305,6 +324,47 @@ class CiLlamaLayer {
   void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
                int out_declared, const std::vector<double> &w, double w_scale,
                const char *tag) const;
+  /// The same, from the tensor on the device.
+  void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
+               int out_declared, const DeviceWeights &w, double w_scale,
+               const char *tag) const;
+  /// Either form.
+  void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
+               int out_declared, const ProjectionWeight &w, double w_scale,
+               const char *tag) const;
+
+  /**
+   * @brief The half-density slot conventions, stated once.
+   *
+   * A residual-stream ciphertext carries `rank/2 - 1` live model channels at
+   * the even declared indices 2, 4, ..., rank-2 -- component zero has no
+   * partner under the banded convention (Doing.md 1.5cu) -- and a hidden one
+   * carries `rank/2` at 0, 2, ..., rank-2, because nothing reduces over the
+   * hidden axis. `ModelSlot`/`HiddenSlot` are live -> declared;
+   * `ModelMap`/`HiddenMap` are declared -> live with -1 at the dead indices,
+   * which is what `DeviceWeights` takes. `CiSinCAttention` and `CiLlamaSeam`
+   * address the same declared indices.
+   */
+  static int ModelSlot(int m, int rank) {
+    const int per = rank / 2 - 1;
+    return (m / per) * rank + 2 * (m % per + 1);
+  }
+  static int HiddenSlot(int j, int rank) {
+    const int per = rank / 2;
+    return (j / per) * rank + 2 * (j % per);
+  }
+  //! `live` is the tensor's own channel count (4096 model, 14336 hidden);
+  //! declared slots past it are dead, as the ciphertexts' tails are.
+  static void ModelMap(std::vector<int> &slot, int declared, int rank,
+                       int live) {
+    slot.assign(declared, -1);
+    for (int m = 0; m < live; m++) slot[ModelSlot(m, rank)] = m;
+  }
+  static void HiddenMap(std::vector<int> &slot, int declared, int rank,
+                        int live) {
+    slot.assign(declared, -1);
+    for (int j = 0; j < live; j++) slot[HiddenSlot(j, rank)] = j;
+  }
 
   void AttentionNorm(std::vector<Ct> &res, const std::vector<Ct> &stream,
                      const std::vector<double> &gain, const Calibration &c,
