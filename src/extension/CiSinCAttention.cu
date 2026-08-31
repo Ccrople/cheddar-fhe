@@ -447,22 +447,25 @@ void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
       boot_->Mult(t, ct, kill_);
       boot_->Rescale(ct, t);
     }
-    return;
+  } else {
+    for (int lo = 0; lo < 4; lo++) {
+      Ct &lo_ct = cts[lo];
+      Ct &hi_ct = cts[lo + 4];
+      Ct aa, bb, dd;
+      boot_->Mult(aa, lo_ct, rope_cos_[lo]);
+      boot_->Mult(bb, hi_ct, rope_neg_sin_[lo]);
+      boot_->Add(aa, aa, bb);
+      boot_->Mult(bb, hi_ct, rope_cos_[lo]);
+      boot_->Mult(dd, lo_ct, rope_sin_[lo]);
+      boot_->Add(bb, bb, dd);
+      boot_->Rescale(lo_ct, aa);
+      boot_->Rescale(hi_ct, bb);
+    }
   }
-  for (int lo = 0; lo < 4; lo++) {
-    Ct &lo_ct = cts[lo];
-    Ct &hi_ct = cts[lo + 4];
-    Ct aa, bb, dd;
-    boot_->Mult(aa, lo_ct, rope_cos_[lo]);
-    boot_->Mult(bb, hi_ct, rope_neg_sin_[lo]);
-    boot_->Add(aa, aa, bb);
-    boot_->Mult(bb, hi_ct, rope_cos_[lo]);
-    boot_->Mult(dd, lo_ct, rope_sin_[lo]);
-    boot_->Add(bb, bb, dd);
-    boot_->Rescale(lo_ct, aa);
-    boot_->Rescale(hi_ct, bb);
-  }
-  // Onto the exchange's level, as `Merge` does for the banded images.
+  // Onto the exchange's level, as `Merge` does for the banded images -- for
+  // V as much as for Q and K: the first dense run returned from the V branch
+  // above this loop and handed the exchange level-12 images ("Hoist: input
+  // level mismatch -- 14 main + 2 terminal against level 8").
   for (size_t i = 0; i < cts.size(); i++) {
     Ct &ct = cts[i];
     const NPInfo before = ct.GetNP();
