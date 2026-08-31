@@ -100,12 +100,23 @@ constexpr int kSinkTokens = 2;
 // channels -- component zero has no partner -- and `rank/2` hidden ones,
 // because nothing reduces over the hidden axis.
 constexpr int kRank = 512, kSmall = kT, kPcmmLevel = 1;
-constexpr int kPerModel = kRank / 2 - 1;   // 255
-constexpr int kPerHidden = kRank / 2;      // 256
-constexpr int kNumH = (kH + kPerModel - 1) / kPerModel;       // 17
-constexpr int kNumHid = (kI + kPerHidden - 1) / kPerHidden;   // 56
-constexpr int kDeclaredH = kNumH * kRank;                     // 8704
-constexpr int kDeclaredHid = kNumHid * kRank;                 // 28672
+// `CHEDDAR_CI_MODULE=1`: the layer's non-leg half on the MODULE basis
+// (Doing.md 3.5-3.7) -- every component live, 8 residual and 28 hidden
+// ciphertexts, the crossings through `CiModuleBasis`/`HalfBootModule`, the
+// SSE secret sampled in the module basis. The leg and the seam are unchanged
+// (their images stay banded); the Q/K/V emissions read dense and write
+// banded.
+const bool kModule = [] {
+  const char *e = std::getenv("CHEDDAR_CI_MODULE");
+  return e != nullptr && e[0] == '1';
+}();
+const int kDensity = kModule ? 1 : 2;
+const int kPerModel = kModule ? kRank : kRank / 2 - 1;   // 512 or 255
+const int kPerHidden = kModule ? kRank : kRank / 2;      // 512 or 256
+const int kNumH = (kH + kPerModel - 1) / kPerModel;       // 8 or 17
+const int kNumHid = (kI + kPerHidden - 1) / kPerHidden;   // 28 or 56
+const int kDeclaredH = kNumH * kRank;                     // 4096 or 8704
+const int kDeclaredHid = kNumHid * kRank;                 // 14336 or 28672
 
 int Rev(int v, int bits) {
   int r = 0;
@@ -130,8 +141,12 @@ int Rev(int v, int bits) {
 int g_tok_pos = 1;
 int Pos(int t) { return g_tok_pos != 0 ? t : Rev(t, 7); }
 
-int ModelSlot(int m) { return (m / kPerModel) * kRank + 2 * (m % kPerModel + 1); }
-int HiddenSlot(int j) { return (j / kPerHidden) * kRank + 2 * (j % kPerHidden); }
+int ModelSlot(int m) {
+  return cheddar::CiLlamaLayer<word>::ModelSlot(m, kRank, kDensity);
+}
+int HiddenSlot(int j) {
+  return cheddar::CiLlamaLayer<word>::HiddenSlot(j, kRank, kDensity);
+}
 
 // The banded recomposition `rec[t*rank + I] = comp_I[t] + [I!=0] comp_{rank-I}[t+1]`
 // and its inverse, which is what `ModDecomp` and a slot read respectively see.
@@ -320,6 +335,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
 
   // ---- the four rings, one secret -----------------------------------------
+  if (kModule) {
+    // `HalfBootModule` needs the SSE secret sparse in the module basis
+    // (Doing.md 3.6); set before any Ring samples one, unless given.
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
+    std::cout << "MODULE BASIS: " << kNumH << " residual and " << kNumHid
+              << " hidden ciphertexts, CHEDDAR_MODULE_SPARSE_SECRET="
+              << std::getenv("CHEDDAR_MODULE_SPARSE_SECRET") << std::endl;
+  }
   Ring boot(kBootParam);  // the leg: slack zero, the softmax walk needs it
   auto swtch = std::make_unique<Ring>(kSwitchParam, boot.ui->GetSecretCoeffs());
   auto small = std::make_unique<Ring>(kSmallParam);
@@ -407,6 +430,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   lcfg.model_declared = kDeclaredH;
   lcfg.hidden_declared = kDeclaredHid;
   lcfg.model_live = kH;
+  lcfg.module_basis = kModule;
   lcfg.product_level = kPcmmLevel;
   // SIXTEEN PARENTS A TILE, which is what the full-width cost model prescribes
   // for the direct route (Doing.md 1.5dc: 228.2 ms per output ciphertext at
@@ -699,8 +723,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     };
     // The declared -> live maps the layer states once.
     std::vector<int> model_map, hidden_map;
-    cheddar::CiLlamaLayer<word>::ModelMap(model_map, kDeclaredH, kRank, kH);
-    cheddar::CiLlamaLayer<word>::HiddenMap(hidden_map, kDeclaredHid, kRank, kI);
+    cheddar::CiLlamaLayer<word>::ModelMap(model_map, kDeclaredH, kRank, kH,
+                                          kDensity);
+    cheddar::CiLlamaLayer<word>::HiddenMap(hidden_map, kDeclaredHid, kRank,
+                                           kI, kDensity);
 
     // ---- the pre-attention norm, encrypted --------------------------------
     typename cheddar::CiLlamaLayer<word>::Calibration cal;
@@ -943,8 +969,9 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       // walks any error the length of the ring. Reading the two bands
       // straight out of the coefficients says which one is wrong -- and the
       // duplicates are not decoration here, they are what makes the image
-      // correctly banded for the next `ModDecomp` (1.5cs).
-      {
+      // correctly banded for the next `ModDecomp` (1.5cs). The module basis
+      // has no band, so the read is the scan and this says nothing there.
+      if (!kModule) {
         double lo = 0.0, du = 0.0;
         for (int k = 0; k < kNumH; k++) {
           Plaintext<word> pt;
@@ -1139,19 +1166,25 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       std::vector<Ciphertext<word>> *dst[3][2] = {
           {&q_a, &q_b}, {&k_a, &k_b}, {&v_a, &v_b}};
       for (int j = 0; j < 3; j++) {
+        // The emission reads the norm output at the layer's own density and
+        // writes the leg's half-density images (the leg is unchanged under
+        // the module basis, Doing.md 3.7 step 4).
         std::vector<Ciphertext<word>> raw;
+        typename cheddar::CiLlamaLayer<word>::ProjectionWeight pw;
+        std::vector<double> wdec;
+        std::vector<int> out_slot;
+        DW dw;
         if (host_weights) {
-          std::vector<double> wdec;
           declare_qkv(*srcs[j], widths[j], wdec);
-          layer.Project(raw, ins, kDeclaredH, kQkvOut, wdec, scales[j],
-                        (tag + names[j]).c_str());
+          pw.host = &wdec;
         } else {
-          std::vector<int> out_slot;
           qkv_out_map(widths[j], out_slot);
-          const DW dw = device_weights(*tens[j], model_map, out_slot, scales[j]);
-          layer.Project(raw, ins, kDeclaredH, kQkvOut, dw, scales[j],
-                        (tag + names[j]).c_str());
+          dw = device_weights(*tens[j], model_map, out_slot, scales[j]);
+          pw.device = &dw;
         }
+        layer.Project(raw, ins, kDeclaredH, kQkvOut, pw, scales[j],
+                      (tag + names[j]).c_str(), /*in_density=*/kDensity,
+                      /*out_density=*/2);
         ASSERT_EQ(static_cast<int>(raw.size()), 16);
         for (int g = 0; g < 16; g++) {
           raw[g].SetNumSlots(num_slots);

@@ -57,6 +57,7 @@
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/BootContext.h"
+#include "extension/CiModuleBasis.h"
 #include "extension/LlamaLinear.h"
 #include "extension/RmsNorm.h"
 #include "extension/SiLu.h"
@@ -85,6 +86,20 @@ constexpr int kTokens = 128;      // T, and the small degree on R+
 constexpr int kRank = 512;        // degree / T, the channels a ciphertext holds
 constexpr int kLive = kRank / 2;  // 1.5by: 256 live components of 512
 constexpr double kEps = 1e-5;
+
+// `CHEDDAR_CI_MODULE=1` runs the full-width feed-forward on the MODULE basis
+// (Doing.md 3.5-3.7): the crossings are `CiModuleBasis`'s StC and
+// `HalfBootModule`, every component is live -- 8 residual and 28 hidden
+// ciphertexts instead of 17 and 56 -- RMSNorm reduces at stride 1 over plain
+// weights, and the SSE secret is sampled in the module basis
+// (`CHEDDAR_MODULE_SPARSE_SECRET`, set here to `128,16` unless given).
+bool ModuleFromEnv() {
+  const char *e = std::getenv("CHEDDAR_CI_MODULE");
+  return e != nullptr && e[0] == '1';
+}
+// The declared-index step of a live channel: 2 on the banded image, 1 on the
+// module basis. Read by `ReportTurn`.
+int g_density = 2;
 
 int Rev(int v, int bits) {
   int r = 0;
@@ -231,7 +246,7 @@ double ReportTurn(const char *name, const Ring &ring,
   const auto comp = CiComponentsFfn(coeffs, rank, tokens);
   double num = 0.0, den = 0.0, absmax = 0.0;
   for (int t = 0; t < tokens; t++) {
-    for (int c = 0; c < declared; c += 2) {
+    for (int c = 0; c < declared; c += g_density) {
       const double w = want[static_cast<size_t>(t) * declared + c];
       num += comp[Rev(c, 9)][Rev(t, 7)] * w;
       den += w * w;
@@ -241,7 +256,7 @@ double ReportTurn(const char *name, const Ring &ring,
   const double fit = num / den;
   double err = 0.0;
   for (int t = 0; t < tokens; t++) {
-    for (int c = 0; c < declared; c += 2) {
+    for (int c = 0; c < declared; c += g_density) {
       const double v = comp[Rev(c, 9)][Rev(t, 7)] / fit;
       err = std::max(err, std::abs(
           v - want[static_cast<size_t>(t) * declared + c]));
@@ -3645,12 +3660,25 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
 
   constexpr int kH = 4096;      // the model dimension
   constexpr int kI = 14336;     // the FFN's inner dimension
-  constexpr int kPerModel = kLive - 1;   // 255: component zero has no partner
-  constexpr int kPerHidden = kLive;      // 256: nothing reduces over hidden
-  const int num_h = (kH + kPerModel - 1) / kPerModel;      // 17
-  const int num_hid = (kI + kPerHidden - 1) / kPerHidden;  // 56
+  // The banded image: 255 model channels a ciphertext (component zero has no
+  // partner) and 256 hidden ones (nothing reduces over hidden). The module
+  // basis: every one of the 512 components.
+  const bool module = ModuleFromEnv();
+  g_density = module ? 1 : 2;
+  const int kPerModel = module ? kRank : kLive - 1;
+  const int kPerHidden = module ? kRank : kLive;
+  const int num_h = (kH + kPerModel - 1) / kPerModel;      // 17, or 8
+  const int num_hid = (kI + kPerHidden - 1) / kPerHidden;  // 56, or 28
   const int declared_h = num_h * kRank;
   const int declared_hidden = num_hid * kRank;
+  if (module) {
+    // `HalfBootModule` needs the SSE secret sparse in the module basis; the
+    // native-sparse secret puts the ModRaise wrap-around ~8x past EvalMod's
+    // range (Doing.md 3.6). Set before any Ring samples a secret.
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
+    std::cout << "  MODULE BASIS: CHEDDAR_MODULE_SPARSE_SECRET="
+              << std::getenv("CHEDDAR_MODULE_SPARSE_SECRET") << std::endl;
+  }
 
   std::vector<double> resid, wn_real, wg_real, wu_real, wd_real;
   ASSERT_TRUE(read_f32("input_nosink.f32", static_cast<size_t>(kTokens) * kH,
@@ -3738,6 +3766,40 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
     boot.ui->PrepareRotationKey(req);
   }
   cheddar::SylphSchedule<word> sched(bctx, num_slots);
+  // The module transforms, grouped as `CiLlamaLayer` groups them: StC in two
+  // real phases at the schedule's StC level, CtS in the boot's own level
+  // count at its CtS start with `n * cts_const` folded (`HalfBootModule`).
+  std::unique_ptr<cheddar::CiModuleBasis<word>> basis;
+  if (module) {
+    const int cts_levels = bctx->GetBootParameter().num_cts_levels_;
+    typename cheddar::CiModuleBasis<word>::Phases ph;
+    ph.stc_small = {7};
+    ph.stc_twist = {9};
+    if (cts_levels == 2) {
+      ph.cts_twist = {9};
+      ph.cts_small = {7};
+    } else if (cts_levels == 3) {
+      ph.cts_twist = {9};
+      ph.cts_small = {4, 3};
+    } else {
+      ASSERT_EQ(cts_levels, 4);
+      ph.cts_twist = {5, 4};
+      ph.cts_small = {4, 3};
+    }
+    basis = std::make_unique<cheddar::CiModuleBasis<word>>(
+        bctx, kTokens, sched.GetStCLevel(),
+        bctx->GetBootParameter().GetCtSStartLevel(), ph,
+        sched.ModuleStCConst(2), num_slots * bctx->GetCtSConst());
+    sched.SetModuleBasis(basis.get());
+    cheddar::EvkRequest req;
+    basis->AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+    std::cout << "  module StC " << basis->GetStCNumLevels()
+              << " levels from " << basis->GetStCLevel() << " (coeff level "
+              << sched.GetCoeffLevel() << "), module CtS "
+              << basis->GetCtSNumLevels() << " levels from "
+              << basis->GetCtSLevel() << std::endl;
+  }
   const int slot_level = sched.GetSlotLevel();
   const int op_level = slot_level - 1;
   const int product_level = 1;
@@ -3772,16 +3834,20 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
             << " ciphertexts (" << kPerModel << " each, declared "
             << declared_h << "), hidden " << kI << " live in " << num_hid
             << " (" << kPerHidden << " each, declared " << declared_hidden
-            << ")" << std::endl;
+            << ")" << (module ? ", MODULE basis" : ", banded image")
+            << std::endl;
 
   // ---- the declared layout ----------------------------------------------
   // Model channel m sits in ciphertext m / 255 at declared index
   // 2 * (m % 255 + 1) -- the `+ 1` is component zero left empty. Hidden
   // channel j sits in ciphertext j / 256 at declared index 2 * (j % 256).
+  // On the module basis every declared index is a channel: the identity.
   auto model_slot = [&](int m) {
+    if (module) return m;
     return (m / kPerModel) * kRank + 2 * (m % kPerModel + 1);
   };
   auto hidden_slot = [&](int j) {
+    if (module) return j;
     return (j / kPerHidden) * kRank + 2 * (j % kPerHidden);
   };
 
@@ -3987,7 +4053,7 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
   cheddar::RmsNormHandler<word> rms(boot.context, kTokens, declared_h,
                                     alpha_declared, op_level, eps_declared,
                                     norm_window, norm_degree,
-                                    /*channel_stride=*/2);
+                                    /*channel_stride=*/module ? 1 : 2);
   ASSERT_EQ(rms.GetNumCiphertexts(), num_h);
   for (int d : rms.GetRotationDistances()) {
     boot.ui->PrepareRotationKey(d, op_level);
@@ -3998,7 +4064,8 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
     wts[k].assign(num_slots, Complex(0.0, 0.0));
     for (int c = 0; c < kRank; c++) {
       const int I = Rev(c, 9);
-      const int src = (c % 2 == 0) ? c : Rev(kRank - I, 9);
+      // The partner's gain at the duplicate band; plain on the module basis.
+      const int src = (module || c % 2 == 0) ? c : Rev(kRank - I, 9);
       const double v = wn[static_cast<size_t>(k) * kRank + src];
       for (int t = 0; t < kTokens; t++) {
         wts[k][static_cast<size_t>(c) * kTokens + t] = Complex(v * root_alpha, 0.0);
@@ -4060,17 +4127,17 @@ TEST(CiFfn, TheFullWidthFeedForwardRunsOnTheRealWeights) {
   }();
   // Every input here is a banded half-density image, so half of every
   // contraction is over exact zeros; see `Config::input_density`.
-  lcfg.input_density = [] {
+  lcfg.input_density = [&] {
     const char *e = std::getenv("CHEDDAR_CI_DENSITY");
-    return (e && e[0]) ? std::atoi(e) : 2;
+    return (e && e[0]) ? std::atoi(e) : (module ? 1 : 2);
   }();
   // Every emission here is read in slots, so its live output channels are the
   // even declared ones and the weight's odd rows are exact zeros -- see
   // `Config::output_density`, and [SYLPH] Table 5, whose 1.6 GiB a layer is
-  // what made this worth looking for.
-  lcfg.output_density = [] {
+  // what made this worth looking for. On the module basis every one is live.
+  lcfg.output_density = [&] {
     const char *e = std::getenv("CHEDDAR_CI_OUT_DENSITY");
-    return (e && e[0]) ? std::atoi(e) : 2;
+    return (e && e[0]) ? std::atoi(e) : (module ? 1 : 2);
   }();
   ProjectOnlyLegCi leg(boot.context, lcfg, pack_keys);
 

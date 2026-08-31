@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "common/Assert.h"
+#include "extension/CiModuleBasis.h"
 
 namespace cheddar {
 
@@ -42,7 +43,43 @@ int SylphSchedule<word>::GetStCLevel() const {
 
 template <typename word>
 int SylphSchedule<word>::GetCoeffLevel() const {
+  if (basis_ != nullptr) return GetStCLevel() - basis_->GetStCNumLevels();
   return boot_->GetBootParameter().GetEndLevel();
+}
+
+template <typename word>
+void SylphSchedule<word>::SetModuleBasis(const CiModuleBasis<word> *basis) {
+  if (basis != nullptr) {
+    AssertTrue(boot_->param_.conjugate_invariant_,
+               "SylphSchedule: the module basis is a conjugate-invariant "
+               "object");
+    AssertTrue(basis->GetStCLevel() == GetStCLevel(),
+               "SylphSchedule: the module StC is compiled at level " +
+                   std::to_string(basis->GetStCLevel()) +
+                   " but this schedule's StC level is " +
+                   std::to_string(GetStCLevel()));
+    AssertTrue(basis->GetCtSLevel() ==
+                   boot_->GetBootParameter().GetCtSStartLevel(),
+               "SylphSchedule: the module CtS must be compiled at the "
+               "BootParameter's CtS start level for HalfBootModule");
+    AssertTrue(basis->GetStCNumLevels() <= GetStCLevel(),
+               "SylphSchedule: the module StC spends more levels than the "
+               "schedule has below its StC level");
+  }
+  basis_ = basis;
+}
+
+template <typename word>
+double SylphSchedule<word>::ModuleStCConst(int num_levels) const {
+  // `stc_const_` is calibrated so that an input at EvalMod's end scale lands
+  // on `GetScale(GetEndLevel())` once `ToCoeff` re-declares the scale; a StC
+  // that lands elsewhere wants that level's canonical scale in its place.
+  AssertTrue(num_levels >= 1 && num_levels <= GetStCLevel(),
+             "ModuleStCConst: the module StC's level count is not within the "
+             "schedule's StC level");
+  const auto &p = boot_->param_;
+  return boot_->GetStCConst() * p.GetScale(GetStCLevel() - num_levels) /
+         p.GetScale(boot_->GetBootParameter().GetEndLevel());
 }
 
 template <typename word>
@@ -185,7 +222,8 @@ void SylphSchedule<word>::Canonicalise(Ct &res, const Ct &x,
 template <typename word>
 void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
                                   const EvkMap<word> &evk_map,
-                                  bool min_ks /*= false*/) const {
+                                  bool min_ks /*= false*/,
+                                  bool native_basis /*= false*/) const {
   const int level = boot_->param_.NPToLevel(x.GetNP());
   const int stc_level = GetStCLevel();
   AssertTrue(level >= stc_level,
@@ -280,10 +318,20 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
   boot_->encoder_.EncodeConstant(up, stc_level, up_factor, undo_restore);
   boot_->Mult(res, *src, up);
 
-  boot_->SlotToCoeff(res, num_slots_, res, evk_map, min_ks);
+  const bool module = basis_ != nullptr && !native_basis;
+  if (module) {
+    // The module StC: the slots become the element's MODULE coordinates,
+    // with `ModuleStCConst()` folded so the bookkeeping below is the native
+    // one's. It takes `basis_->GetStCNumLevels()` levels, which is what
+    // `GetCoeffLevel()` reports.
+    basis_->EvaluateStC(boot_, res, res, evk_map);
+  } else {
+    boot_->SlotToCoeff(res, num_slots_, res, evk_map, min_ks);
+  }
   res.SetNumSlots(num_slots_);
   // Now exactly Boot's situation, so exactly Boot's constant.
-  res.SetScale(boot_->param_.GetScale(GetCoeffLevel()));
+  res.SetScale(boot_->param_.GetScale(
+      module ? GetCoeffLevel() : boot_->GetBootParameter().GetEndLevel()));
 }
 
 template <typename word>
@@ -292,14 +340,18 @@ double SylphSchedule<word>::ToSlot(Ct &res, const Ct &x,
                                    bool min_ks /*= false*/) const {
   const int level = boot_->param_.NPToLevel(x.GetNP());
   double drift = 1.0;
+  Ct low;
+  const Ct *src = &x;
   if (level > 0) {
     const double before = x.GetScale();
-    Ct low;
     boot_->LevelDown(low, x, 0);
     drift = low.GetScale() / before;
-    boot_->HalfBoot(res, low, evk_map, min_ks);
+    src = &low;
+  }
+  if (basis_ != nullptr) {
+    boot_->HalfBootModule(res, *src, evk_map, *basis_);
   } else {
-    boot_->HalfBoot(res, x, evk_map, min_ks);
+    boot_->HalfBoot(res, *src, evk_map, min_ks);
   }
   return drift;
 }
@@ -309,6 +361,9 @@ double SylphSchedule<word>::ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
                                        const Ct &hi,
                                        const EvkMap<word> &evk_map,
                                        bool min_ks /*= false*/) const {
+  AssertTrue(basis_ == nullptr,
+             "ToSlotPair: the pair form reads the native basis; on the "
+             "module basis use ToSlot");
   const int level = boot_->param_.NPToLevel(lo.GetNP());
   AssertTrue(level == boot_->param_.NPToLevel(hi.GetNP()),
              "ToSlotPair: the two ciphertexts must be at the same level");
@@ -333,6 +388,9 @@ double SylphSchedule<word>::ToSlotSplit(Ct &res_lo, Ct &res_hi,
                                         const Ct &merged,
                                         const EvkMap<word> &evk_map,
                                         bool min_ks /*= false*/) const {
+  AssertTrue(basis_ == nullptr,
+             "ToSlotSplit: the split form reads the native basis; on the "
+             "module basis use ToSlot");
   const int level = boot_->param_.NPToLevel(merged.GetNP());
   double drift = 1.0;
   if (level > 0) {

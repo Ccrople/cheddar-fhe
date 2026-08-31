@@ -69,14 +69,27 @@ CiLlamaLayer<word>::CiLlamaLayer(
   // A half-density ciphertext carries `rank/2 - 1` live model channels --
   // component zero has no partner -- and `rank/2` hidden ones, because
   // nothing reduces over the hidden axis. Seventeen of the first hold Llama's
-  // 4096; sixteen do not.
-  AssertTrue(num_model_cts_ * (cfg_.proj_rank / 2 - 1) >= cfg_.model_live,
+  // 4096; sixteen do not. On the module basis every component is a channel
+  // and eight do.
+  channel_stride_ = cfg_.module_basis ? 1 : 2;
+  const int per_model =
+      cfg_.module_basis ? cfg_.proj_rank : cfg_.proj_rank / 2 - 1;
+  AssertTrue(num_model_cts_ * per_model >= cfg_.model_live,
              "CiLlamaLayer: " + std::to_string(num_model_cts_) +
-                 " half-density ciphertexts carry " +
-                 std::to_string(num_model_cts_ * (cfg_.proj_rank / 2 - 1)) +
+                 (cfg_.module_basis ? " dense" : " half-density") +
+                 " ciphertexts carry " +
+                 std::to_string(num_model_cts_ * per_model) +
                  " live model channels, short of " +
                  std::to_string(cfg_.model_live) +
-                 " -- component zero has no partner");
+                 (cfg_.module_basis ? "" : " -- component zero has no partner"));
+  if (cfg_.module_basis) {
+    AssertTrue(boot_->param_.conjugate_invariant_,
+               "CiLlamaLayer: the module basis is a conjugate-invariant "
+               "object");
+    AssertTrue(!cfg_.keep_component_zero,
+               "CiLlamaLayer: keep_component_zero reproduces the banded "
+               "contract, which the module basis does not have");
+  }
 
   // THE CROSSING CONSTANT IS DERIVED, NOT FITTED. `HalfBoot` multiplies the
   // message by `level_zero_scale / q0` and `BootContext` computes both halves
@@ -98,6 +111,40 @@ CiLlamaLayer<word>::CiLlamaLayer(
   slot_level_ = sched_.GetSlotLevel();
   op_level_ = slot_level_ - 1;
 
+  if (cfg_.module_basis) {
+    // The module transforms (Doing.md 3.5/3.6): StC at the schedule's StC
+    // level in two real phases, with the native constant restated for the
+    // level it lands on; CtS at the boot's CtS start in as many levels as the
+    // BootParameter gives CoeffToSlot, with `n * cts_const` folded, which is
+    // what `HalfBootModule` requires. `T` is the small degree, which on R+ is
+    // the token count.
+    const int cts_levels = boot_->GetBootParameter().num_cts_levels_;
+    typename CiModuleBasis<word>::Phases phases;
+    phases.stc_small = {7};
+    phases.stc_twist = {9};
+    if (cts_levels == 2) {
+      phases.cts_twist = {9};
+      phases.cts_small = {7};
+    } else if (cts_levels == 3) {
+      phases.cts_twist = {9};
+      phases.cts_small = {4, 3};
+    } else {
+      AssertTrue(cts_levels == 4,
+                 "CiLlamaLayer: the module CtS is grouped for 2, 3 or 4 "
+                 "CoeffToSlot levels");
+      phases.cts_twist = {5, 4};
+      phases.cts_small = {4, 3};
+    }
+    const int stc_levels = static_cast<int>(phases.stc_small.size()) +
+                           static_cast<int>(phases.stc_twist.size());
+    basis_ = std::make_unique<CiModuleBasis<word>>(
+        boot_, cfg_.num_tokens, sched_.GetStCLevel(),
+        boot_->GetBootParameter().GetCtSStartLevel(), phases,
+        sched_.ModuleStCConst(stc_levels),
+        num_slots_ * boot_->GetCtSConst());
+    sched_.SetModuleBasis(basis_.get());
+  }
+
   typename CiLlamaSeam<word>::Config scfg;
   scfg.proj_rank = cfg_.proj_rank;
   scfg.verbose = cfg_.verbose;
@@ -114,9 +161,12 @@ CiLlamaLayer<word>::CiLlamaLayer(
   // there; every output is one too, so half of `GatherWeights`'s rows are
   // exact zeros that the operand would store, the GEMM would multiply and
   // `ModPack` would recompose. Measured exact at both settings and 1.9991x /
-  // 1.69x apart in work (Doing.md 1.5db/1.5dh).
-  lcfg.input_density = 2;
-  lcfg.output_density = 2;
+  // 1.69x apart in work (Doing.md 1.5db/1.5dh). On the module basis every
+  // component is live at both ends, and the one projection whose ends differ
+  // (O: the seam's banded images in, the dense stream out) states its own
+  // densities per call.
+  lcfg.input_density = GetDensity();
+  lcfg.output_density = GetDensity();
   leg_ = std::make_unique<CiProjectionLeg<word>>(boot_, lcfg,
                                                  std::move(modpack_keys));
 
@@ -126,7 +176,15 @@ CiLlamaLayer<word>::CiLlamaLayer(
               << ", seam input at " << seam_->GetInputLevel()
               << ", crossing " << crossing_ << " (2^"
               << std::log2(std::abs(crossing_)) << "), kappa " << kappa_
-              << std::endl;
+              << (cfg_.module_basis ? ", MODULE basis" : ", native basis")
+              << ", stream " << num_model_cts_ << " cts, hidden "
+              << num_hidden_cts_ << " cts" << std::endl;
+    if (basis_) {
+      std::cout << "CiLlamaLayer: module StC " << basis_->GetStCNumLevels()
+                << " levels from " << basis_->GetStCLevel() << ", module CtS "
+                << basis_->GetCtSNumLevels() << " levels from "
+                << basis_->GetCtSLevel() << std::endl;
+    }
   }
 }
 
@@ -142,8 +200,9 @@ void CiLlamaLayer<word>::AddRequiredRotations(EvkRequest &req) const {
   // yet. The rotation distances do not depend on either.
   RmsNormHandler<word> probe(boot_, cfg_.num_tokens, cfg_.model_declared, 1.0,
                              op_level_, 1e-5, 2.0, NormDegree(2.0),
-                             /*channel_stride=*/2);
+                             channel_stride_);
   for (int d : probe.GetRotationDistances()) req.AddRequest(d, op_level_);
+  if (basis_) basis_->AddRequiredRotations(req, cfg_.min_ks);
 }
 
 template <typename word>
@@ -244,8 +303,10 @@ std::vector<std::vector<Complex>> CiLlamaLayer<word>::NormWeights(
       // AT AN ODD DECLARED CHANNEL THE WEIGHT IS THE PARTNER'S. The duplicate
       // band at channel `c` (odd) holds component `rank - I`, whose live
       // address is `Rev(rank - I)`; the reduction at `channel_stride = 2` sums
-      // the two parities apart, so it must see the same gain at both.
-      const int src = (c % 2 == 0) ? c : Rev(rank - I, log_rank);
+      // the two parities apart, so it must see the same gain at both. The
+      // module basis has no band: every channel carries its own gain.
+      const int src =
+          (cfg_.module_basis || c % 2 == 0) ? c : Rev(rank - I, log_rank);
       const double v = gain[static_cast<size_t>(k) * rank + src];
       for (int t = 0; t < cfg_.num_tokens; t++) {
         wts[k][static_cast<size_t>(c) * cfg_.num_tokens + t] =
@@ -275,13 +336,16 @@ Plaintext<word> CiLlamaLayer<word>::CrossingPlaintext(
   // image), exactly as the last position has no partner.
   const int log_t = Log2Ceil(cfg_.num_tokens);
   std::vector<Complex> vals(num_slots_, Complex(factor, 0.0));
+  // On the module basis there is no duplicate band: a token's factor sits at
+  // its own slot address in every channel, and that is all.
+  const int live_step = cfg_.module_basis ? 1 : 2;
   for (int t = 0; t < cfg_.num_tokens; t++) {
     if (sink[t] == 1.0) continue;
     const int p = static_cast<int>(BitReverseInt(t, log_t));
-    for (int c = 0; p + c * cfg_.num_tokens < num_slots_; c += 2) {
+    for (int c = 0; p + c * cfg_.num_tokens < num_slots_; c += live_step) {
       vals[p + c * cfg_.num_tokens] = Complex(factor * sink[t], 0.0);
     }
-    if (t == 0) continue;
+    if (t == 0 || cfg_.module_basis) continue;
     const int q = static_cast<int>(BitReverseInt(t - 1, log_t));
     for (int c = 1; q + c * cfg_.num_tokens < num_slots_; c += 2) {
       vals[q + c * cfg_.num_tokens] = Complex(factor * sink[t], 0.0);
@@ -405,7 +469,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   const double b2 = beta * beta;
   RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
                            alpha * ratio / b2, op_level_, b2 * cfg_.eps / ratio,
-                           window, NormDegree(window), /*channel_stride=*/2);
+                           window, NormDegree(window), channel_stride_);
   AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
              "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
   const auto wts = NormWeights(gain, alpha / b2);
@@ -448,7 +512,7 @@ std::vector<double> CiLlamaLayer<word>::PlainNormInvSqrt(
   RmsNormHandler<word> probe(boot_, cfg_.num_tokens, cfg_.model_declared,
                              alpha * ratio / b2, op_level_,
                              b2 * cfg_.eps / ratio, window, NormDegree(window),
-                             /*channel_stride=*/2);
+                             channel_stride_);
   // The bracket the circuit evaluates: the DECLARED width and the scaled
   // epsilon, whose two corrections cancel (see `NormTurn`).
   const double root = std::sqrt(alpha);
@@ -469,6 +533,7 @@ void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
                                  int out_declared,
                                  const std::vector<double> &w, double w_scale,
                                  const char *tag) const {
+  leg_->SetDensity(GetDensity(), GetDensity());
   leg_->Project(res, x, in_declared, out_declared, w, w_scale, tag);
 }
 
@@ -477,6 +542,7 @@ void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
                                  const std::vector<Ct> &x, int in_declared,
                                  int out_declared, const DeviceWeights &w,
                                  double w_scale, const char *tag) const {
+  leg_->SetDensity(GetDensity(), GetDensity());
   leg_->Project(res, x, in_declared, out_declared, w, w_scale, tag);
 }
 
@@ -485,8 +551,19 @@ void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
                                  const std::vector<Ct> &x, int in_declared,
                                  int out_declared, const ProjectionWeight &w,
                                  double w_scale, const char *tag) const {
+  Project(res, x, in_declared, out_declared, w, w_scale, tag, GetDensity(),
+          GetDensity());
+}
+
+template <typename word>
+void CiLlamaLayer<word>::Project(std::vector<Ct> &res,
+                                 const std::vector<Ct> &x, int in_declared,
+                                 int out_declared, const ProjectionWeight &w,
+                                 double w_scale, const char *tag,
+                                 int in_density, int out_density) const {
   AssertTrue(w.Given(), std::string("CiLlamaLayer::Project(") + tag +
                             "): the weight must be given in exactly one form");
+  leg_->SetDensity(in_density, out_density);
   if (w.device != nullptr) {
     leg_->Project(res, x, in_declared, out_declared, *w.device, w_scale, tag);
   } else {
@@ -534,8 +611,10 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->LevelDown(ins[k], h_cts[k], cfg_.product_level);
     }
     std::vector<Ct> out;
+    // The seam's images are banded whichever basis the layer reads, so O
+    // reads at density 2 and writes at the layer's own.
     Project(out, ins, attn_channels_, cfg_.model_declared, w.o, c.res_scale,
-            (w.tag + ".o").c_str());
+            (w.tag + ".o").c_str(), /*in_density=*/2, GetDensity());
     AssertTrue(static_cast<int>(out.size()) == num_model_cts_,
                "CiLlamaLayer: the O projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");

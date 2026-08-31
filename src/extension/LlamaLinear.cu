@@ -161,6 +161,46 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                    std::to_string(rank_));
   }
 
+  CheckDensity();
+
+#ifdef USE_CUBLAS
+  use_blas_ = EnvOn("CHEDDAR_PCMM_BLAS", true);
+  if (use_blas_) {
+    blas_.reset(new PcmmBlasHandler<word>(context_->param_));
+    product_blas_ = blas_.get();
+    if (descent_.Enabled()) {
+      // The split is encoded against the primes of the ring the MLWE
+      // ciphertexts live in, so it follows the product and not the block.
+      small_blas_.reset(new PcmmBlasHandler<word>(*product_param_));
+      product_blas_ = small_blas_.get();
+    }
+  }
+#endif
+  std::cout << "CoeffLinearLeg: product on "
+            << (use_blas_ ? "cuBLAS int8 GEMM" : "PcmmAccum")
+            << ", converted weights "
+            << (cache_weights_ ? "cached on the GPU" : "rebuilt every call")
+            << ", descent ";
+  if (descent_.Enabled()) {
+    std::cout << "ring-switched " << degree << " -> "
+              << product_param_->degree_ << " -> " << small_degree_
+              << " (rank " << ring_rank_ << " x " << sub_rank_ << ")";
+  } else {
+    std::cout << "direct " << degree << " -> " << small_degree_ << " (rank "
+              << rank_ << ")";
+  }
+  std::cout << std::endl;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::SetDensity(int input_density, int output_density) {
+  cfg_.input_density = input_density;
+  cfg_.output_density = output_density;
+  CheckDensity();
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::CheckDensity() const {
   // Half density is a claim about the CALLER's ciphertexts that nothing here
   // can verify, so the only thing checkable is that the shape admits it.
   AssertTrue(cfg_.input_density == 1 || cfg_.input_density == 2,
@@ -200,34 +240,6 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
                "product-ring parts, because a live flat index is "
                "i * sub_rank + n < rank/2 exactly when i < ring_rank/2");
   }
-
-#ifdef USE_CUBLAS
-  use_blas_ = EnvOn("CHEDDAR_PCMM_BLAS", true);
-  if (use_blas_) {
-    blas_.reset(new PcmmBlasHandler<word>(context_->param_));
-    product_blas_ = blas_.get();
-    if (descent_.Enabled()) {
-      // The split is encoded against the primes of the ring the MLWE
-      // ciphertexts live in, so it follows the product and not the block.
-      small_blas_.reset(new PcmmBlasHandler<word>(*product_param_));
-      product_blas_ = small_blas_.get();
-    }
-  }
-#endif
-  std::cout << "CoeffLinearLeg: product on "
-            << (use_blas_ ? "cuBLAS int8 GEMM" : "PcmmAccum")
-            << ", converted weights "
-            << (cache_weights_ ? "cached on the GPU" : "rebuilt every call")
-            << ", descent ";
-  if (descent_.Enabled()) {
-    std::cout << "ring-switched " << degree << " -> "
-              << product_param_->degree_ << " -> " << small_degree_
-              << " (rank " << ring_rank_ << " x " << sub_rank_ << ")";
-  } else {
-    std::cout << "direct " << degree << " -> " << small_degree_ << " (rank "
-              << rank_ << ")";
-  }
-  std::cout << std::endl;
 }
 
 template <typename word>
@@ -433,7 +445,12 @@ CoeffLinearLeg<word>::GetOperands(const char *name, const WeightSource &w,
                                   int tile) const {
   const uint64_t fp = w.device != nullptr ? w.device->fingerprint
                                           : Fingerprint(*w.host, w_scale);
-  const std::string key(name);
+  // The densities are part of the operand's shape (`LiveRows`/`LiveColumns`
+  // size it), so a weight converted at one density is a different operand
+  // from the same weight at another; see `SetDensity`.
+  const std::string key = std::string(name) + "@" +
+                          std::to_string(cfg_.input_density) + "x" +
+                          std::to_string(cfg_.output_density);
   auto it = operands_.find(key);
   if (it != operands_.end()) {
     const Operands &held = it->second;

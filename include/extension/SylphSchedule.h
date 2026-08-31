@@ -10,6 +10,9 @@
 
 namespace cheddar {
 
+template <typename word>
+class CiModuleBasis;
+
 /**
  * @brief [SYLPH] figure 2's Private Prefill cycle, as one schedulable object.
  *
@@ -98,6 +101,8 @@ class SylphSchedule {
 
   std::shared_ptr<const BootContext<word>> boot_;
   int num_slots_;
+  //! The module basis both crossings read when set; see `SetModuleBasis`.
+  const CiModuleBasis<word> *basis_ = nullptr;
 
  public:
   /**
@@ -124,6 +129,31 @@ class SylphSchedule {
   // disable copying (or moving also)
   SylphSchedule(const SylphSchedule &) = delete;
   SylphSchedule &operator=(const SylphSchedule &) = delete;
+
+  /**
+   * @brief Cross through the MODULE basis instead of the native one.
+   *
+   * With a basis set, `ToCoeff` runs `basis->EvaluateStC` -- which must be
+   * compiled at `GetStCLevel()` with `ModuleStCConst()` folded -- and
+   * `ToSlot` runs `BootContext::HalfBootModule` through the same object, so
+   * a coefficient image's MODULE coordinates are what the slot leg reads and
+   * writes: every component live, no duplicate band (Doing.md 3.5-3.7).
+   * `GetCoeffLevel()` follows the module StC's own level count. The two pair
+   * forms stay native-only.
+   *
+   * @param basis the compiled transforms, or nullptr for the native ones;
+   *        the caller keeps it alive
+   */
+  void SetModuleBasis(const CiModuleBasis<word> *basis);
+  const CiModuleBasis<word> *GetModuleBasis() const { return basis_; }
+
+  /**
+   * @brief The constant a module StC of `num_levels` levels folds so that
+   * `ToCoeff`'s bookkeeping is unchanged: the native `stc_const`, restated
+   * against the canonical scale of the level the module StC lands on rather
+   * than `GetEndLevel()`'s.
+   */
+  double ModuleStCConst(int num_levels) const;
 
   /** @brief Level `ToSlot` lands on, where the non-linear leg begins. */
   int GetSlotLevel() const;
@@ -217,13 +247,17 @@ class SylphSchedule {
    * ratio to its first nonlinear operator**, folded into whatever plaintext
    * multiply is already there.
    *
-   * @param res output, coefficient-encoded at `GetCoeffLevel()`
+   * @param res output, coefficient-encoded at `GetCoeffLevel()` -- or at
+   *        `GetEndLevel()` when `native_basis` overrides a module basis
    * @param x slot-encoded, at or above `GetStCLevel()`
    * @param evk_map supplies the rotation keys StC needs
    * @param min_ks whether to use minimum key-switching
+   * @param native_basis run the native StC even when a module basis is set:
+   *        for a producer whose output contract is the banded image (the
+   *        seam, until it is re-derived on the module basis)
    */
   void ToCoeff(Ct &res, const Ct &x, const EvkMap<word> &evk_map,
-               bool min_ks = false) const;
+               bool min_ks = false, bool native_basis = false) const;
 
   /**
    * @brief The coefficient to slot leg: HalfBoot.

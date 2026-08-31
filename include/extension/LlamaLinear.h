@@ -303,6 +303,21 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     stage_seconds_ = 0.0;
   }
 
+  /**
+   * @brief Restate the density contract for the projections that follow.
+   *
+   * On the module basis (Doing.md 3.7) ONE leg serves projections whose two
+   * ends differ: the O projection reads the seam's half-density images and
+   * writes a full-density stream, and the Q/K/V emissions read the
+   * full-density norm output and write the leg's half-density images. The
+   * densities are a property of one projection's operands, not of the leg,
+   * so they are set per call; the operand cache keys on them, so a weight
+   * converted at one density is never answered at another.
+   */
+  void SetDensity(int input_density, int output_density);
+  int GetInputDensity() const { return cfg_.input_density; }
+  int GetOutputDensity() const { return cfg_.output_density; }
+
   void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
                int out_channels, const std::vector<double> &w, double w_scale,
                const char *name) const override;
@@ -467,6 +482,9 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   const Operands &GetOperands(const char *name, const WeightSource &w,
                               int in_channels, int out_channels, double w_scale,
                               int parents, int groups, int tile) const;
+
+  //! What the shape admits of `cfg_`'s densities; see `SetDensity`.
+  void CheckDensity() const;
 
   //! Size, scale and a strided sample of the entries. Cheap enough to run on
   //! every call and specific enough that a different tensor cannot pass.

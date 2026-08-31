@@ -11,6 +11,7 @@
 #include "core/EvkRequest.h"
 #include "extension/BootContext.h"
 #include "extension/CiLlamaSeam.h"
+#include "extension/CiModuleBasis.h"
 #include "extension/LlamaLinear.h"
 #include "extension/RmsNorm.h"
 #include "extension/SiLu.h"
@@ -135,6 +136,21 @@ class CiLlamaLayer {
     //! Leave channel zero of the model dimension empty. See the class
     //! comment; false is the wrong contract and exists only to reproduce it.
     bool keep_component_zero = false;
+    //! READ AND WRITE THE MODULE BASIS (Doing.md 3.5-3.7). Half density is
+    //! the convention of the NATIVE transforms, which read `{1, c_j}`
+    //! coefficients as (token, channel); with `CiModuleBasis` the crossings
+    //! read the module coordinates `ModDecomp` extracts instead, so every
+    //! component is live and there is no duplicate band: the residual stream
+    //! is `model_live / proj_rank` ciphertexts (8, not 17) and the hidden
+    //! dimension `hidden / proj_rank` (28, not 56), `RmsNormHandler` reduces
+    //! at stride 1 over plain weights, and component zero is an ordinary
+    //! channel. Both declared widths are then the model's own. The seam's
+    //! output stays the banded image until it is re-derived (step 3), so the
+    //! O projection reads at density 2 and writes at density 1; everything
+    //! after it is dense. The FFN's `BootContext` runs `HalfBootModule`,
+    //! which needs the SSE secret sampled in the module basis
+    //! (`CHEDDAR_MODULE_SPARSE_SECRET=T[,h]`, Doing.md 3.6).
+    bool module_basis = false;
     bool min_ks = false;
     bool verbose = false;
     //! Keep `RmsNormHandler`'s output in SLOTS, before `SlotToCoeff`, so a
@@ -332,39 +348,57 @@ class CiLlamaLayer {
   void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
                int out_declared, const ProjectionWeight &w, double w_scale,
                const char *tag) const;
+  /**
+   * @brief Either form, with the two densities stated: for a projection whose
+   * ends differ from the layer's own convention -- on the module basis the
+   * Q/K/V emissions read the dense norm output (1) and write the leg's
+   * half-density images (2). The forms above use the layer's convention at
+   * both ends (1/1 on the module basis, 2/2 otherwise).
+   */
+  void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_declared,
+               int out_declared, const ProjectionWeight &w, double w_scale,
+               const char *tag, int in_density, int out_density) const;
 
   /**
-   * @brief The half-density slot conventions, stated once.
+   * @brief The slot conventions, stated once, for either density.
    *
-   * A residual-stream ciphertext carries `rank/2 - 1` live model channels at
-   * the even declared indices 2, 4, ..., rank-2 -- component zero has no
-   * partner under the banded convention (Doing.md 1.5cu) -- and a hidden one
-   * carries `rank/2` at 0, 2, ..., rank-2, because nothing reduces over the
-   * hidden axis. `ModelSlot`/`HiddenSlot` are live -> declared;
+   * At `density` 2 (the native transforms' half density) a residual-stream
+   * ciphertext carries `rank/2 - 1` live model channels at the even declared
+   * indices 2, 4, ..., rank-2 -- component zero has no partner under the
+   * banded convention (Doing.md 1.5cu) -- and a hidden one carries `rank/2`
+   * at 0, 2, ..., rank-2, because nothing reduces over the hidden axis. At
+   * `density` 1 (the module basis) every declared index is a live channel and
+   * the map is the identity. `ModelSlot`/`HiddenSlot` are live -> declared;
    * `ModelMap`/`HiddenMap` are declared -> live with -1 at the dead indices,
    * which is what `DeviceWeights` takes. `CiSinCAttention` and `CiLlamaSeam`
    * address the same declared indices.
    */
-  static int ModelSlot(int m, int rank) {
+  static int ModelSlot(int m, int rank, int density = 2) {
+    if (density == 1) return m;
     const int per = rank / 2 - 1;
     return (m / per) * rank + 2 * (m % per + 1);
   }
-  static int HiddenSlot(int j, int rank) {
+  static int HiddenSlot(int j, int rank, int density = 2) {
+    if (density == 1) return j;
     const int per = rank / 2;
     return (j / per) * rank + 2 * (j % per);
   }
   //! `live` is the tensor's own channel count (4096 model, 14336 hidden);
   //! declared slots past it are dead, as the ciphertexts' tails are.
   static void ModelMap(std::vector<int> &slot, int declared, int rank,
-                       int live) {
+                       int live, int density = 2) {
     slot.assign(declared, -1);
-    for (int m = 0; m < live; m++) slot[ModelSlot(m, rank)] = m;
+    for (int m = 0; m < live; m++) slot[ModelSlot(m, rank, density)] = m;
   }
   static void HiddenMap(std::vector<int> &slot, int declared, int rank,
-                        int live) {
+                        int live, int density = 2) {
     slot.assign(declared, -1);
-    for (int j = 0; j < live; j++) slot[HiddenSlot(j, rank)] = j;
+    for (int j = 0; j < live; j++) slot[HiddenSlot(j, rank, density)] = j;
   }
+  //! The density of the layer's own images: 1 on the module basis, else 2.
+  int GetDensity() const { return cfg_.module_basis ? 1 : 2; }
+  //! The compiled module transforms, or null off the module basis.
+  const CiModuleBasis<word> *GetModuleBasis() const { return basis_.get(); }
 
   void AttentionNorm(std::vector<Ct> &res, const std::vector<Ct> &stream,
                      const std::vector<double> &gain, const Calibration &c,
@@ -488,6 +522,12 @@ class CiLlamaLayer {
   int op_level_ = 0;
 
   SylphSchedule<word> sched_;
+  //! `Config::module_basis`: the module StC at `GetStCLevel()` and the
+  //! module CtS at the boot's CtS start, which `sched_` reads.
+  std::unique_ptr<CiModuleBasis<word>> basis_;
+  //! `RmsNormHandler`'s reduction stride: 2 keeps the duplicate band apart,
+  //! 1 is every channel (the module basis has no band).
+  int channel_stride_ = 2;
   std::unique_ptr<CiLlamaSeam<word>> seam_;
   std::unique_ptr<CoeffLinearLeg<word>> leg_;
   //! `Config::keep_norm_slots`: the last norm's channel sum of squares, which

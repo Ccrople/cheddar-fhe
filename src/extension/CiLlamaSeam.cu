@@ -374,7 +374,11 @@ void CiLlamaSeam<word>::Apply(Ct &res, const Ct &booted,
   // the same relation read at coefficient position `row`.
   Ct flipped;
   RunStage(flipped, sum, rev_, evk);
-  sched.ToCoeff(res, flipped, evk, min_ks);
+  // The NATIVE StC, whatever basis the schedule otherwise reads: this seam's
+  // output contract is the banded half-density image (its T2 makes the
+  // duplicates), and the O projection reads it at input density 2 until the
+  // seam is re-derived on the module basis (Doing.md 3.7, step 3).
+  sched.ToCoeff(res, flipped, evk, min_ks, /*native_basis=*/true);
 }
 
 template class CiLlamaSeam<uint32_t>;

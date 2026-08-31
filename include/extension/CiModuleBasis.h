@@ -158,6 +158,9 @@ class CiModuleBasis {
 
   int GetSmallDegree() const { return small_degree_; }
   int GetRank() const { return rank_; }
+  /// The levels the two directions were compiled at (-1 when not built).
+  int GetStCLevel() const { return stc_level_; }
+  int GetCtSLevel() const { return cts_level_; }
   int GetStCNumLevels() const { return NumLevels(stc_groups_); }
   int GetCtSNumLevels() const { return NumLevels(cts_groups_); }
   /// Diagonal counts of the compiled phases, StC then CtS, in evaluation order.
