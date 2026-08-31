@@ -55,6 +55,9 @@ namespace cheddar {
  *
  * All of it is checked coefficient by coefficient on the host in
  * `reference/scripts/ci_module_basis.py` before any of this ran on a device.
+ * The phases pass their pre-rotations along by the SinC prefix's window
+ * rule; StC ends on a whole-lattice phase and comes back clean, CtS ends on
+ * the small stages and spends one closing rotation.
  *
  * ## Conventions
  *
@@ -93,10 +96,20 @@ class CiModuleBasis {
   std::vector<Transform> cts_small_;
   std::vector<int> stc_diagonals_;
   std::vector<int> cts_diagonals_;
+  // The rotation a chain of phases leaves on its output (the SinC prefix's
+  // window rule, see the .cpp); zero when the chain ends on a phase covering
+  // the whole stride lattice, otherwise undone by one HRot.
+  int stc_shift_ = 0;
+  int cts_shift_ = 0;
 
   static std::pair<int, int> Split(int num_diag);
   StripedMatrix Correction(const Parameter<word> &param,
                            const Encoder<word> &encoder) const;
+  // Compile `matrices` as consecutive phases from `start_level` down, with
+  // the pre-rotations chained; returns the rotation left on the output.
+  int Chain(ConstContextPtr<word> context, std::vector<StripedMatrix> &matrices,
+            int start_level, std::vector<Transform> &dst,
+            std::vector<int> &diagonals) const;
 
  public:
   /**

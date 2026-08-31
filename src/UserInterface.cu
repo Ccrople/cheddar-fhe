@@ -1,4 +1,7 @@
 #include "UserInterface.h"
+
+#include <cstdlib>
+#include <iostream>
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
 #include "common/PrimeUtils.h"
@@ -325,6 +328,60 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
   Random::SampleWithoutReplacement(indices.data(), hamming_weight, 0,
                                    degree - 1);
   Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0, 1);
+
+  // `CHEDDAR_MODULE_SPARSE_SECRET=T`: on the conjugate-invariant ring, sample
+  // the sparse secret's `hamming_weight` nonzeros in the MODULE basis over the
+  // rank-T subring and store its native form P(sigma) -- each module nonzero
+  // at (i, t) is native (t, i) plus, for i != 0 and t >= 1, native
+  // (t - 1, rank - i). What the ModRaise's wrap-around integer then costs in
+  // module coordinates is set by sigma's norm rather than by the scan of a
+  // native-sparse secret (Doing.md 3.5, check 6). Resampled on the rare
+  // collision so that the native form stays ternary; the same number of
+  // nonzero positions and signs is drawn either way.
+  const char *module_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+  const int module_small_degree =
+      (module_env != nullptr && module_env[0] != 0) ? std::atoi(module_env) : 0;
+  if (module_small_degree > 0 && context_->param_.conjugate_invariant_) {
+    const int small_degree = module_small_degree;
+    AssertTrue(small_degree > 0 && degree % small_degree == 0 &&
+                   small_degree < degree,
+               "UserInterface: CHEDDAR_MODULE_SPARSE_SECRET must divide the "
+               "degree");
+    const int rank = degree / small_degree;
+    std::vector<int> native(degree, 0);
+    for (int attempt = 0;; attempt++) {
+      AssertTrue(attempt < 1000,
+                 "UserInterface: could not sample a collision-free module "
+                 "sparse secret");
+      std::fill(native.begin(), native.end(), 0);
+      Random::SampleWithoutReplacement(indices.data(), hamming_weight, 0,
+                                       degree - 1);
+      Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0,
+                                      1);
+      for (int j = 0; j < hamming_weight; j++) {
+        const int flat = indices[j];
+        const int i = flat % rank;
+        const int t = flat / rank;
+        const int v = ternary_values[j] ? -1 : 1;
+        native[flat] += v;
+        if (i != 0 && t >= 1) native[(t - 1) * rank + (rank - i)] += v;
+      }
+      bool ternary = true;
+      for (int v : native) ternary &= (v >= -1 && v <= 1);
+      if (ternary) break;
+    }
+    indices.clear();
+    ternary_values.clear();
+    for (int pos = 0; pos < degree; pos++) {
+      if (native[pos] == 0) continue;
+      indices.push_back(pos);
+      ternary_values.push_back(static_cast<word>(native[pos] < 0 ? 1 : 0));
+    }
+    hamming_weight = static_cast<int>(indices.size());
+    std::cout << "UserInterface: sparse secret sampled in the module basis "
+              << "(T = " << small_degree << "): " << hamming_weight
+              << " native coefficients" << std::endl;
+  }
   HostVector<word> sparse_s(num_total_primes * degree, 0);
   for (int i = 0; i < num_total_primes; i++) {
     word prime = all_primes_[i];

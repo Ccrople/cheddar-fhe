@@ -31,6 +31,46 @@ void ScaleRows(StripedMatrix &m, const std::vector<double> &scale) {
   }
 }
 
+// THE WINDOW. `LinearTransform` maps every offset to `(i - pre_rotation) mod
+// n` and wants those to fit in `(bs * gs - 1) * gcd`; a phase whose offsets
+// straddle zero therefore needs a pre-rotation, and the SinC prefix's chain
+// rule (EvalSpecialFFT.cpp, PrepareSinCPrefix) is how consecutive phases
+// pass it along without a rotation between them:
+//
+//     p_0 = -a_0,   p_{i+1} = a_i - a_{i+1},   result = rot(M x, a_last).
+//
+// Here `a` is the tightest window: minus the most negative signed offset.
+// A phase covering the WHOLE stride lattice -- every twist phase that
+// contains the top stride, and the correction-folded one -- fits any
+// pre-rotation, so its window is free, and a chain that ends on one ends
+// clean. A chain that ends elsewhere is finished by one HRot.
+int Window(const StripedMatrix &m, int n) {
+  int gcd = 0;
+  int most_negative = 0;
+  for (const auto &[idx, _] : m) {
+    const int off = ((idx % n) + n) % n;
+    gcd = GCD(gcd, off);
+    const int signed_off = (off <= n / 2) ? off : off - n;
+    most_negative = std::min(most_negative, signed_off);
+  }
+  if (gcd > 0 && static_cast<int>(m.size()) * gcd == n) return -1;  // full
+  return -most_negative;
+}
+
+// Real in, complex through the middle, real out -- one group of phases.
+template <typename word>
+void RunGroup(ConstContextPtr<word> context,
+              const std::vector<ComplexLinearTransform<word>> &group,
+              Ciphertext<word> &res, const Ciphertext<word> &input,
+              const EvkMap<word> &evk_map) {
+  Ciphertext<word> re, im;
+  group.front().EvaluateFromReal(context, re, im, input, evk_map);
+  for (size_t j = 1; j + 1 < group.size(); j++) {
+    group[j].EvaluatePair(context, re, im, re, im, evk_map);
+  }
+  group.back().EvaluateToReal(context, res, re, im, evk_map);
+}
+
 }  // namespace
 
 template <typename word>
@@ -93,6 +133,40 @@ StripedMatrix CiModuleBasis<word>::Correction(
 }
 
 template <typename word>
+int CiModuleBasis<word>::Chain(ConstContextPtr<word> context,
+                               std::vector<StripedMatrix> &matrices,
+                               int start_level, std::vector<Transform> &dst,
+                               std::vector<int> &diagonals) const {
+  const auto &param = context->param_;
+  const int n = num_slots_;
+  const int num_phases = static_cast<int>(matrices.size());
+  std::vector<int> a(num_phases, 0);
+  for (int j = 0; j < num_phases; j++) {
+    const int w = Window(matrices[j], n);
+    // A free window takes whatever closes the chain cleanly: the previous
+    // phase's window when it is not the last, zero when it is.
+    a[j] = (w >= 0) ? w : 0;
+    if (w < 0 && j + 1 < num_phases) a[j] = (j > 0) ? a[j - 1] : 0;
+  }
+  int prev_a = 0;
+  for (int j = 0; j < num_phases; j++) {
+    const int pre_rotation = (j == 0) ? -a[0] : (prev_a - a[j]);
+    prev_a = a[j];
+    const int level = start_level - j;
+    const int nd = matrices[j].GetNumDiag();
+    auto [bs, gs] = Split(nd);
+    dst.emplace_back(context, matrices[j], level,
+                     param.GetRescalePrimeProd(level), bs, gs, pre_rotation,
+                     a[j]);
+    diagonals.push_back(nd);
+    std::cout << "  phase " << j << ": " << nd << " diagonals, level "
+              << level << ", BSGS " << bs << "x" << gs << ", pre_rotation "
+              << pre_rotation << ", pt_rot " << a[j] << std::endl;
+  }
+  return prev_a;
+}
+
+template <typename word>
 CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
                                    int small_degree, int stc_level,
                                    int cts_level, const Phases &phases,
@@ -136,12 +210,15 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
   auto i_of = [&](int flat) { return flat & (rank_ - 1); };
   auto t_of = [&](int flat) { return flat >> log_rank_; };
 
+  std::cout << "CiModuleBasis: slots " << n << ", T " << small_degree_
+            << ", k " << rank_ << std::endl;
+
   // ---- SlotToCoeff -------------------------------------------------------
   if (stc_level >= 0) {
     check_group(phases.stc_small, log_small_, "stc_small");
     check_group(phases.stc_twist, log_rank_, "stc_twist");
-    const int num_phases =
-        static_cast<int>(phases.stc_small.size() + phases.stc_twist.size());
+    const int num_small = static_cast<int>(phases.stc_small.size());
+    const int num_phases = num_small + static_cast<int>(phases.stc_twist.size());
     AssertTrue(stc_level >= num_phases,
                "CiModuleBasis: StC needs one level per phase");
     const double const_div = std::pow(stc_const, 1.0 / num_phases);
@@ -154,46 +231,41 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
                        (t_of(flat) != 0 ? 2.0 : 1.0);
     }
 
-    int level = stc_level;
+    std::vector<StripedMatrix> matrices;
     int cumul = 0;
-    bool first = true;
-    auto build = [&](const std::vector<int> &group,
-                     std::vector<Transform> &dst) {
-      for (int count : group) {
+    for (const auto *group : {&phases.stc_small, &phases.stc_twist}) {
+      for (int count : *group) {
         std::vector<int> stages;
         for (int s = cumul; s < cumul + count; s++) stages.push_back(s);
         StripedMatrix m =
             CiButterflyStages(param, encoder, n, stages, /*inverse_dir=*/false);
-        if (first) ScaleColumns(m, col_scale);
-        first = false;
-        m = StripedMatrix::Mult(m, Complex(const_div, 0.0));
-        const int nd = m.GetNumDiag();
-        auto [bs, gs] = Split(nd);
-        dst.emplace_back(context, m, level, param.GetRescalePrimeProd(level),
-                         bs, gs, 0, 0);
-        stc_diagonals_.push_back(nd);
-        level--;
+        if (matrices.empty()) ScaleColumns(m, col_scale);
+        matrices.push_back(
+            StripedMatrix::Mult(m, Complex(const_div, 0.0)));
         cumul += count;
       }
-    };
-    build(phases.stc_small, stc_small_);
-    build(phases.stc_twist, stc_twist_);
+    }
+    std::cout << " StC at level " << stc_level << ":" << std::endl;
+    std::vector<Transform> all;
+    stc_shift_ = Chain(context, matrices, stc_level, all, stc_diagonals_);
+    for (int j = 0; j < num_phases; j++) {
+      (j < num_small ? stc_small_ : stc_twist_).push_back(std::move(all[j]));
+    }
   }
 
   // ---- CoeffToSlot -------------------------------------------------------
   if (cts_level >= 0) {
     check_group(phases.cts_twist, log_rank_, "cts_twist");
     check_group(phases.cts_small, log_small_, "cts_small");
-    const int num_phases =
-        static_cast<int>(phases.cts_twist.size() + phases.cts_small.size());
+    const int num_twist = static_cast<int>(phases.cts_twist.size());
+    const int num_phases = num_twist + static_cast<int>(phases.cts_small.size());
     AssertTrue(cts_level >= num_phases,
                "CiModuleBasis: CtS needs one level per phase");
     const double const_div = std::pow(cts_const, 1.0 / num_phases);
     // The twist stages return k/2 times (s + w Flip s); the small stages
     // return T times the coordinates. Both are spread over their phases so
     // that no single plaintext carries a 1/256.
-    const double twist_div =
-        std::pow(2.0 / rank_, 1.0 / phases.cts_twist.size());
+    const double twist_div = std::pow(2.0 / rank_, 1.0 / num_twist);
     const double small_div =
         std::pow(1.0 / small_degree_, 1.0 / phases.cts_small.size());
 
@@ -202,7 +274,7 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
       row_scale[pos] = (i_of(module_index(pos)) != 0) ? 0.5 : 1.0;
     }
 
-    int level = cts_level;
+    std::vector<StripedMatrix> matrices;
     int top = log_slots_ - 1;
     for (size_t j = 0; j < phases.cts_twist.size(); j++) {
       const int count = phases.cts_twist[j];
@@ -213,13 +285,8 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
       if (j + 1 == phases.cts_twist.size()) {
         m = StripedMatrix::Mult(Correction(param, encoder), m);
       }
-      m = StripedMatrix::Mult(m, Complex(const_div * twist_div, 0.0));
-      const int nd = m.GetNumDiag();
-      auto [bs, gs] = Split(nd);
-      cts_twist_.emplace_back(context, m, level,
-                              param.GetRescalePrimeProd(level), bs, gs, 0, 0);
-      cts_diagonals_.push_back(nd);
-      level--;
+      matrices.push_back(
+          StripedMatrix::Mult(m, Complex(const_div * twist_div, 0.0)));
       top -= count;
     }
     AssertTrue(top == log_small_ - 1, "CiModuleBasis: twist stages miscounted");
@@ -230,31 +297,20 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
       StripedMatrix m =
           CiButterflyStages(param, encoder, n, stages, /*inverse_dir=*/true);
       if (j + 1 == phases.cts_small.size()) ScaleRows(m, row_scale);
-      m = StripedMatrix::Mult(m, Complex(const_div * small_div, 0.0));
-      const int nd = m.GetNumDiag();
-      auto [bs, gs] = Split(nd);
-      cts_small_.emplace_back(context, m, level,
-                              param.GetRescalePrimeProd(level), bs, gs, 0, 0);
-      cts_diagonals_.push_back(nd);
-      level--;
+      matrices.push_back(
+          StripedMatrix::Mult(m, Complex(const_div * small_div, 0.0)));
       top -= count;
     }
     AssertTrue(top == -1, "CiModuleBasis: small stages miscounted");
+    std::cout << " CtS at level " << cts_level << ":" << std::endl;
+    std::vector<Transform> all;
+    cts_shift_ = Chain(context, matrices, cts_level, all, cts_diagonals_);
+    for (int j = 0; j < num_phases; j++) {
+      (j < num_twist ? cts_twist_ : cts_small_).push_back(std::move(all[j]));
+    }
   }
-
-  std::cout << "CiModuleBasis: slots " << n << ", T " << small_degree_
-            << ", k " << rank_;
-  if (stc_level >= 0) {
-    std::cout << "; StC at level " << stc_level << " in " << GetStCNumLevels()
-              << " phases, diagonals";
-    for (int d : stc_diagonals_) std::cout << " " << d;
-  }
-  if (cts_level >= 0) {
-    std::cout << "; CtS at level " << cts_level << " in " << GetCtSNumLevels()
-              << " phases, diagonals";
-    for (int d : cts_diagonals_) std::cout << " " << d;
-  }
-  std::cout << std::endl;
+  std::cout << " closing rotations: StC " << stc_shift_ << ", CtS "
+            << cts_shift_ << std::endl;
 }
 
 template <typename word>
@@ -263,34 +319,28 @@ void CiModuleBasis<word>::AddRequiredRotations(EvkRequest &req,
   for (const auto *group : {&stc_small_, &stc_twist_, &cts_twist_, &cts_small_}) {
     for (const auto &t : *group) t.AddRequiredRotations(req, min_ks);
   }
-}
-
-namespace {
-
-// Real in, complex through the middle, real out -- one group of phases.
-template <typename word>
-void RunGroup(ConstContextPtr<word> context,
-              const std::vector<ComplexLinearTransform<word>> &group,
-              Ciphertext<word> &res, const Ciphertext<word> &input,
-              const EvkMap<word> &evk_map) {
-  Ciphertext<word> re, im;
-  group.front().EvaluateFromReal(context, re, im, input, evk_map);
-  for (size_t j = 1; j + 1 < group.size(); j++) {
-    group[j].EvaluatePair(context, re, im, re, im, evk_map);
+  if (stc_shift_ != 0) {
+    req.AddRequest(num_slots_ - stc_shift_, stc_level_ - GetStCNumLevels());
   }
-  group.back().EvaluateToReal(context, res, re, im, evk_map);
+  if (cts_shift_ != 0) {
+    req.AddRequest(num_slots_ - cts_shift_, cts_level_ - GetCtSNumLevels());
+  }
 }
-
-}  // namespace
 
 template <typename word>
 void CiModuleBasis<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
   AssertTrue(!stc_small_.empty(), "CiModuleBasis: StC was not built");
-  Ct mid;
+  Ct mid, out;
   RunGroup(context, stc_small_, mid, input, evk_map);
-  RunGroup(context, stc_twist_, res, mid, evk_map);
+  RunGroup(context, stc_twist_, out, mid, evk_map);
+  if (stc_shift_ != 0) {
+    const int back = num_slots_ - stc_shift_;
+    context->HRot(res, out, evk_map.GetRotationKey(back), back);
+  } else {
+    res = std::move(out);
+  }
   res.SetNumSlots(num_slots_);
 }
 
@@ -299,9 +349,15 @@ void CiModuleBasis<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
   AssertTrue(!cts_twist_.empty(), "CiModuleBasis: CtS was not built");
-  Ct mid;
+  Ct mid, out;
   RunGroup(context, cts_twist_, mid, input, evk_map);
-  RunGroup(context, cts_small_, res, mid, evk_map);
+  RunGroup(context, cts_small_, out, mid, evk_map);
+  if (cts_shift_ != 0) {
+    const int back = num_slots_ - cts_shift_;
+    context->HRot(res, out, evk_map.GetRotationKey(back), back);
+  } else {
+    res = std::move(out);
+  }
   res.SetNumSlots(num_slots_);
 }
 

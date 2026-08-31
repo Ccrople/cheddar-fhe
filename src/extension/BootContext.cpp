@@ -1,5 +1,8 @@
 #include "extension/BootContext.h"
 
+#include "core/Mlwe.h"
+#include "extension/CiModuleBasis.h"
+
 #include <cmath>
 #include <memory>
 #include <string>
@@ -278,7 +281,8 @@ void BootContext<word>::AddRequiredRotations(EvkRequest &req, int num_slots,
 template <typename word>
 void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
                                      const EvkMap<word> &evk_map,
-                                     int target_level) const {
+                                     int target_level,
+                                     int module_small_degree) const {
   if (target_level < 0) target_level = boot_param_.GetMaxLevel();
   AssertTrue(target_level > 0 && target_level <= this->param_.max_level_,
              "ModUpToLevel: target level out of range");
@@ -318,14 +322,31 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
   DvView<word> tmp_bx_view = tmp_bx.View(0);
   DvView<word> tmp_ax_view = tmp_ax.View(tmp_ax_num_aux * degree);
 
+  // The module-centred form (Doing.md 3.5): the scan takes the level-zero
+  // residues to module coordinates, the lift centres THOSE, and the
+  // recomposition returns to native coefficients at the target modulus. Both
+  // maps are integer and linear, so per residue they are exact, and what
+  // changes is only which representative of the same ciphertext mod q0 gets
+  // lifted -- the one whose module coordinates lie in (-q0/2, q0/2].
+  std::unique_ptr<MlweHandler<word>> mlwe;
+  if (module_small_degree > 0) {
+    AssertTrue(this->param_.conjugate_invariant_,
+               "ModUpToLevel: the module-centred lift is a conjugate-"
+               "invariant object");
+    mlwe = std::make_unique<MlweHandler<word>>(this->param_,
+                                               this->ntt_handler_);
+  }
+
   // TODO(jongmin.kim): We can remove some redundant NTT here.
   // ModUpToLevel(bx)
   NPInfo max_level_np = target_np;
   this->ntt_handler_.INTTAndMultConst(res_bx_view, np,
                                       working_ct->BxConstView(),
                                       mod_max_intt_const_.ConstView(0));
+  if (mlwe) mlwe->ScanInPlace(res_bx_view, np, module_small_degree);
   this->elem_handler_.ModUpToLevel(tmp_bx_view, res.BxConstView(),
                                    target_level);
+  if (mlwe) mlwe->RecomposeInPlace(tmp_bx_view, max_level_np, module_small_degree);
   this->ntt_handler_.NTT(tmp_bx_view, max_level_np, tmp_bx.ConstView(0), true);
 
   // ModUpToLevel(ax)
@@ -333,8 +354,10 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
   this->ntt_handler_.INTTAndMultConst(res_ax_view, np,
                                       working_ct->AxConstView(),
                                       mod_max_intt_const_.ConstView(0));
+  if (mlwe) mlwe->ScanInPlace(res_ax_view, np, module_small_degree);
   this->elem_handler_.ModUpToLevel(tmp_ax_view, res.AxConstView(),
                                    target_level);
+  if (mlwe) mlwe->RecomposeInPlace(tmp_ax_view, max_level_np, module_small_degree);
   this->ntt_handler_.NTT(tmp_ax_view, max_level_np,
                          tmp_ax.ConstView(tmp_ax_num_aux * degree), true);
 
@@ -752,6 +775,45 @@ void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
   // GetScale(GetStCStartLevel()) here -- as if StC had run -- put the values
   // out by ~2.6e5. What the remaining constant is gets measured rather than
   // derived through cts_const_, stc_const_ and q0.
+  res.SetScale(eval_mod_->end_scale_);
+}
+
+template <typename word>
+void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
+                                       const EvkMap<word> &evk_map,
+                                       const CiModuleBasis<word> &basis) const {
+  counts_.half++;
+  const int max_num_slots = this->param_.MaxNumSlots();
+  const int input_num_slots = input.GetNumSlots();
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
+  AssertTrue(num_slots == max_num_slots,
+             "HalfBootModule: the module basis is a full-slot object");
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  AssertTrue(basis.GetCtSNumLevels() == boot_param_.num_cts_levels_,
+             "HalfBootModule: the module CtS must spend exactly the boot "
+             "parameter's CtS levels, or EvalMod starts at the wrong level");
+
+  Ct main_ct;
+  const int input_level = this->param_.NPToLevel(input.GetNP());
+  if (input_level > 0) {
+    this->LevelDown(main_ct, input, 0);
+    HalfBootModule(res, main_ct, evk_map, basis);
+    return;
+  }
+
+  NPInfo min_np = this->param_.LevelToNP(-1);
+  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+
+  ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel(),
+               basis.GetSmallDegree());
+  main_ct.SetNumSlots(max_num_slots);
+
+  Ct slots;
+  basis.EvaluateCtS(GetContext(), slots, main_ct, evk_map);
+
+  EvaluateModAfterCtS(res, slots, /*full_slot=*/true, evk_map);
+  res.SetNumSlots(input_num_slots);
   res.SetScale(eval_mod_->end_scale_);
 }
 

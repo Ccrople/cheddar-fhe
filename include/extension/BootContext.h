@@ -32,6 +32,9 @@ enum class BootVariant {
  * @tparam word uint32_t or uint64_t
  */
 template <typename word>
+class CiModuleBasis;
+
+template <typename word>
 class BootContext : public Context<word>,
                     public std::enable_shared_from_this<BootContext<word>> {
  private:
@@ -324,7 +327,7 @@ class BootContext : public Context<word>,
    * where the parameter set put it.
    */
   void ModUpToLevel(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
-                    int target_level = -1) const;
+                    int target_level = -1, int module_small_degree = 0) const;
   void CoeffToSlot(Ct &res, int num_slots, const Ct &input,
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
   void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
@@ -447,6 +450,29 @@ class BootContext : public Context<word>,
    */
   void HalfBoot(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
                 bool min_ks = false) const;
+
+  /**
+   * @brief `HalfBoot` reading the MODULE basis: coefficients in, the module
+   * coordinates of the input element out in the slots (Doing.md 3.5).
+   *
+   * Two things differ from `HalfBoot`. The ModRaise centres the level-zero
+   * representatives in module coordinates (scan, lift, recompose --
+   * `MlweHandler::ScanInPlace`/`RecomposeInPlace`), because what EvalMod has
+   * to remove is the wrap-around in the coordinates CoeffToSlot reads, and
+   * that wrap-around is bounded by the sparse secret's norm in THOSE
+   * coordinates: with `CHEDDAR_MODULE_SPARSE_SECRET` the SSE secret is
+   * sampled sparse in the module basis and the bound is the usual one; with
+   * a native-sparse secret it is ~8x larger and EvalMod's range does not
+   * hold. And CoeffToSlot is `basis.EvaluateCtS`, which must be compiled at
+   * `GetCtSStartLevel()` with `cts_const = MaxNumSlots() * GetCtSConst()`
+   * and spend exactly `num_cts_levels_` levels, so that EvalMod sees what it
+   * was compiled for.
+   *
+   * The output carries the same scale bookkeeping as `HalfBoot`: a
+   * permutation of the module coordinates times the message ratio.
+   */
+  void HalfBootModule(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
+                      const CiModuleBasis<word> &basis) const;
 
   /**
    * @brief Two real-payload coefficient ciphertexts through ONE HalfBoot.

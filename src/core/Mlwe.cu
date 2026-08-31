@@ -213,6 +213,69 @@ __global__ void CiModDecompScan(word *const *dst_ptrs, int limb_stride,
   }
 }
 
+// In-place forms of the scan and its inverse on ONE polynomial in the big
+// layout `[limb][t * rank + i]` -- what a module-centred ModRaise applies to
+// the level-zero representatives before the CRT lift and undoes after it
+// (Doing.md 3.5). One thread per (limb, class pair), as CiModDecompScan; the
+// pure class i = 0 is already its own coordinate and is left alone. The scan
+// writes row t after reading it, the recomposition writes row t after reading
+// row t + 1, so both are safe in place; the self-mirror class i = rank/2
+// computes both of its writes from reads taken first and writes one value.
+//
+// grid: 1D over num_limbs * (rank / 2 + 1) threads
+template <typename word>
+__global__ void CiScanInPlace(word *data, const word *primes, int rank,
+                              int small_degree, int degree, int num_limbs) {
+  const int num_chains = rank / 2 + 1;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * num_chains) return;
+  const int limb = tid / num_chains;
+  const int chain = tid - limb * num_chains;
+  if (chain == 0) return;
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  word *d = data + limb * degree;
+  const int i = chain;
+  const int mi = rank - chain;
+  word acc_i = 0;
+  word acc_m = 0;
+  for (int t = small_degree - 1; t >= 0; t--) {
+    const word vi = d[t * rank + i];
+    const word vm = d[t * rank + mi];
+    const word new_i = basic::Sub(vi, acc_m, prime);
+    const word new_m = basic::Sub(vm, acc_i, prime);
+    d[t * rank + i] = new_i;
+    d[t * rank + mi] = new_m;
+    acc_i = new_i;
+    acc_m = new_m;
+  }
+}
+
+template <typename word>
+__global__ void CiRecomposeInPlace(word *data, const word *primes, int rank,
+                                   int small_degree, int degree,
+                                   int num_limbs) {
+  const int num_chains = rank / 2 + 1;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * num_chains) return;
+  const int limb = tid / num_chains;
+  const int chain = tid - limb * num_chains;
+  if (chain == 0) return;
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  word *d = data + limb * degree;
+  const int i = chain;
+  const int mi = rank - chain;
+  for (int t = 0; t < small_degree; t++) {
+    const word xi = d[t * rank + i];
+    const word xm = d[t * rank + mi];
+    const word xi_next = (t + 1 < small_degree) ? d[(t + 1) * rank + i] : 0;
+    const word xm_next = (t + 1 < small_degree) ? d[(t + 1) * rank + mi] : 0;
+    const word ri = basic::Add(xi, xm_next, prime);
+    const word rm = basic::Add(xm, xi_next, prime);
+    d[t * rank + i] = ri;
+    d[t * rank + mi] = rm;
+  }
+}
+
 // The a-part of the i-th output is not a shifted slice of a's components as
 // it is on the power basis. With s = sum_j sigma_j c_j, the module components
 // of a * s follow from c_i c_j = c_{i+j} + c_{|i-j|} and, once i + j crosses
@@ -679,6 +742,49 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
   context->elem_handler_.Add(bx_only, np,
                              {res.BxConstView()},
                              {b_ntt.ConstView(0)});
+}
+
+template <typename word>
+void MlweHandler<word>::ScanInPlace(DvView<word> &poly, const NPInfo &np,
+                                    int small_degree) const {
+  AssertTrue(param_.conjugate_invariant_,
+             "ScanInPlace: the scan is a conjugate-invariant object");
+  const int degree = param_.degree_;
+  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
+                 degree % small_degree == 0 && small_degree < degree,
+             "ScanInPlace: bad small_degree");
+  const int rank = degree / small_degree;
+  const int num_limbs = np.GetNumTotal();
+  AssertTrue(poly.TotalSize() == num_limbs * degree,
+             "ScanInPlace: the view does not match np");
+  constexpr int block_dim = 128;
+  const int num_chains = rank / 2 + 1;
+  const int grid_dim = DivCeil(num_limbs * num_chains, block_dim);
+  kernel::CiScanInPlace<word><<<grid_dim, block_dim>>>(
+      poly.data(), param_.GetPrimesPtr(np), rank, small_degree, degree,
+      num_limbs);
+}
+
+template <typename word>
+void MlweHandler<word>::RecomposeInPlace(DvView<word> &poly, const NPInfo &np,
+                                         int small_degree) const {
+  AssertTrue(param_.conjugate_invariant_,
+             "RecomposeInPlace: the recomposition is a conjugate-invariant "
+             "object");
+  const int degree = param_.degree_;
+  AssertTrue(small_degree > 0 && IsPowOfTwo(small_degree) &&
+                 degree % small_degree == 0 && small_degree < degree,
+             "RecomposeInPlace: bad small_degree");
+  const int rank = degree / small_degree;
+  const int num_limbs = np.GetNumTotal();
+  AssertTrue(poly.TotalSize() == num_limbs * degree,
+             "RecomposeInPlace: the view does not match np");
+  constexpr int block_dim = 128;
+  const int num_chains = rank / 2 + 1;
+  const int grid_dim = DivCeil(num_limbs * num_chains, block_dim);
+  kernel::CiRecomposeInPlace<word><<<grid_dim, block_dim>>>(
+      poly.data(), param_.GetPrimesPtr(np), rank, small_degree, degree,
+      num_limbs);
 }
 
 template class MlweCiphertext<uint32_t>;

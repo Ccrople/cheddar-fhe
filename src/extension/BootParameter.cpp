@@ -1,8 +1,26 @@
 #include "extension/BootParameter.h"
 
+#include <cstdlib>
+
 #include "common/CommonUtils.h"
 
 namespace cheddar {
+
+namespace {
+
+// `CHEDDAR_BOOT_DOUBLE_ANGLE=n` widens EvalMod's range: the sine is
+// approximated over initial_K * 2^n wrap-arounds, one level per doubling.
+// The default 3 (K = 16) is what every measured bootstrap ran with; a
+// module-centred ModRaise under a module-sparse secret sees a wrap-around
+// std of ~4 against ~2.3 (Doing.md 3.5, check 6) and wants 4.
+int DoubleAngleCount() {
+  const char *env = std::getenv("CHEDDAR_BOOT_DOUBLE_ANGLE");
+  if (env == nullptr || env[0] == 0) return 3;
+  const int n = std::atoi(env);
+  return (n >= 1 && n <= 6) ? n : 3;
+}
+
+}  // namespace
 
 BootParameter::BootParameter(int max_level, int num_cts_levels,
                              int num_stc_levels, int log_message_ratio /* = 5*/,
@@ -21,7 +39,7 @@ BootParameter::BootParameter(int max_level, int num_cts_levels,
           0.00083684232451067872756, 0.0, -8.6443599931576702305e-05, 0.0,
           7.0966437900548814324e-06, 0.0, -5.228015817181348194e-07,  0.0,
           2.2714690137973883081e-08, 0.0, -2.3761936068138980797e-09},
-      num_double_angle_{3},
+      num_double_angle_{DoubleAngleCount()},
       initial_K_{2} {}
 
 int BootParameter::GetNumEvalModLevels() const {

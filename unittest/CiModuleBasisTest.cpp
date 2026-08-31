@@ -26,8 +26,11 @@
 #include <cmath>
 #include <iomanip>
 
+#include <cstdlib>
+
 #include "Testbed.h"
 #include "core/Mlwe.h"
+#include "extension/BootContext.h"
 #include "extension/CiModuleBasis.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/Profile.h"
@@ -247,6 +250,131 @@ TEST_P(CiModuleBasisTest, CoeffToSlotReadsTheModuleCoordinates) {
   Report("native CtS (control): slots vs banded image", native);
   EXPECT_LT(native.max_abs, 1e-3);
 }
+
+// The half bootstrap with its CoeffToSlot in the module basis: coefficient
+// image P(y) at level 0 in, the module coordinates y in the slots out. Two
+// knobs decide whether it can work and the test says which it ran with:
+// CHEDDAR_MODULE_SPARSE_SECRET=128 samples the SSE secret sparse in the
+// module basis (Doing.md 3.5, check 6: the wrap-around std 4.0 against 17.7
+// under a native-sparse secret) and CHEDDAR_BOOT_DOUBLE_ANGLE=4 widens
+// EvalMod's range to hold that std (K = 32 against 16). The native HalfBoot
+// on the same input is the control, with the banded image as its answer.
+class CiModuleBoot : public Testbed<word> {};
+
+TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
+  if (!param_->conjugate_invariant_) GTEST_SKIP() << "R+ only";
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr) << "the preset must carry a bootstrap";
+  const int n = param_->MaxNumSlots();
+  const int T = kSmallDegree;
+  const int k = n / T;
+  const int log_n = Log2Ceil(n);
+
+  const char *secret_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+  const bool module_secret = secret_env != nullptr && secret_env[0] != 0;
+  const char *angle_env = std::getenv("CHEDDAR_BOOT_DOUBLE_ANGLE");
+  const int double_angle =
+      (angle_env != nullptr && angle_env[0] != 0) ? std::atoi(angle_env) : 3;
+  std::cout << "module-sparse secret: " << (module_secret ? secret_env : "off")
+            << ", EvalMod double angles: " << double_angle
+            << " (K = " << (2 << double_angle) << ")" << std::endl;
+
+  boot->PrepareEvalMod();
+  boot->PrepareEvalSpecialFFT(n);
+  const BootParameter boot_param(param_->max_level_, num_cts_levels_,
+                                 num_stc_levels_, 5, 0);
+  CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1,
+                            boot_param.GetCtSStartLevel(),
+                            CiModuleBasis<word>::Phases(), 1.0,
+                            n * boot->GetCtSConst());
+  EvkRequest req;
+  boot->AddRequiredRotations(req, n);
+  basis.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> draw;
+  GenerateRandomMessage(draw, n, -1.0, 1.0, /*complex=*/false);
+  std::vector<double> y(n);
+  for (int i = 0; i < n; i++) y[i] = draw[i].real();
+  const auto image = HostRecompose(y, k, T);
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, 0, param_->GetScale(0), image);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+
+  // The boundary constant is fitted off the decrypted slots (1.5bz) and
+  // compared with the derived message ratio; the error is reported after
+  // dividing by the fit.
+  auto fit_and_report = [&](const std::string &name,
+                            const std::vector<double> &expected,
+                            const std::vector<double> &obtained) {
+    double num = 0.0, den = 0.0;
+    for (int s = 0; s < n; s++) {
+      num += expected[s] * obtained[s];
+      den += expected[s] * expected[s];
+    }
+    const double c = num / den;
+    std::vector<double> scaled(n);
+    for (int s = 0; s < n; s++) scaled[s] = obtained[s] / c;
+    const auto stats = Compare(expected, scaled);
+    std::cout << std::scientific << std::setprecision(4) << "[" << name
+              << "] fitted constant " << c << ", derived message ratio "
+              << boot->GetMessageRatio() << ", fit/derived "
+              << std::fixed << std::setprecision(5)
+              << c / boot->GetMessageRatio() << std::endl;
+    Report(name, stats);
+    return stats;
+  };
+
+  std::vector<Complex> got;
+  std::vector<double> expected(n), obtained(n);
+
+  Ciphertext<word> out;
+  Profile::Reset();
+  __ProfileStart("module HalfBoot", 1, );
+  boot->HalfBootModule(out, ct, interface_->GetEvkMap(), basis);
+  __ProfileEnd("module HalfBoot");
+  Profile::Report("module HalfBoot breakdown, warm-up included");
+  DecryptAndDecode(got, out);
+  for (int s = 0; s < n; s++) {
+    expected[s] = y[basis.ModuleIndexOfSlot(s)];
+    obtained[s] = got[s].real();
+  }
+  const auto module = fit_and_report("module HalfBoot: slots vs y", expected,
+                                     obtained);
+
+  Ciphertext<word> out_native;
+  Profile::Reset();
+  __ProfileStart("native HalfBoot (control)", 1, );
+  boot->HalfBoot(out_native, ct, interface_->GetEvkMap());
+  __ProfileEnd("native HalfBoot (control)");
+  Profile::Report("native HalfBoot breakdown, warm-up included");
+  DecryptAndDecode(got, out_native);
+  for (int s = 0; s < n; s++) {
+    expected[s] = image[BitReverseInt(s, log_n)];
+    obtained[s] = got[s].real();
+  }
+  const auto native = fit_and_report("native HalfBoot (control): slots vs P(y)",
+                                     expected, obtained);
+
+  // What is asserted depends on the knobs: the module route needs both, the
+  // native control survives the default secret at the default range and the
+  // module secret only at the wider one.
+  if (module_secret && double_angle >= 4) {
+    EXPECT_LT(module.max_abs, 1e-2) << "the module HalfBoot did not land";
+  }
+  if (!module_secret || double_angle >= 4) {
+    EXPECT_LT(native.max_abs, 1e-2) << "the native control did not land";
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Cheddar, CiModuleBoot, testing::Values("ci16_35.json"),
+    [](const testing::TestParamInfo<CiModuleBoot::ParamType> &info) {
+      std::string param_name = info.param;
+      std::replace(param_name.begin(), param_name.end(), '.', '_');
+      return param_name;
+    });
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CiModuleBasisTest, testing::Values("ci16_35.json"),

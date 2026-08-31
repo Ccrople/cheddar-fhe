@@ -249,6 +249,24 @@ class MlweHandler {
                       const MlweCiphertext<word> &hi) const;
 
   /**
+   * @brief The scan (P^-1) applied IN PLACE to one coefficient-domain
+   * polynomial laid out `[limb][t * rank + i]`, every limb of `np`.
+   *
+   * What a module-centred ModRaise needs (Doing.md 3.5): the wrap-around
+   * integer a bootstrap has to remove is small in whichever coordinates the
+   * level-zero representatives were centred in, and the module-basis
+   * CoeffToSlot reads module coordinates, so the representatives are centred
+   * there -- scan, lift, recompose. Both maps are integer and linear, so per
+   * residue is exact. Conjugate-invariant rings only.
+   */
+  void ScanInPlace(DvView<word> &poly, const NPInfo &np,
+                   int small_degree) const;
+
+  /** @brief The banded recomposition (P), in place; the inverse of the above. */
+  void RecomposeInPlace(DvView<word> &poly, const NPInfo &np,
+                        int small_degree) const;
+
+  /**
    * @brief Inverse-transform a ciphertext component into the coefficient
    * domain and copy it to the host. Exposed because the decomposition is only
    * meaningful against coefficient vectors, so tests need them.
