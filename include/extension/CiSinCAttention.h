@@ -121,11 +121,13 @@ class CiSinCAttention {
     //! Directory to cache the three compiled converters in, or empty for no
     //! cache.
     //!
-    //! THIS IS THE LAYER'S DOMINANT ONE-TIME COST. Building the converters is
-    //! 728-803 s of host-side matrix construction and encoding, against ~10 s
-    //! of GPU-online arithmetic in the layer they serve -- and all 32 layers
-    //! of the model reuse them unchanged, so it is paid once per PROCESS and
-    //! bought nothing for it.
+    //! THIS WAS THE LAYER'S DOMINANT ONE-TIME COST. With the diagonals encoded
+    //! on the host, building the converters was 728-803 s against ~10 s of
+    //! GPU-online arithmetic in the layer they serve; encoded on the device
+    //! (`HoistHandler::CompilePlaintexts`) it is ~300 s, nearly all of it the
+    //! inverse's host-side matrix composition, and the cache reads the three
+    //! in ~7 s. All 32 layers of the model reuse them unchanged, so either way
+    //! it is paid once per PROCESS.
     //!
     //! The archive's identity covers the parameter set only, which is not
     //! enough here: two converters over the same ring can differ in

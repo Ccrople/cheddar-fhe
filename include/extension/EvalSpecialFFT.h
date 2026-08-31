@@ -396,12 +396,14 @@ class CiSinCConverter {
    * @brief Write the compiled conversions.
    *
    * This is the single most expensive object the Llama leg builds. The
-   * constructor's work is host-side: composing the SinC stage matrices with
-   * the chain layout's block maps and the transport premap, folding the copy-
-   * add and its inverse into the diagonals, and then encoding 2048 diagonals
-   * per direction. The leg's three converters are 728-803 s of it, against
-   * ~10 s of GPU-online arithmetic in the layer they serve -- and every one of
-   * the model's 32 layers reuses them unchanged.
+   * constructor's work is host-side matrix composition -- the SinC stage
+   * matrices with the chain layout's block maps and the transport premap, the
+   * copy-add and its inverse folded into the diagonals -- and then 2048
+   * diagonals per direction encoded on the device. Measured on the A100: a
+   * forward composes in ~24 s and encodes in a few seconds; the inverse's
+   * composition is ~200 s (the lambda solve and `FoldNestedUnpack`). The
+   * leg's three were 728-803 s when the encoding was the host's, ~300 s now,
+   * and every one of the model's 32 layers reuses them unchanged.
    *
    * What is NOT written is the recipe: the sub-degree and the levels are
    * recorded, but the chain layout and the premap that shaped the matrices are

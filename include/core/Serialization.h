@@ -20,14 +20,17 @@ namespace cheddar {
  *
  * The library's own account of what it lacks put it plainly: keys and
  * ciphertexts cannot be saved, so every process regenerates them. For a unit
- * test that is a few seconds. For the conjugate-invariant Llama-3 layer it is
- * the whole of the run -- of the ~840 s a layer takes end to end, ~823 s is
+ * test that is a few seconds. For the conjugate-invariant Llama-3 layer it was
+ * the whole of the run -- of the ~840 s a layer took end to end, ~823 s was
  * one-time preparation, and the attention leg's three `CiSinCConverter`s alone
- * are 728-803 s of host-side matrix construction and encoding -- against ~10 s
- * of GPU-online arithmetic. A 32-layer model reuses every one of those objects
- * unchanged, so the preparation is not per layer; but it is per PROCESS, which
- * is what makes iterating on the model cost a quarter of an hour a turn and
- * what makes a 32-layer run impossible to develop against.
+ * were 728-803 s of host-side matrix construction and encoding -- against
+ * ~10 s of GPU-online arithmetic. With the diagonals encoded on the device
+ * (`HoistHandler::CompilePlaintexts`) the three are ~300 s cold, nearly all of
+ * it the inverse's host-side matrix composition, and this cache reads them in
+ * ~7 s: a convenience now, not a necessity. A 32-layer model reuses every one
+ * of those objects unchanged, so the preparation is not per layer; but it is
+ * per PROCESS, which is what made iterating on the model cost a quarter of an
+ * hour a turn.
  *
  * ## The one thing an archive must not do
  *

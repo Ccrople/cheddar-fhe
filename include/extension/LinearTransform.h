@@ -73,9 +73,10 @@ class LinearTransform {
    * @brief Write the compiled transform: its BSGS structure and every
    * plaintext diagonal.
    *
-   * What this caches is `CompilePlaintexts` and the host-side matrix
-   * construction that feeds it -- for the Llama leg's converters, minutes per
-   * transform.
+   * What this caches is the host-side matrix construction that feeds
+   * `CompilePlaintexts` -- for the Llama leg's converters, seconds to minutes
+   * per transform -- and the plaintexts themselves, which the device encodes
+   * in seconds.
    */
   void Save(ArchiveWriter &ar) const;
 
