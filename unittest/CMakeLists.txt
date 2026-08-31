@@ -427,3 +427,11 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35_boot.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci_ringswitch16_35_boot.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35_boot.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree13_35_boot.json COPYONLY)
+
+# The encoding unit on the GPU, against the host encoder it replaces. Checks
+# the coefficient and matrix encodings limb by limb -- both routes round the
+# same way, so agreement is not the bar, identity is -- and then measures every
+# stage with CUDA events, exact byte counts and the occupancy calculator.
+add_executable(encode_gpu_test EncodeGpuTest.cpp)
+target_link_libraries(encode_gpu_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
