@@ -318,8 +318,12 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
   basis.AddRequiredRotations(req);
   interface_->PrepareRotationKey(req);
 
+  // The ride: EvalMod's error is a cubic in the message over the wrap
+  // (CLAUDE.md section 3, -0.00258 m^3), 2.6e-3 at |y| = 1 and 2e-5 at the
+  // FFN's 0.2, which is what the layer's crossings carry.
+  constexpr double kRide = 0.2;
   std::vector<Complex> draw;
-  GenerateRandomMessage(draw, n, -1.0, 1.0, /*complex=*/false);
+  GenerateRandomMessage(draw, n, -kRide, kRide, /*complex=*/false);
   std::vector<double> y(n);
   for (int i = 0; i < n; i++) y[i] = draw[i].real();
   const auto image = HostRecompose(y, k, T);
@@ -392,6 +396,145 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
   if (!module_secret || double_angle >= 4) {
     EXPECT_LT(native.max_abs, 1e-2) << "the native control did not land";
   }
+}
+
+// The module route taken apart, each piece against the host, so that a
+// failure of the half bootstrap names its stage:
+//   1. the in-place scan and recomposition are inverse on device residues;
+//   2. the module-centred lift decrypts to the same message as the native
+//      lift up to q0 times an integer polynomial, and that integer is small
+//      in MODULE coordinates (the native lift's is small in native ones);
+//   3. the module CtS with the boot constant, on the lifted ciphertext, lands
+//      what the host computes from the decrypted coefficients.
+TEST_P(CiModuleBoot, ModuleLiftCentresTheRepresentatives) {
+  if (!param_->conjugate_invariant_) GTEST_SKIP() << "R+ only";
+  auto boot = std::dynamic_pointer_cast<BootContext<word>>(context_);
+  ASSERT_NE(boot, nullptr);
+  const int n = param_->MaxNumSlots();
+  const int T = kSmallDegree;
+  const int k = n / T;
+  const int degree = param_->degree_;
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  const char *secret_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+  const bool module_secret = secret_env != nullptr && secret_env[0] != 0;
+  std::cout << "module-sparse secret: " << (module_secret ? secret_env : "off")
+            << std::endl;
+
+  // 1. scan / recompose round trip on random residues, every limb.
+  {
+    const NPInfo np = param_->LevelToNP(-1);
+    const auto primes = param_->GetPrimeVector(np);
+    const int limbs = np.GetNumTotal();
+    HostVector<word> host(limbs * degree);
+    for (int l = 0; l < limbs; l++) {
+      for (int c = 0; c < degree; c++) {
+        host[l * degree + c] =
+            static_cast<word>((static_cast<uint64_t>(c) * 2654435761u + l * 97u) %
+                              primes[l]);
+      }
+    }
+    DeviceVector<word> dev(limbs * degree);
+    CopyHostToDevice(dev, host);
+    auto view = dev.View(0);
+    mlwe.ScanInPlace(view, np, T);
+    HostVector<word> scanned(limbs * degree);
+    CopyDeviceToHost(scanned, dev);
+    mlwe.RecomposeInPlace(view, np, T);
+    HostVector<word> back(limbs * degree);
+    CopyDeviceToHost(back, dev);
+    size_t mismatches = 0, moved = 0;
+    for (size_t i = 0; i < host.size(); i++) {
+      if (back[i] != host[i]) mismatches++;
+      if (scanned[i] != host[i]) moved++;
+    }
+    std::cout << "[scan/recompose] " << mismatches << " mismatches of "
+              << host.size() << ", " << moved << " entries changed by the scan"
+              << std::endl;
+    EXPECT_EQ(mismatches, 0u);
+    EXPECT_GT(moved, host.size() / 2);
+  }
+
+  // 2. the two lifts of one level-zero ciphertext.
+  constexpr double kRide = 0.2;
+  std::vector<Complex> draw;
+  GenerateRandomMessage(draw, n, -kRide, kRide, /*complex=*/false);
+  std::vector<double> y(n);
+  for (int i = 0; i < n; i++) y[i] = draw[i].real();
+  const auto image = HostRecompose(y, k, T);
+  const double scale = param_->GetScale(0);
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, 0, scale, image);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+
+  const BootParameter boot_param(param_->max_level_, BootCtsLevels(),
+                                 num_stc_levels_, 5, 0);
+  const int top = boot_param.GetMaxLevel();
+  Ciphertext<word> up_native, up_module;
+  boot->ModUpToLevel(up_native, ct, interface_->GetEvkMap(), top);
+  boot->ModUpToLevel(up_module, ct, interface_->GetEvkMap(), top, T);
+
+  double q0 = 1.0;
+  for (word p : param_->GetPrimeVector(param_->LevelToNP(-1))) q0 *= p;
+
+  auto lifted = [&](const Ciphertext<word> &up, const std::string &name) {
+    Plaintext<word> out;
+    interface_->Decrypt(out, up);
+    std::vector<double> coeffs;
+    context_->encoder_.DecodeCoeff(coeffs, out);
+    // (decrypted - message) / q0 must be an integer polynomial; report its
+    // size in native and in module coordinates.
+    std::vector<double> wrap(n);
+    double non_integer = 0.0, max_native = 0.0;
+    for (int c = 0; c < n; c++) {
+      wrap[c] = (coeffs[c] - image[c]) * scale / q0;
+      non_integer = std::max(non_integer,
+                             std::abs(wrap[c] - std::round(wrap[c])));
+      max_native = std::max(max_native, std::abs(wrap[c]));
+    }
+    const auto module = HostScan(wrap, k, T);
+    double max_module = 0.0;
+    for (double v : module) max_module = std::max(max_module, std::abs(v));
+    std::cout << std::fixed << std::setprecision(3) << "[" << name
+              << "] wrap-around: max |native| " << max_native
+              << ", max |module| " << max_module << ", non-integer part "
+              << std::scientific << non_integer << std::endl;
+    EXPECT_LT(non_integer, 1e-2) << name;
+    return coeffs;
+  };
+  lifted(up_native, "native lift");
+  const auto coeffs_module = lifted(up_module, "module lift");
+
+  // 3. the module CtS on the module-lifted ciphertext, boot constant in.
+  CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1, top, BootPhases(),
+                            1.0, n * boot->GetCtSConst());
+  EvkRequest req;
+  basis.AddRequiredRotations(req);
+  interface_->PrepareRotationKey(req);
+  Ciphertext<word> slots_ct;
+  basis.EvaluateCtS(context_, slots_ct, up_module, interface_->GetEvkMap());
+  std::vector<Complex> got;
+  DecryptAndDecode(got, slots_ct);
+  const auto module_coords = HostScan(coeffs_module, k, T);
+  const double factor = n * boot->GetCtSConst() * scale / slots_ct.GetScale();
+  std::vector<double> expected(n), obtained(n);
+  for (int s = 0; s < n; s++) {
+    expected[s] = module_coords[basis.ModuleIndexOfSlot(s)] * n *
+                  boot->GetCtSConst();
+    obtained[s] = got[s].real();
+  }
+  double num = 0.0, den = 0.0;
+  for (int s = 0; s < n; s++) {
+    num += expected[s] * obtained[s];
+    den += expected[s] * expected[s];
+  }
+  std::cout << "[module CtS on the lifted ciphertext] fitted expected->obtained "
+            << std::scientific << num / den << " (declared-scale factor "
+            << factor << ")" << std::endl;
+  for (int s = 0; s < n; s++) obtained[s] /= (num / den);
+  Report("module CtS on the lifted ciphertext, after the fit",
+         Compare(expected, obtained));
 }
 
 INSTANTIATE_TEST_SUITE_P(
