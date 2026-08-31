@@ -116,8 +116,8 @@ class HoistHandler {
    * This was the expensive half of the Llama leg's preparation while
    * `CompilePlaintexts` encoded on the host: the three `CiSinCConverter`s
    * were ~730 s of it, and the seam's per-layer T1 stages 10.4 s. With the
-   * encoding on the device those are ~300 s (the host-side matrix
-   * construction in front of it) and 0.12 s.
+   * encoding on the device and the matrix construction in front of it on
+   * every core, those are about a minute and 0.12 s.
    */
   void Save(ArchiveWriter &ar) const;
 

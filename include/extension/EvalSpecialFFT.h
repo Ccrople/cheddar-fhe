@@ -399,11 +399,12 @@ class CiSinCConverter {
    * constructor's work is host-side matrix composition -- the SinC stage
    * matrices with the chain layout's block maps and the transport premap, the
    * copy-add and its inverse folded into the diagonals -- and then 2048
-   * diagonals per direction encoded on the device. Measured on the A100: a
-   * forward composes in ~24 s and encodes in a few seconds; the inverse's
-   * composition is ~200 s (the lambda solve and `FoldNestedUnpack`). The
-   * leg's three were 728-803 s when the encoding was the host's, ~300 s now,
-   * and every one of the model's 32 layers reuses them unchanged.
+   * diagonals per direction encoded on the device. Measured on the A100
+   * (96 host threads): the P/V pair is 37 s -- forward: stages 5 s, folds
+   * 1.3 s, compile 3 s; inverse: stages 5 s, folds 19.5 s, compile 2.7 s
+   * -- against ~255 s with the encoding on the host and the folds on one
+   * core. The leg's three were 728-803 s then; every one of the model's 32
+   * layers reuses them unchanged.
    *
    * What is NOT written is the recipe: the sub-degree and the levels are
    * recorded, but the chain layout and the premap that shaped the matrices are

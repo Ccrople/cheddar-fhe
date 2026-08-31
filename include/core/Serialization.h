@@ -25,9 +25,9 @@ namespace cheddar {
  * one-time preparation, and the attention leg's three `CiSinCConverter`s alone
  * were 728-803 s of host-side matrix construction and encoding -- against
  * ~10 s of GPU-online arithmetic. With the diagonals encoded on the device
- * (`HoistHandler::CompilePlaintexts`) the three are ~300 s cold, nearly all of
- * it the inverse's host-side matrix composition, and this cache reads them in
- * ~7 s: a convenience now, not a necessity. A 32-layer model reuses every one
+ * (`HoistHandler::CompilePlaintexts`) and the folds on every core the three
+ * are about a minute cold, and this cache reads them in ~7 s: a convenience
+ * now, not a necessity. A 32-layer model reuses every one
  * of those objects unchanged, so the preparation is not per layer; but it is
  * per PROCESS, which is what made iterating on the model cost a quarter of an
  * hour a turn.
