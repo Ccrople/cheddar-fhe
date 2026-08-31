@@ -1537,6 +1537,50 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                   << hhi << "); PER TOKEN: rms 2^" << 0.5 * std::log2(qt / da)
                   << " (factors " << tlo << " .. " << thi << ")" << std::endl;
       }
+      // WHERE IS THE RESIDUAL? 1.5ek excluded nine external differences
+      // between this comparison and `CiBootSet.TheLegRunsOnTheRealWeights`,
+      // which reads 2^-9.45 on the same weights, the same tensor, the same
+      // rings and the same sizing. If what is left is an ADDRESS fault -- and
+      // the live and duplicate bands agreeing to four digits is 1.5du's own
+      // signature for one -- the residual will concentrate on particular
+      // lanes or column blocks. If it is arithmetic it will not.
+      {
+        std::vector<double> el(layout.lanes, 0.0), dl(layout.lanes, 0.0);
+        std::vector<double> ec(layout.rank, 0.0), dc(layout.rank, 0.0);
+        for (int bi = 0; bi < layout.num_cts; bi++) {
+          for (int col = 0; col < layout.rank; col++) {
+            for (int lane = 0; lane < layout.lanes; lane++) {
+              const int k = 2 * bi + lane / 16;
+              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int head = Rev(lane, 5);
+              const int chan = bi * layout.rank + col;
+              for (int t = kSinkTokens; t < kT; t++) {
+                const double wv =
+                    cv * av[static_cast<size_t>(t) * kH + head * kD + chan];
+                const double d =
+                    ga[k][Rev(cc, 9)][Pos(t)] / o_carried - wv;
+                el[lane] += d * d;  dl[lane] += wv * wv;
+                ec[col] += d * d;   dc[col] += wv * wv;
+              }
+            }
+          }
+        }
+        auto worst = [](const std::vector<double> &e,
+                        const std::vector<double> &d, const char *tag) {
+          double lo = 1e300, hi = -1e300;
+          int ilo = 0, ihi = 0;
+          for (size_t i = 0; i < e.size(); i++) {
+            const double r = 0.5 * std::log2(e[i] / d[i]);
+            if (r < lo) { lo = r; ilo = static_cast<int>(i); }
+            if (r > hi) { hi = r; ihi = static_cast<int>(i); }
+          }
+          std::cout << "    [stage 2] by " << tag << ": best 2^" << lo
+                    << " (" << ilo << "), worst 2^" << hi << " (" << ihi
+                    << "), spread " << (hi - lo) << " bits" << std::endl;
+        };
+        worst(el, dl, "LANE");
+        worst(ec, dc, "COLUMN");
+      }
       if (stop_after == 2) return;
     }
 
