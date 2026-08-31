@@ -257,8 +257,13 @@ void HoistHandler<word>::CompilePlaintexts(ConstContextPtr<word> context,
           bs_idx, NPInfo(0, 0, 0, context->param_.degree_));
       int num_p_primes = context->param_.alpha_;
 
-      context->encoder_.Encode(hoist_pt_map_.at(gs_idx).at(bs_idx), pt_level_,
-                               pt_scale_, message, num_p_primes);
+      // On the device: a transform is thousands of these, and the host
+      // encoder's GMP loop over them was the whole of a converter's build
+      // (Doing.md 1.5ez). Same contract as `encoder_.Encode`; on the
+      // conjugate-invariant ring the same rounding too.
+      context->gpu_encoder_.Encode(hoist_pt_map_.at(gs_idx).at(bs_idx),
+                                   pt_level_, pt_scale_, message,
+                                   num_p_primes);
     }
   }
   std::sort(gs_indices_.begin(), gs_indices_.end());

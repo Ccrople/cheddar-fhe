@@ -429,3 +429,13 @@ target_link_libraries(encode_gpu_test
 add_executable(device_weights_test DeviceWeightsTest.cpp)
 target_link_libraries(device_weights_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+if (ENABLE_EXTENSION)
+  # Two compilations of one transform, coefficient by coefficient through the
+  # inverse NTT: a transform compiled on the device against the host encoder
+  # on a small ring, and -- given two converter cache files -- the leg's real
+  # converters as the host wrote them against the device's.
+  add_executable(converter_compare_test ConverterCompareTest.cpp)
+  target_link_libraries(converter_compare_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+endif()

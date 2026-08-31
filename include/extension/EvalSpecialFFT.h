@@ -421,6 +421,14 @@ class CiSinCConverter {
 
   int GetSubDegree() const { return sub_degree_; }
 
+  /// The compiled directions, or null for one that was not built.
+  const LinearTransform<word> *GetForward() const {
+    return forward_.empty() ? nullptr : &forward_.front();
+  }
+  const LinearTransform<word> *GetInverse() const {
+    return inverse_.empty() ? nullptr : &inverse_.front();
+  }
+
   void AddRequiredRotations(EvkRequest &req) const;
 
   void SlotToSinC(ConstContextPtr<word> context, Ct &res, const Ct &input,

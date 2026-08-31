@@ -132,6 +132,9 @@ class LinearTransform {
   /// The diagonal offsets the matrix was compiled from, for a caller pairing
   /// two transforms and needing to know they line up.
   const std::set<int> &GetDiagonalOffsets() const { return diag_offsets_; }
+
+  /// The compiled handler, for a caller reading its plaintexts.
+  const HoistHandler<word> &GetHoist() const { return hoist_; }
 };
 
 }  // namespace cheddar

@@ -113,14 +113,24 @@ class HoistHandler {
    * what is being cached, and the caller who reads it back is by construction
    * running against the parameter set the archive's identity names.
    *
-   * This is the expensive half of the Llama leg's preparation. The three
-   * `CiSinCConverter`s are ~730 s of it, and every second of that is host-side
-   * matrix construction and encoding into these plaintexts.
+   * This was the expensive half of the Llama leg's preparation while
+   * `CompilePlaintexts` encoded on the host: the three `CiSinCConverter`s
+   * were ~730 s of it. With the encoding on the device what remains is the
+   * host-side matrix construction in front of it.
    */
   void Save(ArchiveWriter &ar) const;
 
   /** @brief Rebuild a handler written by `Save`. */
   static HoistHandler Load(ArchiveReader &ar);
+
+  /**
+   * @brief The compiled plaintexts, `[giant step][baby step]`, as `Evaluate`
+   * reads them. Read-only: for a caller comparing two compilations of the
+   * same matrix coefficient by coefficient.
+   */
+  const std::map<int, std::map<int, Pt>> &GetPlaintexts() const {
+    return hoist_pt_map_;
+  }
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 

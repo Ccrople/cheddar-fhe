@@ -8,6 +8,7 @@
 #include "core/Container.h"
 #include "core/ElementWise.h"
 #include "core/Encode.h"
+#include "core/EncodeGpu.h"
 #include "core/MemoryPool.h"
 #include "core/ModSwitch.h"
 #include "core/MultiLevelCiphertext.h"
@@ -89,6 +90,17 @@ class Context {
   NTTHandler<word> ntt_handler_;
   std::vector<ModSwitchHandler<word>> mod_switch_handlers_;
   Encoder<word> encoder_;
+  /**
+   * @brief The same encodings on the device.
+   *
+   * `encoder_` is one host thread and a GMP reduction per (value, prime); it
+   * is the reference and the decoder. Whatever the library encodes in bulk --
+   * a transform's diagonals (`HoistHandler::CompilePlaintexts`), a
+   * projection's operands (`CoeffLinearLeg`) -- goes through this one, which
+   * is limb-identical on the coefficient and matrix encodings and rounds to
+   * nearest where the host's slot encoding truncates (`EncodeGpu.h`).
+   */
+  GpuEncoder<word> gpu_encoder_;
 
   DeviceVector<word> p_prod_;
   DeviceVector<word> p_prod_dts_;

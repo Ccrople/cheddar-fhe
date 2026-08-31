@@ -9,6 +9,7 @@
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
 #include "common/PrimeUtils.h"
+#include "core/Pcmm.h"
 
 namespace cheddar {
 namespace kernel {

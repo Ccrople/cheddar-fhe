@@ -14,9 +14,13 @@
 #include "core/NTT.h"
 #include "core/NPInfo.h"
 #include "core/Parameter.h"
-#include "core/Pcmm.h"
 
 namespace cheddar {
+
+// `Context` owns one of these, and `Pcmm.h` reaches `Context.h` through
+// `Mlwe.h`; the matrix encodings only take the type by reference.
+template <typename word>
+class PlainMatrix;
 
 /**
  * @brief The encoding unit, on the device.

@@ -144,7 +144,8 @@ Context<word>::Context(const Parameter<word> &param)
       memory_pool_(param_),
       elem_handler_(param_),
       ntt_handler_(param_),
-      encoder_(param_, ntt_handler_) {
+      encoder_(param_, ntt_handler_),
+      gpu_encoder_(param_, ntt_handler_) {
   // 0. Set some static variables
   MultiLevelCiphertext<word>::StaticInit(param_, encoder_);
 

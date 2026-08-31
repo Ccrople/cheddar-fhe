@@ -342,10 +342,7 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
   AssertTrue(static_cast<size_t>(w.in_live) * w.out_live ==
                  static_cast<size_t>(w.data->size()),
              "CoeffLinearLeg: DeviceWeights tensor is not [in_live][out_live]");
-  if (gpu_encoder_ == nullptr) {
-    gpu_encoder_ = std::make_unique<GpuEncoder<word>>(
-        *product_param_, product_context_->ntt_handler_);
-  }
+  const GpuEncoder<word> &encoder = product_context_->gpu_encoder_;
   const int level = cfg_.product_level;
   const double scale = product_param_->GetScale(level);
   const int log_rank = Log2Ceil(rank_);
@@ -384,7 +381,7 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
       if (static_cast<size_t>(residues_.size()) < n) {
         residues_.resize(static_cast<int>(n));
       }
-      gpu_encoder_->template EncodeResiduesGathered<float>(
+      encoder.template EncodeResiduesGathered<float>(
           residues_.data(), level, scale, w.data->data(), w.out_live,
           row_map_.data(), col_map_.data(), rows, cols, w_scale);
       typename PcmmBlasHandler<word>::SplitMatrix s;
@@ -395,7 +392,7 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
 #endif
     } else {
       PlainMatrix<word> u;
-      gpu_encoder_->template EncodeMatrixGathered<float>(
+      encoder.template EncodeMatrixGathered<float>(
           u, level, scale, w.data->data(), w.out_live, row_map_.data(),
           col_map_.data(), rows, cols, w_scale);
       res.bytes += static_cast<size_t>(u.data_.size()) * sizeof(word);

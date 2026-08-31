@@ -10,7 +10,6 @@
 #include "core/Context.h"
 #include "core/EvkMap.h"
 #include "core/Mlwe.h"
-#include "core/EncodeGpu.h"
 #include "core/Pcmm.h"
 #include "core/RingSwitch.h"
 #ifdef USE_CUBLAS
@@ -473,12 +472,11 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! every call and specific enough that a different tensor cannot pass.
   static uint64_t Fingerprint(const std::vector<double> &w, double w_scale);
 
-  //! The encoding unit on the product ring, built on the first device-weight
-  //! projection: the operands are encoded against `product_param_`, which
-  //! under the descent is the small ring's.
-  mutable std::unique_ptr<GpuEncoder<word>> gpu_encoder_;
-  //! The encode kernel's two index vectors and, for the cuBLAS path, the
-  //! plain residues between the encode and the split. Sized on demand.
+  //! The gathered encode's two index vectors and, for the cuBLAS path, the
+  //! plain residues between the encode and the split. Sized on demand. The
+  //! encoder itself is the product Context's `gpu_encoder_`: the operands
+  //! are encoded against `product_param_`, which under the descent is the
+  //! small ring's.
   mutable DeviceVector<int32_t> row_map_;
   mutable DeviceVector<int32_t> col_map_;
   mutable DeviceVector<word> residues_;
