@@ -192,7 +192,14 @@ TEST_P(CiModuleBasisTest, CoeffToSlotReadsTheModuleCoordinates) {
 
   CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1, cts_level);
   // The control: the native CtS, compiled at the same level, answer times 1.
-  const BootParameter boot_param(param_->max_level_, num_cts_levels_,
+  // CHEDDAR_TEST_CTS_LEVELS changes its phase count (the preset's is four),
+  // which is how a three-phase native CtS is checked outside a bootstrap.
+  const char *cts_env = std::getenv("CHEDDAR_TEST_CTS_LEVELS");
+  const int native_cts_levels =
+      (cts_env != nullptr && cts_env[0] != 0) ? std::atoi(cts_env)
+                                              : num_cts_levels_;
+  std::cout << "native CtS phases: " << native_cts_levels << std::endl;
+  const BootParameter boot_param(param_->max_level_, native_cts_levels,
                                  num_stc_levels_, 5, 0);
   ASSERT_EQ(boot_param.GetCtSStartLevel(), cts_level);
   EvalSpecialFFT<word> native_fft(context_, boot_param, n, 1.0 / n, 1.0);
@@ -359,12 +366,17 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
     for (int s = 0; s < n; s++) scaled[s] = obtained[s] / c;
     auto stats = Compare(expected, scaled);
     // A slot whose wrap-around left EvalMod's range comes back as a huge
-    // number: count those apart, and refit and report on the rest, so that
-    // a range failure reads as "N slots out of range" and not as noise.
+    // number: count those apart -- against the DERIVED ratio, since one of
+    // them is enough to wreck the fit -- and refit and report on the rest,
+    // so that a range failure reads as "N slots out of range".
+    const double ratio = boot->GetMessageRatio();
+    auto in_range = [&](int s) {
+      return std::abs(obtained[s] / ratio - expected[s]) <= 0.05;
+    };
     int outliers = 0;
     double num2 = 0.0, den2 = 0.0;
     for (int s = 0; s < n; s++) {
-      if (std::abs(scaled[s] - expected[s]) > 0.05) {
+      if (!in_range(s)) {
         outliers++;
         continue;
       }
@@ -375,7 +387,7 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
       const double c2 = num2 / den2;
       std::vector<double> e2, o2;
       for (int s = 0; s < n; s++) {
-        if (std::abs(scaled[s] - expected[s]) > 0.05) continue;
+        if (!in_range(s)) continue;
         e2.push_back(expected[s]);
         o2.push_back(obtained[s] / c2);
       }
