@@ -435,3 +435,9 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree13_35_boot.json
 add_executable(encode_gpu_test EncodeGpuTest.cpp)
 target_link_libraries(encode_gpu_test
                       PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+# The projection leg fed the model's tensor on the device, against itself fed
+# the declared double matrix: the same words out, on both product paths.
+add_executable(device_weights_test DeviceWeightsTest.cpp)
+target_link_libraries(device_weights_test
+                      PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)

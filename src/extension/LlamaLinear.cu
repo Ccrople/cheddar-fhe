@@ -288,11 +288,16 @@ void CoeffLinearLeg<word>::GatherWeights(std::vector<double> &values,
 }
 
 template <typename word>
-void CoeffLinearLeg<word>::BuildOperands(Operands &res,
-                                         const std::vector<double> &w,
+void CoeffLinearLeg<word>::BuildOperands(Operands &res, const WeightSource &w,
                                          int in_channels, int out_channels,
                                          double w_scale, int first_parent,
                                          int num_parents, int groups) const {
+  if (w.device != nullptr) {
+    BuildOperandsOnDevice(res, *w.device, in_channels, out_channels, w_scale,
+                          first_parent, num_parents, groups);
+    return;
+  }
+  const std::vector<double> &host = *w.host;
   // The one scale that leaves the rescaled product canonical at the level
   // below; see the class comment.
   const int level = cfg_.product_level;
@@ -306,7 +311,7 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
   const int rows = LiveRows();
   std::vector<double> values;
   for (int g = 0; g < groups; g++) {
-    GatherWeights(values, w, in_channels, out_channels, g, w_scale,
+    GatherWeights(values, host, in_channels, out_channels, g, w_scale,
                   first_parent, num_parents);
     if (use_blas_) {
 #ifdef USE_CUBLAS
@@ -325,13 +330,112 @@ void CoeffLinearLeg<word>::BuildOperands(Operands &res,
 }
 
 template <typename word>
+void CoeffLinearLeg<word>::BuildOperandsOnDevice(
+    Operands &res, const DeviceWeights &w, int in_channels, int out_channels,
+    double w_scale, int first_parent, int num_parents, int groups) const {
+  AssertTrue(w.data != nullptr && w.in_slot != nullptr && w.out_slot != nullptr,
+             "CoeffLinearLeg: DeviceWeights needs the tensor and both maps");
+  AssertTrue(static_cast<int>(w.in_slot->size()) == in_channels &&
+                 static_cast<int>(w.out_slot->size()) == out_channels,
+             "CoeffLinearLeg: DeviceWeights maps must cover every declared "
+             "channel");
+  AssertTrue(static_cast<size_t>(w.in_live) * w.out_live ==
+                 static_cast<size_t>(w.data->size()),
+             "CoeffLinearLeg: DeviceWeights tensor is not [in_live][out_live]");
+  if (gpu_encoder_ == nullptr) {
+    gpu_encoder_ = std::make_unique<GpuEncoder<word>>(
+        *product_param_, product_context_->ntt_handler_);
+  }
+  const int level = cfg_.product_level;
+  const double scale = product_param_->GetScale(level);
+  const int log_rank = Log2Ceil(rank_);
+  const int live = LiveColumns();
+  const int rows = LiveRows();
+  const int cols = num_parents * live;
+
+  // The column map does not depend on the group: `GatherWeights`'s input
+  // channel, then the declared-to-live composition. Dead declared channels
+  // (odd ones at half density; anything the caller left at -1) read as zero.
+  HostVector<int32_t> col_map(cols);
+  for (int p = 0; p < num_parents; p++) {
+    for (int i = 0; i < live; i++) {
+      const int in_channel =
+          (first_parent + p) * rank_ +
+          static_cast<int>(BitReverseInt(Component(i), log_rank));
+      col_map[static_cast<size_t>(p) * live + i] = (*w.in_slot)[in_channel];
+    }
+  }
+  col_map_.resize(cols);
+  CopyHostToDevice(col_map_, col_map);
+  row_map_.resize(rows);
+  HostVector<int32_t> row_map(rows);
+
+  const NPInfo np = product_param_->LevelToNP(level);
+  for (int g = 0; g < groups; g++) {
+    for (int r = 0; r < rows; r++) {
+      const int out_channel =
+          g * rank_ + static_cast<int>(BitReverseInt(Component(r), log_rank));
+      row_map[r] = (*w.out_slot)[out_channel];
+    }
+    CopyHostToDevice(row_map_, row_map);
+    if (use_blas_) {
+#ifdef USE_CUBLAS
+      const size_t n = static_cast<size_t>(np.GetNumTotal()) * rows * cols;
+      if (static_cast<size_t>(residues_.size()) < n) {
+        residues_.resize(static_cast<int>(n));
+      }
+      gpu_encoder_->template EncodeResiduesGathered<float>(
+          residues_.data(), level, scale, w.data->data(), w.out_live,
+          row_map_.data(), col_map_.data(), rows, cols, w_scale);
+      typename PcmmBlasHandler<word>::SplitMatrix s;
+      product_blas_->SplitMatrixFromResidues(s, level, scale, residues_.data(),
+                                             rows, cols);
+      res.bytes += PcmmBlasHandler<word>::SplitBytes(s);
+      res.split.push_back(std::move(s));
+#endif
+    } else {
+      PlainMatrix<word> u;
+      gpu_encoder_->template EncodeMatrixGathered<float>(
+          u, level, scale, w.data->data(), w.out_live, row_map_.data(),
+          col_map_.data(), rows, cols, w_scale);
+      res.bytes += static_cast<size_t>(u.data_.size()) * sizeof(word);
+      res.u.push_back(std::move(u));
+    }
+  }
+  cudaDeviceSynchronize();
+}
+
+template <typename word>
+uint64_t CoeffLinearLeg<word>::Fingerprint(const float *w, size_t count,
+                                           double w_scale) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t v) {
+    for (int b = 0; b < 8; b++) {
+      h ^= (v >> (8 * b)) & 0xffull;
+      h *= 1099511628211ull;
+    }
+  };
+  mix(static_cast<uint64_t>(count));
+  uint64_t scale_bits = 0;
+  std::memcpy(&scale_bits, &w_scale, sizeof(scale_bits));
+  mix(scale_bits);
+  const size_t step = std::max<size_t>(1, count / 4096);
+  for (size_t i = 0; i < count; i += step) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &w[i], sizeof(bits));
+    mix(bits);
+  }
+  return h;
+}
+
+template <typename word>
 const typename CoeffLinearLeg<word>::Operands &
-CoeffLinearLeg<word>::GetOperands(const char *name,
-                                  const std::vector<double> &w,
+CoeffLinearLeg<word>::GetOperands(const char *name, const WeightSource &w,
                                   int in_channels, int out_channels,
                                   double w_scale, int parents, int groups,
                                   int tile) const {
-  const uint64_t fp = Fingerprint(w, w_scale);
+  const uint64_t fp = w.device != nullptr ? w.device->fingerprint
+                                          : Fingerprint(*w.host, w_scale);
   const std::string key(name);
   auto it = operands_.find(key);
   if (it != operands_.end()) {
@@ -557,7 +661,30 @@ void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
                                    int out_channels,
                                    const std::vector<double> &w, double w_scale,
                                    const char *name) const {
-  RunProjection(res, x, in_channels, out_channels, w, w_scale, name, false);
+  WeightSource src;
+  src.host = &w;
+  RunProjection(res, x, in_channels, out_channels, src, w_scale, name, false);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::Project(std::vector<Ct> &res,
+                                   const std::vector<Ct> &x, int in_channels,
+                                   int out_channels, const DeviceWeights &w,
+                                   double w_scale, const char *name) const {
+  WeightSource src;
+  src.device = &w;
+  RunProjection(res, x, in_channels, out_channels, src, w_scale, name, false);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ProjectMerged(std::vector<Ct> &res,
+                                         const std::vector<Ct> &x,
+                                         int in_channels, int out_channels,
+                                         const DeviceWeights &w, double w_scale,
+                                         const char *name) const {
+  WeightSource src;
+  src.device = &w;
+  RunProjection(res, x, in_channels, out_channels, src, w_scale, name, true);
 }
 
 template <typename word>
@@ -565,14 +692,16 @@ void CoeffLinearLeg<word>::ProjectMerged(
     std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
     int out_channels, const std::vector<double> &w, double w_scale,
     const char *name, const Context<word> &) const {
-  RunProjection(res, x, in_channels, out_channels, w, w_scale, name, true);
+  WeightSource src;
+  src.host = &w;
+  RunProjection(res, x, in_channels, out_channels, src, w_scale, name, true);
 }
 
 template <typename word>
 void CoeffLinearLeg<word>::RunProjection(
     std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
-    int out_channels, const std::vector<double> &w, double w_scale,
-    const char *name, bool merge) const {
+    int out_channels, const WeightSource &w, double w_scale, const char *name,
+    bool merge) const {
   AssertTrue(static_cast<int>(x.size()) * rank_ == in_channels,
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the input ciphertext count times the rank must be the "
@@ -581,7 +710,12 @@ void CoeffLinearLeg<word>::RunProjection(
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the output width must be a whole number of ModPack "
                  "groups");
-  AssertTrue(w.size() == static_cast<size_t>(in_channels) * out_channels,
+  AssertTrue((w.host != nullptr) != (w.device != nullptr),
+             std::string("CoeffLinearLeg::Project(") + name +
+                 "): exactly one weight form");
+  AssertTrue(w.host == nullptr ||
+                 w.host->size() ==
+                     static_cast<size_t>(in_channels) * out_channels,
              std::string("CoeffLinearLeg::Project(") + name +
                  "): the weight matrix is not [in_channels][out_channels]");
 

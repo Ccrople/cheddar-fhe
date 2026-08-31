@@ -10,6 +10,7 @@
 #include "core/Context.h"
 #include "core/EvkMap.h"
 #include "core/Mlwe.h"
+#include "core/EncodeGpu.h"
 #include "core/Pcmm.h"
 #include "core/RingSwitch.h"
 #ifdef USE_CUBLAS
@@ -307,6 +308,57 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
                int out_channels, const std::vector<double> &w, double w_scale,
                const char *name) const override;
 
+  /**
+   * @brief The model's own tensor on the device, and how its channels map to
+   * the declared ones.
+   *
+   * The `std::vector<double>` form of `Project` takes the weight at the
+   * DECLARED widths -- `gate` at the model's width is 8704 x 28672 doubles,
+   * 1.86 GiB, four times the tensor and mostly zeros -- and the leg then
+   * gathers one operand out of it on the host and encodes it there, a
+   * `BigInt` reduction per (value, prime). That was a layer's whole
+   * `pcmm: convert weights` row: 86.88 s against 41.5 s of encrypted
+   * arithmetic (Doing.md 1.5ei).
+   *
+   * The gather is separable -- `values[r][c] = w[col_map[c]][row_map[r]]`,
+   * one map per axis -- so it is an addressing mode of the encode kernel and
+   * not a matrix, and the declared-to-live map composes into the same two
+   * vectors: a NEGATIVE entry is a dead declared channel and reads as zero.
+   * So the kernel reads the f32 blob the exporter wrote, at its own size, and
+   * the declared matrix never exists. Widening f32 to double is exact, so an
+   * f32 model encodes to the same limbs either way; the leg's own test checks
+   * the two `Project`s word for word.
+   */
+  struct DeviceWeights {
+    //! `[in_live][out_live]` row-major -- `reference/export_layers.py`'s
+    //! layout, `w[c * out_live + o]`.
+    const DeviceVector<float> *data = nullptr;
+    int in_live = 0;
+    int out_live = 0;
+    //! Declared input channel -> row of `data`, or -1 for a dead channel.
+    //! `in_channels` entries.
+    const std::vector<int> *in_slot = nullptr;
+    //! Declared output channel -> column of `data`, or -1. `out_channels`
+    //! entries.
+    const std::vector<int> *out_slot = nullptr;
+    //! Of the tensor, for the operand cache's identity check; see
+    //! `Fingerprint(const float *, size_t, double)`.
+    uint64_t fingerprint = 0;
+  };
+
+  /// `Project` from the tensor on the device. Same contract, same output.
+  void Project(std::vector<Ct> &res, const std::vector<Ct> &x, int in_channels,
+               int out_channels, const DeviceWeights &w, double w_scale,
+               const char *name) const;
+  /// `ProjectMerged` from the tensor on the device.
+  void ProjectMerged(std::vector<Ct> &res, const std::vector<Ct> &x,
+                     int in_channels, int out_channels, const DeviceWeights &w,
+                     double w_scale, const char *name) const;
+
+  //! Size, scale and a strided sample of the entries of an f32 tensor: what
+  //! `DeviceWeights::fingerprint` should carry.
+  static uint64_t Fingerprint(const float *w, size_t count, double w_scale);
+
   /// The pair merged where it is worth something: before ModPack, not after.
   void ProjectMerged(std::vector<Ct> &res, const std::vector<Ct> &x,
                      int in_channels, int out_channels,
@@ -315,11 +367,17 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
                      const Context<word> &context) const override;
 
  private:
-  /// Both of the above; `merge` is the only difference between them.
+  //! One of the two weight forms `Project` accepts; the projection reads
+  //! whichever is set and the other is null.
+  struct WeightSource {
+    const std::vector<double> *host = nullptr;
+    const DeviceWeights *device = nullptr;
+  };
+
+  /// All four `Project`s; `merge` and the weight form are the differences.
   void RunProjection(std::vector<Ct> &res, const std::vector<Ct> &x,
-                     int in_channels, int out_channels,
-                     const std::vector<double> &w, double w_scale,
-                     const char *name, bool merge) const;
+                     int in_channels, int out_channels, const WeightSource &w,
+                     double w_scale, const char *name, bool merge) const;
 
   /**
    * @brief The plaintext operands of one projection, converted once.
@@ -392,19 +450,38 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
                      double w_scale, int first_parent, int num_parents) const;
 
   //! Append one tile's `groups` operands to `res`, in group order.
-  void BuildOperands(Operands &res, const std::vector<double> &w,
-                     int in_channels, int out_channels, double w_scale,
-                     int first_parent, int num_parents, int groups) const;
+  void BuildOperands(Operands &res, const WeightSource &w, int in_channels,
+                     int out_channels, double w_scale, int first_parent,
+                     int num_parents, int groups) const;
+  //! The same operands from the tensor on the device: `GatherWeights`'s
+  //! channel map composed with `DeviceWeights::in_slot`/`out_slot` into the
+  //! encode kernel's two index vectors, then one gathered encode per group --
+  //! Montgomery limbs for `PcmmHandler`, plain residues split on the device
+  //! for the cuBLAS product. No host byte of the operand exists.
+  void BuildOperandsOnDevice(Operands &res, const DeviceWeights &w,
+                             int in_channels, int out_channels, double w_scale,
+                             int first_parent, int num_parents,
+                             int groups) const;
 
   //! The cached operands of `name`, built on first use. Asserts that the
   //! weight matrix is the one they were built from.
-  const Operands &GetOperands(const char *name, const std::vector<double> &w,
+  const Operands &GetOperands(const char *name, const WeightSource &w,
                               int in_channels, int out_channels, double w_scale,
                               int parents, int groups, int tile) const;
 
   //! Size, scale and a strided sample of the entries. Cheap enough to run on
   //! every call and specific enough that a different tensor cannot pass.
   static uint64_t Fingerprint(const std::vector<double> &w, double w_scale);
+
+  //! The encoding unit on the product ring, built on the first device-weight
+  //! projection: the operands are encoded against `product_param_`, which
+  //! under the descent is the small ring's.
+  mutable std::unique_ptr<GpuEncoder<word>> gpu_encoder_;
+  //! The encode kernel's two index vectors and, for the cuBLAS path, the
+  //! plain residues between the encode and the split. Sized on demand.
+  mutable DeviceVector<int32_t> row_map_;
+  mutable DeviceVector<int32_t> col_map_;
+  mutable DeviceVector<word> residues_;
 
   /**
    * @brief Which module component the operand's `flat`-th row or column is.

@@ -641,6 +641,31 @@ void GpuEncoder<word>::EncodeMatrixGathered(PlainMatrix<word> &res, int level,
 }
 
 template <typename word>
+template <typename src_t>
+void GpuEncoder<word>::EncodeResiduesGathered(word *dst, int level, double scale,
+                                              const src_t *weight,
+                                              int out_channels,
+                                              const int *row_map,
+                                              const int *col_map, int rows,
+                                              int cols, double w_scale,
+                                              int num_aux /*= 0*/) const {
+  AssertTrue(rows > 0 && cols > 0,
+             "GpuEncoder::EncodeResiduesGathered: Invalid matrix shape");
+  const NPInfo np = param_.LevelToNP(level, num_aux);
+  const int num_primes = np.GetNumTotal();
+  const int64_t n = static_cast<int64_t>(rows) * cols;
+  const int threads = kRnsBlockDim;
+  const int64_t blocks = (n + threads - 1) / threads;
+  const size_t smem = static_cast<size_t>(num_primes) *
+                      (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
+  kernel::RnsGatherKernel<word, src_t>
+      <<<static_cast<int>(blocks), threads, smem, cudaStreamLegacy>>>(
+          dst, weight, out_channels, row_map, col_map, rows, cols, num_primes,
+          PrimeConstants(np), param_.GetInvPrimesPtr(np), w_scale, scale,
+          false);
+}
+
+template <typename word>
 void GpuEncoder<word>::EncodeMatrix(PlainMatrix<word> &res, int level,
                                     double scale,
                                     const std::vector<double> &values, int rows,
@@ -716,5 +741,17 @@ template void GpuEncoder<uint64_t>::EncodeMatrixGathered<float>(
 template void GpuEncoder<uint64_t>::EncodeMatrixGathered<double>(
     PlainMatrix<uint64_t> &, int, double, const double *, int, const int *,
     const int *, int, int, double, int) const;
+template void GpuEncoder<uint32_t>::EncodeResiduesGathered<float>(
+    uint32_t *, int, double, const float *, int, const int *, const int *, int,
+    int, double, int) const;
+template void GpuEncoder<uint32_t>::EncodeResiduesGathered<double>(
+    uint32_t *, int, double, const double *, int, const int *, const int *,
+    int, int, double, int) const;
+template void GpuEncoder<uint64_t>::EncodeResiduesGathered<float>(
+    uint64_t *, int, double, const float *, int, const int *, const int *, int,
+    int, double, int) const;
+template void GpuEncoder<uint64_t>::EncodeResiduesGathered<double>(
+    uint64_t *, int, double, const double *, int, const int *, const int *,
+    int, int, double, int) const;
 
 }  // namespace cheddar

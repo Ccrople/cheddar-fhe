@@ -300,6 +300,26 @@ class GpuEncoder {
   double *CoeffScratch() const;
 
   /**
+   * @brief `EncodeMatrixGathered` without the Montgomery form: the PLAIN
+   * residues `round((w * w_scale) * scale) mod p_j`, prime-major, into a
+   * device buffer of `num_primes * rows * cols` words.
+   *
+   * This is what the cuBLAS product wants. `PcmmBlasHandler::SplitMatrixFrom`
+   * computes exactly these residues on the host with a `BigInt` per (value,
+   * prime) pair before splitting them into int8 pieces, and that host loop is
+   * a layer's whole `pcmm: convert weights` row; the split then runs on the
+   * device from this buffer (`PcmmBlasHandler::SplitMatrixFromResidues`).
+   *
+   * @param dst device, at least `np.GetNumTotal() * rows * cols` words
+   */
+  template <typename src_t>
+  void EncodeResiduesGathered(word *dst, int level, double scale,
+                              const src_t *weight, int out_channels,
+                              const int *row_map, const int *col_map,
+                              int rows, int cols, double w_scale,
+                              int num_aux = 0) const;
+
+  /**
    * @brief What the machine makes of these kernels: registers, static and
    * dynamic shared memory, and the resident blocks per SM the occupancy
    * calculator gives for the launch configuration each stage actually uses.

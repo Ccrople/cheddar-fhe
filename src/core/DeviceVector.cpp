@@ -152,10 +152,17 @@ template class DeviceVector<uint32_t *>;
 template class DeviceVector<uint64_t *>;
 template class DeviceVector<const uint32_t *>;
 template class DeviceVector<const uint64_t *>;
+// float carries a model tensor as the exporter wrote it, so the projection
+// leg's gathered encode reads the f32 blob at its own size instead of a
+// declared-width double matrix built on the host (LlamaLinear.h,
+// `DeviceWeights`).
+template class DeviceVector<float>;
 
 // Explicit instantiation of the template functions
 template void CopyHostToDevice(DeviceVector<int8_t> &dst,
                                const HostVector<int8_t> &src);
+template void CopyHostToDevice(DeviceVector<float> &dst,
+                               const HostVector<float> &src);
 template void CopyHostToDevice(DeviceVector<int32_t> &dst,
                                const HostVector<int32_t> &src);
 template void CopyHostToDevice(DeviceVector<int64_t> &dst,

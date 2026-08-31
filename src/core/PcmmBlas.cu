@@ -182,6 +182,55 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
   CopyHostToDevice(res.data, host);
 }
 
+namespace kernel {
+// Prime-major residues in, piece-major pieces out: the layout
+// `SplitMatrixFrom` writes from the host, produced here from
+// `GpuEncoder::EncodeResiduesGathered`'s buffer. Flat and memory bound.
+template <typename word>
+__global__ void SplitResidues(int8_t *dst, const word *src, size_t per_prime,
+                              int num_primes, int pieces, int piece_bits) {
+  const size_t n = per_prime * num_primes;
+  const size_t k = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (k >= n) return;
+  const word mask = (static_cast<word>(1) << piece_bits) - 1;
+  const word r = src[k];
+  for (int p = 0; p < pieces; p++) {
+    dst[static_cast<size_t>(p) * n + k] =
+        static_cast<int8_t>((r >> (piece_bits * p)) & mask);
+  }
+}
+}  // namespace kernel
+
+template <typename word>
+void PcmmBlasHandler<word>::SplitMatrixFromResidues(
+    SplitMatrix &res, int level, double scale, const word *residues, int rows,
+    int cols, int num_aux /*= 0*/) const {
+  AssertTrue(rows > 0 && cols > 0, "PcmmBlas: invalid matrix shape");
+  NPInfo np = param_.LevelToNP(level, num_aux);
+  auto primes = param_.GetPrimeVector(np);
+  const int num_primes = np.GetNumTotal();
+  int max_bits = 1;
+  for (int j = 0; j < num_primes; j++) {
+    int b = 0;
+    for (word p = primes[j]; p != 0; p >>= 1) b++;
+    max_bits = b > max_bits ? b : max_bits;
+  }
+  const int pieces = (max_bits + kPieceBits - 1) / kPieceBits;
+  const size_t per_prime = static_cast<size_t>(rows) * cols;
+  const size_t n = per_prime * num_primes;
+  res.rows = rows;
+  res.cols = cols;
+  res.pieces = pieces;
+  res.scale = scale;
+  res.np = np;
+  res.data.resize(static_cast<int>(static_cast<size_t>(pieces) * n));
+  const int block = 256;
+  const int grid = static_cast<int>((n + block - 1) / block);
+  kernel::SplitResidues<word><<<grid, block>>>(res.data.data(), residues,
+                                               per_prime, num_primes, pieces,
+                                               kPieceBits);
+}
+
 namespace {
 // The gather and the recombination are both flat; 256 is what every other
 // elementwise kernel in the library uses.

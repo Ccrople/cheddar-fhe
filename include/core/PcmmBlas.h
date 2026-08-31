@@ -164,6 +164,22 @@ class PcmmBlasHandler {
                        const std::vector<double> &values, int rows, int cols,
                        int num_aux = 0) const;
 
+  /**
+   * @brief The same split, from residues already on the device.
+   *
+   * `SplitMatrixFrom` is a host loop -- a `BigInt` reduction per (value,
+   * prime) pair -- and at the model's width it is the whole of a layer's
+   * `pcmm: convert weights` row. `GpuEncoder::EncodeResiduesGathered` writes
+   * the same plain residues on the device, prime-major, and this splits them
+   * into the piece-major int8 layout `Multiply` consumes without a host byte
+   * in between. Same `pieces`, same bytes, same values.
+   *
+   * @param residues device, `np.GetNumTotal() * rows * cols` words, prime-major
+   */
+  void SplitMatrixFromResidues(SplitMatrix &res, int level, double scale,
+                               const word *residues, int rows, int cols,
+                               int num_aux = 0) const;
+
   /** @brief Device bytes the split matrix holds. */
   static size_t SplitBytes(const SplitMatrix &m) {
     return m.data.size() * sizeof(int8_t);
