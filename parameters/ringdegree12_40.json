@@ -1,0 +1,31 @@
+{
+  "log_default_scale": 40,
+  "boot": false,
+  "terminal_primes": [
+    68681729,
+    16515073,
+    67502081
+  ],
+  "main_primes": [],
+  "auxiliary_primes": [
+    295305217
+  ],
+  "default_encryption_level": 1,
+  "level_config": [
+    [
+      0,
+      2
+    ],
+    [
+      0,
+      3
+    ]
+  ],
+  "additional_base": [
+    0,
+    1
+  ],
+  "log_degree": 12,
+  "dense_hamming_weight": 2048,
+  "sparse_hamming_weight": 2048
+}

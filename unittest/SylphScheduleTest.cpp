@@ -1387,7 +1387,8 @@ TEST_P(CycleTestbed, WhereRmsNormsBitsGo) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, CycleTestbed, testing::Values("bootparam_35.json"),
+    Cheddar, CycleTestbed,
+    testing::Values("bootparam_35.json", "sylphflow16_40.json"),
     [](const testing::TestParamInfo<CycleTestbed::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

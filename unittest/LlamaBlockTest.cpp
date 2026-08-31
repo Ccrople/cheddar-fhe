@@ -99,6 +99,22 @@ bool ProbesOn() {
   return on;
 }
 
+// The switch/product pair carries the big preset's bottom primes, so its name
+// follows the preset's scale suffix: sylphflow16_40 -> ringswitch16_40 /
+// ringdegree12_40. Anything without a recognised suffix keeps the _35 pair,
+// which is what every preset before sylphflow16_40 used.
+std::string PairJson(const char *param, const char *stem) {
+  const std::string p(param);
+  const auto dot = p.rfind('.');
+  const auto us = p.rfind('_');
+  std::string suffix = (us != std::string::npos && dot != std::string::npos &&
+                        us < dot)
+                           ? p.substr(us, dot - us)
+                           : "_35";
+  if (suffix != "_30" && suffix != "_35" && suffix != "_40") suffix = "_35";
+  return std::string(stem) + suffix + ".json";
+}
+
 int SlackFromEnv() {
   const char *env = std::getenv("CHEDDAR_SLACK");
   return env ? std::atoi(env) : 8;
@@ -1246,7 +1262,8 @@ class LlamaBlockFixture : public Testbed32 {
 
 INSTANTIATE_TEST_SUITE_P(Cheddar, LlamaBlockFixture,
                          testing::Values("bootparam_35.json",
-                                         "sylphflow16_35.json"),
+                                         "sylphflow16_35.json",
+                                         "sylphflow16_40.json"),
                          [](const testing::TestParamInfo<const char *> &info) {
                            std::string name = info.param;
                            name = name.substr(0, name.find('.'));
@@ -1427,9 +1444,9 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
     Leg::Descent descent;
     if (RingSwitchedPcmmFromEnv()) {
       sw_ring = std::make_unique<ringfixture::Ring<word>>(
-          "ringswitch16_35.json", interface_->GetSecretCoeffs());
-      small_ring =
-          std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+          PairJson(GetParam(), "ringswitch16"), interface_->GetSecretCoeffs());
+      small_ring = std::make_unique<ringfixture::Ring<word>>(
+          PairJson(GetParam(), "ringdegree12"));
       const int ring_rank = param_->degree_ / small_ring->Degree();
       const int sub_rank = small_ring->Degree() / small_degree;
       cudaMemGetInfo(&dev_free, &dev_total);
@@ -1518,9 +1535,9 @@ void LlamaBlockFixture::RunWholeBlock(Mode mode) {
       // a second copy would hold a different one.
       if (sw_ring == nullptr) {
         sw_ring = std::make_unique<ringfixture::Ring<word>>(
-            "ringswitch16_35.json", interface_->GetSecretCoeffs());
-        small_ring =
-            std::make_unique<ringfixture::Ring<word>>("ringdegree12_35.json");
+            PairJson(GetParam(), "ringswitch16"), interface_->GetSecretCoeffs());
+        small_ring = std::make_unique<ringfixture::Ring<word>>(
+            PairJson(GetParam(), "ringdegree12"));
       }
 
       cheddar::SinCLinearLeg<word>::Config scfg;
