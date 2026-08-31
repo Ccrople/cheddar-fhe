@@ -259,7 +259,34 @@ TEST_P(CiModuleBasisTest, CoeffToSlotReadsTheModuleCoordinates) {
 // under a native-sparse secret) and CHEDDAR_BOOT_DOUBLE_ANGLE=4 widens
 // EvalMod's range to hold that std (K = 32 against 16). The native HalfBoot
 // on the same input is the control, with the banded image as its answer.
-class CiModuleBoot : public Testbed<word> {};
+// The ladder must close on default_encryption_level: with four double angles
+// EvalMod takes nine levels, so CoeffToSlot takes three -- one real twist
+// phase and a two-phase small chain -- and with the default three it takes
+// the preset's four.
+namespace {
+int DoubleAngles() {
+  const char *env = std::getenv("CHEDDAR_BOOT_DOUBLE_ANGLE");
+  return (env != nullptr && env[0] != 0) ? std::atoi(env) : 3;
+}
+}  // namespace
+
+class CiModuleBoot : public Testbed<word> {
+ protected:
+  int BootCtsLevels() const override {
+    return num_cts_levels_ - (DoubleAngles() - 3);
+  }
+  CiModuleBasis<word>::Phases BootPhases() const {
+    CiModuleBasis<word>::Phases phases;
+    if (BootCtsLevels() == 3) {
+      phases.cts_twist = {9};
+      phases.cts_small = {4, 3};
+    } else {
+      phases.cts_twist = {5, 4};
+      phases.cts_small = {4, 3};
+    }
+    return phases;
+  }
+};
 
 TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
   if (!param_->conjugate_invariant_) GTEST_SKIP() << "R+ only";
@@ -272,20 +299,19 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
 
   const char *secret_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
   const bool module_secret = secret_env != nullptr && secret_env[0] != 0;
-  const char *angle_env = std::getenv("CHEDDAR_BOOT_DOUBLE_ANGLE");
-  const int double_angle =
-      (angle_env != nullptr && angle_env[0] != 0) ? std::atoi(angle_env) : 3;
+  const int double_angle = DoubleAngles();
   std::cout << "module-sparse secret: " << (module_secret ? secret_env : "off")
             << ", EvalMod double angles: " << double_angle
             << " (K = " << (2 << double_angle) << ")" << std::endl;
 
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(n);
-  const BootParameter boot_param(param_->max_level_, num_cts_levels_,
+  const BootParameter boot_param(param_->max_level_, BootCtsLevels(),
                                  num_stc_levels_, 5, 0);
+  std::cout << "CtS levels " << BootCtsLevels() << ", EvalMod ends at "
+            << boot_param.GetEvalModEndLevel() << std::endl;
   CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1,
-                            boot_param.GetCtSStartLevel(),
-                            CiModuleBasis<word>::Phases(), 1.0,
+                            boot_param.GetCtSStartLevel(), BootPhases(), 1.0,
                             n * boot->GetCtSConst());
   EvkRequest req;
   boot->AddRequiredRotations(req, n);

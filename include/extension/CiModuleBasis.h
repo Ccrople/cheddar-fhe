@@ -8,6 +8,7 @@
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
 #include "extension/ComplexLinearTransform.h"
+#include "extension/LinearTransform.h"
 #include "extension/StripedMatrix.h"
 
 namespace cheddar {
@@ -90,39 +91,51 @@ class CiModuleBasis {
   int stc_level_ = -1;
   int cts_level_ = -1;
 
-  std::vector<Transform> stc_small_;
-  std::vector<Transform> stc_twist_;
-  std::vector<Transform> cts_twist_;
-  std::vector<Transform> cts_small_;
+  // A group is real in and real out (the truncation is what makes the module
+  // transform two such groups). One phase: the real part of its matrix as an
+  // ordinary LinearTransform, `Re(M x) = Re(M) x`. More: the complex
+  // intermediate carried as a pair, lifted by the first and dropped by the
+  // last. Exactly one of the two vectors is populated.
+  struct Group {
+    std::vector<LinearTransform<word>> real;
+    std::vector<Transform> pair;
+  };
+  std::vector<Group> stc_groups_;  // small, then twist
+  std::vector<Group> cts_groups_;  // twist, then small
   std::vector<int> stc_diagonals_;
   std::vector<int> cts_diagonals_;
   // The rotation a chain of phases leaves on its output (the SinC prefix's
-  // window rule, see the .cpp); zero when the chain ends on a phase covering
-  // the whole stride lattice, otherwise undone by one HRot.
+  // window rule, see the .cpp), undone by one HRot when nonzero.
   int stc_shift_ = 0;
   int cts_shift_ = 0;
 
   static std::pair<int, int> Split(int num_diag);
+  static int NumLevels(const std::vector<Group> &groups);
   StripedMatrix Correction(const Parameter<word> &param,
                            const Encoder<word> &encoder) const;
-  // Compile `matrices` as consecutive phases from `start_level` down, with
-  // the pre-rotations chained; returns the rotation left on the output.
+  // Compile `matrices` as consecutive phases from `start_level` down, cut
+  // into groups of `group_sizes`, with the pre-rotations chained; returns
+  // the rotation left on the output.
   int Chain(ConstContextPtr<word> context, std::vector<StripedMatrix> &matrices,
-            int start_level, std::vector<Transform> &dst,
-            std::vector<int> &diagonals) const;
+            const std::vector<int> &group_sizes, int start_level,
+            std::vector<Group> &groups, std::vector<int> &diagonals) const;
+  static void RunGroup(ConstContextPtr<word> context, const Group &group,
+                       Ct &res, const Ct &input, const EvkMap<word> &evk_map);
 
  public:
   /**
-   * @brief Stages per phase, in application order. Each group needs at least
-   * two phases: the first lifts a real input to the complex pair and the
-   * last drops back to real. The small groups must sum to `log2 T`, the
-   * twist groups to `log2 k`.
+   * @brief Stages per phase, in application order. The small groups must sum
+   * to `log2 T`, the twist groups to `log2 k`. A group of one phase is a
+   * single real transform (255 diagonals for seven small stages, the whole
+   * stride-T lattice -- k of them -- for the twist); a longer group is a
+   * pair chain with fewer diagonals per level. The default is two real
+   * phases a direction, which is fewer levels than the native transforms.
    */
   struct Phases {
-    std::vector<int> stc_small{4, 3};
-    std::vector<int> stc_twist{5, 4};
-    std::vector<int> cts_twist{5, 4};
-    std::vector<int> cts_small{4, 3};
+    std::vector<int> stc_small{7};
+    std::vector<int> stc_twist{9};
+    std::vector<int> cts_twist{9};
+    std::vector<int> cts_small{7};
   };
 
   /**
@@ -145,12 +158,8 @@ class CiModuleBasis {
 
   int GetSmallDegree() const { return small_degree_; }
   int GetRank() const { return rank_; }
-  int GetStCNumLevels() const {
-    return static_cast<int>(stc_small_.size() + stc_twist_.size());
-  }
-  int GetCtSNumLevels() const {
-    return static_cast<int>(cts_twist_.size() + cts_small_.size());
-  }
+  int GetStCNumLevels() const { return NumLevels(stc_groups_); }
+  int GetCtSNumLevels() const { return NumLevels(cts_groups_); }
   /// Diagonal counts of the compiled phases, StC then CtS, in evaluation order.
   const std::vector<int> &GetStCDiagonals() const { return stc_diagonals_; }
   const std::vector<int> &GetCtSDiagonals() const { return cts_diagonals_; }

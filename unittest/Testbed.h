@@ -224,7 +224,7 @@ class Testbed : public testing::TestWithParam<const char *> {
     if (enable_boot && UseBootContext()) {
       std::cout << "Bootstrapping enabled" << std::endl;
       context_ = BootContext<word>::Create(
-          *param_, BootParameter(BootMaxLevel(), num_cts_levels_,
+          *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
                                  num_stc_levels_, 5, BootSlackLevels()));
     } else {
       context_ = Context<word>::Create(*param_);
@@ -246,6 +246,11 @@ class Testbed : public testing::TestWithParam<const char *> {
   // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
   // the slot domain before the conversion -- overrides it.
   virtual int BootSlackLevels() const { return 0; }
+  // Levels CoeffToSlot spends. The preset's count reproduces every shipped
+  // bootstrap; a test whose CoeffToSlot is a different transform, or whose
+  // EvalMod is wider (CHEDDAR_BOOT_DOUBLE_ANGLE), moves it so that EvalMod
+  // still ends on default_encryption_level, which BootContext asserts.
+  virtual int BootCtsLevels() const { return num_cts_levels_; }
 
   // Whether SetUp builds a BootContext when the preset asks for one. A test
   // that needs the extension's transforms but not the bootstrap -- the real

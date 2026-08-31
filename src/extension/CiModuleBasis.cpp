@@ -31,19 +31,29 @@ void ScaleRows(StripedMatrix &m, const std::vector<double> &scale) {
   }
 }
 
+StripedMatrix RealPart(const StripedMatrix &m) {
+  StripedMatrix res(m.GetHeight(), m.GetWidth());
+  for (const auto &[idx, diag] : m) {
+    std::vector<Complex> re(diag.size());
+    for (size_t j = 0; j < diag.size(); j++) re[j] = Complex(diag[j].real(), 0.0);
+    res.emplace(idx, std::move(re));
+  }
+  return res;
+}
+
 // THE WINDOW. `LinearTransform` maps every offset to `(i - pre_rotation) mod
 // n` and wants those to fit in `(bs * gs - 1) * gcd`; a phase whose offsets
 // straddle zero therefore needs a pre-rotation, and the SinC prefix's chain
 // rule (EvalSpecialFFT.cpp, PrepareSinCPrefix) is how consecutive phases
 // pass it along without a rotation between them:
 //
-//     p_0 = -a_0,   p_{i+1} = a_i - a_{i+1},   result = rot(M x, a_last).
+//     p_0 = -a_0,   p_{j+1} = a_j - a_{j+1},   result = rot(M x, a_last),
 //
-// Here `a` is the tightest window: minus the most negative signed offset.
-// A phase covering the WHOLE stride lattice -- every twist phase that
-// contains the top stride, and the correction-folded one -- fits any
-// pre-rotation, so its window is free, and a chain that ends on one ends
-// clean. A chain that ends elsewhere is finished by one HRot.
+// `a_j` being the TOTAL shift phase j's output rides on. Here every phase
+// adds exactly its own window -- minus its most negative signed offset, a
+// multiple of its lattice stride, so the gcd `DetermineStride` finds is the
+// stride -- a phase covering the whole stride lattice adds nothing, and
+// what is carried at the end is one HRot.
 int Window(const StripedMatrix &m, int n) {
   int gcd = 0;
   int most_negative = 0;
@@ -53,22 +63,8 @@ int Window(const StripedMatrix &m, int n) {
     const int signed_off = (off <= n / 2) ? off : off - n;
     most_negative = std::min(most_negative, signed_off);
   }
-  if (gcd > 0 && static_cast<int>(m.size()) * gcd == n) return -1;  // full
+  if (gcd > 0 && static_cast<int>(m.size()) * gcd == n) return 0;  // whole
   return -most_negative;
-}
-
-// Real in, complex through the middle, real out -- one group of phases.
-template <typename word>
-void RunGroup(ConstContextPtr<word> context,
-              const std::vector<ComplexLinearTransform<word>> &group,
-              Ciphertext<word> &res, const Ciphertext<word> &input,
-              const EvkMap<word> &evk_map) {
-  Ciphertext<word> re, im;
-  group.front().EvaluateFromReal(context, re, im, input, evk_map);
-  for (size_t j = 1; j + 1 < group.size(); j++) {
-    group[j].EvaluatePair(context, re, im, re, im, evk_map);
-  }
-  group.back().EvaluateToReal(context, res, re, im, evk_map);
 }
 
 }  // namespace
@@ -135,46 +131,73 @@ StripedMatrix CiModuleBasis<word>::Correction(
 template <typename word>
 int CiModuleBasis<word>::Chain(ConstContextPtr<word> context,
                                std::vector<StripedMatrix> &matrices,
-                               int start_level, std::vector<Transform> &dst,
+                               const std::vector<int> &group_sizes,
+                               int start_level, std::vector<Group> &groups,
                                std::vector<int> &diagonals) const {
   const auto &param = context->param_;
   const int n = num_slots_;
-  const int num_phases = static_cast<int>(matrices.size());
-  // `carried` is the prefix's `a`: the total shift the output of phase j
-  // rides on, which the next phase's pre-rotation `p = a_{j-1} - a_j` takes
-  // off again. Each phase adds exactly its own window (a multiple of its
-  // lattice stride, so the gcd `DetermineStride` finds is the stride), a
-  // whole-lattice phase adds nothing, and whatever is carried at the end is
-  // one HRot. Shifting the offsets by the window makes the rotated set
-  // `[0, offset_max + w]`, whose lattice-point count is the diagonal count
-  // of a contiguous set and is what the split has to cover.
   int carried = 0;
-  for (int j = 0; j < num_phases; j++) {
-    const int w = Window(matrices[j], n);
-    const int delta = (w >= 0) ? w : 0;
-    const int pre_rotation = -delta;
-    carried += delta;
-    int gcd = 0;
-    int max_rot = 0;
-    for (const auto &[idx, _] : matrices[j]) {
-      const int rot = ((idx - pre_rotation) % n + n) % n;
-      gcd = GCD(gcd, rot);
-      max_rot = std::max(max_rot, rot);
+  int j = 0;
+  int level = start_level;
+  for (int size : group_sizes) {
+    Group group;
+    for (int q = 0; q < size; q++, j++) {
+      // A group of one phase maps a real input to a real output, so its
+      // matrix can be taken real part first and compiled as an ordinary
+      // LinearTransform: Re(M x) = Re(M) x. Longer groups carry the complex
+      // intermediate as a pair.
+      const bool single = (size == 1);
+      StripedMatrix m = single ? RealPart(matrices[j]) : matrices[j];
+      const int w = Window(m, n);
+      const int pre_rotation = -w;
+      carried += w;
+      int gcd = 0;
+      int max_rot = 0;
+      for (const auto &[idx, _] : m) {
+        const int rot = ((idx - pre_rotation) % n + n) % n;
+        gcd = GCD(gcd, rot);
+        max_rot = std::max(max_rot, rot);
+      }
+      const int nd = m.GetNumDiag();
+      const int span = (gcd > 0) ? max_rot / gcd + 1 : nd;
+      auto [bs, gs] = Split(std::max(nd, span));
+      if (single) {
+        group.real.emplace_back(context, m, level,
+                                param.GetRescalePrimeProd(level), bs, gs,
+                                pre_rotation, carried);
+      } else {
+        group.pair.emplace_back(context, m, level,
+                                param.GetRescalePrimeProd(level), bs, gs,
+                                pre_rotation, carried);
+      }
+      diagonals.push_back(nd);
+      std::cout << "  phase " << j << (single ? " (real)" : " (pair)") << ": "
+                << nd << " diagonals on stride " << gcd << ", span " << span
+                << ", level " << level << ", BSGS " << bs << "x" << gs
+                << ", pre_rotation " << pre_rotation << ", pt_rot " << carried
+                << std::endl;
+      level--;
     }
-    const int nd = matrices[j].GetNumDiag();
-    const int span = (gcd > 0) ? max_rot / gcd + 1 : nd;
-    auto [bs, gs] = Split(std::max(nd, span));
-    const int level = start_level - j;
-    dst.emplace_back(context, matrices[j], level,
-                     param.GetRescalePrimeProd(level), bs, gs, pre_rotation,
-                     carried);
-    diagonals.push_back(nd);
-    std::cout << "  phase " << j << ": " << nd << " diagonals on stride "
-              << gcd << ", span " << span << ", level " << level << ", BSGS "
-              << bs << "x" << gs << ", pre_rotation " << pre_rotation
-              << ", pt_rot " << carried << std::endl;
+    groups.push_back(std::move(group));
   }
   return carried;
+}
+
+template <typename word>
+void CiModuleBasis<word>::RunGroup(ConstContextPtr<word> context,
+                                   const Group &group, Ct &res,
+                                   const Ct &input,
+                                   const EvkMap<word> &evk_map) {
+  if (!group.real.empty()) {
+    group.real.front().Evaluate(context, res, input, evk_map);
+    return;
+  }
+  Ct re, im;
+  group.pair.front().EvaluateFromReal(context, re, im, input, evk_map);
+  for (size_t j = 1; j + 1 < group.pair.size(); j++) {
+    group.pair[j].EvaluatePair(context, re, im, re, im, evk_map);
+  }
+  group.pair.back().EvaluateToReal(context, res, re, im, evk_map);
 }
 
 template <typename word>
@@ -206,9 +229,8 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
   };
   auto check_group = [&](const std::vector<int> &v, int stages,
                          const char *who) {
-    AssertTrue(v.size() >= 2, std::string("CiModuleBasis: ") + who +
-                                  " needs at least two phases (the first "
-                                  "lifts to a pair, the last drops to real)");
+    AssertTrue(!v.empty(), std::string("CiModuleBasis: ") + who +
+                               " needs at least one phase");
     AssertTrue(sum(v) == stages, std::string("CiModuleBasis: ") + who +
                                      " must cover exactly its stages");
     for (int c : v) AssertTrue(c >= 1, "CiModuleBasis: an empty phase");
@@ -228,8 +250,8 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
   if (stc_level >= 0) {
     check_group(phases.stc_small, log_small_, "stc_small");
     check_group(phases.stc_twist, log_rank_, "stc_twist");
-    const int num_small = static_cast<int>(phases.stc_small.size());
-    const int num_phases = num_small + static_cast<int>(phases.stc_twist.size());
+    const int num_phases =
+        static_cast<int>(phases.stc_small.size() + phases.stc_twist.size());
     AssertTrue(stc_level >= num_phases,
                "CiModuleBasis: StC needs one level per phase");
     const double const_div = std::pow(stc_const, 1.0 / num_phases);
@@ -251,17 +273,15 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
         StripedMatrix m =
             CiButterflyStages(param, encoder, n, stages, /*inverse_dir=*/false);
         if (matrices.empty()) ScaleColumns(m, col_scale);
-        matrices.push_back(
-            StripedMatrix::Mult(m, Complex(const_div, 0.0)));
+        matrices.push_back(StripedMatrix::Mult(m, Complex(const_div, 0.0)));
         cumul += count;
       }
     }
     std::cout << " StC at level " << stc_level << ":" << std::endl;
-    std::vector<Transform> all;
-    stc_shift_ = Chain(context, matrices, stc_level, all, stc_diagonals_);
-    for (int j = 0; j < num_phases; j++) {
-      (j < num_small ? stc_small_ : stc_twist_).push_back(std::move(all[j]));
-    }
+    const std::vector<int> sizes{static_cast<int>(phases.stc_small.size()),
+                                 static_cast<int>(phases.stc_twist.size())};
+    stc_shift_ = Chain(context, matrices, sizes, stc_level, stc_groups_,
+                       stc_diagonals_);
   }
 
   // ---- CoeffToSlot -------------------------------------------------------
@@ -314,11 +334,10 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
     }
     AssertTrue(top == -1, "CiModuleBasis: small stages miscounted");
     std::cout << " CtS at level " << cts_level << ":" << std::endl;
-    std::vector<Transform> all;
-    cts_shift_ = Chain(context, matrices, cts_level, all, cts_diagonals_);
-    for (int j = 0; j < num_phases; j++) {
-      (j < num_twist ? cts_twist_ : cts_small_).push_back(std::move(all[j]));
-    }
+    const std::vector<int> sizes{num_twist,
+                                 static_cast<int>(phases.cts_small.size())};
+    cts_shift_ = Chain(context, matrices, sizes, cts_level, cts_groups_,
+                       cts_diagonals_);
   }
   std::cout << " closing rotations: StC " << stc_shift_ << ", CtS "
             << cts_shift_ << std::endl;
@@ -327,8 +346,11 @@ CiModuleBasis<word>::CiModuleBasis(ConstContextPtr<word> context,
 template <typename word>
 void CiModuleBasis<word>::AddRequiredRotations(EvkRequest &req,
                                                bool min_ks) const {
-  for (const auto *group : {&stc_small_, &stc_twist_, &cts_twist_, &cts_small_}) {
-    for (const auto &t : *group) t.AddRequiredRotations(req, min_ks);
+  for (const auto *groups : {&stc_groups_, &cts_groups_}) {
+    for (const auto &g : *groups) {
+      for (const auto &t : g.real) t.AddRequiredRotations(req, min_ks);
+      for (const auto &t : g.pair) t.AddRequiredRotations(req, min_ks);
+    }
   }
   if (stc_shift_ != 0) {
     req.AddRequest(num_slots_ - stc_shift_, stc_level_ - GetStCNumLevels());
@@ -339,13 +361,22 @@ void CiModuleBasis<word>::AddRequiredRotations(EvkRequest &req,
 }
 
 template <typename word>
+int CiModuleBasis<word>::NumLevels(const std::vector<Group> &groups) {
+  int levels = 0;
+  for (const auto &g : groups) {
+    levels += static_cast<int>(g.real.size() + g.pair.size());
+  }
+  return levels;
+}
+
+template <typename word>
 void CiModuleBasis<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
-  AssertTrue(!stc_small_.empty(), "CiModuleBasis: StC was not built");
+  AssertTrue(!stc_groups_.empty(), "CiModuleBasis: StC was not built");
   Ct mid, out;
-  RunGroup(context, stc_small_, mid, input, evk_map);
-  RunGroup(context, stc_twist_, out, mid, evk_map);
+  RunGroup(context, stc_groups_[0], mid, input, evk_map);
+  RunGroup(context, stc_groups_[1], out, mid, evk_map);
   if (stc_shift_ != 0) {
     const int back = num_slots_ - stc_shift_;
     context->HRot(res, out, evk_map.GetRotationKey(back), back);
@@ -359,10 +390,10 @@ template <typename word>
 void CiModuleBasis<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
-  AssertTrue(!cts_twist_.empty(), "CiModuleBasis: CtS was not built");
+  AssertTrue(!cts_groups_.empty(), "CiModuleBasis: CtS was not built");
   Ct mid, out;
-  RunGroup(context, cts_twist_, mid, input, evk_map);
-  RunGroup(context, cts_small_, out, mid, evk_map);
+  RunGroup(context, cts_groups_[0], mid, input, evk_map);
+  RunGroup(context, cts_groups_[1], out, mid, evk_map);
   if (cts_shift_ != 0) {
     const int back = num_slots_ - cts_shift_;
     context->HRot(res, out, evk_map.GetRotationKey(back), back);
