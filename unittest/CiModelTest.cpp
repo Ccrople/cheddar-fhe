@@ -419,6 +419,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
 
   // ModPack's keys live on the ring that runs the projections: the FFN's.
+  MemRow("setup: leg ring's EvalMod, native tables and boot rotation keys");
   const int pack_aux = fui.PrepareModPackKeys(kSmall, kPcmmLevel,
                                               /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
@@ -426,6 +427,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     pack_keys.push_back(&fui.GetModPackKey(kRank, j));
   }
 
+  MemRow("setup: + the FFN ring (its UserInterface) and the ModPack keys");
   // THE CROSSING CONSTANT, DERIVED. `HalfBoot` multiplies the message by
   // `level_zero_scale / q0`; `BootContext` computes it exactly and the leg's
   // `restore` is its inverse. Every earlier test measured this by decrypting a
@@ -464,6 +466,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                 leg_land->param->GetPrimeVector(leg_land->param->LevelToNP(L)))
           << "the leg's landing ring differs from ci16_35 at level " << L;
     }
+    MemRow("setup: + the leg's landing ring (tables, keys)");
     std::cout << "leg landing ring " << leg_param << ": climbs to "
               << lctx->GetBootParameter().GetMaxLevel() << " ("
               << leg_land->param
@@ -484,6 +487,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       bctx, swtch->context, small->context, lifted->context, acfg);
   const auto layout = attn->GetLayout();
 
+  MemRow("setup: + CiSinCAttention (the three converters)");
   swtch->ui->PrepareRingSwitchKey(small->Degree(),
                                   small->ui->GetSecretCoeffs(), 2);
   swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
@@ -501,6 +505,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     attn->AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  MemRow("setup: + the switch/lifted/leg attention keys");
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch->ui->GetEvkMap();
@@ -532,6 +537,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     fctx->ReleaseCtS(num_slots);
   }
 
+  MemRow("setup: + the FFN ring's EvalMod, native StC (CtS released) and boot rotation keys");
   typename cheddar::CiLlamaLayer<word>::Config lcfg;
   lcfg.num_tokens = kT;
   lcfg.proj_rank = kRank;
@@ -561,6 +567,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // `stream_scale` is derived below from the reference, but the layer needs
   // the ciphertext's epsilon at construction, so it is computed here.
   cheddar::CiLlamaLayer<word> layer(fctx, layout, pack_keys, lcfg);
+  MemRow("setup: + the layer (module basis: StC'/CtS', the seam's T2/rev, the leg)");
   {
     EvkRequest req;
     layer.AddRequiredRotations(req);
