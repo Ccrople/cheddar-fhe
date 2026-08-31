@@ -1,6 +1,7 @@
 #include "extension/StripedMatrix.h"
 
 #include "common/Assert.h"
+#include "common/ParallelFor.h"
 
 namespace cheddar {
 
@@ -22,16 +23,31 @@ StripedMatrix StripedMatrix::Mult(const StripedMatrix &a,
 
   StripedMatrix c(width, width);
 
+  // Every (i, j) pair adds into diagonal (i + j) % width at every entry k, so
+  // the entry index is the axis the work splits on: a thread owning a range
+  // of k writes entries no other thread reads or writes, and each entry still
+  // takes its terms in the (i, j) order the serial loop took them.
+  struct Term {
+    const Complex *a;
+    const Complex *b;
+    Complex *c;
+    int shift;
+  };
+  std::vector<Term> terms;
   for (const auto &[i, diag_a] : a) {
     for (const auto &[j, diag_b] : b) {
-      int dest_idx = (i + j) % width;
-      if (c.find(dest_idx) == c.end())
-        c.try_emplace(dest_idx, std::vector<Complex>(width));
-      for (int k = 0; k < width; k++) {
-        c[dest_idx][k] += (diag_a[k] * diag_b[(k + i) % width]);
-      }
+      const int dest_idx = (i + j) % width;
+      c.try_emplace(dest_idx, std::vector<Complex>(width));
+      terms.push_back({diag_a.data(), diag_b.data(), c[dest_idx].data(), i});
     }
   }
+  ParallelFor(width, [&](int k0, int k1) {
+    for (const auto &t : terms) {
+      for (int k = k0; k < k1; k++) {
+        t.c[k] += t.a[k] * t.b[(k + t.shift) % width];
+      }
+    }
+  });
   return c;
 }
 

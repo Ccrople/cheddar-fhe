@@ -144,8 +144,11 @@ else()
   set(MATH_LIB ${LIBTOMMATH})
 endif()
 
+# The host-side matrix composition behind the compiled transforms runs on
+# every core (common/ParallelFor.h).
+find_package(Threads REQUIRED)
 target_link_libraries(cheddar
-  PUBLIC CUDA::cudart rmm ${MATH_LIB}
+  PUBLIC CUDA::cudart rmm ${MATH_LIB} Threads::Threads
 )
 
 target_include_directories(cheddar

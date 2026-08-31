@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/CiSwitchedCcmm.h"
 #include "core/Serialization.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
@@ -356,6 +357,59 @@ INSTANTIATE_TEST_SUITE_P(Cheddar, CompiledTransform,
                            std::replace(name.begin(), name.end(), '.', '_');
                            return name;
                          });
+
+// ---------------------------------------------------------------------------
+// The leg's P/V converter recipe (sub-degree 32, forward at 3, inverse at 1,
+// the chain layout at rank 16, 256 baby steps, no premap) built here on the
+// switch ring and written where `CHEDDAR_CONVERTER_BUILD_OUT` says, so that
+// the test below can hold it against the cache file an earlier build wrote.
+// The constructor prints its own split (stages / folds / compile per
+// direction); this is the harness for the cold build's cost. Skipped when
+// no output path is given: it is minutes and 7 GB.
+// ---------------------------------------------------------------------------
+
+TEST(ConverterBuild, ThePvRecipeIsBuiltAndWritten) {
+  const char *out = std::getenv("CHEDDAR_CONVERTER_BUILD_OUT");
+  if (out == nullptr || out[0] == 0) {
+    GTEST_SKIP() << "set CHEDDAR_CONVERTER_BUILD_OUT to the file to write";
+  }
+  const char *param_env = std::getenv("CHEDDAR_CONVERTER_PARAM");
+  const std::string param = (param_env != nullptr && param_env[0] != 0)
+                                ? param_env
+                                : "ci_ringswitch16_35_boot.json";
+  Ring ring(param, {}, 0, /*build_user_interface=*/false);
+  const int degree = ring.Degree();
+  constexpr int kSubDegree = 32;
+  constexpr int kRank = 16;
+  constexpr int kForwardLevel = 3;
+  constexpr int kInverseLevel = 1;
+  constexpr int kBabySteps = 256;
+  const cheddar::CiSwitchedCcmmLayout layout(degree, degree / kRank,
+                                             kSubDegree);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> conv(ring.context, kSubDegree, kForwardLevel,
+                             kInverseLevel, &layout, /*forward_premap=*/nullptr,
+                             kBabySteps);
+  const auto t1 = std::chrono::steady_clock::now();
+  ASSERT_NE(conv.GetForward(), nullptr);
+  ASSERT_NE(conv.GetInverse(), nullptr);
+
+  int64_t written = 0;
+  {
+    cheddar::ArchiveWriter ar(out, cheddar::IdentityOf(*ring.param));
+    conv.Save(ar);
+    ar.Close();
+    written = ar.Written();
+  }
+  const auto t2 = std::chrono::steady_clock::now();
+  std::cout << "  built both directions in " << std::fixed
+            << std::setprecision(1)
+            << std::chrono::duration<double>(t1 - t0).count()
+            << " s, wrote " << (written >> 20) << " MiB to " << out << " in "
+            << std::chrono::duration<double>(t2 - t1).count() << " s"
+            << std::endl;
+}
 
 // ---------------------------------------------------------------------------
 // Two converter cache files -- one written by the host encoder, one by the

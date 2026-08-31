@@ -1,5 +1,6 @@
 #include "extension/EvalSpecialFFT.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -10,6 +11,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "common/ParallelFor.h"
 
 namespace cheddar {
 
@@ -1332,9 +1334,31 @@ StripedMatrix ComposeCiSinCStages(const Parameter<word> &param,
   return result;
 }
 
-// Accumulator for the two folds below: the diagonals all live on the
-// stride-k lattice, so they are held densely by `offset / k` and packed
-// into a StripedMatrix at the end -- a map lookup per entry would dominate.
+// Accumulator for the folds below: the diagonals all live on the stride-k
+// lattice, so they are held densely by `offset / k` -- every bucket
+// allocated up front, because the folds fill them from many threads at once
+// -- and packed into a StripedMatrix at the end, dropping the buckets
+// nothing landed in. A map lookup per entry would dominate.
+std::vector<std::vector<Complex>> Lattice(int num_blocks, int n) {
+  return std::vector<std::vector<Complex>>(
+      static_cast<size_t>(num_blocks), std::vector<Complex>(n, Complex(0.0)));
+}
+
+// The diagonals of `m` as (offset, data) pairs, every offset checked to sit
+// on the lattice before any thread starts: `AssertTrue` throws, and a throw
+// inside `ParallelFor`'s threads ends the process instead.
+std::vector<std::pair<int, const Complex *>> LatticeDiagonals(
+    const StripedMatrix &m, int k, const char *who) {
+  std::vector<std::pair<int, const Complex *>> diags;
+  diags.reserve(m.size());
+  for (const auto &[idx, diag] : m) {
+    AssertTrue(idx % k == 0,
+               std::string(who) + ": a diagonal left the stride-k lattice");
+    diags.emplace_back(idx, diag.data());
+  }
+  return diags;
+}
+
 StripedMatrix PackLattice(std::vector<std::vector<Complex>> &acc, int n,
                           int k) {
   StripedMatrix res(n, n);
@@ -1375,25 +1399,27 @@ StripedMatrix FoldNestedPack(const StripedMatrix &m,
       dst2src[dst] = src;
     }
   }
-  std::vector<std::vector<Complex>> acc(num_blocks);
-  auto add = [&](int row, int col, Complex v) {
-    const int off = (((col - row) % n) + n) % n;
-    auto &diag = acc[off / k];
-    if (diag.empty()) diag.assign(n, Complex(0.0));
-    diag[row] += v;
-  };
-  for (const auto &[idx, diag] : m) {
-    AssertTrue(idx % k == 0,
-               "FoldNestedPack: a diagonal left the stride-k lattice");
-    for (int j = 0; j < n; j++) {
-      const Complex v = diag[j];
-      if (v == Complex(0.0, 0.0)) continue;
-      const int col = ((j + idx) % n + n) % n;
-      add(j, col, v);
-      const int src = dst2src[col / k];
-      if (src >= 0) add(j, src * k + col % k, v);
+  const auto diags = LatticeDiagonals(m, k, "FoldNestedPack");
+  auto acc = Lattice(num_blocks, n);
+  // Split by ROW: both adds of an entry land in acc[*][j], so a thread that
+  // owns a range of j touches nothing another thread does, and each entry
+  // still takes its terms in the serial order (offsets ascending, the
+  // identity add before the copy).
+  ParallelFor(n, [&](int j0, int j1) {
+    for (int j = j0; j < j1; j++) {
+      for (const auto &[idx, diag] : diags) {
+        const Complex v = diag[j];
+        if (v == Complex(0.0, 0.0)) continue;
+        const int col = ((j + idx) % n + n) % n;
+        acc[((((col - j) % n) + n) % n) / k][j] += v;
+        const int src = dst2src[col / k];
+        if (src >= 0) {
+          const int nc = src * k + col % k;
+          acc[((((nc - j) % n) + n) % n) / k][j] += v;
+        }
+      }
     }
-  }
+  });
   return PackLattice(acc, n, k);
 }
 
@@ -1421,24 +1447,36 @@ StripedMatrix FoldNestedUnpack(const StripedMatrix &m,
       }
     }
   }
-  std::vector<std::vector<Complex>> acc(num_blocks);
-  for (const auto &[idx, diag] : m) {
-    AssertTrue(idx % k == 0,
-               "FoldNestedUnpack: a diagonal left the stride-k lattice");
-    for (int j = 0; j < n; j++) {
-      const Complex v = diag[j];
-      if (v == Complex(0.0, 0.0)) continue;
-      const int col = ((j + idx) % n + n) % n;
-      const int lane = j % k;
-      for (const auto &[a_out, sign] : fanout[j / k]) {
-        const int row = a_out * k + lane;
-        const int off = (((col - row) % n) + n) % n;
-        auto &dst = acc[off / k];
-        if (dst.empty()) dst.assign(n, Complex(0.0));
-        dst[row] += sign * v;
+  // The same map read from the output side: sources[B] lists the (input
+  // block, sign) pairs that land on output block B, input blocks ascending,
+  // which is the order the serial scatter reached each entry in (offsets
+  // ascending, then the input row j = a_in * k + lane ascending).
+  std::vector<std::vector<std::pair<int, double>>> sources(num_blocks);
+  for (int in = 0; in < num_blocks; in++) {
+    for (const auto &[out, sign] : fanout[in]) sources[out].emplace_back(in, sign);
+  }
+  const auto diags = LatticeDiagonals(m, k, "FoldNestedUnpack");
+  auto acc = Lattice(num_blocks, n);
+  // Split by output ROW. This fold is the cold build's cost -- every entry
+  // fans out to ~60 rows on the leg's layout, 8e9 scatter-adds -- and it
+  // was one core for ~200 s (Doing.md 3.3).
+  ParallelFor(n, [&](int r0, int r1) {
+    for (int row = r0; row < r1; row++) {
+      const int lane = row % k;
+      const auto &src = sources[row / k];
+      if (src.empty()) continue;
+      for (const auto &[idx, diag] : diags) {
+        for (const auto &[a_in, sign] : src) {
+          const int j = a_in * k + lane;
+          const Complex v = diag[j];
+          if (v == Complex(0.0, 0.0)) continue;
+          const int col = ((j + idx) % n + n) % n;
+          const int off = (((col - row) % n) + n) % n;
+          acc[off / k][row] += sign * v;
+        }
       }
     }
-  }
+  });
   return PackLattice(acc, n, k);
 }
 
@@ -1452,21 +1490,20 @@ StripedMatrix FoldColumnPremap(const StripedMatrix &m,
                                const std::vector<int> &inv, int k) {
   const int n = m.GetHeight();
   const int num_blocks = n / k;
-  std::vector<std::vector<Complex>> acc(num_blocks);
-  for (const auto &[idx, diag] : m) {
-    AssertTrue(idx % k == 0,
-               "FoldColumnPremap: a diagonal left the stride-k lattice");
-    for (int j = 0; j < n; j++) {
-      const Complex v = diag[j];
-      if (v == Complex(0.0, 0.0)) continue;
-      const int col = ((j + idx) % n + n) % n;
-      const int nc = inv[col / k] * k + col % k;
-      const int off = (((nc - j) % n) + n) % n;
-      auto &dst = acc[off / k];
-      if (dst.empty()) dst.assign(n, Complex(0.0));
-      dst[j] += v;
+  const auto diags = LatticeDiagonals(m, k, "FoldColumnPremap");
+  auto acc = Lattice(num_blocks, n);
+  // Split by row, as FoldNestedPack: one write per entry, into acc[*][j].
+  ParallelFor(n, [&](int j0, int j1) {
+    for (int j = j0; j < j1; j++) {
+      for (const auto &[idx, diag] : diags) {
+        const Complex v = diag[j];
+        if (v == Complex(0.0, 0.0)) continue;
+        const int col = ((j + idx) % n + n) % n;
+        const int nc = inv[col / k] * k + col % k;
+        acc[((((nc - j) % n) + n) % n) / k][j] += v;
+      }
     }
-  }
+  });
   return PackLattice(acc, n, k);
 }
 
@@ -1514,10 +1551,18 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
     if (bs < 1) bs = 1;
     return std::pair<int, int>{bs, DivCeil(nd, bs)};
   };
+  // Three timed pieces per direction: the stage composition, the folds, and
+  // the compile (the device encode). The cold build of the leg's three
+  // converters is this constructor, so its split is printed every time.
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
 
   if (forward_level >= 0) {
     AssertTrue(forward_level >= 1,
                "CiSinCConverter: the conversion spends one level");
+    const auto t_start = Clock::now();
     std::vector<int> stages;
     for (int i = num_stages - p; i < num_stages; i++) stages.push_back(i);
     StripedMatrix m =
@@ -1531,6 +1576,7 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
         diag[j] = Complex(v, 0.0);
       }
     }
+    const auto t_stages = Clock::now();
     // The copy-add composes AFTER the x2 correction: the correction is a
     // property of the flat transform's columns, and the fold relabels which
     // slot feeds a column, not which column it is.
@@ -1551,14 +1597,18 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
       m = FoldColumnPremap(m, inv, sub_degree);
     }
     auto [bs, gs] = split(m.GetNumDiag());
+    const auto t_folded = Clock::now();
+    forward_.emplace_back(context, m, forward_level,
+                          param.GetRescalePrimeProd(forward_level), bs, gs, 0,
+                          0);
     std::cout << "CiSinCConverter forward: " << p << " stages, "
               << m.GetNumDiag() << " diagonals, level " << forward_level
               << ", BSGS " << bs << "x" << gs
               << (chain != nullptr ? ", nested fold" : "")
-              << (forward_premap != nullptr ? ", premap" : "") << std::endl;
-    forward_.emplace_back(context, m, forward_level,
-                          param.GetRescalePrimeProd(forward_level), bs, gs, 0,
-                          0);
+              << (forward_premap != nullptr ? ", premap" : "") << "; stages "
+              << seconds(t_start, t_stages) << " s, folds "
+              << seconds(t_stages, t_folded) << " s, compile "
+              << seconds(t_folded, Clock::now()) << " s" << std::endl;
   }
 
   if (inverse_level >= 0) {
@@ -1567,6 +1617,7 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
     AssertTrue(sub_degree <= kCiSinCInverseLambdaCap,
                "CiSinCConverter: the inverse is only built for sub_degree <= "
                "256 -- see the lambda cap of Doing.md 1.5bn");
+    const auto t_start = Clock::now();
     std::vector<Complex> f1, f2;
     SolveCiSinCInverseLambda(sub_degree, f1, f2);
     // The prefix of CtS: the same strides in the opposite order, highest
@@ -1589,18 +1640,23 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
         diag[j] = Complex((diag[j] * lam).real(), 0.0);
       }
     }
+    const auto t_stages = Clock::now();
     // The block scan composes AFTER the lambda correction: the corrected
     // matrix is the one whose output rows hold the flat message, and the
     // scan is a map on those values.
     if (chain != nullptr) m = FoldNestedUnpack(m, *chain);
     auto [bs, gs] = split(m.GetNumDiag());
-    std::cout << "CiSinCConverter inverse: " << p << " stages, "
-              << m.GetNumDiag() << " diagonals, level " << inverse_level
-              << ", BSGS " << bs << "x" << gs
-              << (chain != nullptr ? ", nested fold" : "") << std::endl;
+    const auto t_folded = Clock::now();
     inverse_.emplace_back(context, m, inverse_level,
                           param.GetRescalePrimeProd(inverse_level), bs, gs, 0,
                           0);
+    std::cout << "CiSinCConverter inverse: " << p << " stages, "
+              << m.GetNumDiag() << " diagonals, level " << inverse_level
+              << ", BSGS " << bs << "x" << gs
+              << (chain != nullptr ? ", nested fold" : "") << "; stages "
+              << seconds(t_start, t_stages) << " s, folds "
+              << seconds(t_stages, t_folded) << " s, compile "
+              << seconds(t_folded, Clock::now()) << " s" << std::endl;
   }
 }
 
