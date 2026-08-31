@@ -561,6 +561,14 @@ TEST(CiNestedPacking, TheFlatEncodingOfTheBlockSumsIsTheNestedOperand) {
 // result -- the part-level read of 1.5bm and the flat read undone by the
 // block scan. The _l2 trio's third level is exactly this transform's budget.
 
+// The bootstrap trio: ci16_35's own bottom primes, so a ci16_35 ciphertext at
+// level <= 4 crosses keylessly (Doing.md 1.5bt). Correctness-lane on the small
+// ring (Q * P = 2^182+ at degree 4096); no security or timing claim.
+constexpr const char *kBootParam = "ci16_35.json";
+constexpr const char *kBootSwitchParam = "ci_ringswitch16_35_boot.json";
+constexpr const char *kBootSmallParam = "ci12_35_boot.json";
+constexpr const char *kBootLiftedParam = "ringdegree13_35_boot.json";
+
 TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
   Ring boot(kBootParam);
   Ring swtch(kBootSwitchParam, boot.ui->GetSecretCoeffs());
