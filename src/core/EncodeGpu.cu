@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <cmath>
+#include <cstring>
 
 #include "common/Assert.h"
 #include "common/Basic.cuh"
@@ -128,34 +129,45 @@ __device__ __forceinline__ uint64_t WideResidue(double a, uint64_t p,
   return r;
 }
 
+// The per-prime table, staged once per block instead of once per thread: it is
+// the same 24 bytes for all 256 threads and it is read `num_primes` times by
+// each of them. Both RNS kernels open with this.
 template <typename word>
-__global__ void RnsDecomposeKernel(word *dst, const double *src, int n,
-                                   int num_primes, const uint64_t *consts,
-                                   const make_signed_t<word> *inv_primes,
-                                   double scale, bool montgomery) {
-  using signed_word = make_signed_t<word>;
+struct PrimeTable {
+  uint64_t *p;
+  uint64_t *mu;
+  uint64_t *r2;
+  make_signed_t<word> *qinv;
+};
 
-  // The per-prime table, staged once per block instead of once per thread:
-  // it is the same 24 bytes for all 256 threads and it is read `num_primes`
-  // times by each of them.
-  extern __shared__ uint64_t sh_const[];
-  uint64_t *sh_p = sh_const;
-  uint64_t *sh_mu = sh_p + num_primes;
-  uint64_t *sh_r2 = sh_mu + num_primes;
-  signed_word *sh_qinv = reinterpret_cast<signed_word *>(sh_r2 + num_primes);
-
+template <typename word>
+__device__ __forceinline__ PrimeTable<word> LoadPrimeTable(
+    uint64_t *smem, int num_primes, const uint64_t *consts,
+    const make_signed_t<word> *inv_primes) {
+  PrimeTable<word> t;
+  t.p = smem;
+  t.mu = t.p + num_primes;
+  t.r2 = t.mu + num_primes;
+  t.qinv = reinterpret_cast<make_signed_t<word> *>(t.r2 + num_primes);
   for (int j = threadIdx.x; j < num_primes; j += blockDim.x) {
-    sh_p[j] = consts[3 * j];
-    sh_mu[j] = consts[3 * j + 1];
-    sh_r2[j] = consts[3 * j + 2];
-    sh_qinv[j] = inv_primes[j];
+    t.p[j] = consts[3 * j];
+    t.mu[j] = consts[3 * j + 1];
+    t.r2[j] = consts[3 * j + 2];
+    t.qinv[j] = inv_primes[j];
   }
   __syncthreads();
+  return t;
+}
 
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-
-  const double value = round(src[i] * scale);
+// One already-scaled value into its `num_primes` limbs, at `dst[j * stride +
+// index]`. This is the whole of what the host spends BigInt on.
+template <typename word>
+__device__ __forceinline__ void WriteLimbs(word *dst, int64_t index,
+                                           int64_t stride, double value,
+                                           int num_primes,
+                                           const PrimeTable<word> &t,
+                                           bool montgomery) {
+  using signed_word = make_signed_t<word>;
   const bool negative = value < 0.0;
   const double magnitude = fabs(value);
   // 2^64 exactly; below it the conversion to uint64_t is exact and one
@@ -165,21 +177,103 @@ __global__ void RnsDecomposeKernel(word *dst, const double *src, int n,
       narrow ? static_cast<uint64_t>(magnitude) : UINT64_C(0);
 
   for (int j = 0; j < num_primes; j++) {
-    const uint64_t p = sh_p[j];
-    uint64_t r = narrow ? Barrett64(narrow_value, p, sh_mu[j])
-                        : WideResidue(magnitude, p, sh_mu[j]);
+    const uint64_t p = t.p[j];
+    uint64_t r = narrow ? Barrett64(narrow_value, p, t.mu[j])
+                        : WideResidue(magnitude, p, t.mu[j]);
     if (negative && r != 0) r = p - r;
     if (montgomery) {
       // r * R mod p, as ToMontgomery does it on the host: one Montgomery
       // multiplication by R^2 mod p, which is the library's own primitive.
-      signed_word t = basic::detail::__mult_montgomery_lazy<word>(
-          static_cast<signed_word>(r), static_cast<signed_word>(sh_r2[j]),
-          static_cast<word>(p), sh_qinv[j]);
-      if (t < 0) t += static_cast<signed_word>(p);
-      r = static_cast<uint64_t>(t);
+      signed_word m = basic::detail::__mult_montgomery_lazy<word>(
+          static_cast<signed_word>(r), static_cast<signed_word>(t.r2[j]),
+          static_cast<word>(p), t.qinv[j]);
+      if (m < 0) m += static_cast<signed_word>(p);
+      r = static_cast<uint64_t>(m);
     }
-    dst[static_cast<int64_t>(j) * n + i] = static_cast<word>(r);
+    dst[static_cast<int64_t>(j) * stride + index] = static_cast<word>(r);
   }
+}
+
+template <typename word>
+__global__ void RnsDecomposeKernel(word *dst, const double *src, int n,
+                                   int num_primes, const uint64_t *consts,
+                                   const make_signed_t<word> *inv_primes,
+                                   double scale, bool montgomery) {
+  extern __shared__ uint64_t sh_const[];
+  const PrimeTable<word> table =
+      LoadPrimeTable<word>(sh_const, num_primes, consts, inv_primes);
+
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  WriteLimbs<word>(dst, i, n, round(src[i] * scale), num_primes, table,
+                   montgomery);
+}
+
+// ---------------------------------------------------------------------------
+// The gather fused into the encoding.
+//
+// `CoeffLinearLeg::GatherWeights` builds the operand on the host and hands a
+// `rows x cols` vector of doubles to the encoder, so the model's weights cross
+// PCIe once per projection group, as doubles, after a strided host loop. The
+// gather is separable -- entry (r, c) is `w[col_map[c]][row_map[r]] * w_scale`
+// and neither map depends on the other index -- so both maps fit in two small
+// index vectors and the whole of it becomes an addressing mode here. The
+// weight matrix then crosses once, in its own precision, and the host loop
+// disappears.
+//
+// The read is scattered: `w` is [in_channel][out_channel] and the operand is
+// [out][in], so this is a gather-transpose and consecutive threads land
+// `out_channels` apart. Nothing in the maps is available to fix that
+// generically -- they are opaque permutations to this kernel -- and the write
+// side carries `num_primes` words for every value read, so the amplification
+// is bounded by the ratio. Measured rather than argued: see the test.
+// ---------------------------------------------------------------------------
+template <typename word, typename src_t>
+__global__ void RnsGatherKernel(word *dst, const src_t *w, int out_channels,
+                                const int *row_map, const int *col_map,
+                                int rows, int cols, int num_primes,
+                                const uint64_t *consts,
+                                const make_signed_t<word> *inv_primes,
+                                double w_scale, double scale,
+                                bool montgomery) {
+  extern __shared__ uint64_t sh_const[];
+  const PrimeTable<word> table =
+      LoadPrimeTable<word>(sh_const, num_primes, consts, inv_primes);
+
+  const int64_t n = static_cast<int64_t>(rows) * cols;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+
+  const int r = static_cast<int>(i / cols);
+  const int c = static_cast<int>(i - static_cast<int64_t>(r) * cols);
+  // A NEGATIVE MAP ENTRY IS A DEAD CHANNEL, and that is what lets the real
+  // model be read directly. Half density declares 8704 model channels for
+  // 4096 live ones and 28672 hidden for 14336, and the pipeline builds that
+  // declared matrix on the host first -- 1.86 GiB of doubles for `gate`, 4x
+  // the tensor, mostly zeros. Composing the declared-to-live map into these
+  // two vectors instead means the kernel reads the f32 blob the exporter
+  // wrote, at its own size, and the declared matrix never exists.
+  const int out_index = row_map[r];
+  const int in_index = col_map[c];
+  const double value =
+      (out_index < 0 || in_index < 0)
+          ? 0.0
+          : static_cast<double>(
+                w[static_cast<int64_t>(in_index) * out_channels + out_index]);
+  // The same two multiplications the host does, in the same order: it forms
+  // `w * w_scale` into the gathered vector and rounds `value * scale` in the
+  // encoder, so grouping them the other way would round differently.
+  WriteLimbs<word>(dst, i, n, round((value * w_scale) * scale), num_primes,
+                   table, montgomery);
+}
+
+// The real message into the transform's complex buffer. On R+ the slots are
+// real, so only `num_slots` doubles need cross the link rather than 2 * that,
+// and the imaginary axis is written here instead of transferred.
+__global__ void ExpandRealKernel(double2 *dst, const double *src, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  dst[i] = make_double2(src[i], 0.0);
 }
 
 }  // namespace kernel
@@ -197,7 +291,8 @@ GpuEncoder<word>::GpuEncoder(const Parameter<word> &param,
       twiddle_(static_cast<size_t>(2) * param.MaxNumSlots(), cudaStreamLegacy),
       fft_(0, cudaStreamLegacy),
       coeff_(static_cast<size_t>(param.degree_), cudaStreamLegacy),
-      value_stage_(0, cudaStreamLegacy) {
+      value_stage_(0, cudaStreamLegacy),
+      real_stage_(0, cudaStreamLegacy) {
   // The same entry the host reads out of its length-M table, computed the same
   // way so that the two transforms differ in nothing but where they run.
   HostVector<double> host(static_cast<size_t>(2) * max_slots_, 0.0);
@@ -248,18 +343,70 @@ double *GpuEncoder<word>::CoeffScratch() const {
 
 // Into `fft_`, not into a pointer the caller took first: EnsureScratch may
 // reallocate, so a pointer read before it is stale by the time the copy lands.
+//
+// THE INTERLEAVE IS NOT WORK. `std::complex<T>` is required to be layout-
+// compatible with `T[2]` -- C++11 26.4/4 says `reinterpret_cast<T*>(p)[2*i]`
+// is the real part of `p[i]` for an array of them -- so the (re, im) buffer
+// the transform wants IS the vector's own storage, and the element loop that
+// was here rebuilt it a double at a time. It cost 59 us of the stage's 102 at
+// 2^16 slots, against 43 for the transfer it was preparing.
 template <typename word>
 void GpuEncoder<word>::StageMessage(const std::vector<Complex> &message,
                                     int num_slots) const {
   EnsureScratch(num_slots);
-  const int given = static_cast<int>(message.size());
-  for (int i = 0; i < num_slots; i++) {
-    host_stage_[2 * i] = i < given ? message[i].real() : 0.0;
-    host_stage_[2 * i + 1] = i < given ? message[i].imag() : 0.0;
+  const int given = std::min(static_cast<int>(message.size()), num_slots);
+  std::memcpy(host_stage_, reinterpret_cast<const double *>(message.data()),
+              static_cast<size_t>(given) * 2 * sizeof(double));
+  if (given < num_slots) {
+    std::memset(host_stage_ + 2 * given, 0,
+                static_cast<size_t>(num_slots - given) * 2 * sizeof(double));
   }
-  cudaMemcpyAsync(fft_.data(), host_stage_,
-                  static_cast<size_t>(2) * num_slots * sizeof(double),
+  StageFromBuffer(num_slots, false);
+}
+
+// The same, for a message that is real -- which on R+ is every message, the
+// ring being totally real. Half as many bytes cross the link and the imaginary
+// axis is written by a kernel that moves 1.5 MiB at device bandwidth instead
+// of 512 KiB at PCIe bandwidth.
+template <typename word>
+void GpuEncoder<word>::StageRealMessage(const std::vector<double> &message,
+                                        int num_slots) const {
+  EnsureScratch(num_slots);
+  const int given = std::min(static_cast<int>(message.size()), num_slots);
+  std::memcpy(host_stage_, message.data(),
+              static_cast<size_t>(given) * sizeof(double));
+  if (given < num_slots) {
+    std::memset(host_stage_ + given, 0,
+                static_cast<size_t>(num_slots - given) * sizeof(double));
+  }
+  StageFromBuffer(num_slots, true);
+}
+
+template <typename word>
+double *GpuEncoder<word>::StagingBuffer(int num_slots) const {
+  EnsureScratch(num_slots);
+  return host_stage_;
+}
+
+template <typename word>
+void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
+  EnsureScratch(num_slots);
+  if (!real) {
+    cudaMemcpyAsync(fft_.data(), host_stage_,
+                    static_cast<size_t>(2) * num_slots * sizeof(double),
+                    cudaMemcpyHostToDevice, cudaStreamLegacy);
+    return;
+  }
+  if (real_stage_.size() < static_cast<size_t>(num_slots)) {
+    real_stage_.resize(num_slots, cudaStreamLegacy);
+  }
+  cudaMemcpyAsync(real_stage_.data(), host_stage_,
+                  static_cast<size_t>(num_slots) * sizeof(double),
                   cudaMemcpyHostToDevice, cudaStreamLegacy);
+  const int threads = 256;
+  const int blocks = (num_slots + threads - 1) / threads;
+  kernel::ExpandRealKernel<<<blocks, threads, 0, cudaStreamLegacy>>>(
+      reinterpret_cast<double2 *>(fft_.data()), real_stage_.data(), num_slots);
 }
 
 template <typename word>
@@ -396,6 +543,28 @@ void GpuEncoder<word>::Encode(Plaintext<word> &ptxt, int level, double scale,
 }
 
 template <typename word>
+void GpuEncoder<word>::EncodeReal(Plaintext<word> &ptxt, int level,
+                                  double scale,
+                                  const std::vector<double> &message,
+                                  int num_aux /*= 0*/) const {
+  const int num_slots = 1 << Log2Ceil<int>(static_cast<int>(message.size()));
+  AssertTrue(num_slots <= max_slots_,
+             "GpuEncoder::EncodeReal: too many slots for this ring");
+
+  StageRealMessage(message, num_slots);
+  SpecialIFFT(fft_.data(), num_slots);
+  FftToCoeff(coeff_.data(), fft_.data(), num_slots);
+
+  const NPInfo np = param_.LevelToNP(level, num_aux);
+  ptxt.ModifyNP(np);
+  ptxt.SetNumSlots(num_slots);
+  ptxt.SetScale(scale);
+  RnsDecompose(ptxt.mx_.data(), coeff_.data(), degree_, np, scale, false);
+  auto view = ptxt.View();
+  ntt_handler_.NTT(view, np, ptxt.ConstView(), true);
+}
+
+template <typename word>
 void GpuEncoder<word>::EncodeCoeff(Plaintext<word> &ptxt, int level,
                                    double scale,
                                    const std::vector<double> &coeffs,
@@ -438,6 +607,37 @@ void GpuEncoder<word>::EncodeMatrixFromDevice(PlainMatrix<word> &res, int level,
   res.np_ = np;
   res.data_.resize(np.GetNumTotal() * n);
   RnsDecompose(res.data_.data(), values, n, np, scale, true);
+}
+
+template <typename word>
+template <typename src_t>
+void GpuEncoder<word>::EncodeMatrixGathered(PlainMatrix<word> &res, int level,
+                                            double scale, const src_t *weight,
+                                            int out_channels,
+                                            const int *row_map,
+                                            const int *col_map, int rows,
+                                            int cols, double w_scale,
+                                            int num_aux /*= 0*/) const {
+  AssertTrue(rows > 0 && cols > 0,
+             "GpuEncoder::EncodeMatrixGathered: Invalid matrix shape");
+  const NPInfo np = param_.LevelToNP(level, num_aux);
+  const int num_primes = np.GetNumTotal();
+  const int64_t n = static_cast<int64_t>(rows) * cols;
+  res.rows_ = rows;
+  res.cols_ = cols;
+  res.scale_ = scale;
+  res.np_ = np;
+  res.data_.resize(static_cast<int>(num_primes * n));
+
+  const int threads = kRnsBlockDim;
+  const int64_t blocks = (n + threads - 1) / threads;
+  const size_t smem = static_cast<size_t>(num_primes) *
+                      (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
+  kernel::RnsGatherKernel<word, src_t>
+      <<<static_cast<int>(blocks), threads, smem, cudaStreamLegacy>>>(
+          res.data_.data(), weight, out_channels, row_map, col_map, rows, cols,
+          num_primes, PrimeConstants(np), param_.GetInvPrimesPtr(np), w_scale,
+          scale, true);
 }
 
 template <typename word>
@@ -498,5 +698,23 @@ void GpuEncoder<word>::ReportKernelAttributes(std::ostream &os, int num_primes,
 
 template class GpuEncoder<uint32_t>;
 template class GpuEncoder<uint64_t>;
+
+// The weight source is a template parameter rather than an overload because
+// the model arrives as f32 blobs and staying in f32 halves what crosses PCIe,
+// while f64 is what a caller holding a converted matrix already has. Widening
+// f32 to double is exact, so an f32 model encodes to the same limbs either
+// way -- which is what the test asserts.
+template void GpuEncoder<uint32_t>::EncodeMatrixGathered<float>(
+    PlainMatrix<uint32_t> &, int, double, const float *, int, const int *,
+    const int *, int, int, double, int) const;
+template void GpuEncoder<uint32_t>::EncodeMatrixGathered<double>(
+    PlainMatrix<uint32_t> &, int, double, const double *, int, const int *,
+    const int *, int, int, double, int) const;
+template void GpuEncoder<uint64_t>::EncodeMatrixGathered<float>(
+    PlainMatrix<uint64_t> &, int, double, const float *, int, const int *,
+    const int *, int, int, double, int) const;
+template void GpuEncoder<uint64_t>::EncodeMatrixGathered<double>(
+    PlainMatrix<uint64_t> &, int, double, const double *, int, const int *,
+    const int *, int, int, double, int) const;
 
 }  // namespace cheddar

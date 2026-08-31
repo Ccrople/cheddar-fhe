@@ -111,6 +111,8 @@ class GpuEncoder {
   mutable double *host_stage_ = nullptr;
   mutable size_t host_stage_size_ = 0;
   mutable rmm::device_uvector<double> value_stage_;
+  // Where a real message lands before the imaginary axis is written onto it.
+  mutable rmm::device_uvector<double> real_stage_;
 
   // Per-prime constants the RNS stage reads: the prime, its Barrett constant
   // and R^2 mod p, three uint64 a prime, in the order `GetPrimesPtr` lists
@@ -148,6 +150,69 @@ class GpuEncoder {
    * message across -- and a stage nobody times is a stage nobody fixes.
    */
   void StageMessage(const std::vector<Complex> &message, int num_slots) const;
+
+  /**
+   * @brief The same, for a real message -- which on the conjugate-invariant
+   * ring is every message, the ring being totally real. Half as many bytes
+   * cross PCIe and the imaginary axis is written on the device.
+   */
+  void StageRealMessage(const std::vector<double> &message,
+                        int num_slots) const;
+
+  /**
+   * @brief The pinned buffer the two calls above copy INTO, so that a caller
+   * which is building its message anyway can build it here instead.
+   *
+   * The copy is not instruction-bound and cannot be optimised: measured at
+   * 2^16 slots it is 58 us against 46 for the transfer it feeds, and it runs
+   * at 18 GB/s, which is what a host memory copy of a megabyte costs. The only
+   * way past it is not to make it. Every message in this tree is assembled
+   * element by element by its caller -- a mask, a RoPE table, a residual
+   * stream -- so assembling it in this buffer costs the caller nothing.
+   *
+   * Holds `2 * num_slots` doubles for a complex message, interleaved (re, im),
+   * and `num_slots` for a real one. Invalidated by the next call that grows
+   * the scratch, so it is a staging area and not storage.
+   */
+  double *StagingBuffer(int num_slots) const;
+
+  /**
+   * @brief Transfer what the caller wrote into `StagingBuffer`. `real` selects
+   * the half-width layout, exactly as StageRealMessage does.
+   */
+  void StageFromBuffer(int num_slots, bool real) const;
+
+  /**
+   * @brief The slot encoding of a real message. Off R+ this is a message whose
+   * imaginary part is zero, which is what every mask in this tree is.
+   */
+  void EncodeReal(Plaintext<word> &ptxt, int level, double scale,
+                  const std::vector<double> &message, int num_aux = 0) const;
+
+  /**
+   * @brief The plaintext matrix encoding with the gather fused in, from a
+   * weight matrix that is already on the device.
+   *
+   * `CoeffLinearLeg::GatherWeights` builds the operand on the host --
+   * `values[r][c] = w[col(c)][row(r)] * w_scale` -- and hands `rows * cols`
+   * doubles to the encoder, so a layer's model crosses PCIe as doubles, in
+   * pieces, behind a strided host loop. The gather is separable: neither index
+   * map depends on the other index. So the two maps become two small device
+   * vectors, the addressing moves into the kernel, and the weight matrix
+   * crosses once in whatever precision it already has.
+   *
+   * @param res output encoded matrix, in Montgomery form as EncodeMatrix
+   * @param weight device pointer, [in_channels][out_channels] row-major
+   * @param out_channels the row stride of `weight`
+   * @param row_map device vector of `rows` output-channel indices
+   * @param col_map device vector of `cols` input-channel indices
+   * @param w_scale the per-tensor scale the gather applies
+   */
+  template <typename src_t>
+  void EncodeMatrixGathered(PlainMatrix<word> &res, int level, double scale,
+                            const src_t *weight, int out_channels,
+                            const int *row_map, const int *col_map, int rows,
+                            int cols, double w_scale, int num_aux = 0) const;
 
   /**
    * @brief Stage 1. The special inverse FFT, in place on `data`, which holds

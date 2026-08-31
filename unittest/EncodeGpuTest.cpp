@@ -22,6 +22,9 @@
 
 #include "Testbed.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "common/CommonUtils.h"
 #include "core/EncodeGpu.h"
 #include "core/Pcmm.h"
@@ -137,6 +140,58 @@ void Row(const std::string &name, double ms, double bytes, double ops,
               << " G/s";
   }
   std::cout << std::endl;
+}
+
+// The shape of `CoeffLinearLeg::GatherWeights`, written out here rather than
+// linked: that function lives in the extension, which this file compiles
+// without, and what matters about it is the loop, not its two index maps --
+//
+//   values[r][c] = w[col_map[c]][row_map[r]] * w_scale
+//
+// -- which is separable, and which is the whole of why the gather can move
+// into the encoding kernel. A negative map entry is a dead channel and
+// contributes a zero, which is how the declared half-density layout is read
+// off the live tensor without ever building it.
+std::vector<double> HostGather(const std::vector<double> &w, int out_channels,
+                               const std::vector<int> &row_map,
+                               const std::vector<int> &col_map,
+                               double w_scale) {
+  const int rows = static_cast<int>(row_map.size());
+  const int cols = static_cast<int>(col_map.size());
+  std::vector<double> values(static_cast<size_t>(rows) * cols, 0.0);
+  for (int r = 0; r < rows; r++) {
+    if (row_map[r] < 0) continue;
+    for (int c = 0; c < cols; c++) {
+      if (col_map[c] < 0) continue;
+      values[static_cast<size_t>(r) * cols + c] =
+          w[static_cast<size_t>(col_map[c]) * out_channels + row_map[r]] *
+          w_scale;
+    }
+  }
+  return values;
+}
+
+// The maps the leg builds: an output channel is its group's base plus the bit
+// reversal of the module component, and an input channel is its parent's base
+// plus the same reversal. Reproduced so the benchmark reads a realistic --
+// that is, scattered -- address pattern rather than a contiguous one.
+std::vector<int> RowMap(int rows, int rank, int group) {
+  const int log_rank = Log2Ceil(rank);
+  std::vector<int> map(rows);
+  for (int r = 0; r < rows; r++) {
+    map[r] = group * rank + static_cast<int>(BitReverseInt(r, log_rank));
+  }
+  return map;
+}
+
+std::vector<int> ColMap(int cols, int rank, int live, int first_parent) {
+  const int log_rank = Log2Ceil(rank);
+  std::vector<int> map(cols);
+  for (int c = 0; c < cols; c++) {
+    map[c] = (first_parent + c / live) * rank +
+             static_cast<int>(BitReverseInt(c % live, log_rank));
+  }
+  return map;
 }
 
 }  // namespace
@@ -305,6 +360,69 @@ TEST_P(EncodeGpuTest, TheSlotEncodingMatchesTheHost) {
   }
 }
 
+// The real-message path, which sends half as many bytes because R+ has no
+// imaginary axis for them to describe. It must be the SAME encoding, not a
+// nearby one: the imaginary halves it does not transfer are written on the
+// device as exact zeros, so the transform sees the identical input and every
+// limb has to match what the complex path produces.
+TEST_P(EncodeGpuTest, TheRealMessagePathIsTheSameEncoding) {
+  const int num_slots = param_->MaxNumSlots();
+  for (int level : LevelsToSweep()) {
+    const double scale = DetermineScale(level);
+    std::vector<Complex> message;
+    GenerateRandomMessage(message, num_slots, -1.0, 1.0, false);
+    std::vector<double> real_message(num_slots);
+    for (int i = 0; i < num_slots; i++) real_message[i] = message[i].real();
+
+    Plaintext<word> complex_pt;
+    Plaintext<word> real_pt;
+    gpu_->Encode(complex_pt, level, scale, message);
+    gpu_->EncodeReal(real_pt, level, scale, real_message);
+    cudaDeviceSynchronize();
+
+    const auto a = Limbs(complex_pt);
+    const auto b = Limbs(real_pt);
+    ASSERT_EQ(a.size(), b.size()) << "level " << level;
+    int differing = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+      if (a[i] != b[i]) differing++;
+    }
+    EXPECT_EQ(differing, 0) << differing << " of " << a.size()
+                            << " limbs differ at level " << level;
+
+    // And the zero-copy route, composed out of the public stages: the message
+    // written straight into the pinned buffer, so no host copy happens at all.
+    // It has to reach the same limbs, or the buffer is not the same buffer.
+    const NPInfo np = param_->LevelToNP(level);
+    Plaintext<word> staged_pt;
+    double *buffer = gpu_->StagingBuffer(num_slots);
+    for (int i = 0; i < num_slots; i++) buffer[i] = real_message[i];
+    gpu_->StageFromBuffer(num_slots, true);
+    gpu_->SpecialIFFT(gpu_->FftScratch(num_slots), num_slots);
+    gpu_->FftToCoeff(gpu_->CoeffScratch(), gpu_->FftScratch(num_slots),
+                     num_slots);
+    staged_pt.ModifyNP(np);
+    staged_pt.SetNumSlots(num_slots);
+    staged_pt.SetScale(scale);
+    gpu_->RnsDecompose(staged_pt.mx_.data(), gpu_->CoeffScratch(),
+                       param_->degree_, np, scale, false);
+    {
+      auto view = staged_pt.View();
+      context_->ntt_handler_.NTT(view, np, staged_pt.ConstView(), true);
+    }
+    cudaDeviceSynchronize();
+    const auto c = Limbs(staged_pt);
+    ASSERT_EQ(a.size(), c.size());
+    int staged_differing = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+      if (a[i] != c[i]) staged_differing++;
+    }
+    EXPECT_EQ(staged_differing, 0)
+        << staged_differing << " of " << a.size()
+        << " limbs differ on the zero-copy route at level " << level;
+  }
+}
+
 // The plaintext matrix encoding, which is the layer's model-conversion row.
 // Both routes round to nearest and convert to Montgomery form, so this one is
 // bit-identical too -- and it has to be, because a limb that is off by one is
@@ -366,6 +484,258 @@ TEST_P(EncodeGpuTest, TheWideValuePathIsExact) {
     if (a[i] != b[i]) differing++;
   }
   EXPECT_EQ(differing, 0) << differing << " of " << a.size() << " limbs differ";
+}
+
+// The gather fused into the encoding, against the host doing it in two steps.
+// Bit-identical is the bar, not agreement: a limb off by one is a weight off
+// by 2^-35 in a place no accuracy ledger would attribute.
+TEST_P(EncodeGpuTest, TheGatheredEncodingIsBitIdenticalToTheHost) {
+  const int rank = 64;
+  const int live = rank / 2;
+  const int rows = live;
+  const int cols = 4 * live;
+  const int in_channels = 4 * rank;
+  const int out_channels = 3 * rank;
+  const double w_scale = 0.375;
+
+  std::vector<double> w = RandomReals(in_channels * out_channels, 1.0);
+  // The model ships as f32, so the reference is the f32 values widened back --
+  // otherwise this would be testing double-versus-float, which is a different
+  // claim from the one being made.
+  std::vector<float> w32(w.begin(), w.end());
+  for (size_t i = 0; i < w.size(); i++) w[i] = static_cast<double>(w32[i]);
+  // A dead entry in either map, which is what reading the real model through
+  // the declared layout produces, and which the host reference has to agree
+  // with by writing a zero.
+  std::vector<int> row_map = RowMap(rows, rank, 1);
+  std::vector<int> col_map = ColMap(cols, rank, live, 0);
+  row_map[7] = -1;
+  col_map[13] = -1;
+
+  const std::vector<double> values =
+      HostGather(w, out_channels, row_map, col_map, w_scale);
+
+  DeviceVector<int> d_row(rows);
+  DeviceVector<int> d_col(cols);
+  CopyHostToDevice(d_row, HostVector<int>(row_map.begin(), row_map.end()));
+  CopyHostToDevice(d_col, HostVector<int>(col_map.begin(), col_map.end()));
+  DeviceVector<int32_t> d_w32(static_cast<int>(w32.size()));
+  cudaMemcpyAsync(d_w32.data(), w32.data(), w32.size() * sizeof(float),
+                  cudaMemcpyHostToDevice, cudaStreamLegacy);
+  cudaDeviceSynchronize();
+
+  PcmmHandler<word> pcmm(*param_);
+  for (int level : LevelsToSweep()) {
+    const double scale = DetermineScale(level);
+    PlainMatrix<word> host_u;
+    PlainMatrix<word> gpu_u;
+    pcmm.EncodeMatrix(host_u, level, scale, values, rows, cols);
+    gpu_->template EncodeMatrixGathered<float>(
+        gpu_u, level, scale, reinterpret_cast<const float *>(d_w32.data()),
+        out_channels, d_row.data(), d_col.data(), rows, cols, w_scale);
+    cudaDeviceSynchronize();
+
+    const auto a = Limbs(host_u);
+    const auto b = Limbs(gpu_u);
+    ASSERT_EQ(a.size(), b.size());
+    int differing = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+      if (a[i] != b[i]) differing++;
+    }
+    // The host gathers in double from a double weight; the device gathers from
+    // the f32 the model actually ships. Widening f32 to double is exact, and
+    // `w` here came from f32, so the two are the same number -- which is the
+    // reason the model can be left in its own precision on the device.
+    EXPECT_EQ(differing, 0) << differing << " of " << a.size()
+                            << " limbs differ at level " << level;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The real Llama-3-8B `gate` weight, at the real width, through both routes.
+//
+// Everything above runs on shapes; this runs on the tensor. `wgate.f32` is
+// 4096 x 14336 f32 in this tree's [in, out] convention, and the layer turns it
+// into 56 plaintext operands of 256 x 4352 -- one per output group, every
+// model ciphertext as columns.
+//
+// What the pipeline does today is three host steps: marshal the real tensor
+// into the DECLARED half-density layout (8704 x 28672 doubles, 1.86 GiB, four
+// times the tensor and mostly zeros), gather a group out of it, encode. The
+// two index maps compose, so the middle matrix is not information -- and the
+// fused kernel reads the exporter's own f32 blob instead.
+// ---------------------------------------------------------------------------
+TEST_P(EncodeGpuTest, TheGatheredEncodingRunsOnTheRealLlamaWeights) {
+  const char *dir_env = std::getenv("LLAMA3_REAL_DIR");
+  const std::string dir =
+      dir_env != nullptr && dir_env[0] != '\0' ? dir_env : "";
+  if (dir.empty()) {
+    GTEST_SKIP() << "LLAMA3_REAL_DIR is not set; this needs the real model";
+  }
+  std::ifstream blob(dir + "/wgate.f32", std::ios::binary);
+  if (!blob.is_open()) {
+    GTEST_SKIP() << "no wgate.f32 under " << dir;
+  }
+
+  // The real tensor, and the declared layout the leg indexes it through.
+  constexpr int kModel = 4096;      // live model channels
+  constexpr int kHidden = 14336;    // live hidden channels
+  constexpr int kRank = 512;        // the ModPack group, and the module rank
+  constexpr int kPerModel = 255;    // rank/2 - 1: component zero has no partner
+  constexpr int kPerHidden = 256;   // rank/2
+  const int model_cts = (kModel + kPerModel - 1) / kPerModel;    // 17
+  const int hidden_groups = (kHidden + kPerHidden - 1) / kPerHidden;  // 56
+  const int declared_hidden = hidden_groups * kRank;             // 28672
+
+  std::vector<float> w32(static_cast<size_t>(kModel) * kHidden);
+  blob.read(reinterpret_cast<char *>(w32.data()),
+            static_cast<std::streamsize>(w32.size() * sizeof(float)));
+  ASSERT_EQ(blob.gcount(),
+            static_cast<std::streamsize>(w32.size() * sizeof(float)))
+      << "wgate.f32 is not " << kModel << " x " << kHidden << " f32";
+  blob.close();
+
+  // The declared-to-live inverses. Model channel m sits at declared index
+  // 2 * (m % 255 + 1) of ciphertext m / 255; hidden channel j at 2 * (j % 256)
+  // of group j / 256. Everything else -- the odd declared indices, component
+  // zero, and the tail past the live width -- is dead, and a dead map entry is
+  // what the kernel writes a zero for.
+  auto model_live = [&](int declared) {
+    const int k = declared / kRank;
+    const int e = declared % kRank;
+    if ((e & 1) != 0 || e == 0) return -1;
+    const int m = k * kPerModel + (e / 2 - 1);
+    return m < kModel ? m : -1;
+  };
+  auto hidden_live = [&](int declared) {
+    const int k = declared / kRank;
+    const int e = declared % kRank;
+    if ((e & 1) != 0) return -1;
+    const int j = k * kPerHidden + e / 2;
+    return j < kHidden ? j : -1;
+  };
+
+  const int group = 3;  // one of the 56 hidden groups
+  const int rows = kRank / 2;              // 256 live output rows
+  const int cols = model_cts * kRank / 2;  // 4352, every model ciphertext
+  const double w_scale = 0.0423;           // the leg's own cq/ck
+
+  // Composed straight to live indices: the declared matrix never exists.
+  std::vector<int> row_map(rows);
+  for (int r = 0; r < rows; r++) {
+    row_map[r] = hidden_live(group * kRank +
+                             static_cast<int>(BitReverseInt(r, 9)));
+  }
+  std::vector<int> col_map(cols);
+  for (int c = 0; c < cols; c++) {
+    col_map[c] = model_live((c / (kRank / 2)) * kRank +
+                            static_cast<int>(BitReverseInt(c % (kRank / 2), 9)));
+  }
+  int dead_rows = 0, dead_cols = 0;
+  for (int v : row_map) dead_rows += (v < 0);
+  for (int v : col_map) dead_cols += (v < 0);
+  std::cout << "  real gate: " << kModel << " x " << kHidden << " f32, group "
+            << group << " -> " << rows << " x " << cols << " (" << dead_rows
+            << " dead rows, " << dead_cols << " dead columns of " << cols << ")"
+            << std::endl;
+  // Only the last model ciphertext is short, and only in its tail.
+  ASSERT_EQ(dead_rows, 0);
+  ASSERT_EQ(dead_cols, model_cts * kPerHidden - kModel);
+
+  const int level = 0;
+  const double scale = DetermineScale(level);
+  const NPInfo np = param_->LevelToNP(level);
+
+  // ---- the route the pipeline runs today ---------------------------------
+  const double marshal_ms = TimeHostMs(1, [&] {
+    std::vector<double> declared(static_cast<size_t>(kRank) * declared_hidden,
+                                 0.0);
+    // One model ciphertext's worth of the declared matrix, so the timing is
+    // per-parent rather than 1.86 GiB in one allocation; the full marshal is
+    // this times `model_cts`.
+    for (int m = 0; m < kPerModel; m++) {
+      const size_t dc = 2 * (m + 1);
+      for (int j = 0; j < kHidden; j++) {
+        declared[dc * declared_hidden +
+                 ((j / kPerHidden) * kRank + 2 * (j % kPerHidden))] =
+            w32[static_cast<size_t>(m) * kHidden + j];
+      }
+    }
+  });
+
+  std::vector<double> values;
+  const double gather_ms = TimeHostMs(1, [&] {
+    values.assign(static_cast<size_t>(rows) * cols, 0.0);
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        if (row_map[r] < 0 || col_map[c] < 0) continue;
+        values[static_cast<size_t>(r) * cols + c] =
+            static_cast<double>(
+                w32[static_cast<size_t>(col_map[c]) * kHidden + row_map[r]]) *
+            w_scale;
+      }
+    }
+  });
+
+  PcmmHandler<word> pcmm(*param_);
+  PlainMatrix<word> host_u;
+  const double encode_ms = TimeHostMs(1, [&] {
+    pcmm.EncodeMatrix(host_u, level, scale, values, rows, cols);
+  });
+
+  // ---- the fused route ----------------------------------------------------
+  DeviceVector<int> d_row(rows);
+  DeviceVector<int> d_col(cols);
+  CopyHostToDevice(d_row, HostVector<int>(row_map.begin(), row_map.end()));
+  CopyHostToDevice(d_col, HostVector<int>(col_map.begin(), col_map.end()));
+  // f32 on the device, in the model's own precision. DeviceVector is not
+  // instantiated for float, and the bytes are what matter here.
+  DeviceVector<int32_t> d_w(static_cast<int>(w32.size()));
+  const double upload_ms = TimeGpu(3, [&] {
+    cudaMemcpyAsync(d_w.data(), w32.data(), w32.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, cudaStreamLegacy);
+  });
+  const float *dw = reinterpret_cast<const float *>(d_w.data());
+
+  PlainMatrix<word> gpu_u;
+  const double fused_ms = TimeGpu(20, [&] {
+    gpu_->template EncodeMatrixGathered<float>(gpu_u, level, scale, dw, kHidden,
+                                               d_row.data(), d_col.data(), rows,
+                                               cols, w_scale);
+  });
+  cudaDeviceSynchronize();
+
+  const auto a = Limbs(host_u);
+  const auto b = Limbs(gpu_u);
+  ASSERT_EQ(a.size(), b.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < a.size(); i++) {
+    if (a[i] != b[i]) differing++;
+  }
+  EXPECT_EQ(differing, 0u) << differing << " of " << a.size()
+                           << " limbs differ on the real gate weight";
+
+  const double entries = static_cast<double>(rows) * cols;
+  const double limbs = entries * np.GetNumTotal();
+  std::cout << std::fixed << std::setprecision(3);
+  std::cout << "  host marshal (one of " << model_cts
+            << " parents) " << marshal_ms << " ms, gather " << gather_ms
+            << " ms, EncodeMatrix " << encode_ms << " ms" << std::endl;
+  std::cout << "  gpu weight upload (" << (w32.size() * sizeof(float) >> 20)
+            << " MiB f32, one-time) " << upload_ms << " ms, fused gather+encode "
+            << fused_ms << " ms" << std::endl;
+  const double host_group = marshal_ms * model_cts / hidden_groups + gather_ms +
+                            encode_ms;
+  std::cout << "  per group: host " << host_group << " ms (marshal amortised "
+            << "over the " << hidden_groups << " groups), gpu " << fused_ms
+            << " ms -- " << std::setprecision(1) << (host_group / fused_ms)
+            << "x" << std::setprecision(3) << std::endl;
+  std::cout << "  the whole gate tensor (" << hidden_groups << " groups): host "
+            << std::setprecision(2) << (host_group * hidden_groups / 1000.0)
+            << " s, gpu " << (upload_ms + fused_ms * hidden_groups) / 1000.0
+            << " s including the upload" << std::endl;
+  std::cout << "  fused throughput " << std::setprecision(1)
+            << (limbs / (fused_ms * 1e-3) / 1e9) << " G limb/s" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,8 +861,41 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
         gpu_->RnsDecompose(gpu_pt.mx_.data(), coeff_dev, degree, np, scale,
                            true);
       });
+      std::vector<double> real_message(num_slots);
+      for (int i = 0; i < num_slots; i++) real_message[i] = message[i].real();
       const double stage_ms =
           TimeGpu(100, [&] { gpu_->StageMessage(message, num_slots); });
+
+      // THE STAGE SPLIT, MEASURED RATHER THAN SUBTRACTED. The first reading of
+      // this row assumed the transfer ran at the 16 MiB reference's 24 GB/s
+      // and attributed the rest to the host copy. These two rows are the
+      // transfer alone, at exactly the size the stage uses, and the host copy
+      // alone -- so the attribution stops being an inference.
+      const size_t stage_bytes =
+          static_cast<size_t>(2) * num_slots * sizeof(double);
+      double *pinned = nullptr;
+      cudaMallocHost(reinterpret_cast<void **>(&pinned), stage_bytes);
+      DeviceVector<word> stage_sink(
+          static_cast<int>(stage_bytes / sizeof(word)));
+      const double h2d_only_ms = TimeGpu(100, [&] {
+        cudaMemcpyAsync(stage_sink.data(), pinned, stage_bytes,
+                        cudaMemcpyHostToDevice, cudaStreamLegacy);
+      });
+      const double memcpy_only_ms = TimeHostMs(100, [&] {
+        std::memcpy(pinned, message.data(), stage_bytes);
+      });
+      cudaFreeHost(pinned);
+
+      const double stage_real_ms =
+          TimeGpu(100, [&] { gpu_->StageRealMessage(real_message, num_slots); });
+      // The floor: the message already in the pinned buffer, so the stage is
+      // the transfer and nothing else.
+      const double stage_buf_ms =
+          TimeGpu(100, [&] { gpu_->StageFromBuffer(num_slots, false); });
+      const double stage_buf_real_ms =
+          TimeGpu(100, [&] { gpu_->StageFromBuffer(num_slots, true); });
+      const double whole_real_ms = TimeGpu(
+          50, [&] { gpu_->EncodeReal(gpu_pt, level, scale, real_message); });
       const double fft_ms = TimeGpuWithSetup(
           100, [&] { gpu_->StageMessage(message, num_slots); },
           [&] { gpu_->SpecialIFFT(fft, num_slots); });
@@ -522,6 +925,16 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
       Row("host Encode, slots (GMP)", host_slot_ms, 0, 0, 0);
       Row("gpu 0. StageMessage (H2D)", stage_ms,
           2.0 * num_slots * sizeof(double), 0, 0);
+      Row("gpu 0.  H2D alone, same size", h2d_only_ms,
+          static_cast<double>(stage_bytes), 0, 0);
+      Row("gpu 0.  host memcpy alone", memcpy_only_ms,
+          static_cast<double>(stage_bytes), 0, 0);
+      Row("gpu 0. StageRealMessage", stage_real_ms,
+          1.0 * num_slots * sizeof(double), 0, 0);
+      Row("gpu 0. StageFromBuffer", stage_buf_ms,
+          static_cast<double>(stage_bytes), 0, 0);
+      Row("gpu 0. StageFromBuffer, real", stage_buf_real_ms,
+          1.0 * num_slots * sizeof(double), 0, 0);
       Row("gpu 1. SpecialIFFT", fft_ms, fft_bytes, fft_flops, copy_gbps);
       Row("gpu 2. FftToCoeff", fold_ms, fold_bytes, 0, copy_gbps);
       Row("gpu 3. RnsDecompose", rns_ms, rns_bytes,
@@ -531,6 +944,7 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
       Row("gpu 4. NTT (existing)", ntt_ms, 0, 0, 0);
       Row("gpu EncodeCoeff, total", whole_coeff_ms, 0, 0, 0);
       Row("gpu Encode slots, total", whole_slot_ms, 0, 0, 0);
+      Row("gpu EncodeReal slots, total", whole_real_ms, 0, 0, 0);
       std::cout << "  speedup: EncodeCoeff " << std::setprecision(1)
                 << (host_coeff_ms / whole_coeff_ms) << "x, Encode "
                 << (host_slot_ms / whole_slot_ms) << "x" << std::endl;
