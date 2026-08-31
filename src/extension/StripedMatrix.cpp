@@ -43,9 +43,14 @@ StripedMatrix StripedMatrix::Mult(const StripedMatrix &a,
   }
   ParallelFor(width, [&](int k0, int k1) {
     for (const auto &t : terms) {
-      for (int k = k0; k < k1; k++) {
-        t.c[k] += t.a[k] * t.b[(k + t.shift) % width];
-      }
+      // `(k + shift) mod width` without a division per entry: the index
+      // wraps exactly once, at k = width - shift.
+      int s = t.shift % width;
+      if (s < 0) s += width;
+      const int wrap = std::min(k1, width - s);
+      int k = k0;
+      for (; k < wrap; k++) t.c[k] += t.a[k] * t.b[k + s];
+      for (; k < k1; k++) t.c[k] += t.a[k] * t.b[k + s - width];
     }
   });
   return c;

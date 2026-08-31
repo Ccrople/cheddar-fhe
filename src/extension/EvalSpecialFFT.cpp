@@ -1401,22 +1401,27 @@ StripedMatrix FoldNestedPack(const StripedMatrix &m,
   }
   const auto diags = LatticeDiagonals(m, k, "FoldNestedPack");
   auto acc = Lattice(num_blocks, n);
-  // Split by ROW: both adds of an entry land in acc[*][j], so a thread that
-  // owns a range of j touches nothing another thread does, and each entry
-  // still takes its terms in the serial order (offsets ascending, the
-  // identity add before the copy).
-  ParallelFor(n, [&](int j0, int j1) {
-    for (int j = j0; j < j1; j++) {
+  // Split by ROW BLOCK. On the lattice every offset is a whole number of
+  // blocks, so for a fixed (row block, diagonal) the bucket an entry lands in
+  // does not depend on its lane: the identity add is the diagonal's own
+  // bucket, the copy's is (src - row block), and the k lanes of a block are
+  // k consecutive entries on both sides. A thread's writes are its own row
+  // blocks' entries and nothing else, and each entry still takes its terms in
+  // the serial order (offsets ascending, the identity add before the copy).
+  ParallelFor(num_blocks, [&](int b0, int b1) {
+    for (int rb = b0; rb < b1; rb++) {
+      const int row0 = rb * k;
       for (const auto &[idx, diag] : diags) {
-        const Complex v = diag[j];
-        if (v == Complex(0.0, 0.0)) continue;
-        const int col = ((j + idx) % n + n) % n;
-        acc[((((col - j) % n) + n) % n) / k][j] += v;
-        const int src = dst2src[col / k];
-        if (src >= 0) {
-          const int nc = src * k + col % k;
-          acc[((((nc - j) % n) + n) % n) / k][j] += v;
-        }
+        const int shift = (((idx % n) + n) % n) / k;
+        const Complex *in = diag + row0;
+        Complex *same = acc[shift].data() + row0;
+        for (int lane = 0; lane < k; lane++) same[lane] += in[lane];
+        const int src = dst2src[(rb + shift) % num_blocks];
+        if (src < 0) continue;
+        Complex *copy = acc[((src - rb) % num_blocks + num_blocks) % num_blocks]
+                            .data() +
+                        row0;
+        for (int lane = 0; lane < k; lane++) copy[lane] += in[lane];
       }
     }
   });
@@ -1457,22 +1462,29 @@ StripedMatrix FoldNestedUnpack(const StripedMatrix &m,
   }
   const auto diags = LatticeDiagonals(m, k, "FoldNestedUnpack");
   auto acc = Lattice(num_blocks, n);
-  // Split by output ROW. This fold is the cold build's cost -- every entry
-  // fans out to ~60 rows on the leg's layout, 8e9 scatter-adds -- and it
-  // was one core for ~200 s (Doing.md 3.3).
-  ParallelFor(n, [&](int r0, int r1) {
-    for (int row = r0; row < r1; row++) {
-      const int lane = row % k;
-      const auto &src = sources[row / k];
+  // Split by output ROW BLOCK. This fold is the cold build's cost: every
+  // entry fans out to ~60 rows on the leg's layout, 8e9 adds, and as a
+  // scatter of single entries it was one core for ~200 s and 96 cores for
+  // 82 s -- memory latency, not arithmetic (Doing.md 3.3). On the lattice
+  // the bucket of (input block, output block, diagonal) does not depend on
+  // the lane -- `(a_in - a_out) * k + idx`, all multiples of k -- so the k
+  // lanes are one contiguous vector add from `diag[a_in * k ..]` into
+  // `acc[bucket][a_out * k ..]`. A thread's writes are its own row blocks',
+  // and each entry takes its terms in the serial order: offsets ascending,
+  // then input blocks ascending.
+  ParallelFor(num_blocks, [&](int b0, int b1) {
+    for (int a_out = b0; a_out < b1; a_out++) {
+      const auto &src = sources[a_out];
       if (src.empty()) continue;
+      const int row0 = a_out * k;
       for (const auto &[idx, diag] : diags) {
+        const int shift = (((idx % n) + n) % n) / k;
         for (const auto &[a_in, sign] : src) {
-          const int j = a_in * k + lane;
-          const Complex v = diag[j];
-          if (v == Complex(0.0, 0.0)) continue;
-          const int col = ((j + idx) % n + n) % n;
-          const int off = (((col - row) % n) + n) % n;
-          acc[off / k][row] += sign * v;
+          const int bucket =
+              ((a_in - a_out + shift) % num_blocks + num_blocks) % num_blocks;
+          Complex *dst = acc[bucket].data() + row0;
+          const Complex *in = diag + a_in * k;
+          for (int lane = 0; lane < k; lane++) dst[lane] += sign * in[lane];
         }
       }
     }
@@ -1492,15 +1504,19 @@ StripedMatrix FoldColumnPremap(const StripedMatrix &m,
   const int num_blocks = n / k;
   const auto diags = LatticeDiagonals(m, k, "FoldColumnPremap");
   auto acc = Lattice(num_blocks, n);
-  // Split by row, as FoldNestedPack: one write per entry, into acc[*][j].
-  ParallelFor(n, [&](int j0, int j1) {
-    for (int j = j0; j < j1; j++) {
+  // Split by row block, as FoldNestedPack: one lane-contiguous add per
+  // (row block, diagonal), into the bucket (inv[column block] - row block).
+  ParallelFor(num_blocks, [&](int b0, int b1) {
+    for (int rb = b0; rb < b1; rb++) {
+      const int row0 = rb * k;
       for (const auto &[idx, diag] : diags) {
-        const Complex v = diag[j];
-        if (v == Complex(0.0, 0.0)) continue;
-        const int col = ((j + idx) % n + n) % n;
-        const int nc = inv[col / k] * k + col % k;
-        acc[((((nc - j) % n) + n) % n) / k][j] += v;
+        const int shift = (((idx % n) + n) % n) / k;
+        const int nb = inv[(rb + shift) % num_blocks];
+        Complex *dst =
+            acc[((nb - rb) % num_blocks + num_blocks) % num_blocks].data() +
+            row0;
+        const Complex *in = diag + row0;
+        for (int lane = 0; lane < k; lane++) dst[lane] += in[lane];
       }
     }
   });
