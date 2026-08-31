@@ -268,6 +268,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(boot_level_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # Landing (flexible-output) bootstrap on the CI ring: a sub-ladder of
+  # ci16_35 that climbs less and lands lower, and crosses keylessly from
+  # ci16_35. Uses RingFixture (two rings, one secret), not Testbed.
+  add_executable(boot_landing_test BootLandingTest.cpp)
+  target_link_libraries(boot_landing_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Llama RoPE, [SYLPH] section 3.2. The real-weight case needs LLAMA3_REAL_DIR.
   add_executable(rope_test RoPeTest.cpp)
   target_link_libraries(rope_test
@@ -401,6 +408,40 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)
+# Landing sub-ladders of ci16_35 (gen_landing.py, L in [5,19]); the test
+# defaults to land13 and reaches the rest via CHEDDAR_LAND_PARAM.
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land5.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land5.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land6.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land6.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land7.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land7.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land8.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land8.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land9.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land9.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land10.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land10.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land12.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land12.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land14.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land14.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land16.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land16.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19.json COPYONLY)
+# The clean-landing sub-ladders of ci16_35 (gen_landing.py); boot_landing_test
+# defaults to land13 and reaches the others via CHEDDAR_LAND_PARAM.
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json
