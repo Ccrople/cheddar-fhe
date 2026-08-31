@@ -463,12 +463,25 @@ void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
     boot_->Rescale(hi_ct, bb);
   }
   // Onto the exchange's level, as `Merge` does for the banded images.
-  for (auto &ct : cts) {
-    if (boot_->param_.NPToLevel(ct.GetNP()) > cfg_.exchange_level) {
+  for (size_t i = 0; i < cts.size(); i++) {
+    Ct &ct = cts[i];
+    const NPInfo before = ct.GetNP();
+    const int here = boot_->param_.NPToLevel(before);
+    if (here > cfg_.exchange_level) {
       Ct down;
       boot_->LevelDown(down, ct, cfg_.exchange_level);
       ct = std::move(down);
     }
+    const NPInfo after = ct.GetNP();
+    AssertTrue(boot_->param_.NPToLevel(after) == cfg_.exchange_level,
+               "CiSinCAttention::Rope: image " + std::to_string(i) +
+                   " left at (" + std::to_string(after.num_main_) + " main + " +
+                   std::to_string(after.num_ter_) + " terminal), level " +
+                   std::to_string(boot_->param_.NPToLevel(after)) +
+                   ", from (" + std::to_string(before.num_main_) + " + " +
+                   std::to_string(before.num_ter_) + "), level " +
+                   std::to_string(here) + "; the exchange is at " +
+                   std::to_string(cfg_.exchange_level));
   }
 }
 
@@ -503,6 +516,16 @@ void CiSinCAttention<word>::ExchangeAll(std::vector<Ct> &cts,
   const int window_back = degree_ - window_;
   for (auto &ct : cts) {
     Ct shifted, swapped;
+    {
+      const NPInfo np = ct.GetNP();
+      AssertTrue(boot_->param_.NPToLevel(np) == cfg_.exchange_level,
+                 "CiSinCAttention::ExchangeAll: an image arrives at (" +
+                     std::to_string(np.num_main_) + " main + " +
+                     std::to_string(np.num_ter_) + " terminal), level " +
+                     std::to_string(boot_->param_.NPToLevel(np)) +
+                     ", not the exchange's " +
+                     std::to_string(cfg_.exchange_level));
+    }
     exchange_[0].Evaluate(boot_, shifted, ct, evk);
     boot_->HRot(swapped, shifted, evk.GetRotationKey(window_back),
                 window_back);
