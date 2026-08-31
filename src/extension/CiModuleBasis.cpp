@@ -140,30 +140,41 @@ int CiModuleBasis<word>::Chain(ConstContextPtr<word> context,
   const auto &param = context->param_;
   const int n = num_slots_;
   const int num_phases = static_cast<int>(matrices.size());
-  std::vector<int> a(num_phases, 0);
+  // `carried` is the prefix's `a`: the total shift the output of phase j
+  // rides on, which the next phase's pre-rotation `p = a_{j-1} - a_j` takes
+  // off again. Each phase adds exactly its own window (a multiple of its
+  // lattice stride, so the gcd `DetermineStride` finds is the stride), a
+  // whole-lattice phase adds nothing, and whatever is carried at the end is
+  // one HRot. Shifting the offsets by the window makes the rotated set
+  // `[0, offset_max + w]`, whose lattice-point count is the diagonal count
+  // of a contiguous set and is what the split has to cover.
+  int carried = 0;
   for (int j = 0; j < num_phases; j++) {
     const int w = Window(matrices[j], n);
-    // A free window takes whatever closes the chain cleanly: the previous
-    // phase's window when it is not the last, zero when it is.
-    a[j] = (w >= 0) ? w : 0;
-    if (w < 0 && j + 1 < num_phases) a[j] = (j > 0) ? a[j - 1] : 0;
-  }
-  int prev_a = 0;
-  for (int j = 0; j < num_phases; j++) {
-    const int pre_rotation = (j == 0) ? -a[0] : (prev_a - a[j]);
-    prev_a = a[j];
-    const int level = start_level - j;
+    const int delta = (w >= 0) ? w : 0;
+    const int pre_rotation = -delta;
+    carried += delta;
+    int gcd = 0;
+    int max_rot = 0;
+    for (const auto &[idx, _] : matrices[j]) {
+      const int rot = ((idx - pre_rotation) % n + n) % n;
+      gcd = GCD(gcd, rot);
+      max_rot = std::max(max_rot, rot);
+    }
     const int nd = matrices[j].GetNumDiag();
-    auto [bs, gs] = Split(nd);
+    const int span = (gcd > 0) ? max_rot / gcd + 1 : nd;
+    auto [bs, gs] = Split(std::max(nd, span));
+    const int level = start_level - j;
     dst.emplace_back(context, matrices[j], level,
                      param.GetRescalePrimeProd(level), bs, gs, pre_rotation,
-                     a[j]);
+                     carried);
     diagonals.push_back(nd);
-    std::cout << "  phase " << j << ": " << nd << " diagonals, level "
-              << level << ", BSGS " << bs << "x" << gs << ", pre_rotation "
-              << pre_rotation << ", pt_rot " << a[j] << std::endl;
+    std::cout << "  phase " << j << ": " << nd << " diagonals on stride "
+              << gcd << ", span " << span << ", level " << level << ", BSGS "
+              << bs << "x" << gs << ", pre_rotation " << pre_rotation
+              << ", pt_rot " << carried << std::endl;
   }
-  return prev_a;
+  return carried;
 }
 
 template <typename word>
