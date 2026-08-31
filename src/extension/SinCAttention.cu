@@ -244,7 +244,8 @@ void SinCAttention<word>::CanonicalDown(Ct &res, const Ct &x,
                                 std::to_string(from) + " to " +
                                 std::to_string(level));
   if (from == level) {
-    res = x;
+    // Already there; LevelDown at its own level is the library's copy.
+    boot_->LevelDown(res, x, level);
     return;
   }
   // One multiply by an exact 1.0, encoded at the scale that makes
