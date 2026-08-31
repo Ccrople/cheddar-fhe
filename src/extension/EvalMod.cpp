@@ -1,5 +1,8 @@
 #include "extension/EvalMod.h"
 
+#include <cmath>
+#include <string>
+
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 
@@ -29,6 +32,17 @@ EvalMod<word>::EvalMod(ConstContextPtr<word> context,
   for (int i = 0; i < mod_levels; i++) {
     target_scale = target_scale * target_scale /
                    context->param_.GetRescalePrimeProd(start_level - i);
+    // The recursion's fixed point is the rescale width; a ladder whose
+    // EvalMod levels differ in width runs away from it (2^60 over 58-bit
+    // levels: 2^62, 2^66, 2^74, 2^90 -- measured as an output of exactly
+    // zero on a landing preset with its two 30-bit spares at the top of
+    // EvalMod, Doing.md 3.9). The next level's plaintexts cannot carry it.
+    AssertTrue(target_scale <= std::ldexp(1.0, 62),
+               "EvalMod: the polynomial's scale ran away to 2^" +
+                   std::to_string(std::log2(target_scale)) + " at level " +
+                   std::to_string(start_level - i - 1) +
+                   "; every EvalMod level must rescale by (about) the "
+                   "start scale's width");
   }
 
   mod_functions_.emplace_back(boot_param.mod_coefficients_, start_level,

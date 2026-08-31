@@ -51,7 +51,17 @@ total_main = m_land + 2 * NE + 2 * main_levels
 spare30 = [i for i in lo30 if i >= peak and not (first29 <= i < first29 + 16)]
 spare_needed = total_main - (peak + 16)
 assert len(spare30) >= spare_needed, "not enough spare 30-bit primes"
-new_main = main[:peak] + main[first29:first29 + 16] + [main[i] for i in spare30[:spare_needed]]
+# The EvalMod ladder must rescale by the SAME width at every level it runs
+# its polynomial on: EvalMod's scale recursion s <- s^2 / prod has the
+# rescale width as its fixed point, and a 60-bit level at the TOP with
+# 58-bit levels below sends it 2^60 -> 2^62 -> 2^66 -> 2^74 -> 2^90 and
+# annihilates the output (measured on the first land13c2e9). So the extra
+# EvalMod primes (NE > 8, two 30-bit spares a level) go at the BOTTOM of
+# the ladder, where the K = 16 junction landings already ride 59/60-bit
+# levels, and the 16 29-bit primes sit above them under CoeffToSlot.
+extra = 2 * (NE - 8)
+spares = [main[i] for i in spare30[:spare_needed]]
+new_main = main[:peak] + spares[:extra] + main[first29:first29 + 16] + spares[extra:]
 assert len(new_main) == total_main
 new_term = term[:]
 
