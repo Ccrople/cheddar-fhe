@@ -170,5 +170,6 @@
     0,
     0
   ],
-  "conjugate_invariant": true
+  "conjugate_invariant": true,
+  "num_double_angle": 4
 }

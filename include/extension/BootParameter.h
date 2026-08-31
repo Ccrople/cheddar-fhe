@@ -36,8 +36,18 @@ struct BootParameter {
    * the linear phase's working range and only a couple of them are used.
    * Slack D moves the whole conversion down by D and the linear phase with it.
    */
+  /**
+   * @param num_double_angle EvalMod's double-angle count r: the sine is
+   *        approximated over `initial_K * 2^r` wrap-arounds, one level per
+   *        doubling, and the mod polynomial's leading factor follows it. 0
+   *        takes `CHEDDAR_BOOT_DOUBLE_ANGLE` (default 3, K = 16); 4 is K = 32,
+   *        what the module-sparse secret's wrap-around wants (Doing.md 3.9),
+   *        and a preset carries it as `num_double_angle` so that two rings in
+   *        one process can differ.
+   */
   BootParameter(int max_level, int num_cts_levels, int num_stc_levels,
-                int log_message_ratio = 5, int num_slack_levels = 0);
+                int log_message_ratio = 5, int num_slack_levels = 0,
+                int num_double_angle = 0);
 
   const int max_level_;
   const int num_cts_levels_;

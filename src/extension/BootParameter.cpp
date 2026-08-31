@@ -55,14 +55,17 @@ std::vector<double> ScaledModCoefficients(int num_double_angle) {
 
 BootParameter::BootParameter(int max_level, int num_cts_levels,
                              int num_stc_levels, int log_message_ratio /* = 5*/,
-                             int num_slack_levels /* = 0*/)
+                             int num_slack_levels /* = 0*/,
+                             int num_double_angle /* = 0*/)
     : max_level_{max_level},
       num_cts_levels_{num_cts_levels},
       num_stc_levels_{num_stc_levels},
       num_slack_levels_{num_slack_levels},
       log_message_ratio_{log_message_ratio},
-      mod_coefficients_{ScaledModCoefficients(DoubleAngleCount())},
-      num_double_angle_{DoubleAngleCount()},
+      mod_coefficients_{ScaledModCoefficients(
+          num_double_angle > 0 ? num_double_angle : DoubleAngleCount())},
+      num_double_angle_{num_double_angle > 0 ? num_double_angle
+                                             : DoubleAngleCount()},
       initial_K_{2} {}
 
 int BootParameter::GetNumEvalModLevels() const {

@@ -91,12 +91,16 @@ print(f"L{LAND} t={t_land} [{kind}]: max={max_level} climb#Q={total_main+NT} "
       f"logQP={logQP:.0f} EvalMod={[round(x) for x in em]} CtS={[round(x) for x in ct]} "
       f"{'OK' if ok else 'BAD'}")
 if not ok: sys.exit(1)
-json.dump({"log_degree": j["log_degree"], "log_default_scale": j["log_default_scale"],
+out = {"log_degree": j["log_degree"], "log_default_scale": j["log_default_scale"],
            "boot": True, "dense_hamming_weight": j["dense_hamming_weight"],
            "sparse_hamming_weight": j["sparse_hamming_weight"], "num_cts_levels": NUM_CTS,
            "num_stc_levels": j["num_stc_levels"], "terminal_primes": new_term,
            "main_primes": new_main, "auxiliary_primes": aux,
            "default_encryption_level": LAND, "level_config": new_lc,
-           "additional_base": j.get("additional_base", [0, 0]), "conjugate_invariant": True},
-          open(OUT, "w"), indent=2)
+           "additional_base": j.get("additional_base", [0, 0]), "conjugate_invariant": True}
+# EvalMod's double-angle count is pinned in the preset when it is not the
+# process default: NE = 5 (the degree-30 polynomial) + r.
+if NE != 8:
+    out["num_double_angle"] = NE - 5
+json.dump(out, open(OUT, "w"), indent=2)
 print(f"LANDING={LAND}")

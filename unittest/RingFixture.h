@@ -103,11 +103,15 @@ struct Ring {
 #ifdef ENABLE_EXTENSION
     const bool enable_boot = j.contains("boot") && bool(j["boot"]);
     if (enable_boot) {
+      // A preset may pin EvalMod's double-angle count (`num_double_angle`:
+      // 4 is K = 32 on nine EvalMod levels); otherwise the process default.
+      const int num_double_angle =
+          j.contains("num_double_angle") ? int(j["num_double_angle"]) : 0;
       context = cheddar::BootContext<word>::Create(
           *param, cheddar::BootParameter(param->max_level_,
                                          int(j["num_cts_levels"]),
                                          int(j["num_stc_levels"]), 5,
-                                         boot_slack_levels));
+                                         boot_slack_levels, num_double_angle));
     } else {
       context = cheddar::Context<word>::Create(*param);
     }
