@@ -90,6 +90,12 @@ class LinearTransform {
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 
+  /// Residency of the compiled plaintexts; see `HoistHandler::Unstage`.
+  void Unstage() const { hoist_.Unstage(); }
+  void Stage() const { hoist_.Stage(); }
+  bool IsOnDevice() const { return hoist_.IsOnDevice(); }
+  size_t PlaintextBytes() const { return hoist_.PlaintextBytes(); }
+
   void Evaluate(ConstContextPtr<word> context, Ct &res, const Ct &input,
                 const EvkMap<word> &evk_map, bool min_ks = false) const;
 

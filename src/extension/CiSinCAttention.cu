@@ -14,6 +14,7 @@
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/ChebyshevFit.h"
+#include "extension/Profile.h"
 #include "extension/StripedMatrix.h"
 
 namespace cheddar {
@@ -112,6 +113,31 @@ CiSinCAttention<word>::CiSinCAttention(
   conv_k_ = MakeConverter("k", /*inverse_level=*/-1, layout, &pre_k_);
   conv_pv_ = MakeConverter("pv", cfg_.inverse_level, layout,
                            /*premap=*/nullptr);
+
+  // THE CONVERTERS' RESIDENCY (Doing.md 3.9). Each is read once a layer (pv
+  // twice) and is the largest object the leg owns, so `host` takes q and k
+  // off the device between uses and `host_all` pv too; the plaintexts come
+  // back through `HoldConverter` for the use and go again after it.
+  {
+    const char *env = std::getenv("CHEDDAR_CONVERTER_RESIDENCY");
+    const std::string mode = (env != nullptr) ? env : "";
+    converter_residency_ = (mode == "host") ? 1 : (mode == "host_all") ? 2 : 0;
+    if (converter_residency_ != 0) {
+      size_t bytes = 0;
+      for (const auto *c : {conv_q_.get(), conv_k_.get(), conv_pv_.get()}) {
+        if (!Staged(*c)) continue;
+        for (const auto *t : {c->GetForward(), c->GetInverse()}) {
+          if (t != nullptr) bytes += t->PlaintextBytes();
+        }
+        HoldConverter(*c, /*on_device=*/false);
+      }
+      if (cfg_.verbose) {
+        std::cout << "CiSinCAttention: converter residency " << mode << ", "
+                  << (bytes >> 20) << " MiB of plaintexts staged to host memory"
+                  << std::endl;
+      }
+    }
+  }
 
   // The 63-diagonal token/head exchange (1.5by), window convention: the
   // negative offsets 127 * [-31, 31] pass DetermineStride's wrap wall as
@@ -482,9 +508,32 @@ std::vector<Ciphertext<word>> CiSinCAttention<word>::VCall(
 }
 
 template <typename word>
+bool CiSinCAttention<word>::Staged(const CiSinCConverter<word> &conv) const {
+  if (converter_residency_ == 0) return false;
+  if (&conv == conv_pv_.get()) return converter_residency_ == 2;
+  return true;
+}
+
+template <typename word>
+void CiSinCAttention<word>::HoldConverter(const CiSinCConverter<word> &conv,
+                                          bool on_device) const {
+  if (!Staged(conv)) return;
+  NvtxScope _n(on_device ? "attn: stage a converter" : "attn: unstage a converter");
+  for (const auto *t : {conv.GetForward(), conv.GetInverse()}) {
+    if (t == nullptr) continue;
+    if (on_device) {
+      t->Stage();
+    } else {
+      t->Unstage();
+    }
+  }
+}
+
+template <typename word>
 void CiSinCAttention<word>::Convert(const CiSinCConverter<word> &conv,
                                     std::vector<Ct> &cts,
                                     const EvkMap<word> &evk) const {
+  HoldConverter(conv, /*on_device=*/true);
   for (auto &ct : cts) {
     Ct at_level;
     boot_->LevelDown(at_level, ct, cfg_.forward_level);
@@ -492,6 +541,7 @@ void CiSinCAttention<word>::Convert(const CiSinCConverter<word> &conv,
     conv.SlotToSinC(switch_ctx_, sinc, at_level, evk);
     ct = std::move(sinc);
   }
+  HoldConverter(conv, /*on_device=*/false);
 }
 
 template <typename word>
@@ -524,9 +574,11 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
   }
   res.clear();
   res.resize(layout.num_cts);
+  HoldConverter(*conv_pv_, /*on_device=*/true);
   for (int bi = 0; bi < layout.num_cts; bi++) {
     conv_pv_->SinCToSlot(switch_ctx_, res[bi], acc[bi], *keys.swtch);
   }
+  HoldConverter(*conv_pv_, /*on_device=*/false);
 }
 
 template <typename word>
@@ -820,9 +872,11 @@ void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
   ExchangeAll(v_a, *keys.boot);
   // P's own ciphertexts are the two calls' lhs halves verbatim (1.5bw).
   std::vector<Ct> p_sinc(layout.num_cts);
+  HoldConverter(*conv_pv_, /*on_device=*/true);
   for (int bi = 0; bi < layout.num_cts; bi++) {
     conv_pv_->SlotToSinC(switch_ctx_, p_sinc[bi], p[bi], *keys.swtch);
   }
+  HoldConverter(*conv_pv_, /*on_device=*/false);
   ChainAndReturn(res, p_sinc, v_a, /*rhs_is_k=*/false, keys);
 }
 

@@ -47,7 +47,13 @@ class HoistHandler {
   constexpr static int max_log_beta_ = 4;
   constexpr static int max_log_bs_ = 7;
 
-  std::map<int, std::map<int, Pt>> hoist_pt_map_;
+  // `mutable`: residency (`Stage`/`Unstage`) is not a logical change to the
+  // transform, and every reader of the map is const.
+  mutable std::map<int, std::map<int, Pt>> hoist_pt_map_;
+  // The plaintexts' host copies, in map order, filled by the first `Unstage`
+  // and kept: a transform that is unstaged twice copies down once.
+  mutable std::vector<HostVector<word>> host_pts_;
+  mutable bool on_device_ = true;
 
   // initialization-related methods
   void ExtractBSIndices(const PlainHoistMap &hoist_map);
@@ -132,6 +138,24 @@ class HoistHandler {
   const std::map<int, std::map<int, Pt>> &GetPlaintexts() const {
     return hoist_pt_map_;
   }
+
+  /**
+   * @brief Move the compiled plaintexts off the device into host memory,
+   * keeping everything else, and bring them back.
+   *
+   * A transform that is read once a layer -- the attention leg's three
+   * converters, 15.3 GiB of plaintexts on ci16_35 -- need not stand on the
+   * device between its uses: `Unstage` copies every diagonal down (once; the
+   * host copies are kept) and frees the device buffers, `Stage` allocates
+   * and copies them back. `Evaluate` on an unstaged handler is an error.
+   * Both are const because residency is not a logical change; the leg's
+   * `StageOperands` is the same idea for the projection weights.
+   */
+  void Unstage() const;
+  void Stage() const;
+  bool IsOnDevice() const { return on_device_; }
+  /// Bytes the plaintexts occupy on the device when staged.
+  size_t PlaintextBytes() const;
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 

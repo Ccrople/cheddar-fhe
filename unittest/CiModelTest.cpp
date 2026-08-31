@@ -428,6 +428,35 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
 
   MemRow("setup: + the FFN ring (its UserInterface) and the ModPack keys");
+
+  // ---- the FFN ring's boot tables and keys, BEFORE the converters -----------
+  // Compiling a ring's native tables peaks ~19 GiB above what it keeps (69.8
+  // GiB measured against 50.7 live once the converters and the attention keys
+  // stood); done here the peak lands on an emptier card.
+  if (!ffn_own_ring) {
+    // The same ring as the leg's: the ModPack keys were prepared through the
+    // leg's UserInterface, so this Context needs the narrow basis they use.
+    boot_ffn.context->PrepareNarrowKeySwitch(kPcmmLevel, pack_aux);
+  }
+  fctx->PrepareEvalMod();
+  // The native CtS/StC tables: donated by the leg's Context when the two
+  // share a ring (the tables are encoded against the primes), compiled here
+  // otherwise.
+  fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
+                              ffn_own_ring ? nullptr : bctx.get());
+  {
+    EvkRequest req;
+    fctx->AddRequiredRotations(req, num_slots, min_ks);
+    fui.PrepareRotationKey(req);
+  }
+  if (kModule && ffn_own_ring) {
+    // On the module basis this Context crosses through HalfBootModule, whose
+    // CoeffToSlot is the CiModuleBasis; its native CtS tables are never read
+    // and the seam's native StC is all it keeps.
+    fctx->ReleaseCtS(num_slots);
+  }
+
+  MemRow("setup: + the FFN ring's EvalMod, native StC (CtS released) and boot rotation keys");
   // THE CROSSING CONSTANT, DERIVED. `HalfBoot` multiplies the message by
   // `level_zero_scale / q0`; `BootContext` computes it exactly and the leg's
   // `restore` is its inverse. Every earlier test measured this by decrypting a
@@ -513,31 +542,6 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   keys.ring_switch = &swtch->ui->GetRingSwitchKey(layout.rank);
   keys.inverse_ring_switch = &swtch->ui->GetInverseRingSwitchKey(layout.rank);
 
-  // ---- the FFN's Context, and the layer ------------------------------------
-  if (!ffn_own_ring) {
-    // The same ring as the leg's: the ModPack keys were prepared through the
-    // leg's UserInterface, so this Context needs the narrow basis they use.
-    boot_ffn.context->PrepareNarrowKeySwitch(kPcmmLevel, pack_aux);
-  }
-  fctx->PrepareEvalMod();
-  // The native CtS/StC tables: donated by the leg's Context when the two
-  // share a ring (the tables are encoded against the primes), compiled here
-  // otherwise.
-  fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
-                              ffn_own_ring ? nullptr : bctx.get());
-  {
-    EvkRequest req;
-    fctx->AddRequiredRotations(req, num_slots, min_ks);
-    fui.PrepareRotationKey(req);
-  }
-  if (kModule && ffn_own_ring) {
-    // On the module basis this Context crosses through HalfBootModule, whose
-    // CoeffToSlot is the CiModuleBasis; its native CtS tables are never read
-    // and the seam's native StC is all it keeps.
-    fctx->ReleaseCtS(num_slots);
-  }
-
-  MemRow("setup: + the FFN ring's EvalMod, native StC (CtS released) and boot rotation keys");
   typename cheddar::CiLlamaLayer<word>::Config lcfg;
   lcfg.num_tokens = kT;
   lcfg.proj_rank = kRank;

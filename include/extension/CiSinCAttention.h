@@ -315,6 +315,17 @@ class CiSinCAttention {
   CiSwitchedCcmmHandler<word> ccmm_;
   std::vector<int> pre_q_, pre_k_;
   std::unique_ptr<CiSinCConverter<word>> conv_q_, conv_k_, conv_pv_;
+  //! `CHEDDAR_CONVERTER_RESIDENCY`: which converters stand on the device
+  //! between their uses. 0 = all three (15.3 GiB of plaintexts on ci16_35);
+  //! 1 = "host": q and k are staged from host memory around their one use a
+  //! layer and pv stays (it is read twice); 2 = "host_all": all three are
+  //! staged. A staged converter costs its plaintexts' host-to-device copy
+  //! per use (~5 GiB each) and no device memory in between.
+  int converter_residency_ = 0;
+  bool Staged(const CiSinCConverter<word> &conv) const;
+  //! Put a staged converter's plaintexts on the device (`on_device`) or take
+  //! them off; a no-op for a resident one.
+  void HoldConverter(const CiSinCConverter<word> &conv, bool on_device) const;
   std::vector<LinearTransform<word>> exchange_;  // zero or one entry
 
   // The transport's plaintexts: 4 x (cos, sin, -sin) shared by Q and K,

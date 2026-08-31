@@ -238,6 +238,65 @@ __global__ void GSFusedComplexKernel(
 }  // namespace kernel
 
 template <typename word>
+size_t HoistHandler<word>::PlaintextBytes() const {
+  size_t n = 0;
+  if (on_device_) {
+    for (const auto &[_, pt_map] : hoist_pt_map_) {
+      for (const auto &[__, pt] : pt_map) n += pt.mx_.size();
+    }
+  } else {
+    for (const auto &h : host_pts_) n += h.size();
+  }
+  return n * sizeof(word);
+}
+
+template <typename word>
+void HoistHandler<word>::Unstage() const {
+  if (!on_device_) return;
+  const bool first = host_pts_.empty();
+  size_t i = 0;
+  for (auto &[_, pt_map] : hoist_pt_map_) {
+    for (auto &[__, pt] : pt_map) {
+      if (first) {
+        host_pts_.emplace_back();
+        CopyDeviceToHost(host_pts_.back(), pt.mx_);
+      } else {
+        AssertTrue(i < host_pts_.size() &&
+                       host_pts_[i].size() == static_cast<size_t>(pt.mx_.size()),
+                   "HoistHandler::Unstage: the host copies do not match the "
+                   "plaintexts");
+      }
+      i++;
+    }
+  }
+  // The copies are asynchronous; nothing may free the source before they
+  // land. Then a move-assigned empty vector rather than `resize(0)`: rmm's
+  // resize is free to keep the allocation, and the point is to give it back.
+  cudaStreamSynchronize(cudaStreamLegacy);
+  for (auto &[_, pt_map] : hoist_pt_map_) {
+    for (auto &[__, pt] : pt_map) pt.mx_ = DeviceVector<word>(0);
+  }
+  on_device_ = false;
+}
+
+template <typename word>
+void HoistHandler<word>::Stage() const {
+  if (on_device_) return;
+  size_t i = 0;
+  for (auto &[_, pt_map] : hoist_pt_map_) {
+    for (auto &[__, pt] : pt_map) {
+      AssertTrue(i < host_pts_.size(),
+                 "HoistHandler::Stage: no host copy for a plaintext");
+      pt.mx_ = DeviceVector<word>(static_cast<int>(host_pts_[i].size()));
+      CopyHostToDevice(pt.mx_, host_pts_[i]);
+      i++;
+    }
+  }
+  cudaStreamSynchronize(cudaStreamLegacy);
+  on_device_ = true;
+}
+
+template <typename word>
 void HoistHandler<word>::ExtractBSIndices(const PlainHoistMap &hoist_map) {
   for (const auto &[_, bs_map] : hoist_map) {
     for (const auto &[bs_idx, _] : bs_map) {
