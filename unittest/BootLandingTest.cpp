@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "extension/CiModuleBasis.h"
 
 namespace {
 
@@ -256,4 +257,92 @@ TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
   EXPECT_LT(f.residual, 0.01)
       << "the crossed-and-bootstrapped message did not survive; either the "
          "crossing was not keyless or the landing ladder is wrong";
+}
+
+// (3) The layer's OTHER crossing op on the landing ladder: `HalfBootModule`
+// (Doing.md 3.5-3.7) reads the MODULE coordinates of the coefficient image
+// through `CiModuleBasis`'s CoeffToSlot -- in the ladder's own CtS level count,
+// which for a `*c2` preset (gen_landing.py's 4th argument) is the two-level
+// real form. Coefficients in at level 0, the module coordinates out in the
+// slots at the landing, times the crossing constant. Needs the SSE secret
+// sampled in the module basis, which this test sets unless given.
+TEST(BootLanding, HalfBootModuleLandsTheModuleCoordinates) {
+  setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
+  Ring land(LandParam());
+  auto b = PrepareBoot(land);
+  const int n = land.param->MaxNumSlots();
+  const int T = 128;
+  const int k = n / T;
+  const int cts_levels = b->GetBootParameter().num_cts_levels_;
+  typename cheddar::CiModuleBasis<word>::Phases ph;
+  if (cts_levels == 2) {
+    ph.cts_twist = {9};
+    ph.cts_small = {7};
+  } else if (cts_levels == 3) {
+    ph.cts_twist = {9};
+    ph.cts_small = {4, 3};
+  } else {
+    ASSERT_EQ(cts_levels, 4);
+    ph.cts_twist = {5, 4};
+    ph.cts_small = {4, 3};
+  }
+  cheddar::CiModuleBasis<word> basis(land.context, T, /*stc_level=*/-1,
+                                     b->GetBootParameter().GetCtSStartLevel(),
+                                     ph, 1.0, n * b->GetCtSConst());
+  {
+    EvkRequest req;
+    basis.AddRequiredRotations(req, MinKs());
+    land.ui->PrepareRotationKey(req);
+  }
+  std::cout << "[module] " << LandParam() << ": climb to "
+            << b->GetBootParameter().GetMaxLevel() << " ("
+            << LimbsAt(land, b->GetBootParameter().GetMaxLevel())
+            << " limbs), module CtS " << basis.GetCtSNumLevels()
+            << " levels from " << basis.GetCtSLevel() << ", HalfBoot lands "
+            << b->GetBootParameter().GetEvalModEndLevel() << std::endl;
+
+  // Random module coordinates at the FFN's ride, and their native image
+  // `r[t k + i] = x_i[t] + [i != 0] x_{k-i}[t+1]` (what ModPack emits).
+  std::mt19937_64 gen(0x3D01);
+  std::uniform_real_distribution<double> d(-0.2, 0.2);
+  std::vector<double> x(static_cast<size_t>(n));  // flat = t * k + i
+  for (auto &v : x) v = d(gen);
+  std::vector<double> image(static_cast<size_t>(n), 0.0);
+  for (int t = 0; t < T; t++) {
+    for (int i = 0; i < k; i++) {
+      double v = x[static_cast<size_t>(t) * k + i];
+      if (i != 0 && t + 1 < T) v += x[static_cast<size_t>(t + 1) * k + (k - i)];
+      image[static_cast<size_t>(t) * k + i] = v;
+    }
+  }
+  Plaintext<word> pt;
+  land.context->encoder_.EncodeCoeff(pt, 0, land.param->GetScale(0), image);
+  Ciphertext<word> ct;
+  land.ui->Encrypt(ct, pt);
+  ct.SetNumSlots(n);
+
+  Ciphertext<word> res;
+  b->HalfBootModule(res, ct, land.ui->GetEvkMap(), basis);
+  EXPECT_EQ(land.param->NPToLevel(res.GetNP()),
+            b->GetBootParameter().GetEvalModEndLevel());
+  const auto got = Decrypt(land, res);
+  // Slot s carries module coordinate BitReverse(s); the message rides the
+  // crossing constant, which `GetMessageRatio` states exactly.
+  std::vector<Complex> want(static_cast<size_t>(n));
+  double absmax = 0.0;
+  for (int s = 0; s < n; s++) {
+    want[s] = Complex(x[basis.ModuleIndexOfSlot(s)], 0.0);
+    absmax = std::max(absmax, std::abs(want[s].real()));
+  }
+  const Fit f = FitResidual(want, got);
+  std::cout << "[module] HalfBootModule carried " << f.carried
+            << " against the derived " << b->GetMessageRatio()
+            << " (fit/derived " << f.carried / b->GetMessageRatio()
+            << "), residual " << f.residual << " on |x| <= " << absmax
+            << " = 2^" << std::log2(f.residual / absmax) << std::endl;
+  EXPECT_NEAR(f.carried / b->GetMessageRatio(), 1.0, 5e-3)
+      << "the module HalfBoot does not carry the crossing constant";
+  EXPECT_LT(f.residual / absmax, 2e-3)
+      << "the module coordinates did not survive the landing ladder's "
+         "HalfBootModule";
 }

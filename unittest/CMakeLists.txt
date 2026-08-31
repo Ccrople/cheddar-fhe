@@ -450,6 +450,17 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19.json COPYONLY)
 # The clean-landing sub-ladders of ci16_35 (gen_landing.py); boot_landing_test
 # defaults to land13 and reaches the others via CHEDDAR_LAND_PARAM.
+# The same ladders with TWO CoeffToSlot levels (gen_landing.py's 4th argument):
+# the module-basis CtS in its two-level real form (Doing.md 3.6/3.7), for the
+# feed-forward's BootContext.
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c2.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15c2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15c2.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19c2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19c2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

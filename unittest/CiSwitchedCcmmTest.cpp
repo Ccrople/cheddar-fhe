@@ -679,13 +679,19 @@ TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
     boot.context->encoder_.DecodeCoeff(coeffs, out);
     double magnitude = 0.0;
     for (double c : coeffs) magnitude = std::max(magnitude, std::abs(c));
-    std::cout << "  the hoist zone on ci16_35 at level 3: |output| "
-              << magnitude << " (mod-Q noise; clean would be O(1))"
-              << std::endl;
-    EXPECT_GT(magnitude, 1e3)
-        << "the hoisted conversion on ci16_35's alpha-12 basis came back "
-           "clean -- the 1.5x zone moved; revisit where the conversions "
-           "live";
+    // THE ZONE IS CLOSED. `Hoist.cu`'s baby-step dispatch had no branch for
+    // `num_accum == 1` and launched nothing, so a hoisted transform below
+    // level 7 on this alpha-12 basis returned whatever memory it was handed
+    // (Doing.md 1.1/1.5bt); this block used to pin that as the regression.
+    // With the padded count starting at one the same conversion comes back
+    // clean, and a conversion that does not is the dispatch again.
+    std::cout << "  the former hoist zone on ci16_35 at level 3: |output| "
+              << magnitude << " (clean is O(1); the missing num_accum == 1 "
+              << "branch gave mod-Q noise)" << std::endl;
+    EXPECT_LT(magnitude, 10.0)
+        << "the hoisted conversion on ci16_35's alpha-12 basis at level 3 "
+           "came back as mod-Q noise -- the num_accum == 1 dispatch in "
+           "Hoist.cu is missing again";
   }
 
   const RealBatch a = SampleBatch(layout.lanes, layout.dim, layout.dim,

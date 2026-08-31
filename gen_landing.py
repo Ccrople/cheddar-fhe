@@ -21,6 +21,9 @@
 # and full Boot available).
 import json, math, sys
 SRC, LAND, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+# Optional 4th argument: CoeffToSlot levels (default 4, the native CtS; 2 is the
+# module-basis CtS in its two-level real form, Doing.md 3.6/3.7).
+NUM_CTS_ARG = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 j = json.load(open(SRC, encoding="utf-8"))
 main, term, aux = j["main_primes"], j["terminal_primes"], j["auxiliary_primes"]
 lc = [tuple(x) for x in j["level_config"]]
@@ -28,7 +31,7 @@ bits = lambda p: math.log2(p)
 sizes = [round(bits(p)) for p in main]
 b29 = [i for i, s in enumerate(sizes) if s == 29]
 lo30 = [i for i, s in enumerate(sizes) if s == 30]
-NE, NUM_CTS, NT = 8, 4, len(term)
+NE, NUM_CTS, NT = 8, NUM_CTS_ARG, len(term)
 first29 = b29[0]
 assert len(b29) == 2 * NE
 assert 5 <= LAND <= 19, "landing must be in [5,19] (below 5 no room to compute; " \

@@ -72,10 +72,13 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
   AssertTrue(rev_level_ - 1 >= stc_level,
              "CiLlamaSeam: the seam has to leave the ciphertext at StC's own "
              "level");
-  // 1.5bt's zone, asserted rather than remembered: a LinearTransform is a
-  // hoisted transform and ci16_35 returns 1e25..1e47 below level 7.
-  AssertTrue(t2_level_ > 7,
-             "CiLlamaSeam: the seam runs inside the num_accum == 1 zone");
+  // 1.5bt's zone used to be asserted here (`t2_level_ > 7`): a hoisted
+  // transform below level 7 on ci16_35 returned 1e25..1e47, because
+  // `Hoist.cu`'s baby-step dispatch had no branch for `num_accum == 1`. That
+  // branch exists now and the zone with it; what is left is the arithmetic
+  // the levels need.
+  AssertTrue(t2_level_ >= 2,
+             "CiLlamaSeam: the seam needs its stages above level 1");
 
   const int dim = layout_.dim;
   const int cols = layout_.rank;
