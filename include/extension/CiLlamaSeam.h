@@ -135,6 +135,13 @@ class CiLlamaSeam {
     //! changes only how many diagonals and levels the same map costs.
     std::vector<std::vector<std::pair<int, int>>> t1_stages = {
         {{11, 0}}, {{10, 1}}, {{9, 2}, {8, 3}, {6, 5}, {7, 4}}};
+    //! THE MODULE BASIS (Doing.md 3.7 step 3). One booted ciphertext becomes
+    //! ONE dense coefficient image: T1 over all 32 lanes (channel
+    //! `rev4(col) * 32 + rev5(lane)`, the same three stages, no half taken
+    //! out), the token reversal, and the schedule's MODULE StC. T2 -- the
+    //! duplicates -- does not exist, and the ladder is one level shorter.
+    //! `PrepareHalf` then takes only half 0, which is the whole ciphertext.
+    bool module_basis = false;
     bool verbose = false;
   };
 

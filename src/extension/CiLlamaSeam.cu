@@ -61,7 +61,9 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
   // the same constants were once correct and then silently wrong when the
   // slack moved, and the symptom was coefficients at 4.99e+47.
   rev_level_ = stc_level + 1;
-  t2_level_ = rev_level_ + 1;
+  // No T2 on the module basis: the reversal is the last stage before StC and
+  // T1 sits directly above it.
+  t2_level_ = cfg_.module_basis ? rev_level_ : rev_level_ + 1;
   t1_top_ = t2_level_ + static_cast<int>(cfg_.t1_stages.size());
 
   AssertTrue(t1_top_ <= context_->param_.max_level_,
@@ -90,7 +92,7 @@ CiLlamaSeam<word>::CiLlamaSeam(ConstContextPtr<word> context,
   };
 
   // ---- T2: the duplicates ------------------------------------------------
-  {
+  if (!cfg_.module_basis) {
     StripedMatrix m2(degree_, degree_);
     for (int col = 0; col < cols; col++) {
       for (int lh = 0; lh < lanes_per_half; lh++) {
@@ -225,6 +227,7 @@ template <typename word>
 void CiLlamaSeam<word>::AddRequiredRotations(EvkRequest &req) const {
   rev_.transform->AddRequiredRotations(req);
   req.AddRequest(rev_.back, rev_level_ - 1);
+  if (cfg_.module_basis) return;
   t2_.transform->AddRequiredRotations(req);
   req.AddRequest(t2_.back, t2_level_ - 1);
   // The live half is brought onto the duplicates' level with a constant
@@ -236,12 +239,18 @@ void CiLlamaSeam<word>::AddRequiredRotations(EvkRequest &req) const {
 template <typename word>
 void CiLlamaSeam<word>::PrepareHalf(int half) {
   AssertTrue(half == 0 || half == 1, "CiLlamaSeam: half must be 0 or 1");
+  AssertTrue(!cfg_.module_basis || half == 0,
+             "CiLlamaSeam: on the module basis one booted ciphertext is one "
+             "dense image -- there is only half 0");
   DropHalf();
 
   const int dim = layout_.dim;
   const int cols = layout_.rank;
   const int lanes = layout_.lanes;
-  const int lanes_per_half = lanes / 2;
+  // On the module basis every lane of the ciphertext lands in the one image:
+  // the "half" is the whole, and T1's 12-bit reversal puts `rev5(lane)` in
+  // the channel's low five bits with nothing taken out.
+  const int lanes_per_half = cfg_.module_basis ? lanes : lanes / 2;
   const int log_lanes = Log2Ceil(lanes);
   auto slot_chain = [&](int row, int col, int lane) {
     return Rev(col, log_cols_) * (dim * lanes) + Rev(row, log_dim_) * lanes +
@@ -273,7 +282,8 @@ void CiLlamaSeam<word>::PrepareHalf(int half) {
       int y = cur[e];
       for (const auto &sw : cfg_.t1_stages[st]) y = SwapBits(y, sw.first, sw.second);
       // The last transposition puts `half` at the destination's token field,
-      // where the packing wants a zero.
+      // where the packing wants a zero. (Nothing to take out on the module
+      // basis: `half` is 0 and the lane's fifth bit is a channel bit.)
       if (last) y -= dim * half;
       mid[e] = y;
       const int off = ((cur[e] - y) % degree_ + degree_) % degree_;
@@ -346,6 +356,19 @@ void CiLlamaSeam<word>::Apply(Ct &res, const Ct &booted,
     Ct next;
     RunStage(next, live, st, evk);
     live = std::move(next);
+  }
+
+  if (cfg_.module_basis) {
+    // No duplicates to make: reverse the token field and hand the dense
+    // slot image to the MODULE StC, whose module coordinates are then the
+    // (channel, position) image `ModDecomp` reads clean.
+    AssertTrue(sched.GetModuleBasis() != nullptr,
+               "CiLlamaSeam: a module-basis seam needs a schedule that "
+               "reads the module basis");
+    Ct flipped;
+    RunStage(flipped, live, rev_, evk);
+    sched.ToCoeff(res, flipped, evk, min_ks);
+    return;
   }
 
   // The duplicates come off T1's output directly: T2 carries the token step

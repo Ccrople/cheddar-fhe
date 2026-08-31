@@ -552,7 +552,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
   // Both seam halves' rotations up front: the stages themselves are built per
   // half inside the loop, but their keys are the same set every layer.
-  for (int half = 0; half < 2; half++) {
+  for (int half = 0; half < (kModule ? 1 : 2); half++) {
     layer.PrepareSeamHalf(half);
     EvkRequest req;
     layer.AddSeamHalfRotations(req);
@@ -1570,8 +1570,18 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                 << in_mx << std::endl;
     }
     attn_out.clear();
-    std::vector<Ciphertext<word>> h_cts(2 * layout.num_cts);
-    for (int half = 0; half < 2; half++) {
+    // THE SEAM'S IMAGES: two half-density ones per booted ciphertext on the
+    // banded image, one dense one on the module basis (Doing.md 3.7 step 3,
+    // T2 gone). `seam_ct`/`seam_chan` state where (bi, col, lane) lands.
+    const int seam_halves = kModule ? 1 : 2;
+    auto seam_ct = [&](int bi, int lane) {
+      return kModule ? bi : 2 * bi + lane / 16;
+    };
+    auto seam_chan = [&](int col, int lane) {
+      return Rev(col, 4) * 32 + Rev(kModule ? lane : lane % 16, 5);
+    };
+    std::vector<Ciphertext<word>> h_cts(seam_halves * layout.num_cts);
+    for (int half = 0; half < seam_halves; half++) {
       // T1's three stages are compiled per half and dropped, so this is one
       // more piece of per-layer preparation sitting inside an online row --
       // the same stages every layer, held apart only because each is the
@@ -1580,7 +1590,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       layer.PrepareSeamHalf(half);
       seam_prep_ms += Ms(sp0, Tick());
       for (int bi = 0; bi < layout.num_cts; bi++) {
-        layer.Seam(h_cts[bi * 2 + half], booted[bi], fevk);
+        layer.Seam(h_cts[bi * seam_halves + half], booted[bi], fevk);
       }
     }
     layer.DropSeamHalf();
@@ -1613,8 +1623,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       for (int bi = 0; bi < layout.num_cts; bi++) {
         for (int col = 0; col < layout.rank; col++) {
           for (int lane = 0; lane < layout.lanes; lane++) {
-            const int k = 2 * bi + lane / 16;
-            const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+            const int k = seam_ct(bi, lane);
+            const int cc = seam_chan(col, lane);
             const int head = Rev(lane, 5);
             const int chan = bi * layout.rank + col;
             for (int t = kSinkTokens; t < kT; t++) {
@@ -1633,8 +1643,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       for (int bi = 0; bi < layout.num_cts; bi++) {
         for (int col = 0; col < layout.rank; col++) {
           for (int lane = 0; lane < layout.lanes; lane++) {
-            const int k = 2 * bi + lane / 16;
-            const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+            const int k = seam_ct(bi, lane);
+            const int cc = seam_chan(col, lane);
             const int head = Rev(lane, 5);
             const int chan = bi * layout.rank + col;
             for (int t = kSinkTokens; t < kT; t++) {
@@ -1659,7 +1669,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       // say whether the image is correctly banded -- two bands failing
       // IDENTICALLY is a read at the wrong address, not a wrong image
       // (1.5du).
-      {
+      if (!kModule) {
         std::vector<std::vector<double>> raw(h_cts.size());
         for (size_t k = 0; k < h_cts.size(); k++) {
           Plaintext<word> pt;
@@ -1670,8 +1680,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         for (int bi = 0; bi < layout.num_cts; bi++) {
           for (int col = 0; col < layout.rank; col++) {
             for (int lane = 0; lane < layout.lanes; lane++) {
-              const int k = 2 * bi + lane / 16;
-              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int k = seam_ct(bi, lane);
+              const int cc = seam_chan(col, lane);
               const int head = Rev(lane, 5);
               const int chan = bi * layout.rank + col;
               const int Id = Rev(cc, 9);
@@ -1717,8 +1727,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         for (int bi = 0; bi < layout.num_cts; bi++) {
           for (int col = 0; col < layout.rank; col++) {
             for (int lane = 0; lane < layout.lanes; lane++) {
-              const int k = 2 * bi + lane / 16;
-              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int k = seam_ct(bi, lane);
+              const int cc = seam_chan(col, lane);
               const int head = Rev(lane, 5);
               const int chan = bi * layout.rank + col;
               for (int t = kSinkTokens; t < kT; t++) {
@@ -1735,8 +1745,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         for (int bi = 0; bi < layout.num_cts; bi++) {
           for (int col = 0; col < layout.rank; col++) {
             for (int lane = 0; lane < layout.lanes; lane++) {
-              const int k = 2 * bi + lane / 16;
-              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int k = seam_ct(bi, lane);
+              const int cc = seam_chan(col, lane);
               const int head = Rev(lane, 5);
               const int chan = bi * layout.rank + col;
               for (int t = kSinkTokens; t < kT; t++) {
@@ -1777,8 +1787,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         for (int bi = 0; bi < layout.num_cts; bi++) {
           for (int col = 0; col < layout.rank; col++) {
             for (int lane = 0; lane < layout.lanes; lane++) {
-              const int k = 2 * bi + lane / 16;
-              const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+              const int k = seam_ct(bi, lane);
+              const int cc = seam_chan(col, lane);
               const int head = Rev(lane, 5);
               const int chan = bi * layout.rank + col;
               for (int t = kSinkTokens; t < kT; t++) {
@@ -1825,13 +1835,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // exactly `CiLlamaSeam`'s `chan_of` and the order `CoeffLinearLeg` numbers
     // a parent's channels in; its live row of `wo` is `head*128 + chan` with
     // head = rev5(lane), chan = bi*16 + col.
-    const int attn_declared = 2 * layout.num_cts * kRank;
+    const int attn_declared = seam_halves * layout.num_cts * kRank;
     std::vector<int> attn_map(attn_declared, -1);
     for (int bi = 0; bi < layout.num_cts; bi++) {
       for (int col = 0; col < layout.rank; col++) {
         for (int lane = 0; lane < layout.lanes; lane++) {
-          const int k = 2 * bi + lane / 16;
-          const int cc = Rev(col, 4) * 32 + Rev(lane % 16, 5);
+          const int k = seam_ct(bi, lane);
+          const int cc = seam_chan(col, lane);
           attn_map[k * kRank + cc] = Rev(lane, 5) * kD + bi * layout.rank + col;
         }
       }

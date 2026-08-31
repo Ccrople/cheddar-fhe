@@ -58,7 +58,10 @@ CiLlamaLayer<word>::CiLlamaLayer(
       cfg_{cfg},
       sched_{boot_, boot_->param_.MaxNumSlots()} {
   num_slots_ = boot_->param_.MaxNumSlots();
-  attn_channels_ = 2 * layout.num_cts * cfg_.proj_rank;
+  // The seam's images: two half-density ones per booted ciphertext on the
+  // banded image, one dense one on the module basis.
+  attn_channels_ =
+      (cfg_.module_basis ? 1 : 2) * layout.num_cts * cfg_.proj_rank;
 
   AssertTrue(cfg_.model_declared % cfg_.proj_rank == 0 &&
                  cfg_.hidden_declared % cfg_.proj_rank == 0,
@@ -147,6 +150,7 @@ CiLlamaLayer<word>::CiLlamaLayer(
 
   typename CiLlamaSeam<word>::Config scfg;
   scfg.proj_rank = cfg_.proj_rank;
+  scfg.module_basis = cfg_.module_basis;
   scfg.verbose = cfg_.verbose;
   seam_ = std::make_unique<CiLlamaSeam<word>>(boot_, layout,
                                               sched_.GetStCLevel(), scfg);
@@ -611,10 +615,10 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->LevelDown(ins[k], h_cts[k], cfg_.product_level);
     }
     std::vector<Ct> out;
-    // The seam's images are banded whichever basis the layer reads, so O
-    // reads at density 2 and writes at the layer's own.
+    // The seam's images follow the layer's basis (dense on the module basis,
+    // banded otherwise), and so does O's input density.
     Project(out, ins, attn_channels_, cfg_.model_declared, w.o, c.res_scale,
-            (w.tag + ".o").c_str(), /*in_density=*/2, GetDensity());
+            (w.tag + ".o").c_str(), GetDensity(), GetDensity());
     AssertTrue(static_cast<int>(out.size()) == num_model_cts_,
                "CiLlamaLayer: the O projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");
