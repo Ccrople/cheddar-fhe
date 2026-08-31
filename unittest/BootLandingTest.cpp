@@ -338,11 +338,27 @@ TEST(BootLanding, HalfBootModuleLandsTheModuleCoordinates) {
     absmax = std::max(absmax, std::abs(want[s].real()));
   }
   const Fit f = FitResidual(want, got);
+  // Where the residual lives: a few slots far out is EvalMod past its range
+  // (the SSE secret's wrap-around, Doing.md 3.6 -- a property of the DRAW at
+  // h = 16), every slot a little out is the transform. Both are reported.
+  int far = 0, near = 0;
+  double rms = 0.0;
+  const double ratio = b->GetMessageRatio();
+  for (int s = 0; s < n; s++) {
+    const double e = std::abs(got[s].real() - ratio * want[s].real());
+    rms += e * e;
+    if (e > 1e-4 * absmax) far++;
+    if (e > 1e-5 * absmax) near++;
+  }
+  rms = std::sqrt(rms / n);
   std::cout << "[module] HalfBootModule carried " << f.carried
-            << " against the derived " << b->GetMessageRatio()
-            << " (fit/derived " << f.carried / b->GetMessageRatio()
-            << "), residual " << f.residual << " on |x| <= " << absmax
-            << " = 2^" << std::log2(f.residual / absmax) << std::endl;
+            << " against the derived " << ratio << " (fit/derived "
+            << f.carried / ratio << "), residual " << f.residual
+            << " on |x| <= " << absmax << " = 2^"
+            << std::log2(f.residual / absmax) << ", rms 2^"
+            << std::log2(rms / absmax) << " against the derived ratio; slots "
+            << "past 1e-5: " << near << ", past 1e-4: " << far << " of " << n
+            << std::endl;
   EXPECT_NEAR(f.carried / b->GetMessageRatio(), 1.0, 5e-3)
       << "the module HalfBoot does not carry the crossing constant";
   EXPECT_LT(f.residual / absmax, 2e-3)
