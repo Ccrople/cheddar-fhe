@@ -1610,6 +1610,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       layer.PrepareSeamHalf(half);
       seam_prep_ms += Ms(sp0, Tick());
       for (int bi = 0; bi < layout.num_cts; bi++) {
+        // The Boot landed on the LEG's ring -- level 16 on ci16_35, 10 on
+        // land13 -- and the seam runs on the FFN's, whose ladder holds only
+        // ci16_35's levels 0..L: a level-16 ciphertext has no NP there
+        // ("NPInfo not found: 17 main + 4 terminal"). Bring it to the seam's
+        // input level on the ring it is on; that level is shared.
+        const int seam_in = layer.GetSeamInputLevel();
+        if (boot.param->NPToLevel(booted[bi].GetNP()) > seam_in) {
+          Ciphertext<word> down;
+          bctx->LevelDown(down, booted[bi], seam_in);
+          booted[bi] = std::move(down);
+        }
         layer.Seam(h_cts[bi * seam_halves + half], booted[bi], fevk);
       }
     }
