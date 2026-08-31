@@ -167,18 +167,19 @@ Tally Compare(const Ring &ring, const Plaintext<word> &a,
       t.other++;
       continue;
     }
+    const int64_t magnitude = d < 0 ? -d : d;
     if (d == 0) {
       t.identical++;
     } else if (d == 1) {
       t.plus_one++;
     } else if (d == -1) {
       t.minus_one++;
-    } else if (std::llabs(d) <= bound) {
+    } else if (magnitude <= bound) {
       t.within++;
     } else {
       t.other++;
     }
-    if (std::llabs(d) <= bound) t.max_abs = std::max(t.max_abs, std::llabs(d));
+    if (magnitude <= bound) t.max_abs = std::max(t.max_abs, magnitude);
   }
   return t;
 }
