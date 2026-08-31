@@ -312,11 +312,19 @@ GpuEncoder<word>::GpuEncoder(const Parameter<word> &param,
   cudaMemcpyAsync(twiddle_.data(), host.data(), host.size() * sizeof(double),
                   cudaMemcpyHostToDevice, cudaStreamLegacy);
   cudaStreamSynchronize(cudaStreamLegacy);
+  cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming);
 }
 
 template <typename word>
 GpuEncoder<word>::~GpuEncoder() {
+  WaitForStaging();
+  if (staged_ != nullptr) cudaEventDestroy(staged_);
   if (host_stage_ != nullptr) cudaFreeHost(host_stage_);
+}
+
+template <typename word>
+void GpuEncoder<word>::WaitForStaging() const {
+  if (staged_ != nullptr) cudaEventSynchronize(staged_);
 }
 
 template <typename word>
@@ -324,6 +332,7 @@ void GpuEncoder<word>::EnsureScratch(int num_slots) const {
   const size_t need = static_cast<size_t>(2) * num_slots;
   if (fft_.size() < need) fft_.resize(need, cudaStreamLegacy);
   if (host_stage_size_ < need) {
+    WaitForStaging();
     if (host_stage_ != nullptr) cudaFreeHost(host_stage_);
     cudaMallocHost(reinterpret_cast<void **>(&host_stage_),
                    need * sizeof(double));
@@ -355,6 +364,7 @@ template <typename word>
 void GpuEncoder<word>::StageMessage(const std::vector<Complex> &message,
                                     int num_slots) const {
   EnsureScratch(num_slots);
+  WaitForStaging();
   const int given = std::min(static_cast<int>(message.size()), num_slots);
   std::memcpy(host_stage_, reinterpret_cast<const double *>(message.data()),
               static_cast<size_t>(given) * 2 * sizeof(double));
@@ -373,6 +383,7 @@ template <typename word>
 void GpuEncoder<word>::StageRealMessage(const std::vector<double> &message,
                                         int num_slots) const {
   EnsureScratch(num_slots);
+  WaitForStaging();
   const int given = std::min(static_cast<int>(message.size()), num_slots);
   std::memcpy(host_stage_, message.data(),
               static_cast<size_t>(given) * sizeof(double));
@@ -386,9 +397,13 @@ void GpuEncoder<word>::StageRealMessage(const std::vector<double> &message,
 template <typename word>
 double *GpuEncoder<word>::StagingBuffer(int num_slots) const {
   EnsureScratch(num_slots);
+  WaitForStaging();
   return host_stage_;
 }
 
+// The event is recorded right behind the transfer, so that the wait before the
+// next host write is for the DMA alone and not for the kernels queued after
+// it: the encode of message n keeps running while message n+1 is staged.
 template <typename word>
 void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
   EnsureScratch(num_slots);
@@ -396,6 +411,7 @@ void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
     cudaMemcpyAsync(fft_.data(), host_stage_,
                     static_cast<size_t>(2) * num_slots * sizeof(double),
                     cudaMemcpyHostToDevice, cudaStreamLegacy);
+    cudaEventRecord(staged_, cudaStreamLegacy);
     return;
   }
   if (real_stage_.size() < static_cast<size_t>(num_slots)) {
@@ -404,6 +420,7 @@ void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
   cudaMemcpyAsync(real_stage_.data(), host_stage_,
                   static_cast<size_t>(num_slots) * sizeof(double),
                   cudaMemcpyHostToDevice, cudaStreamLegacy);
+  cudaEventRecord(staged_, cudaStreamLegacy);
   const int threads = 256;
   const int blocks = (num_slots + threads - 1) / threads;
   kernel::ExpandRealKernel<<<blocks, threads, 0, cudaStreamLegacy>>>(

@@ -238,6 +238,44 @@ class EncodeGpuTest : public Testbed<word> {
   }
 };
 
+// The pinned staging buffer is one buffer and the transfer out of it is
+// asynchronous, so a caller encoding in a loop -- every transform's diagonals
+// -- is writing message n+1 into it while message n's DMA may still be
+// reading it, unless the encoder waits. It did not wait, and nothing above
+// could see that: every other test here encodes one message and synchronises.
+// `converter_compare_test` saw it first (one plaintext of four wholly wrong on
+// ringdegree12_35), then Bootstrap/bootparam_35 at SNR 1e-6. So: sixteen
+// distinct messages encoded back to back with no synchronisation between
+// them, then each decoded and matched to its own.
+TEST_P(EncodeGpuTest, BackToBackEncodesKeepTheirOwnMessages) {
+  const int num_slots = param_->MaxNumSlots();
+  const bool ci = param_->conjugate_invariant_;
+  // Level 0: `Decode` rebuilds its CRT weights per slot, quadratic in the
+  // prime count, and sixteen of them are wanted.
+  const int level = 0;
+  const double scale = DetermineScale(level);
+  constexpr int kMessages = 16;
+  std::vector<std::vector<Complex>> messages(kMessages);
+  std::vector<Plaintext<word>> pts(kMessages);
+  for (int m = 0; m < kMessages; m++) {
+    GenerateRandomMessage(messages[m], num_slots, -1.0, 1.0, !ci);
+  }
+  for (int m = 0; m < kMessages; m++) {
+    gpu_->Encode(pts[m], level, scale, messages[m]);
+  }
+  cudaDeviceSynchronize();
+  for (int m = 0; m < kMessages; m++) {
+    std::vector<Complex> got;
+    context_->encoder_.Decode(got, pts[m]);
+    double worst = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      worst = std::max(worst, std::abs(got[i] - messages[m][i]));
+    }
+    EXPECT_LT(worst, 1e-6) << "message " << m << " of " << kMessages
+                           << " did not come back as itself";
+  }
+}
+
 // The coefficient encoding is the one both routes round the same way, so it is
 // the one that can be asked for bit-identity rather than for agreement.
 TEST_P(EncodeGpuTest, TheCoefficientEncodingIsBitIdenticalToTheHost) {

@@ -114,6 +114,14 @@ class GpuEncoder {
   // which is 15 GB/s against 24 on this link.
   mutable double *host_stage_ = nullptr;
   mutable size_t host_stage_size_ = 0;
+  // Recorded after every transfer out of `host_stage_`, and waited on before
+  // anything writes into it again. The transfer is asynchronous and the
+  // buffer is one buffer: a caller encoding in a loop -- every transform's
+  // diagonals -- would otherwise write message n+1 over message n while the
+  // DMA is still reading it. It did, before this event existed:
+  // `converter_compare_test` saw one plaintext of four wholly wrong on the
+  // ordinary ring, and Bootstrap/bootparam_35 decoded at SNR 1e-6.
+  mutable cudaEvent_t staged_ = nullptr;
   mutable rmm::device_uvector<double> value_stage_;
   // Where a real message lands before the imaginary axis is written onto it.
   mutable rmm::device_uvector<double> real_stage_;
@@ -136,6 +144,8 @@ class GpuEncoder {
   static constexpr int kMaxLogChunk = 11;
 
   void EnsureScratch(int num_slots) const;
+  // The previous transfer out of `host_stage_` has completed.
+  void WaitForStaging() const;
 
  public:
   GpuEncoder(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);
@@ -176,7 +186,9 @@ class GpuEncoder {
    *
    * Holds `2 * num_slots` doubles for a complex message, interleaved (re, im),
    * and `num_slots` for a real one. Invalidated by the next call that grows
-   * the scratch, so it is a staging area and not storage.
+   * the scratch, so it is a staging area and not storage. Returned only once
+   * the previous transfer out of it has completed, so the caller may write
+   * into it immediately.
    */
   double *StagingBuffer(int num_slots) const;
 
