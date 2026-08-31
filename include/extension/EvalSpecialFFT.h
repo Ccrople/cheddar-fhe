@@ -125,6 +125,12 @@ class EvalSpecialFFT {
 
   /// The CoeffToSlot tables, for another EvalSpecialFFT to adopt. Never null.
   std::shared_ptr<CtSTables> GetCtSTables() const { return cts_; }
+  /// Drop this object's reference to the CoeffToSlot tables, keeping
+  /// SlotToCoeff: for a BootContext whose only CoeffToSlot is a
+  /// `CiModuleBasis` (HalfBootModule) but whose native SlotToCoeff is still
+  /// read. `EvaluateCtS` and `AddRequiredRotations` fail after it.
+  void DropCtS() { cts_.reset(); }
+  bool HasCtS() const { return cts_ != nullptr; }
 
   void AddRequiredRotations(EvkRequest &req, bool min_ks = false) const;
 

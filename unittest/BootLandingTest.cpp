@@ -182,7 +182,10 @@ TEST(BootLanding, LandsLowerAndPreservesTheMessage) {
   // its fit, but StC then reads a scale the 25-bit phase left slightly off and
   // corrupts (residual ~4.6). So full Boot is valid at ODD landings >= 11;
   // HalfBoot is what an even landing offers, ~2 bits lossier.
-  const bool boot_ok = boot_land >= 7 && (LandLevel() % 2 == 1);
+  // (1) is gone: Hoist.cu's baby-step dispatch now has its num_accum == 1
+  // branch, so StC runs at any level and full Boot is limited by (2) alone --
+  // odd landings, with StC's three levels below them.
+  const bool boot_ok = boot_land >= 1 && (LandLevel() % 2 == 1);
   if (boot_ok) {
     Ciphertext<word> res;
     EncryptAt(land, ct, msg, 0);
@@ -238,7 +241,7 @@ TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
   // clears ci16_35's num_accum==1 zone (message preserving, lands in the shared
   // range), else the layer's HalfBoot.
   const bool use_boot =
-      b->GetBootParameter().GetEndLevel() >= 7 && (LandLevel() % 2 == 1);
+      b->GetBootParameter().GetEndLevel() >= 1 && (LandLevel() % 2 == 1);
   Ciphertext<word> res;
   if (use_boot)
     b->Boot(res, ct, land.ui->GetEvkMap());

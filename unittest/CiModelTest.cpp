@@ -363,11 +363,51 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     boot.ui->PrepareRotationKey(req);
   }
 
-  const int pack_aux = boot.ui->PrepareModPackKeys(kSmall, kPcmmLevel,
-                                                   /*num_aux=*/-1);
+  // THE FEED-FORWARD'S RING. `CHEDDAR_CI_FFN_PARAM` names a landing sub-ladder
+  // of ci16_35 (gen_landing.py; `ci16_35_land13c2` climbs to 23 and lands
+  // HalfBoot at 13 with a two-level CtS, Doing.md 3.9) for the layer's
+  // non-leg half; its levels 0..L are ci16_35's own, so ciphertexts cross
+  // between the two rings without a key, while the KEYS are per ring -- the
+  // key layout follows the ring's main count -- so that ring gets its own
+  // UserInterface on the same secret, and every key the layer uses comes from
+  // it. Unset, the FFN's Context is a second BootContext on ci16_35 itself,
+  // sharing the leg's keys, as before.
+  const char *ffn_param_env = std::getenv("CHEDDAR_CI_FFN_PARAM");
+  const std::string ffn_param =
+      (ffn_param_env && ffn_param_env[0]) ? ffn_param_env : kBootParam;
+  const bool ffn_own_ring = ffn_param != kBootParam;
+  Ring boot_ffn(ffn_param, boot.ui->GetSecretCoeffs(), /*slack=*/9,
+                /*build_user_interface=*/ffn_own_ring);
+  cheddar::UserInterface<word> &fui = ffn_own_ring ? *boot_ffn.ui : *boot.ui;
+  const cheddar::EvkMap<word> &fevk = fui.GetEvkMap();
+  auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
+  ASSERT_NE(fctx, nullptr);
+  ASSERT_EQ(fctx->GetBootParameter().GetEvalModEndLevel(),
+            boot_ffn.param->default_encryption_level_);
+  std::cout << "FFN ring " << ffn_param << ": climbs to "
+            << fctx->GetBootParameter().GetMaxLevel() << " ("
+            << boot_ffn.param->LevelToNP(fctx->GetBootParameter().GetMaxLevel())
+                   .GetNumTotal()
+            << " limbs), HalfBoot lands "
+            << fctx->GetBootParameter().GetEvalModEndLevel() << ", StC at "
+            << fctx->GetBootParameter().GetStCStartLevel()
+            << (ffn_own_ring ? ", its own keys" : ", the leg's keys")
+            << std::endl;
+  if (ffn_own_ring) {
+    // The shared bottom, checked: what "keyless" rests on.
+    for (int L = 0; L <= boot_ffn.param->default_encryption_level_; L++) {
+      ASSERT_EQ(boot.param->GetPrimeVector(boot.param->LevelToNP(L)),
+                boot_ffn.param->GetPrimeVector(boot_ffn.param->LevelToNP(L)))
+          << "the FFN ring's level " << L << " differs from ci16_35's";
+    }
+  }
+
+  // ModPack's keys live on the ring that runs the projections: the FFN's.
+  const int pack_aux = fui.PrepareModPackKeys(kSmall, kPcmmLevel,
+                                              /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
   for (int j = 0; j < kRank; j++) {
-    pack_keys.push_back(&boot.ui->GetModPackKey(kRank, j));
+    pack_keys.push_back(&fui.GetModPackKey(kRank, j));
   }
 
   // THE CROSSING CONSTANT, DERIVED. `HalfBoot` multiplies the message by
@@ -410,18 +450,27 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   keys.inverse_ring_switch = &swtch->ui->GetInverseRingSwitchKey(layout.rank);
 
   // ---- the FFN's Context, and the layer ------------------------------------
-  Ring boot_ffn(kBootParam, boot.ui->GetSecretCoeffs(), /*slack=*/9,
-                /*build_user_interface=*/false);
-  auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
-  ASSERT_NE(fctx, nullptr);
-  boot_ffn.context->PrepareNarrowKeySwitch(kPcmmLevel, pack_aux);
+  if (!ffn_own_ring) {
+    // The same ring as the leg's: the ModPack keys were prepared through the
+    // leg's UserInterface, so this Context needs the narrow basis they use.
+    boot_ffn.context->PrepareNarrowKeySwitch(kPcmmLevel, pack_aux);
+  }
   fctx->PrepareEvalMod();
+  // The native CtS/StC tables: donated by the leg's Context when the two
+  // share a ring (the tables are encoded against the primes), compiled here
+  // otherwise.
   fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
-                              /*cts_donor=*/bctx.get());
+                              ffn_own_ring ? nullptr : bctx.get());
   {
     EvkRequest req;
     fctx->AddRequiredRotations(req, num_slots, min_ks);
-    boot.ui->PrepareRotationKey(req);
+    fui.PrepareRotationKey(req);
+  }
+  if (kModule && ffn_own_ring) {
+    // On the module basis this Context crosses through HalfBootModule, whose
+    // CoeffToSlot is the CiModuleBasis; its native CtS tables are never read
+    // and the seam's native StC is all it keeps.
+    fctx->ReleaseCtS(num_slots);
   }
 
   typename cheddar::CiLlamaLayer<word>::Config lcfg;
@@ -456,7 +505,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   {
     EvkRequest req;
     layer.AddRequiredRotations(req);
-    boot.ui->PrepareRotationKey(req);
+    fui.PrepareRotationKey(req);
   }
   // Both seam halves' rotations up front: the stages themselves are built per
   // half inside the loop, but their keys are the same set every layer.
@@ -464,7 +513,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     layer.PrepareSeamHalf(half);
     EvkRequest req;
     layer.AddSeamHalfRotations(req);
-    boot.ui->PrepareRotationKey(req);
+    fui.PrepareRotationKey(req);
   }
   layer.DropSeamHalf();
   const auto t_setup1 = Tick();
@@ -805,7 +854,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     }
 
     std::vector<Ciphertext<word>> normed;
-    layer.AttentionNorm(normed, stream, an_dec, cal, boot.ui->GetEvkMap());
+    layer.AttentionNorm(normed, stream, an_dec, cal, fevk);
     const auto t_norm = Tick();
 
     // ---- STAGE 1: the pre-attention norm, against the host ---------------
@@ -1482,7 +1531,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       layer.PrepareSeamHalf(half);
       seam_prep_ms += Ms(sp0, Tick());
       for (int bi = 0; bi < layout.num_cts; bi++) {
-        layer.Seam(h_cts[bi * 2 + half], booted[bi], boot.ui->GetEvkMap());
+        layer.Seam(h_cts[bi * 2 + half], booted[bi], fevk);
       }
     }
     layer.DropSeamHalf();
@@ -1791,7 +1840,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     lw.tag = tag;
 
     std::vector<Ciphertext<word>> next;
-    layer.FeedForward(next, h_cts, stream, lw, cal, boot.ui->GetEvkMap());
+    layer.FeedForward(next, h_cts, stream, lw, cal, fevk);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_ffn = Tick();
 

@@ -207,6 +207,18 @@ class BootContext : public Context<word>,
    */
   bool ReleaseEvalSpecialFFT(int num_slots);
 
+  /**
+   * @brief Drop only the native CoeffToSlot tables compiled for `num_slots`,
+   * keeping SlotToCoeff: for a Context that crosses through `HalfBootModule`
+   * (whose CoeffToSlot is the `CiModuleBasis`) but still runs the native
+   * `SlotToCoeff` -- the feed-forward's Context on the module basis, whose
+   * seam reads the native StC. `HalfBoot`/`Boot`/`CoeffToSlot` fail after
+   * it; call it after `AddRequiredRotations`, which reads both halves.
+   *
+   * @return whether anything was dropped
+   */
+  bool ReleaseCtS(int num_slots);
+
   // 2. Retrieve required rotation distances for performing bootstrapping.
 
   /**

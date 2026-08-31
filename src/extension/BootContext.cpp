@@ -261,6 +261,14 @@ bool BootContext<word>::ReleaseEvalSpecialFFT(int num_slots) {
 }
 
 template <typename word>
+bool BootContext<word>::ReleaseCtS(int num_slots) {
+  auto it = eval_fft_.find(num_slots);
+  if (it == eval_fft_.end() || !it->second.HasCtS()) return false;
+  it->second.DropCtS();
+  return true;
+}
+
+template <typename word>
 bool BootContext<word>::IsBootPrepared(int num_slots) const {
   return (eval_mod_ != nullptr) &&
          (eval_fft_.find(num_slots) != eval_fft_.end());
