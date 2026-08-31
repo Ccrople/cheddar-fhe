@@ -254,15 +254,39 @@ double ReportTurn(const char *name, const Ring &ring,
     }
   }
   const double fit = num / den;
-  double err = 0.0;
+  double err = 0.0, sq = 0.0;
+  int worst_t = -1, worst_c = -1, count = 0, past = 0;
+  // Where the error lives: the worst entry, the rms, and how many entries sit
+  // past 2^-10 of the range -- a few is a boundary (a position, a component),
+  // all of them is the circuit.
   for (int t = 0; t < tokens; t++) {
     for (int c = 0; c < declared; c += g_density) {
       const double v = comp[Rev(c, 9)][Rev(t, 7)] / fit;
-      err = std::max(err, std::abs(
-          v - want[static_cast<size_t>(t) * declared + c]));
+      const double e =
+          std::abs(v - want[static_cast<size_t>(t) * declared + c]);
+      sq += e * e;
+      count++;
+      if (e > err) {
+        err = e;
+        worst_t = t;
+        worst_c = c;
+      }
+    }
+  }
+  for (int t = 0; t < tokens; t++) {
+    for (int c = 0; c < declared; c += g_density) {
+      const double v = comp[Rev(c, 9)][Rev(t, 7)] / fit;
+      const double e =
+          std::abs(v - want[static_cast<size_t>(t) * declared + c]);
+      if (e > absmax / 1024.0) past++;
     }
   }
   const auto ce = CoeffDomainError(coeffs, want, fit, declared, rank, tokens);
+  std::cout << "  [" << name << "] worst at token " << worst_t << " (position "
+            << Rev(worst_t, 7) << "), declared channel " << worst_c
+            << " (component " << Rev(worst_c, 9) << "); rms 2^"
+            << std::log2(std::sqrt(sq / count) / absmax) << "; " << past
+            << " of " << count << " entries past 2^-10" << std::endl;
   std::cout << "  [" << name << "] carried " << fit << ", relative "
             << (err / absmax) << " = 2^" << std::log2(err / absmax)
             << "   | coeff-domain live " << (ce.live / ce.mx) << " = 2^"
