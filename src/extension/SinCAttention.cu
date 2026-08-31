@@ -231,7 +231,42 @@ void SinCAttention<word>::Descend(std::vector<Ct> &res,
     Ct dropped, sinc;
     boot_->LevelDown(dropped, stage[i], sinc_level);
     boot_->SlotToSinC(sinc, num_slots_, dropped, evk);
-    boot_->LevelDown(res[i], sinc, cfg_.product_level);
+    CanonicalDown(res[i], sinc, cfg_.product_level);
+  }
+}
+
+template <typename word>
+void SinCAttention<word>::CanonicalDown(Ct &res, const Ct &x,
+                                        int level) const {
+  const auto &param = boot_->param_;
+  const int from = param.NPToLevel(x.GetNP());
+  AssertTrue(from >= level, "SinCAttention: CanonicalDown from level " +
+                                std::to_string(from) + " to " +
+                                std::to_string(level));
+  if (from == level) {
+    res = x;
+    return;
+  }
+  // One multiply by an exact 1.0, encoded at the scale that makes
+  // `x.GetScale() * scale / prod(from)` land on canonical(from - 1) -- the
+  // prefix pair's idiom, and SylphSchedule::Canonicalise's without its
+  // restore constant. `1.0` is exact at any scale, so nothing is lost that an
+  // ordinary rescale would not also lose.
+  const double target = param.GetScale(from - 1);
+  const double scale = target * param.GetRescalePrimeProd(from) / x.GetScale();
+  Constant<word> one;
+  boot_->encoder_.EncodeConstant(one, from, scale, 1.0);
+  Ct tmp;
+  boot_->Mult(tmp, x, one);
+  Ct canon;
+  boot_->Rescale(canon, tmp);
+  canon.SetScale(target);
+  // From canonical, LevelDown stays canonical: scale(l)^2 / prod(l) is
+  // scale(l - 1) by Parameter's own recursion.
+  if (from - 1 == level) {
+    res = std::move(canon);
+  } else {
+    boot_->LevelDown(res, canon, level);
   }
 }
 

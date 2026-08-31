@@ -262,6 +262,19 @@ class SinCAttention {
   enum class Leg { kQuery, kKey, kValue, kProb };
   void Descend(std::vector<Ct> &res, const std::vector<const Ct *> &x, Leg leg,
                const EvkMap<word> &evk) const;
+  // LevelDown that lands on the CANONICAL scale of `level`, whatever scale
+  // it was handed. SlotToSinC's phases encode their plaintexts at each
+  // level's own rescale product, so a ciphertext keeps its scale metadata
+  // through the transform -- it leaves at GetScale(sinc_level) rather than
+  // at canonical(sinc_level - phases) -- and `LevelDown` preserves any
+  // offset from canonical (`scale(l)^2 / prod(l) = scale(l-1)` is exact
+  // only from canonical). On a ladder pinned to one scale the two coincide
+  // to millibits; on sylphflow16_40, whose low band rides a hump,
+  // GetScale(8) and GetScale(5) differ by 4.0 bits and the operands reached
+  // the product 2^-4 too small each (Doing.md 1.5et). The first step here
+  // is the canonicalising multiply the prefix pair already uses; every
+  // LevelDown after it stays canonical. Same cost as LevelDown.
+  void CanonicalDown(Ct &res, const Ct &x, int level) const;
   // The product, then the shift, then HalfBoot and the prefix.
   void Ascend(std::vector<Ct> &res, std::vector<Ct> &product,
               const LinearTransform<word> &prefix,
