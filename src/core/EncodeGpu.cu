@@ -219,10 +219,20 @@ GpuEncoder<word>::GpuEncoder(const Parameter<word> &param,
 }
 
 template <typename word>
+GpuEncoder<word>::~GpuEncoder() {
+  if (host_stage_ != nullptr) cudaFreeHost(host_stage_);
+}
+
+template <typename word>
 void GpuEncoder<word>::EnsureScratch(int num_slots) const {
   const size_t need = static_cast<size_t>(2) * num_slots;
   if (fft_.size() < need) fft_.resize(need, cudaStreamLegacy);
-  if (host_stage_.size() < need) host_stage_.resize(need);
+  if (host_stage_size_ < need) {
+    if (host_stage_ != nullptr) cudaFreeHost(host_stage_);
+    cudaMallocHost(reinterpret_cast<void **>(&host_stage_),
+                   need * sizeof(double));
+    host_stage_size_ = need;
+  }
 }
 
 template <typename word>
@@ -236,9 +246,10 @@ double *GpuEncoder<word>::CoeffScratch() const {
   return coeff_.data();
 }
 
+// Into `fft_`, not into a pointer the caller took first: EnsureScratch may
+// reallocate, so a pointer read before it is stale by the time the copy lands.
 template <typename word>
-void GpuEncoder<word>::StageMessage(double *device_dst,
-                                    const std::vector<Complex> &message,
+void GpuEncoder<word>::StageMessage(const std::vector<Complex> &message,
                                     int num_slots) const {
   EnsureScratch(num_slots);
   const int given = static_cast<int>(message.size());
@@ -246,7 +257,7 @@ void GpuEncoder<word>::StageMessage(double *device_dst,
     host_stage_[2 * i] = i < given ? message[i].real() : 0.0;
     host_stage_[2 * i + 1] = i < given ? message[i].imag() : 0.0;
   }
-  cudaMemcpyAsync(device_dst, host_stage_.data(),
+  cudaMemcpyAsync(fft_.data(), host_stage_,
                   static_cast<size_t>(2) * num_slots * sizeof(double),
                   cudaMemcpyHostToDevice, cudaStreamLegacy);
 }
@@ -371,7 +382,7 @@ void GpuEncoder<word>::Encode(Plaintext<word> &ptxt, int level, double scale,
                "slots, and this message has an imaginary part");
   }
 
-  StageMessage(fft_.data(), message, num_slots);
+  StageMessage(message, num_slots);
   SpecialIFFT(fft_.data(), num_slots);
   FftToCoeff(coeff_.data(), fft_.data(), num_slots);
 

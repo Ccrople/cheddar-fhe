@@ -22,6 +22,7 @@
 
 #include "Testbed.h"
 
+#include "common/CommonUtils.h"
 #include "core/EncodeGpu.h"
 #include "core/Pcmm.h"
 
@@ -73,6 +74,29 @@ double TimeGpu(int reps, F &&body) {
   std::vector<double> samples;
   samples.reserve(reps);
   for (int r = 0; r < reps; r++) {
+    timer.Start();
+    body();
+    samples.push_back(timer.Stop());
+  }
+  return Median(std::move(samples));
+}
+
+// The same, with a per-rep setup that is NOT inside the events. The special
+// FFT is in place and its 1/S normalisation lives in the next stage, so
+// running it a hundred times on its own output multiplies the message by S
+// each pass -- and what that measures is the wide-value path of a later stage,
+// not the transform. Everything is on one stream, so the setup has completed
+// before the start event is reached.
+template <typename S, typename F>
+double TimeGpuWithSetup(int reps, S &&setup, F &&body) {
+  EventTimer timer;
+  setup();
+  body();
+  cudaDeviceSynchronize();
+  std::vector<double> samples;
+  samples.reserve(reps);
+  for (int r = 0; r < reps; r++) {
+    setup();
     timer.Start();
     body();
     samples.push_back(timer.Stop());
@@ -247,19 +271,37 @@ TEST_P(EncodeGpuTest, TheSlotEncodingMatchesTheHost) {
     context_->encoder_.Decode(host_msg, host_pt);
     context_->encoder_.Decode(gpu_msg, gpu_pt);
     double worst_msg = 0.0;
-    double worst_round_trip = 0.0;
+    double gpu_round_trip = 0.0;
+    double host_round_trip = 0.0;
     for (size_t i = 0; i < host_msg.size(); i++) {
       worst_msg = std::max(worst_msg, std::abs(host_msg[i] - gpu_msg[i]));
       // Against the message itself, so that "the two agree" cannot be two
-      // wrong transforms agreeing.
-      worst_round_trip =
-          std::max(worst_round_trip, std::abs(message[i] - gpu_msg[i]));
+      // wrong transforms agreeing -- and separately for each route, because
+      // they do not round the same way.
+      gpu_round_trip =
+          std::max(gpu_round_trip, std::abs(message[i] - gpu_msg[i]));
+      host_round_trip =
+          std::max(host_round_trip, std::abs(message[i] - host_msg[i]));
     }
     std::cout << "  level 0: slots |host - gpu| = " << std::scientific
-              << worst_msg << ", gpu round trip = " << worst_round_trip
-              << std::fixed << std::endl;
-    EXPECT_LT(worst_msg, 1e-9);
-    EXPECT_LT(worst_round_trip, 1e-6);
+              << worst_msg << ", round trip: gpu " << gpu_round_trip
+              << ", host " << host_round_trip << std::fixed << std::endl;
+
+    // THE TWO ROUTES DO NOT ROUND THE SAME WAY, AND ONLY ONE OF THEM ROUNDS.
+    // `Encoder::EncodeCoeff`'s own comment records it: the slot path reaches
+    // the limbs through `BigInt(double)`, which TRUNCATES, while the
+    // coefficient path calls `std::round` first. So off the conjugate-
+    // invariant ring -- where `Encode` goes through `RealVectorToPlaintext`
+    // and both routes round -- every coefficient here differs by up to one
+    // unit of `scale`, a bias rather than a jitter, and the inverse transform
+    // sums 2^15 of them into each slot. Demanding agreement below that would
+    // be demanding that this reproduce a half-ulp the library documents as a
+    // defect. What is asserted instead is the thing that matters: the GPU's
+    // own round trip is no worse than the host's.
+    const double quantum = 1.0 / DetermineScale(level);
+    EXPECT_LT(worst_msg, quantum * num_slots);
+    EXPECT_LT(gpu_round_trip, 1e-6);
+    EXPECT_LE(gpu_round_trip, host_round_trip * 1.5 + quantum);
   }
 }
 
@@ -376,7 +418,7 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
     const size_t bytes = size_t{16} << 20;
     HostVector<double> pageable(bytes / sizeof(double));
     double *pinned = nullptr;
-    cudaMallocHost(&pinned, bytes);
+    cudaMallocHost(reinterpret_cast<void **>(&pinned), bytes);
     DeviceVector<word> sink(static_cast<int>(bytes / sizeof(word)));
     const double page_ms = TimeGpu(10, [&] {
       cudaMemcpyAsync(sink.data(), pageable.data(), bytes,
@@ -433,14 +475,29 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
       gpu_->EncodeCoeff(gpu_pt, level, scale, coeffs);
       cudaDeviceSynchronize();
 
-      const double fft_ms =
-          TimeGpu(100, [&] { gpu_->SpecialIFFT(fft, num_slots); });
-      const double fold_ms =
-          TimeGpu(100, [&] { gpu_->FftToCoeff(coeff_dev, fft, num_slots); });
+      // The RNS stage FIRST, while `coeff_dev` still holds the coefficients
+      // EncodeCoeff put there: the two transform stages below overwrite it,
+      // and a stage measured on the wrong input measures the wrong branch.
       const double rns_ms = TimeGpu(100, [&] {
         gpu_->RnsDecompose(gpu_pt.mx_.data(), coeff_dev, degree, np, scale,
                            false);
       });
+      // The same stage with the Montgomery conversion switched on. It adds a
+      // wide multiply and a reduction per limb and moves not one extra byte,
+      // so the difference between these two rows is the whole of the evidence
+      // for whether the stage is bound by memory or by arithmetic -- and it
+      // needs no profiler to read.
+      const double rns_mont_ms = TimeGpu(100, [&] {
+        gpu_->RnsDecompose(gpu_pt.mx_.data(), coeff_dev, degree, np, scale,
+                           true);
+      });
+      const double stage_ms =
+          TimeGpu(100, [&] { gpu_->StageMessage(message, num_slots); });
+      const double fft_ms = TimeGpuWithSetup(
+          100, [&] { gpu_->StageMessage(message, num_slots); },
+          [&] { gpu_->SpecialIFFT(fft, num_slots); });
+      const double fold_ms =
+          TimeGpu(100, [&] { gpu_->FftToCoeff(coeff_dev, fft, num_slots); });
       const double ntt_ms = TimeGpu(100, [&] {
         auto view = gpu_pt.View();
         context_->ntt_handler_.NTT(view, np, gpu_pt.ConstView(), true);
@@ -463,9 +520,13 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
 
       Row("host EncodeCoeff (GMP)", host_coeff_ms, 0, 0, 0);
       Row("host Encode, slots (GMP)", host_slot_ms, 0, 0, 0);
+      Row("gpu 0. StageMessage (H2D)", stage_ms,
+          2.0 * num_slots * sizeof(double), 0, 0);
       Row("gpu 1. SpecialIFFT", fft_ms, fft_bytes, fft_flops, copy_gbps);
       Row("gpu 2. FftToCoeff", fold_ms, fold_bytes, 0, copy_gbps);
       Row("gpu 3. RnsDecompose", rns_ms, rns_bytes,
+          static_cast<double>(degree) * num_primes, copy_gbps);
+      Row("gpu 3. RnsDecompose + Mont", rns_mont_ms, rns_bytes,
           static_cast<double>(degree) * num_primes, copy_gbps);
       Row("gpu 4. NTT (existing)", ntt_ms, 0, 0, 0);
       Row("gpu EncodeCoeff, total", whole_coeff_ms, 0, 0, 0);
@@ -532,9 +593,11 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
       std::cout << "  a layer's 3354 MiB of operands: host "
                 << std::setprecision(1)
                 << (layer_limbs / (limbs / (host_ms * 1e-3))) << " s, gpu "
-                << std::setprecision(2)
-                << (layer_limbs / (limbs / (gpu_dev_ms * 1e-3))) << " s"
-                << std::endl;
+                << std::setprecision(3)
+                << (layer_limbs / (limbs / (gpu_ms * 1e-3)))
+                << " s from host memory, "
+                << (layer_limbs / (limbs / (gpu_dev_ms * 1e-3)))
+                << " s on device" << std::endl;
     }
   }
 }

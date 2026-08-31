@@ -105,8 +105,11 @@ class GpuEncoder {
 
   // Host staging for the message, so the H2D copy is one contiguous transfer
   // rather than one per slot, and device staging for a matrix handed over in
-  // host memory.
-  mutable HostVector<double> host_stage_;
+  // host memory. The host side is PINNED: the copy is on the critical path of
+  // every slot encoding and pageable memory costs the driver a bounce buffer,
+  // which is 15 GB/s against 24 on this link.
+  mutable double *host_stage_ = nullptr;
+  mutable size_t host_stage_size_ = 0;
   mutable rmm::device_uvector<double> value_stage_;
 
   // Per-prime constants the RNS stage reads: the prime, its Barrett constant
@@ -127,15 +130,24 @@ class GpuEncoder {
   static constexpr int kMaxLogChunk = 11;
 
   void EnsureScratch(int num_slots) const;
-  void StageMessage(double *device_dst, const std::vector<Complex> &message,
-                    int num_slots) const;
 
  public:
   GpuEncoder(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);
+  ~GpuEncoder();
 
   // Owns device state, like every other handler here.
   GpuEncoder(const GpuEncoder &) = delete;
   GpuEncoder &operator=(const GpuEncoder &) = delete;
+
+  /**
+   * @brief Stage 0. The message into the transform's device buffer: the
+   * interleave onto (re, im) pairs on the host, then one contiguous transfer.
+   *
+   * It is a stage like the others because it turned out to be the expensive
+   * one -- a slot encoding is 52 us of kernels behind 260 us of getting the
+   * message across -- and a stage nobody times is a stage nobody fixes.
+   */
+  void StageMessage(const std::vector<Complex> &message, int num_slots) const;
 
   /**
    * @brief Stage 1. The special inverse FFT, in place on `data`, which holds
