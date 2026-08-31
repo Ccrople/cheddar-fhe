@@ -236,6 +236,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_fft_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # The same two transforms in the MODULE basis (Doing.md 3.5): StC lands the
+  # slots as module coordinates -- checked by the host scan and by the device
+  # ModDecomp/ModPack round trip -- and CtS reads them back through the pair
+  # correction, against the native CtS on the same element as the control.
+  add_executable(ci_module_basis_test CiModuleBasisTest.cpp)
+  target_link_libraries(ci_module_basis_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)

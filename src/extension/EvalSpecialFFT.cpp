@@ -1734,4 +1734,20 @@ std::unique_ptr<CiSinCConverter<word>> CiSinCConverter<word>::Load(
 template class CiSinCConverter<uint32_t>;
 template class CiSinCConverter<uint64_t>;
 
+template <typename word>
+StripedMatrix CiButterflyStages(const Parameter<word> &param,
+                                const Encoder<word> &encoder, int num_slots,
+                                const std::vector<int> &stage_indices,
+                                bool inverse_dir) {
+  return ComposeCiSinCStages(param, encoder, num_slots, stage_indices,
+                             inverse_dir);
+}
+
+template StripedMatrix CiButterflyStages<uint32_t>(
+    const Parameter<uint32_t> &, const Encoder<uint32_t> &, int,
+    const std::vector<int> &, bool);
+template StripedMatrix CiButterflyStages<uint64_t>(
+    const Parameter<uint64_t> &, const Encoder<uint64_t> &, int,
+    const std::vector<int> &, bool);
+
 }  // namespace cheddar

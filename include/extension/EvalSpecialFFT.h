@@ -291,6 +291,22 @@ class EvalSpecialFFT {
 };
 
 /**
+ * @brief One composed product of the library's butterfly stages, as
+ * `EvalSpecialFFT::PopulatePlainMatrices` defines them, for a caller building
+ * a transform out of a different grouping of the same stages.
+ *
+ * `stage_indices` lists stages (stride = 2^i) in APPLICATION order: the first
+ * is multiplied on the right. `inverse_dir` false is a StC-direction product
+ * (`plain_fft_stages_`), true a CtS-direction one (`plain_ifft_stages_`). No
+ * scalar is folded in. `CiSinCConverter` and `CiModuleBasis` are the callers.
+ */
+template <typename word>
+StripedMatrix CiButterflyStages(const Parameter<word> &param,
+                                const Encoder<word> &encoder, int num_slots,
+                                const std::vector<int> &stage_indices,
+                                bool inverse_dir);
+
+/**
  * @brief The one-phase, one-level form of the conjugate-invariant SinC
  * conversions, for rings that cannot host `EvalSpecialFFT` at all.
  *
