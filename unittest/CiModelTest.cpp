@@ -510,8 +510,15 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   typename cheddar::CiSinCAttention<word>::Config acfg;
   acfg.restore = 1.0 / crossing;
   acfg.rope_base = kRopeTheta;
-  // Where the q/k/v HalfBoots land, which is where the RoPE masks are encoded.
-  acfg.land_level = lctx->GetBootParameter().GetEvalModEndLevel();
+  // Where the q/k/v crossings land, which is where the RoPE masks are
+  // encoded: the FFN ring's HalfBootModule on the module basis (dense
+  // images), else the leg's landing ring's HalfBoot.
+  acfg.dense_images = kModule;
+  acfg.land_level = kModule ? fctx->GetBootParameter().GetEvalModEndLevel()
+                            : lctx->GetBootParameter().GetEvalModEndLevel();
+  // And the scale they arrive at: the crossing ring's EvalMod end scale.
+  acfg.landing_scale = kModule ? fctx->GetStCInputScale()
+                               : lctx->GetStCInputScale();
   auto attn = std::make_unique<cheddar::CiSinCAttention<word>>(
       bctx, swtch->context, small->context, lifted->context, acfg);
   const auto layout = attn->GetLayout();
@@ -1233,22 +1240,33 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     for (int k = 0; k < kNumH; k++) {
       boot_ffn.context->LevelDown(ins[k], normed[k], kPcmmLevel);
     }
-    const int kQkvOut = 16 * kRank;
+    // THE EMISSION'S ROWS. Banded: 16 half-images, group g = (channel group
+    // g/2, family g%2), 16 heads a group at rows hh*16 + cp, the leg merging
+    // the two families. Dense (the module basis, Doing.md 3.12): 8 images,
+    // group g = channel group, all 32 heads at rows hh*16 + cp -- which is
+    // the leg's doorstep AFTER its merge, so the leg's front end loses the
+    // kill and the merge and nothing else changes.
+    const int kQkvGroups = kModule ? 8 : 16;
+    const int kQkvHeads = kModule ? 32 : 16;
+    const int kQkvOut = kQkvGroups * kRank;
+    // (group, head-in-group, channel-in-group) -> (declared row, live column)
+    auto qkv_entry = [&](int width, int g, int hh, int cp, int &oc, int &o) {
+      const int heads_w = width / kD;
+      const int l = kModule ? g : g / 2;
+      const int head = kModule ? hh : (g % 2) * 16 + hh;
+      const int chan = l * 16 + cp;
+      const int row = hh * 16 + cp;
+      oc = g * kRank + Rev(row, 9);
+      o = (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD + chan;
+    };
     auto declare_qkv = [&](const std::vector<double> &w, int width,
                            std::vector<double> &out) {
       out.assign(static_cast<size_t>(kDeclaredH) * kQkvOut, 0.0);
-      const int heads_w = width / kD;
-      for (int g = 0; g < 16; g++) {
-        const int l = g / 2, fam = g % 2;
-        for (int hh = 0; hh < 16; hh++) {
+      for (int g = 0; g < kQkvGroups; g++) {
+        for (int hh = 0; hh < kQkvHeads; hh++) {
           for (int cp = 0; cp < 16; cp++) {
-            const int row = hh * 16 + cp;
-            const int head = fam * 16 + hh;
-            const int chan = l * 16 + cp;
-            const int o =
-                (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD +
-                chan;
-            const int oc = g * kRank + Rev(row, 9);
+            int oc = 0, o = 0;
+            qkv_entry(width, g, hh, cp, oc, o);
             for (int c = 0; c < kH; c++) {
               out[static_cast<size_t>(ModelSlot(c)) * kQkvOut + oc] =
                   w[static_cast<size_t>(c) * width + o];
@@ -1262,23 +1280,21 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // vector: this is the whole of what the device form needs.
     auto qkv_out_map = [&](int width, std::vector<int> &out_slot) {
       out_slot.assign(kQkvOut, -1);
-      const int heads_w = width / kD;
-      for (int g = 0; g < 16; g++) {
-        const int l = g / 2, fam = g % 2;
-        for (int hh = 0; hh < 16; hh++) {
+      for (int g = 0; g < kQkvGroups; g++) {
+        for (int hh = 0; hh < kQkvHeads; hh++) {
           for (int cp = 0; cp < 16; cp++) {
-            const int row = hh * 16 + cp;
-            const int head = fam * 16 + hh;
-            const int chan = l * 16 + cp;
-            out_slot[g * kRank + Rev(row, 9)] =
-                (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD +
-                chan;
+            int oc = 0, o = 0;
+            qkv_entry(width, g, hh, cp, oc, o);
+            out_slot[oc] = o;
           }
         }
       }
     };
 
     std::vector<Ciphertext<word>> q_a(8), q_b(8), k_a(8), k_b(8), v_a(8), v_b(8);
+    // The dense images (module basis): 8 a tensor, crossed by HalfBootModule
+    // on the FFN ring, whose landing is the leg's `land_level`.
+    std::vector<Ciphertext<word>> qd(8), kd(8), vd(8);
     {
       const char *names[3] = {".q", ".k", ".v"};
       const std::vector<double> *srcs[3] = {&wq_f, &wk_f, &wv_f};
@@ -1306,11 +1322,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         }
         layer.Project(raw, ins, kDeclaredH, kQkvOut, pw, scales[j],
                       (tag + names[j]).c_str(), /*in_density=*/kDensity,
-                      /*out_density=*/2);
-        ASSERT_EQ(static_cast<int>(raw.size()), 16);
-        for (int g = 0; g < 16; g++) {
+                      /*out_density=*/kDensity);
+        ASSERT_EQ(static_cast<int>(raw.size()), kQkvGroups);
+        std::vector<Ciphertext<word>> *ddst[3] = {&qd, &kd, &vd};
+        for (int g = 0; g < kQkvGroups; g++) {
           raw[g].SetNumSlots(num_slots);
-          lctx->HalfBoot((*dst[j][g % 2])[g / 2], raw[g], *levk, min_ks);
+          if (kModule) {
+            fctx->HalfBootModule((*ddst[j])[g], raw[g], fevk,
+                                 *layer.GetModuleBasis());
+          } else {
+            lctx->HalfBoot((*dst[j][g % 2])[g / 2], raw[g], *levk, min_ks);
+          }
         }
       }
     }
@@ -1362,7 +1384,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       // Q, in the clear, pre-RoPE: the emission carries no RoPE.
       const int l = 0;
       Plaintext<word> pt;
-      boot.ui->Decrypt(pt, q_a[l]);
+      boot.ui->Decrypt(pt, kModule ? qd[l] : q_a[l]);
       std::vector<Complex> sl;
       boot.context->encoder_.Decode(sl, pt);
       double nq = 0.0, dq = 0.0, mq = 0.0;
@@ -1420,7 +1442,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       // convention is being guessed at -- and leaves the rest of the leg
       // untouched. If stage 2 then reads ~2^-9.4 the term is the operands; if
       // it does not, it is the leg's own path in this test.
-      if (EnvInt("CHEDDAR_CI_EXACT_QKV", 0) != 0) {
+      if (!kModule && EnvInt("CHEDDAR_CI_EXACT_QKV", 0) != 0) {
         const std::vector<double> *wsrc[3] = {&wq_f, &wk_f, &wv_f};
         const int wwidth[3] = {kH, kKv, kKv};
         const double wscale[3] = {cq, ck, cv};
@@ -1516,7 +1538,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
     // ---- the leg ----------------------------------------------------------
     std::vector<Ciphertext<word>> s0;
-    attn->Scores(s0, q_a, q_b, k_a, k_b, keys);
+    if (kModule) {
+      attn->Scores(s0, qd, kd, keys);
+    } else {
+      attn->Scores(s0, q_a, q_b, k_a, k_b, keys);
+    }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const double carried = s0[0].GetScale() / boot.param->base_scale_;
     ASSERT_LT(carried * cqk * s_abs, 0.95)
@@ -1529,7 +1555,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::vector<Ciphertext<word>> P;
     attn->SoftMax(P, scores, carried, boot.ui->GetEvkMap());
     std::vector<Ciphertext<word>> attn_out;
-    attn->Values(attn_out, P, v_a, v_b, keys);
+    if (kModule) {
+      attn->Values(attn_out, P, vd, keys);
+    } else {
+      attn->Values(attn_out, P, v_a, v_b, keys);
+    }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_leg = Tick();
 

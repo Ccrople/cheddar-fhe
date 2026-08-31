@@ -87,6 +87,24 @@ class CiSinCAttention {
   struct Config {
     int sub_degree = 32;      //!< k; fixes the Llama alignment below
     int land_level = 19;  //!< where HalfBoot lands the half-images
+    //! DENSE IMAGES (Doing.md 3.10/3.12): the projections write one dense
+    //! ciphertext per 16-channel group, rows `head * 16 + channel` over all
+    //! 32 heads, and `HalfBootModule` lands it -- which is exactly this
+    //! leg's doorstep AFTER `Merge` (`Door0` = rev4(c % 16) << 12 |
+    //! rev5(head) << 7 | rev7(t)). So the two families, the kill mask and
+    //! the merge do not exist: the RoPE masks cover every head, and
+    //! `Scores`/`Values` take 8 ciphertexts a tensor. Everything from the
+    //! exchange on is unchanged.
+    bool dense_images = false;
+    //! The declared scale the images ARRIVE at: 0 = this leg's own boot's
+    //! `GetStCInputScale()` (a HalfBoot on the same ring). A crossing on
+    //! another ring lands at ITS EvalMod's end scale -- 2^56 on the K = 32
+    //! ladder `ci16_35_land13c2e9` against ci16_35's 2^58 -- with the same
+    //! message on 4x smaller integers, and the score Boot would then see a
+    //! 4x smaller message and lose two bits. The RoPE masks are encoded at
+    //! `stc / landing_scale` times their scale, which moves the integers
+    //! and the declared scale together and leaves the message alone.
+    double landing_scale = 0.0;
     //! The merge and the 63-diagonal exchange. This is a DIAL, not the
     //! landing: `Merge` drops the halves onto it, and a key switch pays
     //! for the limbs it carries -- measured on an A100 at 4.51 ms per
@@ -231,6 +249,10 @@ class CiSinCAttention {
   void Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
               std::vector<Ct> &q_b, std::vector<Ct> &k_a,
               std::vector<Ct> &k_b, const Keys &keys) const;
+  /// The dense form (`Config::dense_images`): 8 dense images a tensor at
+  /// `land_level`, consumed.
+  void Scores(std::vector<Ct> &res, std::vector<Ct> &q, std::vector<Ct> &k,
+              const Keys &keys) const;
 
   /**
    * @brief Compile the softmax walk for one calibration. Rebuilds the two
@@ -267,8 +289,14 @@ class CiSinCAttention {
    */
   void Values(std::vector<Ct> &res, std::vector<Ct> &p, std::vector<Ct> &v_a,
               std::vector<Ct> &v_b, const Keys &keys) const;
+  /// The dense form: 8 dense value images at `land_level`, consumed.
+  void Values(std::vector<Ct> &res, std::vector<Ct> &p, std::vector<Ct> &v,
+              const Keys &keys) const;
 
  private:
+  //! RoPE on dense images: the (lo, lo + 4) pairs of one vector, no kill;
+  //! without angles the restore multiply alone (V).
+  void Rope(std::vector<Ct> &cts, bool with_angles) const;
   void BuildPremaps();
   void BuildTransportPlaintexts();
 

@@ -287,8 +287,21 @@ template <typename word>
 void CiSinCAttention<word>::BuildTransportPlaintexts() {
   const auto &layout = ccmm_.GetLayout();
   const int half = layout.contraction;
-  const double pt_scale =
-      boot_->param_.GetRescalePrimeProd(cfg_.land_level) * gamma_;
+  // `landing_scale`: the images' declared scale on arrival against the one
+  // this leg's constants were stated for (see Config). The ratio is a power
+  // of two between two EvalMod ladders of this family (exactly 4 for the
+  // K = 32 landing ring), so the fold is exact.
+  const double stc_here = boot_->GetStCInputScale();
+  const double arrival =
+      cfg_.landing_scale > 0.0 ? cfg_.landing_scale : stc_here;
+  const double pt_scale = boot_->param_.GetRescalePrimeProd(cfg_.land_level) *
+                          gamma_ * (stc_here / arrival);
+  if (cfg_.verbose && arrival != stc_here) {
+    std::cout << "CiSinCAttention: images arrive at scale 2^"
+              << std::log2(arrival) << " against the leg's 2^"
+              << std::log2(stc_here) << "; the RoPE masks carry the ratio "
+              << (stc_here / arrival) << std::endl;
+  }
   std::vector<double> theta(half);
   for (int m = 0; m < half; m++) {
     theta[m] = std::pow(cfg_.rope_base, -2.0 * m / layout.dim);
@@ -299,6 +312,9 @@ void CiSinCAttention<word>::BuildTransportPlaintexts() {
   rope_cos_.resize(4);
   rope_sin_.resize(4);
   rope_neg_sin_.resize(4);
+  // The heads a mask covers: the a family's 16 (the b family arrives by the
+  // merge), or all 32 of a dense image.
+  const int mask_heads = cfg_.dense_images ? layout.lanes : 16;
   for (int lo = 0; lo < 4; lo++) {
     std::vector<Complex> cm(degree_, Complex(0.0, 0.0));
     std::vector<Complex> sm(degree_, Complex(0.0, 0.0));
@@ -306,7 +322,7 @@ void CiSinCAttention<word>::BuildTransportPlaintexts() {
     for (int t = 0; t < layout.dim; t++) {
       for (int cp = 0; cp < 16; cp++) {
         const double ang = t * theta[lo * 16 + cp];
-        for (int hh = 0; hh < 16; hh++) {
+        for (int hh = 0; hh < mask_heads; hh++) {
           const int slot = Door0(t, lo * 16 + cp, hh);
           cm[slot] = Complex(std::cos(ang) * cfg_.restore, 0.0);
           sm[slot] = Complex(std::sin(ang) * cfg_.restore, 0.0);
@@ -325,7 +341,7 @@ void CiSinCAttention<word>::BuildTransportPlaintexts() {
     std::vector<Complex> km(degree_, Complex(0.0, 0.0));
     for (int t = 0; t < layout.dim; t++) {
       for (int cp = 0; cp < 16; cp++) {
-        for (int hh = 0; hh < 16; hh++) {
+        for (int hh = 0; hh < mask_heads; hh++) {
           km[Door0(t, cp, hh)] = Complex(cfg_.restore, 0.0);
         }
       }
@@ -416,6 +432,42 @@ void CiSinCAttention<word>::RopeAndKill(std::vector<Ct> &a_cts,
       boot_->Add(bb, bb, dd);
       boot_->Rescale(lo_ct, aa);
       boot_->Rescale(hi_ct, bb);
+    }
+  }
+}
+
+template <typename word>
+void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
+  AssertTrue(cfg_.dense_images && static_cast<int>(cts.size()) == 8,
+             "CiSinCAttention::Rope: eight dense images");
+  if (!with_angles) {
+    // V: the restore alone (the mask is `restore` at every doorstep slot).
+    for (auto &ct : cts) {
+      Ct t;
+      boot_->Mult(t, ct, kill_);
+      boot_->Rescale(ct, t);
+    }
+    return;
+  }
+  for (int lo = 0; lo < 4; lo++) {
+    Ct &lo_ct = cts[lo];
+    Ct &hi_ct = cts[lo + 4];
+    Ct aa, bb, dd;
+    boot_->Mult(aa, lo_ct, rope_cos_[lo]);
+    boot_->Mult(bb, hi_ct, rope_neg_sin_[lo]);
+    boot_->Add(aa, aa, bb);
+    boot_->Mult(bb, hi_ct, rope_cos_[lo]);
+    boot_->Mult(dd, lo_ct, rope_sin_[lo]);
+    boot_->Add(bb, bb, dd);
+    boot_->Rescale(lo_ct, aa);
+    boot_->Rescale(hi_ct, bb);
+  }
+  // Onto the exchange's level, as `Merge` does for the banded images.
+  for (auto &ct : cts) {
+    if (boot_->param_.NPToLevel(ct.GetNP()) > cfg_.exchange_level) {
+      Ct down;
+      boot_->LevelDown(down, ct, cfg_.exchange_level);
+      ct = std::move(down);
     }
   }
 }
@@ -582,10 +634,46 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
 }
 
 template <typename word>
+void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
+                                   std::vector<Ct> &k, const Keys &keys) const {
+  Rope(q, /*with_angles=*/true);
+  Rope(k, /*with_angles=*/true);
+  ExchangeAll(q, *keys.boot);
+  ExchangeAll(k, *keys.boot);
+  Convert(*conv_q_, q, *keys.swtch);
+  ChainAndReturn(res, q, k, /*rhs_is_k=*/true, keys);
+  if (cfg_.verbose) {
+    std::cout << "CiSinCAttention::Scores (dense): out @"
+              << boot_->param_.NPToLevel(res[0].GetNP()) << ", carried "
+              << res[0].GetScale() / boot_->param_.base_scale_ << std::endl;
+  }
+}
+
+template <typename word>
+void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
+                                   std::vector<Ct> &v, const Keys &keys) const {
+  const auto &layout = ccmm_.GetLayout();
+  AssertTrue(boot_->param_.NPToLevel(p[0].GetNP()) == cfg_.forward_level,
+             "CiSinCAttention: Values expects P at forward_level");
+  Rope(v, /*with_angles=*/false);
+  ExchangeAll(v, *keys.boot);
+  std::vector<Ct> p_sinc(layout.num_cts);
+  HoldConverter(*conv_pv_, /*on_device=*/true);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    conv_pv_->SlotToSinC(switch_ctx_, p_sinc[bi], p[bi], *keys.swtch);
+  }
+  HoldConverter(*conv_pv_, /*on_device=*/false);
+  ChainAndReturn(res, p_sinc, v, /*rhs_is_k=*/false, keys);
+}
+
+template <typename word>
 void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
                                    std::vector<Ct> &q_b, std::vector<Ct> &k_a,
                                    std::vector<Ct> &k_b,
                                    const Keys &keys) const {
+  AssertTrue(!cfg_.dense_images,
+             "CiSinCAttention::Scores: this leg was built for dense images; "
+             "call the 8-ciphertext form");
   RopeAndKill(q_a, q_b, /*with_angles=*/true);
   RopeAndKill(k_a, k_b, /*with_angles=*/true);
   Merge(q_a, q_b, *keys.boot);
