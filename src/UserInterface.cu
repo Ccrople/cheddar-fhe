@@ -1,6 +1,7 @@
 #include "UserInterface.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
@@ -338,9 +339,19 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
   // native-sparse secret (Doing.md 3.5, check 6). Resampled on the rare
   // collision so that the native form stays ternary; the same number of
   // nonzero positions and signs is drawn either way.
+  // `T,h` overrides the module hamming weight (the wrap-around's std grows
+  // as sqrt(h), and the module product carries ~3x the native's terms).
   const char *module_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
-  const int module_small_degree =
-      (module_env != nullptr && module_env[0] != 0) ? std::atoi(module_env) : 0;
+  int module_small_degree = 0;
+  if (module_env != nullptr && module_env[0] != 0) {
+    module_small_degree = std::atoi(module_env);
+    const char *comma = std::strchr(module_env, ',');
+    if (comma != nullptr && std::atoi(comma + 1) > 0) {
+      hamming_weight = std::atoi(comma + 1);
+      indices.assign(hamming_weight, 0);
+      ternary_values.assign(hamming_weight, 0);
+    }
+  }
   if (module_small_degree > 0 && context_->param_.conjugate_invariant_) {
     const int small_degree = module_small_degree;
     AssertTrue(small_degree > 0 && degree % small_degree == 0 &&

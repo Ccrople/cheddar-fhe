@@ -270,10 +270,20 @@ int DoubleAngles() {
 }
 }  // namespace
 
+// CHEDDAR_TEST_CTS_LEVELS picks CoeffToSlot's level count (default: the
+// preset's), and the boot's top level is placed so that EvalMod still ends
+// on default_encryption_level: 19 + (5 + double angles) + CtS levels.
 class CiModuleBoot : public Testbed<word> {
  protected:
   int BootCtsLevels() const override {
-    return num_cts_levels_ - (DoubleAngles() - 3);
+    const char *env = std::getenv("CHEDDAR_TEST_CTS_LEVELS");
+    if (env != nullptr && env[0] != 0) return std::atoi(env);
+    return num_cts_levels_;
+  }
+  int BootMaxLevel() const override {
+    const int top = default_encryption_level_ + 5 + DoubleAngles() +
+                    BootCtsLevels();
+    return std::min(top, param_->max_level_);
   }
   CiModuleBasis<word>::Phases BootPhases() const {
     CiModuleBasis<word>::Phases phases;
@@ -306,9 +316,10 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
 
   boot->PrepareEvalMod();
   boot->PrepareEvalSpecialFFT(n);
-  const BootParameter boot_param(param_->max_level_, BootCtsLevels(),
+  const BootParameter boot_param(BootMaxLevel(), BootCtsLevels(),
                                  num_stc_levels_, 5, 0);
-  std::cout << "CtS levels " << BootCtsLevels() << ", EvalMod ends at "
+  std::cout << "boot top level " << BootMaxLevel() << ", CtS levels "
+            << BootCtsLevels() << ", EvalMod ends at "
             << boot_param.GetEvalModEndLevel() << std::endl;
   CiModuleBasis<word> basis(context_, T, /*stc_level=*/-1,
                             boot_param.GetCtSStartLevel(), BootPhases(), 1.0,
@@ -346,7 +357,33 @@ TEST_P(CiModuleBoot, HalfBootReadsTheModuleCoordinates) {
     const double c = num / den;
     std::vector<double> scaled(n);
     for (int s = 0; s < n; s++) scaled[s] = obtained[s] / c;
-    const auto stats = Compare(expected, scaled);
+    auto stats = Compare(expected, scaled);
+    // A slot whose wrap-around left EvalMod's range comes back as a huge
+    // number: count those apart, and refit and report on the rest, so that
+    // a range failure reads as "N slots out of range" and not as noise.
+    int outliers = 0;
+    double num2 = 0.0, den2 = 0.0;
+    for (int s = 0; s < n; s++) {
+      if (std::abs(scaled[s] - expected[s]) > 0.05) {
+        outliers++;
+        continue;
+      }
+      num2 += expected[s] * obtained[s];
+      den2 += expected[s] * expected[s];
+    }
+    if (outliers > 0 && outliers < n / 2) {
+      const double c2 = num2 / den2;
+      std::vector<double> e2, o2;
+      for (int s = 0; s < n; s++) {
+        if (std::abs(scaled[s] - expected[s]) > 0.05) continue;
+        e2.push_back(expected[s]);
+        o2.push_back(obtained[s] / c2);
+      }
+      std::cout << "[" << name << "] " << outliers << " slots out of range; "
+                << "the other " << e2.size() << " refit at " << std::scientific
+                << c2 << ":" << std::endl;
+      Report(name + ", in-range slots", Compare(e2, o2));
+    }
     std::cout << std::scientific << std::setprecision(4) << "[" << name
               << "] fitted constant " << c << ", derived message ratio "
               << boot->GetMessageRatio() << ", fit/derived "
@@ -468,7 +505,7 @@ TEST_P(CiModuleBoot, ModuleLiftCentresTheRepresentatives) {
   Ciphertext<word> ct;
   interface_->Encrypt(ct, pt);
 
-  const BootParameter boot_param(param_->max_level_, BootCtsLevels(),
+  const BootParameter boot_param(BootMaxLevel(), BootCtsLevels(),
                                  num_stc_levels_, 5, 0);
   const int top = boot_param.GetMaxLevel();
   Ciphertext<word> up_native, up_module;
