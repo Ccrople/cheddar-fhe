@@ -1,3 +1,5 @@
+#include <string>
+
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
 #include "extension/Hoist.h"
@@ -807,7 +809,15 @@ void HoistHandler<word>::EvaluateBabyStep(ConstContextPtr<word> context,
   int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
   int degree = context->param_.degree_;
   AssertTrue(num_q_primes == context->param_.LevelToNP(pt_level_).GetNumQ(),
-             "Hoist: input level mismatch");
+             "Hoist: input level mismatch -- the input carries " +
+                 std::to_string(num_q_primes) + " Q primes (" +
+                 std::to_string(input_np.num_main_) + " main + " +
+                 std::to_string(input_np.num_ter_) +
+                 " terminal) but the transform was compiled at level " +
+                 std::to_string(pt_level_) + " = " +
+                 std::to_string(
+                     context->param_.LevelToNP(pt_level_).GetNumQ()) +
+                 " Q primes on this context");
   AssertTrue(input.GetNP().num_aux_ == 0, "Hoist: input should be mod-down");
   AssertFalse(input.HasRx(), "Hoist: input should be relinearized");
 
