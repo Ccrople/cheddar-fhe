@@ -17,18 +17,20 @@
 // that SHARES ci16_35's bottom primes, so a ci16_35 ciphertext crosses into it
 // with no key -- `gen_landing.py` builds it.
 //
-// HALFBOOT LANDS AT EVERY L in [5, 19]; FULL BOOT AT ODD L >= 11. HalfBoot --
-// the layer's crossing op -- is CtS + EvalMod and lands at ANY L (odd residual
-// ~1.1e-04; even ~3.8e-04, the ~2-bit cost of the single 25-bit CtS level an
-// even landing forces, 5 - t_L being odd). Full Boot additionally runs StC,
-// which (a) needs its landing above ci16_35's num_accum==1 zone and (b) at an
-// even landing reads the scale the 25-bit CtS left slightly off and corrupts --
-// so Boot is clean only at ODD L >= 11 (residual ~3e-05). Junctions (L 9, 15,
-// where grafting swapped mains out below the running peak) are fine: EvalMod's
-// bottom two levels ride the swapped-out 30-bit mains at 59/60-bit, tolerated.
-// The 12-level budget above the landing (8 EvalMod + 4 CtS, pinned by
-// default_enc == max - 12) is why there is no room for a bridge. gen_landing.py
-// emits any L in [5, 19]; odd L is preferred (full precision, full Boot).
+// HALFBOOT LANDS AT EVERY L in [5, 19]; FULL BOOT AT EVERY L THAT CLEARS THE
+// num_accum==1 ZONE (odd L >= 11, even L >= 10). HalfBoot -- the layer's
+// crossing op -- is CtS + EvalMod and lands at ANY L, residual ~1.1e-04 at both
+// parities. Full Boot additionally runs StC, which needs its landing above
+// ci16_35's num_accum==1 zone (levels 0..6), i.e. GetEndLevel() >= 7; there it
+// is clean at both parities, residual ~3e-05. The even landing's single 25-bit
+// CtS terminal (forced because 5 - t_L is odd and a rescale is pure-main OR
+// pure-term) no longer restricts Boot: gen_landing.py places it at the very top
+// (num_cts = 5) and EvalSpecialFFT consumes it with a PURE RESCALE instead of a
+// transform phase -- that was the fix. Junctions (L 9, 10, 15, 16, grafting
+// swapped mains out below the running peak) are fine: EvalMod's bottom levels
+// ride the swapped-out 30-bit mains at 59/60-bit, tolerated. Odd landings keep
+// num_cts = 4 (byte-identical to before; L=19 == the ci16_35 ladder itself);
+// even landings use num_cts = 5.
 //
 // WHAT IS MEASURED. (1) The preset bootstraps, lands where its BootParameter
 // asks, and preserves the message -- HalfBoot at every L, Boot where valid.
@@ -172,20 +174,15 @@ TEST(BootLanding, LandsLowerAndPreservesTheMessage) {
             << "the layer folds is absorbed by the fit)" << std::endl;
   EXPECT_LT(h.residual, 0.01) << "HalfBoot did not preserve the message";
 
-  // Full Boot additionally runs SlotToCoeff. Two things restrict it, both
-  // measured, neither touching HalfBoot (the layer's crossing op, which has no
-  // StC and lands at ANY L >= 5). (1) StC is a hoisted transform, and on
-  // ci16_35's alpha-12 basis a hoisted transform in the num_accum==1 zone
-  // (levels 0..6) produces mod-Q noise (Doing.md 1.5bt), so Boot needs its
-  // landing >= 7. (2) At an EVEN landing the CtS carries a single-terminal
-  // 25-bit level (5 - t_L odd); HalfBoot absorbs the ~2-bit precision cost in
-  // its fit, but StC then reads a scale the 25-bit phase left slightly off and
-  // corrupts (residual ~4.6). So full Boot is valid at ODD landings >= 11;
-  // HalfBoot is what an even landing offers, ~2 bits lossier.
-  // (1) is gone: Hoist.cu's baby-step dispatch now has its num_accum == 1
-  // branch, so StC runs at any level and full Boot is limited by (2) alone --
-  // odd landings, with StC's three levels below them.
-  const bool boot_ok = boot_land >= 1 && (LandLevel() % 2 == 1);
+  // Full Boot additionally runs SlotToCoeff. Nothing restricts it any more:
+  // (1) ci16_35's num_accum==1 zone (levels 0..6, mod-Q noise from a hoisted
+  // transform, Doing.md 1.5bt) was Hoist.cu's baby-step dispatch starting at
+  // a padded count of two, and the branch exists now, so StC runs at any
+  // level; (2) the even landing's single-terminal (25-bit) CtS level is
+  // consumed by a pure rescale instead of a transform phase (the even presets
+  // place it at the top, num_cts = 5), so both parities land clean (~3e-5).
+  // HalfBoot -- the layer's crossing op, no StC -- was always valid at ANY L.
+  const bool boot_ok = boot_land >= 1;
   if (boot_ok) {
     Ciphertext<word> res;
     EncryptAt(land, ct, msg, 0);
@@ -199,8 +196,8 @@ TEST(BootLanding, LandsLowerAndPreservesTheMessage) {
     EXPECT_NEAR(bf.carried, 1.0, 0.02) << "Boot should be message preserving";
   } else {
     std::cout << "[landing] Boot skipped (landing " << LandLevel() << ", lands at "
-              << boot_land << "; full Boot needs an odd landing >= 11. HalfBoot "
-                 "is the layer op here)" << std::endl;
+              << boot_land << "; full Boot needs GetEndLevel() >= 7. HalfBoot is "
+                 "the layer op here)" << std::endl;
   }
 }
 
@@ -238,10 +235,11 @@ TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
 
   // Bootstrap it with the LANDING ring's BootContext and keys -- no key switch
   // moves it between rings; same secret, same level-0 primes. Boot where its StC
-  // clears ci16_35's num_accum==1 zone (message preserving, lands in the shared
-  // range), else the layer's HalfBoot.
-  const bool use_boot =
-      b->GetBootParameter().GetEndLevel() >= 1 && (LandLevel() % 2 == 1);
+  // Bootstrap it with the LANDING ring's BootContext and keys -- no key switch
+  // moves it between rings; same secret, same level-0 primes. Boot wherever
+  // its StC has a level to land on (either parity; the zone is closed), else
+  // the layer's HalfBoot.
+  const bool use_boot = b->GetBootParameter().GetEndLevel() >= 1;
   Ciphertext<word> res;
   if (use_boot)
     b->Boot(res, ct, land.ui->GetEvkMap());

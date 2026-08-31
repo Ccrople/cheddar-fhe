@@ -561,7 +561,44 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
 
   int cts_stages_left = log_num_slots;
   int cts_stages_cumul = 0;
-  double cts_const_div = std::pow(cts_const_, 1.0 / num_cts_phases);
+
+  // A landing CoeffToSlot whose ladder must pass through a single-terminal
+  // (~25-bit) level cannot fold that level into a transform phase without
+  // injecting large coefficient-domain noise -- device-measured: the thin
+  // phase's stages amplify it (worst at the top), invisible in HalfBoot's slot
+  // comparison but exposed by SlotToCoeff. Such a level is instead consumed by
+  // a PURE RESCALE (a constant-1 multiply at the level's own rescale product,
+  // then a rescale) in EvaluateCtS, and the remaining THICK levels carry every
+  // stage. A shipped preset's CtS levels are all >= 2^33, so num_thin == 0 and
+  // everything below is byte-identical (num_transform == num_cts_phases).
+  constexpr double kThinRescaleProd = 1073741824.0;  // 2^30
+  cts_thin_levels_.clear();
+  cts_thin_consts_.clear();
+  for (int i = 0; i < num_cts_phases; i++) {
+    const double prod = context->param_.GetRescalePrimeProd(cts_level - i);
+    if (prod < kThinRescaleProd) {
+      cts_thin_levels_.push_back(cts_level - i);
+      Constant<word> thin_c;
+      context->encoder_.EncodeConstant(thin_c, cts_level - i, prod, 1.0);
+      cts_thin_consts_.push_back(std::move(thin_c));
+    }
+  }
+  const int num_thin = static_cast<int>(cts_thin_levels_.size());
+  const int num_transform = num_cts_phases - num_thin;
+  AssertTrue(num_transform >= 2,
+             "EvalSpecialFFT: CoeffToSlot needs at least two transform levels "
+             "once the thin single-terminal levels are set aside");
+  // The pure-rescale prologue in EvaluateCtS descends from the top, so the thin
+  // levels must BE the topmost ones -- a thin level sitting below a thick one
+  // would be rescaled at the wrong level. Landing ladders place the single
+  // terminal at the very top for exactly this reason.
+  for (int k = 0; k < num_thin; k++) {
+    AssertTrue(cts_thin_levels_[k] == cts_level - k,
+               "EvalSpecialFFT: thin (single-terminal) CtS levels must be the "
+               "topmost levels of the CoeffToSlot ladder");
+  }
+
+  double cts_const_div = std::pow(cts_const_, 1.0 / num_transform);
   // std::cout << "cts_const_div: " << cts_const_div << std::endl;
   double stc_const_div = std::pow(stc_const_, 1.0 / num_stc_phases);
   // std::cout << "stc_const_div: " << stc_const_div << std::endl;
@@ -585,20 +622,28 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
     const int adopted = static_cast<int>(conjugate_invariant_
                                              ? cts_->ci_phases.size()
                                              : cts_->phases.size());
-    AssertTrue(adopted == num_cts_phases,
+    AssertTrue(adopted == num_transform,
                "EvalSpecialFFT: the adopted CoeffToSlot tables have " +
                    std::to_string(adopted) + " phases against this boot "
-                   "parameter's " + std::to_string(num_cts_phases));
+                   "parameter's " + std::to_string(num_transform) +
+                   " transform phases");
   }
 
+  int tphase = 0;  // index among the THICK (transform) phases only
   for (int i = 0; build_cts && i < num_cts_phases; i++) {
-    std::cout << "CtS preparation phase " << i << std::endl;
+    if (context->param_.GetRescalePrimeProd(cts_level - i) < kThinRescaleProd) {
+      // Thin single-terminal level: no transform phase. EvaluateCtS consumes it
+      // with a pure rescale, so it takes no stages and no diagonals here.
+      continue;
+    }
+    std::cout << "CtS preparation phase " << tphase << " (level "
+              << cts_level - i << ")" << std::endl;
     // CtS: high strides (num_slots / 2) --> low strides (1)
     int num_stages;
-    if (i == 0) {
-      num_stages = DivCeil(cts_stages_left, num_cts_phases);
+    if (tphase == 0) {
+      num_stages = DivCeil(cts_stages_left, num_transform);
     } else {
-      num_stages = cts_stages_left / (num_cts_phases - i);
+      num_stages = cts_stages_left / (num_transform - tphase);
     }
     cts_stages_left -= num_stages;
 
@@ -609,11 +654,11 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
 
     // Decomposing into Wx and -iWx part for later decomposition of real and
     // imag part for non-full-slot cases
-    if (i == num_cts_phases - 1 && !full_slot_ && !conjugate_invariant_) {
+    if (tphase == num_transform - 1 && !full_slot_ && !conjugate_invariant_) {
       StripedMatrix extended(num_slots_ * 2, num_slots_ * 2);
-      for (auto &[i, diag] : phase_matrix) {
-        int dst_idx = i;
-        if (i >= num_slots_ / 2) dst_idx += num_slots_;
+      for (auto &[k, diag] : phase_matrix) {
+        int dst_idx = k;
+        if (k >= num_slots_ / 2) dst_idx += num_slots_;
         extended.try_emplace(dst_idx, num_slots_ * 2, Complex(0));
         for (int j = 0; j < num_slots_; j++) {
           extended.at(dst_idx)[j] = diag[j];
@@ -625,18 +670,18 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
     phase_matrix = StripedMatrix::Mult(phase_matrix, cts_const_div);
 
     int num_eff_diag = phase_matrix.GetNumDiag();
-    if (i == num_cts_phases - 1) num_eff_diag += 1;
+    if (tphase == num_transform - 1) num_eff_diag += 1;
     auto [bs, gs] = BSGSSplit(num_eff_diag);
 
-    // std::cout << "CtS phase " << i << ": bs = " << bs << ", gs = " << gs
+    // std::cout << "CtS phase " << tphase << ": bs = " << bs << ", gs = " << gs
     //          << std::endl;
 
     // Min-KS adjustment (can be used also for hoisting)
     int pre_rotation;
     int additional_pt_rot = -(1 << cts_stages_left);
-    if (i == 0) {
+    if (tphase == 0) {
       pre_rotation = (1 << cts_stages_left);
-    } else if (i == num_cts_phases - 1) {
+    } else if (tphase == num_transform - 1) {
       pre_rotation = -(1 << num_stages);
       additional_pt_rot = 0;
     } else {
@@ -657,6 +702,7 @@ void EvalSpecialFFT<word>::PreparePlaintexts(ConstContextPtr<word> context) {
                                additional_pt_rot);
     }
     cts_stages_cumul += num_stages;
+    tphase++;
   }
 
   // 2. StC initialization
@@ -775,6 +821,24 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
                                        const Ct &input,
                                        const EvkMap<word> &evk_map,
                                        bool min_ks) const {
+  // Consume any thin single-terminal CtS levels (set aside in PreparePlaintexts)
+  // with a pure rescale -- a constant-1 multiply at the level's own rescale
+  // product, then a rescale -- so the transform phases below, built only for the
+  // thick levels, receive the input one level lower. Empty (no copy, no work)
+  // for every shipped preset.
+  Ct pre;
+  const Ct *in_ptr = &input;
+  if (!cts_thin_levels_.empty()) {
+    // The first rescale writes `pre` straight from the const input (Ciphertext
+    // is move-only, so there is no copy to make); any further ones are in place.
+    context->MultUnsafe(pre, input, cts_thin_consts_[0], cts_thin_levels_[0]);
+    context->Rescale(pre, pre);
+    for (size_t k = 1; k < cts_thin_levels_.size(); k++) {
+      context->MultUnsafe(pre, pre, cts_thin_consts_[k], cts_thin_levels_[k]);
+      context->Rescale(pre, pre);
+    }
+    in_ptr = &pre;
+  }
   if (conjugate_invariant_) {
     // Real in, complex through the middle, real out. The first phase lifts the
     // input to a pair, the last drops the imaginary half it does not need, and
@@ -782,7 +846,7 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
     // same thing the ordinary path returns, only real.
     int num_phases = static_cast<int>(cts_->ci_phases.size());
     Ct im;
-    cts_->ci_phases.at(0).EvaluateFromReal(context, res, im, input, evk_map,
+    cts_->ci_phases.at(0).EvaluateFromReal(context, res, im, *in_ptr, evk_map,
                                           min_ks);
     for (int i = 1; i < num_phases - 1; i++) {
       cts_->ci_phases.at(i).EvaluatePair(context, res, im, res, im, evk_map,
@@ -794,7 +858,7 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
     return;
   }
   int num_cts_phases = cts_->phases.size();
-  cts_->phases.at(0).Evaluate(context, res, input, evk_map, min_ks);
+  cts_->phases.at(0).Evaluate(context, res, *in_ptr, evk_map, min_ks);
   for (int i = 1; i < num_cts_phases; i++) {
     cts_->phases.at(i).Evaluate(context, res, res, evk_map, min_ks);
   }
