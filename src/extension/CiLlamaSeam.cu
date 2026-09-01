@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/CiLlamaSeam.h"
 
 #include <algorithm>
@@ -347,6 +348,7 @@ template <typename word>
 void CiLlamaSeam<word>::Apply(Ct &res, const Ct &booted,
                               SylphSchedule<word> &sched,
                               const EvkMap<word> &evk, bool min_ks) const {
+  NvtxScope _nv("seam: Apply");
   AssertTrue(prepared_half_ >= 0,
              "CiLlamaSeam: PrepareHalf must run before Apply");
 

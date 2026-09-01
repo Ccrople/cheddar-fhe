@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/SylphSchedule.h"
 
 #include <algorithm>
@@ -224,6 +225,7 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
                                   const EvkMap<word> &evk_map,
                                   bool min_ks /*= false*/,
                                   bool native_basis /*= false*/) const {
+  NvtxScope _nv("sched: ToCoeff");
   const int level = boot_->param_.NPToLevel(x.GetNP());
   const int stc_level = GetStCLevel();
   AssertTrue(level >= stc_level,
@@ -338,6 +340,7 @@ template <typename word>
 double SylphSchedule<word>::ToSlot(Ct &res, const Ct &x,
                                    const EvkMap<word> &evk_map,
                                    bool min_ks /*= false*/) const {
+  NvtxScope _nv("sched: ToSlot");
   const int level = boot_->param_.NPToLevel(x.GetNP());
   double drift = 1.0;
   Ct low;
@@ -361,6 +364,7 @@ double SylphSchedule<word>::ToSlotPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
                                        const Ct &hi,
                                        const EvkMap<word> &evk_map,
                                        bool min_ks /*= false*/) const {
+  NvtxScope _nv("sched: ToSlotPair");
   AssertTrue(basis_ == nullptr,
              "ToSlotPair: the pair form reads the native basis; on the "
              "module basis use ToSlot");
@@ -388,6 +392,7 @@ double SylphSchedule<word>::ToSlotSplit(Ct &res_lo, Ct &res_hi,
                                         const Ct &merged,
                                         const EvkMap<word> &evk_map,
                                         bool min_ks /*= false*/) const {
+  NvtxScope _nv("sched: ToSlotSplit");
   AssertTrue(basis_ == nullptr,
              "ToSlotSplit: the split form reads the native basis; on the "
              "module basis use ToSlot");

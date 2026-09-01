@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/CiSinCBasis.h"
 
 #include <cmath>
@@ -587,18 +588,21 @@ template <typename word>
 void CiSinCBasis<word>::Forward(const std::string &name, Ct &res,
                                 const Ct &input,
                                 const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("tower forward");
   Run(FindForward(name), res, input, evk_map);
 }
 
 template <typename word>
 void CiSinCBasis<word>::EvaluateCtS(Ct &res, const Ct &input,
                                     const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("tower CtS");
   Run(cts_, res, input, evk_map);
 }
 
 template <typename word>
 void CiSinCBasis<word>::Prefix(Ct &res, const Ct &input,
                                const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("tower prefix");
   Run(prefix_, res, input, evk_map);
 }
 

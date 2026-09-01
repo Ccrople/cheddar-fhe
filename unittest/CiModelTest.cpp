@@ -68,6 +68,7 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "extension/Profile.h"
 #include "core/MemoryPool.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
@@ -831,6 +832,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
   for (int L = first_layer; L < first_layer + num_layers; L++) {
     const auto t_layer0 = Tick();
+    std::unique_ptr<cheddar::NvtxScope> stage =
+        std::make_unique<cheddar::NvtxScope>("stage: attention norm");
     MemRow("layer start");
     const std::string ld = wdir + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
     // The weight-cache name. A repeated tag with different weights is a wrong
@@ -986,6 +989,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::vector<Ciphertext<word>> normed;
     layer.AttentionNorm(normed, stream, an_dec, cal, fevk);
     const auto t_norm = Tick();
+    stage.reset();
+    stage = std::make_unique<cheddar::NvtxScope>("stage: q/k/v");
     MemRow("after the attention norm");
 
     // ---- STAGE 1: the pre-attention norm, against the host ---------------
@@ -1389,6 +1394,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_proj = Tick();
+    stage.reset();
+    stage = std::make_unique<cheddar::NvtxScope>("stage: leg");
     MemRow("after the q/k/v emissions and their HalfBoots");
 
     // ---- STAGE 1.5: one Q half-image, at the doorstep addresses ----------
@@ -1617,6 +1624,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_leg = Tick();
+    stage.reset();
+    stage = std::make_unique<cheddar::NvtxScope>("stage: seam");
 
     // ---- the seam ---------------------------------------------------------
     //
@@ -1729,6 +1738,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     booted.clear();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_seam = Tick();
+    stage.reset();
+    stage = std::make_unique<cheddar::NvtxScope>("stage: ffn");
     MemRow("after the leg, the Boots and the seam");
 
     // ---- STAGE 2: the seam's images, against the clear attention output ---
@@ -2035,6 +2046,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     layer.FeedForward(next, h_cts, stream, lw, cal, fevk);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_ffn = Tick();
+    stage.reset();
+    stage = std::make_unique<cheddar::NvtxScope>("stage: after-layer ledger");
     MemRow("after the feed-forward");
     // The layer's weights are read once: their operands go, their pinned
     // mirrors stay for the next layer's (same shapes).

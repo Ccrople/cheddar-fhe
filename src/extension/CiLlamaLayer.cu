@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/CiLlamaLayer.h"
 
 #include <algorithm>
@@ -230,6 +231,7 @@ void CiLlamaLayer<word>::DropSeamHalf() {
 template <typename word>
 void CiLlamaLayer<word>::Seam(Ct &res, const Ct &booted,
                               const EvkMap<word> &evk) {
+  NvtxScope _nv("layer: Seam");
   seam_->Apply(res, booted, sched_, evk, cfg_.min_ks);
 }
 
@@ -393,6 +395,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
                                   double stream_scale,
                                   const std::vector<double> &sink,
                                   const EvkMap<word> &evk) {
+  NvtxScope _nv("layer: NormTurn");
   AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
              "CiLlamaLayer: the residual stream is " +
                  std::to_string(num_model_cts_) + " ciphertexts");
@@ -584,6 +587,7 @@ void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const std::vector<double> &gain,
                                        const Calibration &c,
                                        const EvkMap<word> &evk) {
+  NvtxScope _nv("layer: AttentionNorm");
   NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window,
            c.stream_scale, c.attn_sink, evk);
 }
@@ -594,6 +598,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
                                      const std::vector<Ct> &stream,
                                      const Weights &w, const Calibration &c,
                                      const EvkMap<word> &evk) {
+  NvtxScope _nv("layer: FeedForward");
   AssertTrue(w.o.Given() && w.gate.Given() && w.up.Given() &&
                  w.down.Given() && w.ffn_norm != nullptr,
              "CiLlamaLayer: every weight must be given, in exactly one form");

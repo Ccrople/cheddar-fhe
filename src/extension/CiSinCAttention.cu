@@ -489,6 +489,7 @@ template <typename word>
 void CiSinCAttention<word>::RopeAndKill(std::vector<Ct> &a_cts,
                                         std::vector<Ct> &b_cts,
                                         bool with_angles) const {
+  NvtxScope _nv("attn: RopeAndKill");
   if (!with_angles) {
     // V: restore + kill alone -- the sin terms are zero, so the pair
     // arithmetic collapses to one mask multiply per ciphertext.
@@ -521,6 +522,7 @@ void CiSinCAttention<word>::RopeAndKill(std::vector<Ct> &a_cts,
 
 template <typename word>
 void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
+  NvtxScope _nv("attn: Rope");
   AssertTrue(cfg_.dense_images && static_cast<int>(cts.size()) == 8,
              "CiSinCAttention::Rope: eight dense images");
   if (!with_angles) {
@@ -575,6 +577,7 @@ template <typename word>
 void CiSinCAttention<word>::Merge(std::vector<Ct> &a_cts,
                                   std::vector<Ct> &b_cts,
                                   const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: Merge");
   const int merge_idx = degree_ - 128;
   for (size_t l = 0; l < a_cts.size(); l++) {
     // Onto the dial's level first (see the constructor): the drop is free
@@ -599,6 +602,7 @@ void CiSinCAttention<word>::Merge(std::vector<Ct> &a_cts,
 template <typename word>
 void CiSinCAttention<word>::ExchangeAll(std::vector<Ct> &cts,
                                         const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: Exchange");
   const int window_back = degree_ - window_;
   for (auto &ct : cts) {
     Ct shifted, swapped;
@@ -622,6 +626,7 @@ void CiSinCAttention<word>::ExchangeAll(std::vector<Ct> &cts,
 template <typename word>
 std::vector<Ciphertext<word>> CiSinCAttention<word>::Cross(
     const std::vector<Ct> &k_cts, int call, const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: Cross");
   const auto &layout = ccmm_.GetLayout();
   std::vector<Ct> out(layout.num_cts);
   for (int t_hi = 0; t_hi < layout.num_cts; t_hi++) {
@@ -653,6 +658,7 @@ std::vector<Ciphertext<word>> CiSinCAttention<word>::Cross(
 template <typename word>
 std::vector<Ciphertext<word>> CiSinCAttention<word>::VCall(
     const std::vector<Ct> &v_cts, int call, const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: VCall");
   const auto &layout = ccmm_.GetLayout();
   std::vector<Ct> out(layout.num_cts);
   for (int l = 0; l < layout.num_cts; l++) {
@@ -694,6 +700,7 @@ template <typename word>
 void CiSinCAttention<word>::Convert(const std::string &which,
                                     std::vector<Ct> &cts,
                                     const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: Convert (descent)");
   if (cfg_.fused) {
     const std::string name = (which == "pv") ? "p" : which;
     const int level = basis_->GetForwardLevel(name);
@@ -731,6 +738,7 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
                                            const std::vector<Ct> &rhs_source,
                                            bool rhs_is_k, const Keys &keys,
                                            double *carried) const {
+  NvtxScope _nv("attn: chain (CC-MM) + return");
   const auto &layout = ccmm_.GetLayout();
   std::vector<Ct> acc;
   for (int call = 0; call < 2; call++) {
@@ -782,6 +790,7 @@ template <typename word>
 void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
                                    std::vector<Ct> &k, const Keys &keys,
                                    double *carried) const {
+  NvtxScope _nv("attn: Scores");
   Rope(q, /*with_angles=*/true);
   Rope(k, /*with_angles=*/true);
   ExchangeAll(q, *keys.boot);
@@ -801,6 +810,7 @@ template <typename word>
 void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
                                    std::vector<Ct> &v, const Keys &keys,
                                    double *carried) const {
+  NvtxScope _nv("attn: Values");
   AssertTrue(boot_->param_.NPToLevel(p[0].GetNP()) == cfg_.forward_level,
              "CiSinCAttention: Values expects P at forward_level");
   Rope(v, /*with_angles=*/false);
@@ -817,6 +827,7 @@ void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
                                    std::vector<Ct> &q_b, std::vector<Ct> &k_a,
                                    std::vector<Ct> &k_b, const Keys &keys,
                                    double *carried) const {
+  NvtxScope _nv("attn: Scores");
   AssertTrue(!cfg_.dense_images,
              "CiSinCAttention::Scores: this leg was built for dense images; "
              "call the 8-ciphertext form");
@@ -1010,6 +1021,7 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
                                     const std::vector<Ct> &scores,
                                     double carried,
                                     const EvkMap<word> &evk) const {
+  NvtxScope _nv("attn: SoftMax");
   AssertTrue(softmax_ready_, "CiSinCAttention: call PrepareSoftMax first");
   const auto &layout = ccmm_.GetLayout();
   const int top = GetTopLevel();
@@ -1100,6 +1112,7 @@ template <typename word>
 void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
                                    std::vector<Ct> &v_a, std::vector<Ct> &v_b,
                                    const Keys &keys, double *carried) const {
+  NvtxScope _nv("attn: Values");
   AssertTrue(boot_->param_.NPToLevel(p[0].GetNP()) == cfg_.forward_level,
              "CiSinCAttention: Values expects P at forward_level");
   RopeAndKill(v_a, v_b, /*with_angles=*/false);

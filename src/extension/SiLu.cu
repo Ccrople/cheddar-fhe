@@ -1,5 +1,6 @@
 #include <cmath>
 
+#include "extension/Profile.h"
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/ChebyshevFit.h"
@@ -61,6 +62,7 @@ double SiLuHandler<word>::PlainSiLu(double x) const {
 template <typename word>
 void SiLuHandler<word>::Apply(Ct &res, const Ct &normalised_x,
                               const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("silu: Apply");
   // The input must already be x / range. Reinterpreting the scale here would
   // be free but would hand EvalPoly a non-canonical input scale, which is
   // exactly what silently broke RMSNorm: the same coefficients were exact in

@@ -1,5 +1,6 @@
 #include <cmath>
 
+#include "extension/Profile.h"
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "extension/ChebyshevFit.h"
@@ -189,6 +190,7 @@ void RmsNormHandler<word>::Apply(
     std::vector<Ct> &res, const std::vector<Ct> &x,
     const std::vector<std::vector<Complex>> &weight,
     const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("rmsnorm: Apply");
   AssertTrue(static_cast<int>(x.size()) == num_ct_,
              "RmsNorm: wrong number of input ciphertexts");
   AssertTrue(weight.size() == x.size(),

@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/BootContext.h"
 
 #include "core/Mlwe.h"
@@ -292,6 +293,7 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
                                      const EvkMap<word> &evk_map,
                                      int target_level, int module_small_degree,
                                      int tower_inner_rank) const {
+  NvtxScope _nv("boot: ModRaise");
   if (target_level < 0) target_level = boot_param_.GetMaxLevel();
   AssertTrue(target_level > 0 && target_level <= this->param_.max_level_,
              "ModUpToLevel: target level out of range");
@@ -418,6 +420,7 @@ template <typename word>
 void BootContext<word>::CoeffToSlot(Ct &res, int num_slots, const Ct &input,
                                     const EvkMap<word> &evk_map,
                                     bool min_ks /*= false*/) const {
+  NvtxScope _nv("boot: CtS native");
   eval_fft_.at(num_slots).EvaluateCtS(GetContext(), res, input, evk_map,
                                       min_ks);
 }
@@ -426,6 +429,7 @@ template <typename word>
 void BootContext<word>::SlotToCoeff(Ct &res, int num_slots, const Ct &input,
                                     const EvkMap<word> &evk_map,
                                     bool min_ks /*= false*/) const {
+  NvtxScope _nv("boot: StC native");
   eval_fft_.at(num_slots).EvaluateStC(GetContext(), res, input, evk_map,
                                       min_ks);
 }
@@ -502,6 +506,7 @@ void BootContext<word>::SinCPrefix(Ct &res, int num_slots, const Ct &input,
 template <typename word>
 void BootContext<word>::EvaluateMod(Ct &res, const Ct &input,
                                     const Evk &mult_key) const {
+  NvtxScope _nv("boot: EvalMod");
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
   this->AssertSameScale(input, eval_mod_->start_scale_);
   eval_mod_->Evaluate(GetContext(), res, input, mult_key);
@@ -512,6 +517,7 @@ template <typename word>
 void BootContext<word>::EvaluateModAfterCtS(Ct &res, Ct &main_ct,
                                             bool full_slot,
                                             const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("boot: EvalMod");
   main_ct.SetScale(eval_mod_->start_scale_);
 
   if (this->param_.conjugate_invariant_) {
@@ -543,6 +549,7 @@ void BootContext<word>::EvaluateModAfterCtS(Ct &res, Ct &main_ct,
 template <typename word>
 void BootContext<word>::SplitAndEvaluateMod(Ct &lo, Ct &hi, const Ct &main_ct,
                                             const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("boot: EvalMod split");
   // main = a + i b. Conjugation gives a - i b, and the two combinations are
   // real: lo = 2a, and hi = i * (conj - main) = i * (-2 i b) = 2b. Whatever
   // constant CtS folded in rides both identically, which is why the calibration
@@ -559,6 +566,7 @@ template <typename word>
 void BootContext<word>::HalfBootPair(Ct &res_lo, Ct &res_hi, const Ct &lo,
                                      const Ct &hi, const EvkMap<word> &evk_map,
                                      bool min_ks) const {
+  NvtxScope _nv("boot: HalfBootPair");
   counts_.pair++;
   AssertTrue(!this->param_.conjugate_invariant_,
              "HalfBootPair: the real subring's CtS lands real slots, so there "
@@ -601,6 +609,7 @@ template <typename word>
 void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
                                       const EvkMap<word> &evk_map,
                                       bool min_ks) const {
+  NvtxScope _nv("boot: HalfBootSplit");
   counts_.pair++;
   AssertTrue(!this->param_.conjugate_invariant_,
              "HalfBootSplit: the real subring's CtS lands real slots, so there "
@@ -644,6 +653,7 @@ void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
 template <typename word>
 void BootContext<word>::Boot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
+  NvtxScope _nv("boot: Boot");
   counts_.full++;
   int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
@@ -733,6 +743,7 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
 template <typename word>
 void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
                              const EvkMap<word> &evk_map, bool min_ks) const {
+  NvtxScope _nv("boot: HalfBoot");
   counts_.half++;
   int max_num_slots = this->param_.MaxNumSlots();
   int input_num_slots = input.GetNumSlots();
@@ -801,6 +812,7 @@ template <typename word>
 void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
                                        const EvkMap<word> &evk_map,
                                        const CiModuleBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootModule");
   counts_.half++;
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();
@@ -841,6 +853,7 @@ template <typename word>
 void BootContext<word>::HalfBootTower(Ct &res, const Ct &input,
                                       const EvkMap<word> &evk_map,
                                       const CiSinCBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootTower");
   counts_.half++;
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();

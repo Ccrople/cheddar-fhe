@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "extension/CiModuleBasis.h"
 
 #include <cmath>
@@ -373,6 +374,7 @@ template <typename word>
 void CiModuleBasis<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("module StC");
   AssertTrue(!stc_groups_.empty(), "CiModuleBasis: StC was not built");
   Ct mid, out;
   RunGroup(context, stc_groups_[0], mid, input, evk_map);
@@ -390,6 +392,7 @@ template <typename word>
 void CiModuleBasis<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
                                       const Ct &input,
                                       const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("module CtS");
   AssertTrue(!cts_groups_.empty(), "CiModuleBasis: CtS was not built");
   Ct mid, out;
   RunGroup(context, cts_groups_[0], mid, input, evk_map);

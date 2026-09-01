@@ -1,3 +1,4 @@
+#include "extension/Profile.h"
 #include "core/Context.h"
 
 #include <tuple>
@@ -674,6 +675,7 @@ void Context<word>::AdjustLevelForMultKey(int &level, const int num_q,
 
 template <typename word>
 void Context<word>::MultKey(Ct &res, const Ct &a, const Evk &key) const {
+  NvtxScope _nv("ks: MultKey");
   NPInfo np = a.GetNP();
   int level = param_.NPToLevel(np);
   int num_aux = key.GetNP().num_aux_;
@@ -701,6 +703,7 @@ void Context<word>::MultKey(Ct &res, const Ct &a, const Evk &key) const {
 template <typename word>
 void Context<word>::MultKeyNoModDown(Ct &accum, const std::vector<Dv> &a_modup,
                                      const Ct &a_orig, const Evk &key) const {
+  NvtxScope _nv("ks: MultKeyNoModDown");
   NPInfo a_orig_np = a_orig.GetNP();
   int level = param_.NPToLevel(a_orig_np);
   int num_main = a_orig_np.num_main_;
@@ -746,6 +749,7 @@ void Context<word>::ModUpForKeySwitchBatch(
     Dv &buffer, std::vector<std::vector<DvConstView<word>>> &mod_up_views,
     const Ct &a, const Evk &key, const DvConstView<word> &a_coeffs,
     int batch) const {
+  NvtxScope _nv("ks: ModUpBatch");
   NPInfo a_np = a.GetNP();
   AssertTrue(a_np.num_aux_ == 0,
              "ModUpForKeySwitchBatch is not supported for ciphertexts with p "
@@ -804,6 +808,7 @@ void Context<word>::MultKeyAccumNoModDown(
     Ct &accum, const std::vector<std::vector<DvConstView<word>>> &a_modups,
     const Ct &a_orig, const std::vector<const Evk *> &keys,
     bool accumulate) const {
+  NvtxScope _nv("ks: MultKeyAccum");
   AssertTrue(!keys.empty(), "MultKeyAccumNoModDown: no keys");
   AssertTrue(a_modups.size() >= keys.size(),
              "MultKeyAccumNoModDown: fewer mod-up results than keys");
@@ -862,6 +867,7 @@ void Context<word>::MultKeyAccumNoModDown(
 template <typename word>
 void Context<word>::MultKeyNoModDown(Ct &accum, const Ct &a,
                                      const Evk &key) const {
+  NvtxScope _nv("ks: MultKeyNoModDown");
   NPInfo a_np = a.GetNP();
   AssertTrue(a_np.num_aux_ == 0,
              "MultKeyNoModDown is not supported for ciphertexts with p primes");
@@ -952,6 +958,7 @@ void Context<word>::RelinearizeRescale(Ct &res, const Ct &a,
 
 template <typename word>
 void Context<word>::Rescale(Ct &res, const Ct &a) const {
+  NvtxScope _nv("op: Rescale");
   if (&res == &a) {
     Warn("Rescale is not adequate for in-place operations");
     Ct temp;
@@ -990,6 +997,7 @@ void Context<word>::Rescale(Ct &res, const Ct &a) const {
 template <typename word>
 void Context<word>::HRot(Ct &res, const Ct &a, const Evk &rot_key,
                          int rot_dist) const {
+  NvtxScope _nv("ks: HRot");
   int num_slots = a.GetNumSlots();
   rot_dist %= num_slots;
   if (rot_dist < 0) rot_dist += num_slots;
@@ -1018,6 +1026,7 @@ void Context<word>::HConj(Ct &res, const Ct &a, const Evk &conj_key) const {
 template <typename word>
 void Context<word>::HRotAdd(Ct &res, const Ct &a, const Ct &b,
                             const Evk &rot_key, int rot_dist) const {
+  NvtxScope _nv("ks: HRotAdd");
   AssertSameNP(a, b);
   AssertSameScale(a, b);
   int num_slots = Max(a.GetNumSlots(), b.GetNumSlots());
@@ -1083,6 +1092,7 @@ void Context<word>::HConjAdd(Ct &res, const Ct &a, const Ct &b,
 template <typename word>
 void Context<word>::HMult(Ct &res, const Ct &a, const Ct &b,
                           const Evk &mult_key, bool rescale) const {
+  NvtxScope _nv("ks: HMult");
   Mult(res, a, b);
   if (rescale) {
     RelinearizeRescale(res, res, mult_key);
@@ -1136,6 +1146,7 @@ void Context<word>::MadUnsafe(Ct &res, const Ct &a, const Const &b) const {
 
 template <typename word>
 void Context<word>::LevelDown(Ct &res, const Ct &a, int target_level) const {
+  NvtxScope _nv("op: LevelDown");
   Ct mult_temp, next;
   int level = param_.NPToLevel(a.GetNP());
   const Ct *prev_res = &a;
