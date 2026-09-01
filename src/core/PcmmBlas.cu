@@ -33,6 +33,23 @@ namespace kernel {
 // its own, so the tile goes through shared memory: reads run along x, which is
 // contiguous in each source, and writes run along j, which is contiguous in the
 // destination.
+// Digit `p` of `r` in BALANCED base 2^piece_bits, i.e. in [-2^(b-1), 2^(b-1)):
+// add half a digit at every position, take the plain digit, subtract the
+// half back. Exact and branch-free; the biased value needs one bit more than
+// `r`, which `PiecesFor` allows for. The host split, the residue split and
+// the gather must all take this same digit, so it is stated once.
+template <typename word>
+__host__ __device__ inline int8_t BalancedDigit(word r, int p, int piece_bits) {
+  const uint64_t half = static_cast<uint64_t>(1) << (piece_bits - 1);
+  uint64_t bias = 0;
+  for (int i = 0; i < 8; i++) bias |= half << (piece_bits * i);
+  const uint64_t biased = static_cast<uint64_t>(r) + bias;
+  const uint64_t mask = (static_cast<uint64_t>(1) << piece_bits) - 1;
+  return static_cast<int8_t>(
+      static_cast<int>((biased >> (piece_bits * p)) & mask) -
+      static_cast<int>(half));
+}
+
 template <typename word>
 __global__ void SplitGather(int8_t *dst, const word *const *src_ptrs, int cols,
                             int degree, int limb_offset, int pieces,
@@ -51,15 +68,13 @@ __global__ void SplitGather(int8_t *dst, const word *const *src_ptrs, int cols,
   }
   __syncthreads();
 
-  const word mask = (static_cast<word>(1) << piece_bits) - 1;
   for (int i = ty; i < kTile; i += blockDim.y) {
     const int x = x0 + i, j = j0 + tx;
     if (x >= degree || j >= cols) continue;
     const word v = tile[tx][i];
     const size_t o = static_cast<size_t>(x) * cols + j;
     for (int p = 0; p < pieces; p++) {
-      dst[static_cast<size_t>(p) * n + o] =
-          static_cast<int8_t>((v >> (piece_bits * p)) & mask);
+      dst[static_cast<size_t>(p) * n + o] = BalancedDigit(v, p, piece_bits);
     }
   }
 }
@@ -99,10 +114,15 @@ __global__ void CombineGroups(word *const *dst_ptrs, const int32_t *groups,
   const make_signed_t<word> inv_prime = basic::StreamingLoadConst(inv_prime_ptr);
   const int row = static_cast<int>(idx / degree);
   const int x = static_cast<int>(idx % degree);
+  // Balanced digits make a group sum signed: a negative one is lifted by the
+  // multiple of the prime the host put behind the shifts, and the
+  // Montgomery product stays in bounds either way (ProductComponent).
+  const int64_t lift =
+      static_cast<int64_t>(basic::StreamingLoadConst(shift_pow + num_groups));
   word acc = 0;
   for (int t = 0; t < num_groups; t++) {
-    const word part =
-        static_cast<word>(static_cast<uint32_t>(groups[t * n + idx]));
+    const int64_t g = static_cast<int64_t>(groups[t * n + idx]);
+    const word part = static_cast<word>(g < 0 ? g + lift : g);
     const word shift = basic::StreamingLoadConst(shift_pow + t);
     acc = basic::Add(acc, basic::MultMontgomery(part, shift, prime, inv_prime),
                      prime);
@@ -145,7 +165,7 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
     for (word p = primes[j]; p != 0; p >>= 1) b++;
     max_bits = b > max_bits ? b : max_bits;
   }
-  const int pieces = (max_bits + kPieceBits - 1) / kPieceBits;
+  const int pieces = PiecesFor(max_bits);
 
   const size_t per_prime = static_cast<size_t>(rows) * cols;
   HostVector<int8_t> host(static_cast<size_t>(pieces) * num_primes * per_prime);
@@ -160,7 +180,6 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
   // cheap. Both end up writing the same plain residues, which is what makes
   // the two paths comparable bit for bit.
   BigInt residue(static_cast<uint64_t>(0));
-  const word mask = (static_cast<word>(1) << kPieceBits) - 1;
   for (size_t i = 0; i < per_prime; i++) {
     BigInt value(std::round(values[i] * scale));
     for (int j = 0; j < num_primes; j++) {
@@ -168,7 +187,7 @@ void PcmmBlasHandler<word>::SplitMatrixFrom(SplitMatrix &res, int level,
       const word r = static_cast<word>(residue.GetUnsigned());
       for (int p = 0; p < pieces; p++) {
         host[(static_cast<size_t>(p) * num_primes + j) * per_prime + i] =
-            static_cast<int8_t>((r >> (kPieceBits * p)) & mask);
+            kernel::BalancedDigit(r, p, kPieceBits);
       }
     }
   }
@@ -192,11 +211,9 @@ __global__ void SplitResidues(int8_t *dst, const word *src, size_t per_prime,
   const size_t n = per_prime * num_primes;
   const size_t k = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (k >= n) return;
-  const word mask = (static_cast<word>(1) << piece_bits) - 1;
   const word r = src[k];
   for (int p = 0; p < pieces; p++) {
-    dst[static_cast<size_t>(p) * n + k] =
-        static_cast<int8_t>((r >> (piece_bits * p)) & mask);
+    dst[static_cast<size_t>(p) * n + k] = BalancedDigit(r, p, piece_bits);
   }
 }
 }  // namespace kernel
@@ -215,7 +232,7 @@ void PcmmBlasHandler<word>::SplitMatrixFromResidues(
     for (word p = primes[j]; p != 0; p >>= 1) b++;
     max_bits = b > max_bits ? b : max_bits;
   }
-  const int pieces = (max_bits + kPieceBits - 1) / kPieceBits;
+  const int pieces = PiecesFor(max_bits);
   const size_t per_prime = static_cast<size_t>(rows) * cols;
   const size_t n = per_prime * num_primes;
   res.rows = rows;
@@ -325,11 +342,14 @@ void PcmmBlasHandler<word>::ProductComponent(
   const int num_chunks = (vec_len + chunk - 1) / chunk;
   AssertTrue(split.size() == static_cast<size_t>(num_primes) * num_chunks,
              "PcmmBlas: the split source was cut for a different shape");
-  // A cuBLAS group entry is at most 127 * 127 * cols. It has to fit int32 for
-  // the GEMM at all, and CombineGroups' Montgomery reduction needs exactly the
-  // same bound (Basic.cuh:102, a * b within q * 2^31).
-  AssertTrue(static_cast<uint64_t>(16129) * cols < (1ull << 31),
-             "PcmmBlas: too many columns for an int32 accumulator");
+  // A cuBLAS group entry is within +-128 * 128 * cols. It has to fit int32
+  // for the GEMM at all, and CombineGroups lifts a negative one by the
+  // smallest multiple of the prime above 2^28 (`kLiftBound`), so the lifted
+  // value is below 2^28 + p < 2^31 and its Montgomery product with a shift
+  // (< p) stays inside q * 2^31 (Basic.cuh:102).
+  constexpr uint64_t kLiftBound = static_cast<uint64_t>(1) << 28;
+  AssertTrue(static_cast<uint64_t>(16384) * cols <= kLiftBound,
+             "PcmmBlas: too many columns for the signed int32 accumulator");
 
   DeviceVector<int32_t> groups(
       static_cast<int>(static_cast<size_t>(num_groups) * rows * chunk));
@@ -340,8 +360,11 @@ void PcmmBlasHandler<word>::ProductComponent(
   const int one = 1, zero = 0;
 
   for (int j = 0; j < num_primes; j++) {
-    // 2^(7*(k+l)) mod p, laid out to match the (l * pieces + k) buffer order.
-    HostVector<word> h_shift(num_groups);
+    // 2^(8*(k+l)) mod p, laid out to match the (l * pieces + k) buffer order,
+    // and behind them the lift: the smallest multiple of p at or above
+    // `kLiftBound`, which brings any group sum (>= -2^28) to a non-negative
+    // value below 2^28 + p.
+    HostVector<word> h_shift(num_groups + 1);
     {
       const uint64_t p = primes[j];
       std::vector<uint64_t> pow(2 * pieces - 1);
@@ -356,8 +379,9 @@ void PcmmBlasHandler<word>::ProductComponent(
               static_cast<word>(pow[k + l]), primes[j]);
         }
       }
+      h_shift[num_groups] = static_cast<word>(((kLiftBound + p - 1) / p) * p);
     }
-    DeviceVector<word> d_shift(num_groups);
+    DeviceVector<word> d_shift(num_groups + 1);
     CopyHostToDevice(d_shift, h_shift);
 
     for (int c = 0; c < num_chunks; c++) {

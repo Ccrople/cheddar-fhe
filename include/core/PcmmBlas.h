@@ -40,17 +40,20 @@ namespace cheddar {
  *
  * ## The splitting
  *
- * Residues are below a prime of up to 30 bits. Signed int8 holds
- * `[0, 127]` safely, so each value becomes `S = ceil(bits / 7)` pieces of 7
- * bits. A piece product is at most `127 * 127 < 2^14`, and summing `cols`
- * of them (4096 = 2^12) reaches `2^26`, inside int32 with room to spare.
+ * Residues are below a prime of up to 30 bits. Each value becomes
+ * `S = PiecesFor(bits)` BALANCED digits of 8 bits in `[-128, 127]` -- four
+ * for a 30-bit prime, where 7-bit unsigned pieces needed five and therefore
+ * 25 piece products instead of 16 (Doing.md 3.19: the product is 36 % of the
+ * layer's kernel time, so the digit width is not a detail). A piece product
+ * is within `+-2^14`, and summing `cols` of them (8704 < 2^14) stays within
+ * `+-2^28`, inside int32 with room to spare.
  *
- * Pieces `k` of U and `l` of the source contribute at shift `7 * (k + l)`, so
- * the `S^2` products fall into `2S - 1` shift groups. cuBLAS accumulates each
- * group in place with `beta = 1`, and one kernel recombines them modulo the
- * prime. That keeps the group sums inside int32 while the recombination, which
- * needs 64-bit intermediates, happens once per output element rather than once
- * per product.
+ * Pieces `k` of U and `l` of the source contribute at shift `8 * (k + l)`.
+ * Each of the `S^2` products lands in its own int32 slab (`beta = 0`: cuBLAS's
+ * integer path does not guarantee an in-place accumulation), and one kernel
+ * recombines the slabs modulo the prime, lifting a negative sum by a multiple
+ * of the prime first. The recombination, which needs 64-bit intermediates,
+ * happens once per output element rather than once per product.
  *
  * ## The layout is the whole performance story
  *
@@ -90,9 +93,17 @@ class PcmmBlasHandler {
   const Parameter<word> &param_;
   cublasHandle_t handle_ = nullptr;
 
-  // 7 bits per int8 piece: signed int8 reaches 127, so this is the largest
-  // width that never needs an offset or a sign fixup.
-  static constexpr int kPieceBits = 7;
+  // 8 bits per int8 piece, as BALANCED digits in [-128, 127]: the digit `p`
+  // of `r` is byte `p` of `r + 0x80..80` minus 128, so a 30-bit residue is
+  // four pieces and a product 16 GEMMs instead of the 25 that 7-bit unsigned
+  // pieces cost (Doing.md 3.19). The int32 group sums are then signed, and
+  // `CombineGroups` lifts a negative one by a multiple of the prime.
+  static constexpr int kPieceBits = 8;
+  //! Pieces that cover `max_bits`-bit residues with the bias trick: the
+  //! biased value `r + 0x80..80` needs one more bit than `r`.
+  static int PiecesFor(int max_bits) {
+    return (max_bits + 1 + kPieceBits - 1) / kPieceBits;
+  }
 
  public:
   /** @brief U split into int8 pieces, one set per RNS prime. Setup-time. */
