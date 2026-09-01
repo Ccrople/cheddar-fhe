@@ -297,6 +297,16 @@ class PcmmBlasHandler {
                 const SplitSource &src) const;
 
   /**
+   * @brief The same RLWE product into ONE buffer: row `i`'s b-part at
+   * `dst + i * dst_ct_stride`, its a-part `q_words` further, `q_words =
+   * np.GetNumTotal() * degree`. What a batched rescale over the tile wants
+   * (`ModSwitchHandler::RescaleBatch` reads polynomials at one stride), and
+   * the same words `Multiply` would have put in `u.rows` ciphertexts.
+   */
+  void MultiplyInto(word *dst, int dst_ct_stride, const SplitMatrix &u,
+                    const SplitSource &src) const;
+
+  /**
    * @brief The MLWE product against a source that is already split.
    *
    * Identical in result to the overload above; that one is this one with a

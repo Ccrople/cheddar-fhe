@@ -196,6 +196,30 @@ void CiBatchProjection<word>::Split(Source &src, const std::vector<Ct> &x,
   src.level = op.level;
 }
 
+namespace kernel {
+// dst_ptrs[2 * z + blockIdx.y][i] = src[z][poly blockIdx.y][i]: one tile's
+// rescaled rows, `[row][b|a][words]` in `src`, into the rows' own buffers.
+template <typename word>
+__global__ void ScatterRows(word *const *dst_ptrs, int poly_words,
+                            const word *src) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= poly_words) return;
+  const int z = blockIdx.z;
+  dst_ptrs[2 * z + blockIdx.y][i] =
+      src[static_cast<size_t>(z) * 2 * poly_words +
+          static_cast<size_t>(blockIdx.y) * poly_words + i];
+}
+}  // namespace kernel
+
+template <typename word>
+bool CiBatchProjection<word>::RescaleSerial() {
+  static const bool serial = [] {
+    const char *e = std::getenv("CHEDDAR_BATCH_RESCALE_SERIAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return serial;
+}
+
 template <typename word>
 void CiBatchProjection<word>::Project(std::vector<Ct> &res, const Source &src,
                                       const std::string &name,
@@ -211,18 +235,71 @@ void CiBatchProjection<word>::Project(std::vector<Ct> &res, const Source &src,
   AssertTrue(tile >= 0 && tile < static_cast<int>(op.tiles.size()),
              "CiBatchProjection::Project: no tile " + std::to_string(tile) +
                  " in " + name);
-  std::vector<Ct> part;
+  const SplitMatrix &u = op.tiles[tile];
+
+  if (RescaleSerial()) {
+    // The A/B: one `Rescale` per output ciphertext.
+    std::vector<Ct> part;
+    {
+      NvtxScope _g("batch: gemm");
+      blas_->Multiply(part, u, src.split);
+    }
+    NvtxScope _r("batch: rescale");
+    res.clear();
+    res.reserve(part.size());
+    for (auto &p : part) {
+      Ct r;
+      context_->Rescale(r, p);
+      res.push_back(std::move(r));
+    }
+    return;
+  }
+
+  // The tile's rows into one buffer, ONE rescale over its `2 * rows`
+  // polynomials (`ModSwitchHandler::RescaleBatch`, word for word the
+  // per-ciphertext one), and the rows scattered into their ciphertexts. At
+  // the model's width a projection is 4096-14336 rescales, each a
+  // launch-bound few hundred microseconds on a 4-limb ciphertext; batched
+  // they are a handful of launches.
+  const Parameter<word> &param = context_->param_;
+  const int rows = u.rows;
+  const int degree = param.degree_;
+  const int level = op.level;
+  const int q_words = src.split.np.GetNumTotal() * degree;
+  const NPInfo next_np = param.LevelToNP(level - 1);
+  const int next_words = next_np.GetNumTotal() * degree;
+  DeviceVector<word> prod(static_cast<size_t>(rows) * 2 * q_words);
   {
     NvtxScope _g("batch: gemm");
-    blas_->Multiply(part, op.tiles[tile], src.split);
+    blas_->MultiplyInto(prod.data(), 2 * q_words, u, src.split);
   }
-  NvtxScope _r("batch: rescale");
-  res.clear();
-  res.reserve(part.size());
-  for (auto &p : part) {
-    Ct r;
-    context_->Rescale(r, p);
-    res.push_back(std::move(r));
+  DeviceVector<word> rescaled(static_cast<size_t>(rows) * 2 * next_words);
+  {
+    NvtxScope _r("batch: rescale batch");
+    context_->mod_switch_handlers_.at(level).RescaleBatch(
+        rescaled.data(), next_words, prod.data(), q_words, 2 * rows);
+  }
+  prod = DeviceVector<word>();
+  {
+    NvtxScope _s("batch: scatter");
+    res.clear();
+    res.resize(rows);
+    HostVector<word *> ptrs(2 * rows);
+    for (int i = 0; i < rows; i++) {
+      Ct &r = res[i];
+      r.RemoveRx();
+      r.ModifyNP(next_np);
+      r.SetScale(u.scale * src.split.scale / param.GetRescalePrimeProd(level));
+      r.SetNumSlots(src.split.num_slots);
+      ptrs[2 * i] = r.bx_.data();
+      ptrs[2 * i + 1] = r.ax_.data();
+    }
+    DeviceVector<word *> ptrs_dev(2 * rows);
+    CopyHostToDevice(ptrs_dev, ptrs);
+    constexpr int kBlock = 256;
+    kernel::ScatterRows<word>
+        <<<dim3((next_words + kBlock - 1) / kBlock, 2, rows), kBlock>>>(
+            ptrs_dev.data(), next_words, rescaled.data());
   }
 }
 

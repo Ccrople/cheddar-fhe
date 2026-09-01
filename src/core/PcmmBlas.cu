@@ -551,6 +551,43 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
 }
 
 template <typename word>
+void PcmmBlasHandler<word>::MultiplyInto(word *dst, int dst_ct_stride,
+                                         const SplitMatrix &u,
+                                         const SplitSource &src) const {
+  const int rows = u.rows, cols = u.cols;
+  AssertTrue(rows > 0 && cols > 0, "PcmmBlas::MultiplyInto: bad shape");
+  AssertTrue(src.rank == 1 && src.degree == param_.degree_,
+             "PcmmBlas::MultiplyInto: the split source is not an RLWE one");
+  AssertTrue(cols == src.cols && u.pieces == src.pieces && u.np == src.np,
+             "PcmmBlas::MultiplyInto: the split source was prepared for a "
+             "different matrix");
+  AssertTrue(rows <= src.rows,
+             "PcmmBlas::MultiplyInto: the split source was cut for fewer "
+             "rows than this tile has");
+  AssertTrue(ChunkFor(cols, src.rows, u.pieces, src.degree) == src.chunk_b,
+             "PcmmBlas::MultiplyInto: the split source was cut for a "
+             "different row count");
+  const int degree = src.degree;
+  const int q_words = src.np.GetNumTotal() * degree;
+  AssertTrue(dst_ct_stride >= 2 * q_words,
+             "PcmmBlas::MultiplyInto: the row stride must hold both parts");
+
+  HostVector<word *> h_dst_bx(rows), h_dst_ax(rows);
+  for (int i = 0; i < rows; i++) {
+    h_dst_bx[i] = dst + static_cast<size_t>(i) * dst_ct_stride;
+    h_dst_ax[i] = h_dst_bx[i] + q_words;
+  }
+  DeviceVector<word *> d_dst_bx(rows), d_dst_ax(rows);
+  CopyHostToDevice(d_dst_bx, h_dst_bx);
+  CopyHostToDevice(d_dst_ax, h_dst_ax);
+
+  ProductComponent(d_dst_bx.data(), src.b_data, u, src.np, degree,
+                   src.chunk_b);
+  ProductComponent(d_dst_ax.data(), src.a_data, u, src.np, degree,
+                   src.chunk_a);
+}
+
+template <typename word>
 void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
                                      const SplitMatrix &u,
                                      const std::vector<Ct> &cts) const {

@@ -256,6 +256,10 @@ class CiBatchProjection {
                        int out, const std::vector<double> &gain);
 
  private:
+  //! `CHEDDAR_BATCH_RESCALE_SERIAL=1`: one `Rescale` per output instead
+  //! of the tile's batched one (the A/B; the words are the same).
+  static bool RescaleSerial();
+
   ConstContextPtr<word> context_;
   Config cfg_;
   std::unique_ptr<PcmmBlasHandler<word>> blas_;
