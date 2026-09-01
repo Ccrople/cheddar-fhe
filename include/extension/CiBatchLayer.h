@@ -104,7 +104,12 @@ class CiBatchLayer {
     //! GiB at the model's width) between the sum of squares and the apply,
     //! or boot each channel twice and hold nothing. The first is 4096
     //! bootstraps cheaper a norm, the second 24 GiB smaller.
-    bool hold_channels = true;
+    //! The attention's norm holds nothing by default: the converters and
+    //! the split of the normalised stream already stand beside it. The
+    //! feed-forward's norm holds (`hold_channels_ffn`): its peak was 55 GiB
+    //! with them held, and 4096 bootstraps are four minutes a layer.
+    bool hold_channels = false;
+    bool hold_channels_ffn = true;
     //! Drop the boot's CoeffToSlot/SlotToCoeff tables (6.4 GiB on
     //! `ci16_35`) once a norm's bootstraps are done and rebuild them at the
     //! next norm: nothing between two norms bootstraps, and the tables are
@@ -197,11 +202,13 @@ class CiBatchLayer {
    *
    * @param stream `model` ciphertexts, any level, carrying `stream_scale`
    * @param sink the per-token rescale, or empty
+   * @param hold keep the booted channels between the two passes
+   *        (`Config::hold_channels` / `hold_channels_ffn`)
    */
   void NormTurn(typename CiBatchProjection<word>::Source &src,
                 const std::vector<Ct> &stream, double alpha, double window,
                 const std::vector<double> &sink, double stream_scale,
-                const EvkMap<word> &evk) const;
+                const EvkMap<word> &evk, bool hold) const;
 
   /**
    * @brief The whole feed-forward half: norm, gate/up, SiLU, down, residual.

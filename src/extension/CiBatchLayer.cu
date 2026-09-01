@@ -69,7 +69,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
                                   double window,
                                   const std::vector<double> &sink,
                                   double stream_scale,
-                                  const EvkMap<word> &evk) const {
+                                  const EvkMap<word> &evk, bool hold_ch) const {
   NvtxScope _nv("batch: NormTurn");
   const int model = cfg_.model;
   const int T = cfg_.num_tokens;
@@ -101,7 +101,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   // relinearization (the tensor product's three components add), and the
   // channel itself either kept at the level the apply will meet it or
   // dropped to be booted again (`Config::hold_channels`).
-  std::vector<Ct> xs(cfg_.hold_channels ? model : 0);
+  std::vector<Ct> xs(hold_ch ? model : 0);
   Ct acc;
   {
     NvtxScope _a("batch: norm pass A");
@@ -115,12 +115,12 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       } else {
         boot_->Add(acc, acc, sq);
       }
-      if (cfg_.hold_channels) boot_->LevelDown(xs[c], up, hold);
+      if (hold_ch) boot_->LevelDown(xs[c], up, hold);
     }
   }
   // The last bootstrap of this norm, when the channels are held: the
   // tables can go now.
-  if (cfg_.hold_channels && cfg_.release_boot_tables) {
+  if (hold_ch && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
   stages_.boot += SinceSeconds(t0);
@@ -207,7 +207,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
     NvtxScope _b("batch: norm pass B");
     for (int c = 0; c < model; c++) {
       Ct x_c;
-      if (cfg_.hold_channels) {
+      if (hold_ch) {
         x_c = std::move(xs[c]);
       } else {
         Ct up;
@@ -219,10 +219,10 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       proj_->AddColumn(src, c, y_c);
     }
   }
-  if (!cfg_.hold_channels && cfg_.release_boot_tables) {
+  if (!hold_ch && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
-  if (cfg_.hold_channels) {
+  if (hold_ch) {
     stages_.norm += SinceSeconds(t0);
   } else {
     stages_.boot += SinceSeconds(t0);
@@ -230,7 +230,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   if (cfg_.verbose) {
     std::cout << "  [batch] NormTurn: window " << window << " degree " << used
               << ", r at level " << lr << ", y at level " << (hold - 1)
-              << ", split " << (cfg_.hold_channels ? "from held channels"
+              << ", split " << (hold_ch ? "from held channels"
                                                     : "from a second boot")
               << std::endl;
   }
@@ -256,7 +256,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   // 1. The norm, straight into the split the projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
-           evk);
+           evk, cfg_.hold_channels_ffn);
   const int ly = src_y.level;
   if (cfg_.verbose) MemoryPool::Report("batch: after the norm");
 
@@ -404,7 +404,7 @@ void CiBatchLayer<word>::Attention(
   // 1. The pre-attention norm, into the split the three projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.attn_alpha, c.attn_norm_window, c.attn_sink,
-           c.stream_scale, evk);
+           c.stream_scale, evk, cfg_.hold_channels);
   const int ly = src_y.level;
   if (cfg_.verbose) MemoryPool::Report("batch: after the attention norm");
 

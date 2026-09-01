@@ -627,7 +627,7 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   cfg.eps = eps;
   cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 512);
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
-  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
+  cfg.hold_channels_ffn = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS_FFN", 1) != 0;
   cfg.verbose = true;
   auto t0 = Sync();
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
@@ -1621,7 +1621,7 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
   auto t0 = Sync();
   typename cheddar::CiBatchProjection<word>::Source src;
   layer.NormTurn(src, stream, alpha, window, sink, stream_scale,
-                 boot.ui->GetEvkMap());
+                 boot.ui->GetEvkMap(), cfg.hold_channels);
   auto t1 = Sync();
   std::cout << "  NormTurn on " << model << " channels: " << Ms(t0, t1) / 1000.0
             << " s" << std::endl;
