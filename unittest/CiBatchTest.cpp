@@ -1213,3 +1213,252 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   }
   EXPECT_LT(worst, std::ldexp(1.0, -6));
 }
+
+// ---------------------------------------------------------------------------
+// 7. Whole layers, chained, on the real weights: layer L reads L-1's
+//    ENCRYPTED output. `CHEDDAR_CI_BATCH_LAYERS` layers from layer 0; the
+//    instance at factor 1 (B/2) is checked against the exporter's h_L{L}.f64
+//    on the user tokens after every layer -- the other instances carry the
+//    same prompt at another factor and have no float64 twin past the first
+//    attention. The stream carries one factor for the whole run, sized on
+//    the run's largest residual.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  const char *rdir_env = std::getenv("LLAMA3_REF_DIR");
+  if (wdir_env == nullptr || rdir_env == nullptr) {
+    GTEST_SKIP() << "LLAMA3_ALL_DIR and LLAMA3_REF_DIR must both be set";
+  }
+  const std::string wd = wdir_env;
+  const std::string rd = rdir_env;
+  constexpr int kH = 4096, kKv = 1024, kI = 14336, kHeads = 32,
+                kSinkTokens = 2;
+  const int num_layers = EnvInt("CHEDDAR_CI_BATCH_LAYERS", 1);
+  const double ride = [] {
+    const char *e = std::getenv("CHEDDAR_CI_BATCH_RIDE");
+    return (e && e[0]) ? std::atof(e) : 0.35;
+  }();
+  const double score_ride = [] {
+    const char *e = std::getenv("CHEDDAR_CI_BATCH_SCORE_RIDE");
+    return (e && e[0]) ? std::atof(e) : 0.35;
+  }();
+
+  nlohmann::json calib_all;
+  {
+    std::ifstream f(rd + "/calib.json");
+    ASSERT_TRUE(f.good()) << rd << "/calib.json";
+    calib_all = nlohmann::json::parse(f);
+  }
+  // One stream factor for the run: the largest residual any of its layers
+  // reaches, sink rows included (as the single-prompt model test sizes it).
+  double stream_absmax = calib_all["layers"][0]["in_absmax"].get<double>();
+  for (int L = 0; L < num_layers; L++) {
+    const auto &cj = calib_all["layers"][L];
+    stream_absmax = std::max(stream_absmax, cj["out_absmax"].get<double>());
+    stream_absmax = std::max(stream_absmax, cj["resid_absmax"].get<double>());
+  }
+  const double stream_scale = ride / stream_absmax;
+  std::cout << "  " << num_layers << " layer(s); the stream reaches "
+            << stream_absmax << ", so it carries " << stream_scale
+            << " (ride " << ride << ")" << std::endl;
+
+  std::vector<float> x0;
+  ASSERT_TRUE(ReadF32(wd + "/input_nosink.f32",
+                      static_cast<size_t>(kTokens) * kH, x0));
+
+  Ring boot("ci16_35.json");
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  auto t0 = Sync();
+  cheddar::CiBatchLayer<word>::Config cfg;
+  cfg.num_tokens = kTokens;
+  cfg.model = kH;
+  cfg.hidden = kI;
+  cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 512);
+  cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
+  cfg.verbose = EnvInt("CHEDDAR_CI_BATCH_VERBOSE", 1) != 0;
+  cheddar::CiBatchLayer<word> layer(bctx, cfg);
+  cheddar::CiBatchAttention<word>::Config acfg;
+  acfg.rope_level = cfg.norm_apply_level - 2;
+  acfg.verbose = cfg.verbose;
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, acfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const int chain_level = attn.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  cheddar::CiBatchAttention<word>::Keys akeys;
+  akeys.swtch = &swtch.ui->GetEvkMap();
+  akeys.lifted = &lifted.ui->GetEvkMap();
+  akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
+  akeys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+  auto t1 = Sync();
+  std::cout << "  setup: " << std::fixed << std::setprecision(1)
+            << Ms(t0, t1) / 1000.0 << " s, " << FreeMiB() << " MiB free"
+            << std::endl;
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = layout.num_instances;
+  const int b_ref = B / 2;  // factor 1.0
+  auto factor = [&](int b) { return 0.5 + static_cast<double>(b) / B; };
+  std::vector<Ciphertext<word>> stream;
+  {
+    HostTensor x{B, kTokens, kH, {}};
+    x.v.resize(static_cast<size_t>(B) * kTokens * kH);
+    for (int b = 0; b < B; b++) {
+      const double f = factor(b) * stream_scale;
+      for (int t = 0; t < kTokens; t++) {
+        for (int c = 0; c < kH; c++) {
+          x.At(b, t, c) =
+              f * static_cast<double>(x0[static_cast<size_t>(t) * kH + c]);
+        }
+      }
+    }
+    EncryptChannels(boot, layout, x, 0, stream);
+  }
+  auto t2 = Sync();
+  std::cout << "  encrypt the stream: " << Ms(t1, t2) / 1000.0 << " s"
+            << std::endl;
+
+  double total_s = 0.0;
+  for (int L = 0; L < num_layers; L++) {
+    const std::string ld = wd + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
+    const auto &cj = calib_all["layers"][L];
+    std::vector<float> wq, wk, wv, wo, wg, wu, wd_, an, fn;
+    ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
+    ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+    ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
+    ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
+    ASSERT_TRUE(ReadF32(ld + "/wgate.f32", static_cast<size_t>(kH) * kI, wg));
+    ASSERT_TRUE(ReadF32(ld + "/wup.f32", static_cast<size_t>(kH) * kI, wu));
+    ASSERT_TRUE(ReadF32(ld + "/wdown.f32", static_cast<size_t>(kI) * kH, wd_));
+    ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an));
+    ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, fn));
+    cheddar::DeviceVector<float> q_dev, k_dev, v_dev, o_dev, g_dev, u_dev,
+        d_dev;
+    ToDevice(q_dev, wq);
+    ToDevice(k_dev, wk);
+    ToDevice(v_dev, wv);
+    ToDevice(o_dev, wo);
+    ToDevice(g_dev, wg);
+    ToDevice(u_dev, wu);
+    ToDevice(d_dev, wd_);
+    cheddar::CiBatchLayer<word>::AttnWeights aw;
+    aw.q = q_dev.data();
+    aw.k = k_dev.data();
+    aw.v = v_dev.data();
+    aw.o = o_dev.data();
+    aw.attn_norm.assign(an.begin(), an.end());
+    cheddar::CiBatchLayer<word>::Weights fw;
+    fw.gate = g_dev.data();
+    fw.up = u_dev.data();
+    fw.down = d_dev.data();
+    fw.ffn_norm.assign(fn.begin(), fn.end());
+
+    cheddar::CiBatchLayer<word>::Calibration cal;
+    cal.alpha = cj["alpha"];
+    cal.norm_window = cj["norm_window"];
+    cal.silu_range = cj["silu_range"];
+    cal.attn_alpha = cj["attn_alpha"];
+    cal.attn_norm_window = cj["attn_norm_window"];
+    cal.stream_scale = stream_scale;
+    cal.attn_sink.assign(kTokens, 1.0);
+    cal.ffn_sink.assign(kTokens, 1.0);
+    if (cj.contains("attn_sink")) {
+      const auto v = cj["attn_sink"].get<std::vector<double>>();
+      for (size_t i = 0; i < v.size() && i < cal.attn_sink.size(); i++) {
+        cal.attn_sink[i] = v[i];
+      }
+    }
+    if (cj.contains("ffn_sink")) {
+      const auto v = cj["ffn_sink"].get<std::vector<double>>();
+      for (size_t i = 0; i < v.size() && i < cal.ffn_sink.size(); i++) {
+        cal.ffn_sink[i] = v[i];
+      }
+    }
+    const double s_min = cj["s_raw_min"], s_max = cj["s_raw_max"];
+    cal.span_raw = s_max - s_min;
+    cal.s_raw_max = s_max;
+    cal.m_eff = cj["span"];
+    cal.row_shift_raw.assign(kHeads, std::vector<double>(kTokens, 0.0));
+    cal.row_norm.assign(kHeads, std::vector<double>(kTokens, 1.0));
+    for (int h = 0; h < kHeads; h++) {
+      for (int t = 0; t < kTokens; t++) {
+        cal.row_shift_raw[h][t] = cj["row_shift_raw"][h][t].get<double>();
+        cal.row_norm[h][t] = cj["row_norm"][h][t].get<double>();
+      }
+    }
+    const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
+    cal.cq = cal.ck = std::sqrt(cqk);
+
+    bctx->ResetBootCounts();
+    auto tl0 = Sync();
+    std::vector<Ciphertext<word>> next;
+    layer.Layer(next, stream, aw, fw, cal, attn, akeys, boot.ui->GetEvkMap());
+    auto tl1 = Sync();
+    stream = std::move(next);
+    const auto st = layer.GetStages();
+    const auto counts = bctx->GetBootCounts();
+    total_s += Ms(tl0, tl1) / 1000.0;
+    std::cout << "  LAYER " << L << ", " << B << " instances: "
+              << Ms(tl0, tl1) / 1000.0 << " s wall = " << Ms(tl0, tl1) / B
+              << " ms per instance-layer; boots " << counts.full
+              << " (tables " << layer.GetPrepareSeconds()
+              << " s); boot " << st.boot << " norm " << st.norm << " q/k/v "
+              << st.qkv << " scores " << st.scores << " softmax "
+              << st.softmax << " values " << st.values << " o " << st.o
+              << " gate/up " << st.gate_up << " silu " << st.silu << " down "
+              << st.down << " s; " << FreeMiB() << " MiB free" << std::endl;
+
+    // The reference instance against the exporter's residual after layer L.
+    std::vector<double> h_ref;
+    ASSERT_TRUE(ReadF64(rd + "/h_L" + (L < 10 ? "0" : "") + std::to_string(L) +
+                            ".f64",
+                        static_cast<size_t>(kTokens) * kH, h_ref));
+    HostTensor got{B, kTokens, kH, {}};
+    got.v.assign(static_cast<size_t>(B) * kTokens * kH, 0.0);
+    std::vector<int> all_c(kH);
+    for (int c = 0; c < kH; c++) all_c[c] = c;
+    DecryptChannels(boot, layout, stream, all_c, got);
+    std::vector<double> out(static_cast<size_t>(kTokens) * kH);
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < kH; c++) {
+        out[static_cast<size_t>(t) * kH + c] = got.At(b_ref, t, c) / stream_scale;
+      }
+    }
+    const double e_user = RmsRel(out, h_ref, kTokens, kH, kSinkTokens);
+    const double e_all = RmsRel(out, h_ref, kTokens, kH, 0);
+    std::cout << "  layer " << L << " output, instance " << b_ref
+              << " vs h_L" << L << ".f64: 2^-" << std::setprecision(2)
+              << Bits(e_user) << " over user tokens (2^-" << Bits(e_all)
+              << " over all)" << std::endl;
+    EXPECT_LT(e_user, std::ldexp(1.0, -4)) << "layer " << L;
+  }
+  std::cout << "  " << num_layers << " layer(s): " << total_s << " s = "
+            << total_s / num_layers / B * 1000.0 << " ms per instance-layer"
+            << std::endl;
+}
