@@ -136,16 +136,20 @@ void HostProject(const HostTensor &x, const std::vector<float> &w, int out,
   y.tokens = x.tokens;
   y.channels = out;
   y.v.assign(static_cast<size_t>(x.instances) * x.tokens * out, 0.0);
-  cheddar::ParallelFor(static_cast<int>(os.size()), [&](int oi) {
-    const int o = os[oi];
-    for (int b : bs) {
-      for (int t = 0; t < x.tokens; t++) {
-        double acc = 0.0;
-        const double *row = &x.v[(static_cast<size_t>(b) * x.tokens + t) * in];
-        for (int c = 0; c < in; c++) {
-          acc += row[c] * static_cast<double>(w[static_cast<size_t>(c) * out + o]);
+  cheddar::ParallelFor(static_cast<int>(os.size()), [&](int begin, int end) {
+    for (int oi = begin; oi < end; oi++) {
+      const int o = os[oi];
+      for (int b : bs) {
+        for (int t = 0; t < x.tokens; t++) {
+          double acc = 0.0;
+          const double *row =
+              &x.v[(static_cast<size_t>(b) * x.tokens + t) * in];
+          for (int c = 0; c < in; c++) {
+            acc += row[c] *
+                   static_cast<double>(w[static_cast<size_t>(c) * out + o]);
+          }
+          y.At(b, t, o) = acc;
         }
-        y.At(b, t, o) = acc;
       }
     }
   });
