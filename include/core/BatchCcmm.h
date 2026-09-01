@@ -109,7 +109,18 @@ class BatchCcmmHandler {
    */
   void Multiply(ConstContextPtr<word> context, std::vector<Ct> &res,
                 const std::vector<Ct> &lhs, const std::vector<Ct> &rhs,
-                int sub_degree, const EvkMap<word> &evk_map) const;
+                int sub_degree, const EvkMap<word> &evk_map,
+                bool rhs_row_wise = false) const;
+  /**
+   * `rhs_row_wise`: the second operand is ALREADY the row-wise encryption
+   * step 1 would produce -- ciphertext j holds ROW j of M' -- so step 1 is
+   * skipped. This is the score product on the batched layout: with Q and K
+   * both projected one channel per ciphertext (rows = tokens), K as given
+   * is the row-wise form of K^T, and `Q K^T` needs no transpose of K at all
+   * (HEonGPU's LLAMA3_8B_LAYER_FLOW.md 20.3, as an algorithm). Everything
+   * from step 2 on is unchanged; the contraction runs over the ciphertext
+   * index of both operands as before.
+   */
 };
 
 }  // namespace cheddar

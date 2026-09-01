@@ -73,7 +73,8 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
                                       const std::vector<Ct> &lhs,
                                       const std::vector<Ct> &rhs,
                                       int sub_degree,
-                                      const EvkMap<word> &evk_map) const {
+                                      const EvkMap<word> &evk_map,
+                                      bool rhs_row_wise) const {
   const int degree = param_.degree_;
   const int d = degree / sub_degree;
   AssertTrue(sub_degree >= 2 && sub_degree <= degree && IsPowOfTwo(sub_degree),
@@ -101,14 +102,18 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
   // 1. The second operand becomes row-wise. This is the step that makes the
   //    contraction of step 2 line up; everything else follows from it.
   NvtxScope _nv("ccmm: Multiply (lifted ring)");
-  std::vector<Ct> rhs_transposed;
-  {
-    NvtxScope _c("ccmm: Cmt (rhs)");
-    cmt_.Cmt(context, rhs_transposed, rhs, sub_degree, evk_map);
-  }
-
   SubringCoeffMatrix<word> b_bar, a_bar;
-  matrix_.ToMatrices(b_bar, a_bar, rhs_transposed, sub_degree, true);
+  if (rhs_row_wise) {
+    // The caller's rhs is already row j per ciphertext; step 1 elided.
+    matrix_.ToMatrices(b_bar, a_bar, rhs, sub_degree, true);
+  } else {
+    std::vector<Ct> rhs_transposed;
+    {
+      NvtxScope _c("ccmm: Cmt (rhs)");
+      cmt_.Cmt(context, rhs_transposed, rhs, sub_degree, evk_map);
+    }
+    matrix_.ToMatrices(b_bar, a_bar, rhs_transposed, sub_degree, true);
+  }
 
   SubringCoeffMatrix<word> b_mat, a_mat;
   matrix_.ToMatrices(b_mat, a_mat, lhs, sub_degree, false);

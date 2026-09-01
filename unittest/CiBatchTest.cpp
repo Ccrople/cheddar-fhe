@@ -40,6 +40,8 @@
 
 #include "RingFixture.h"
 #include "common/Assert.h"
+#include "core/BatchCcmm.h"
+#include "core/CiLift.h"
 #include "common/ParallelFor.h"
 #include "extension/BootContext.h"
 #include "extension/CiBatch.h"
@@ -725,4 +727,133 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   EXPECT_LT(worst_layer, std::ldexp(1.0, -8))
       << "the batched feed-forward is far from the float64 reference";
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// 4. The score product on the batched layout: Q K^T with K as projected.
+//
+// On the batched layout Q and K both come out of the projection one channel
+// per ciphertext with the tokens in the blocks. [KANG] Algorithm 4 contracts
+// the CIPHERTEXT index of both operands after its step 1 has made the second
+// operand row-wise -- and K as projected IS the row-wise encryption of K^T
+// (ciphertext c = row c of K^T = channel c over the tokens). So the score
+// product skips step 1 (`rhs_row_wise`) and transposes nothing.
+//
+// What has to be checked is the lifted-ring twist of Doing.md 1.5bl. The lift
+// puts Lambda = I + w^-1 P E on the BLOCK index of every lifted ciphertext,
+// and in the elided form the blocks are the FREE indices of both operands, so
+// the product comes back as Lambda S Lambda^T per lane: the CI read strips the
+// outer Lambda (the lift structure itself) and the descent's trace turns the
+// inner one into (I + cos(theta) P E) on the KEY-TOKEN axis -- score column l
+// arrives as S[:, l] + cos(theta) S[:, d - l]. Confining K's live tokens to
+// blocks x < d/2 kills the partner term identically for every l < d/2. That
+// is the derivation; this test is whether the hardware agrees: one call,
+// full 128-channel contraction, key tokens 0..63 live, and columns 0..63
+// compared against the per-lane host product. The other 64 columns are
+// where the flipped partners land and are reported, not asserted.
+// ---------------------------------------------------------------------------
+namespace {
+using RealBatch = std::vector<std::vector<std::vector<double>>>;  // [lane][i][x]
+}  // namespace
+
+TEST(CiBatch, TheElidedScoreProductHoldsUnderTheContract) {
+  Ring ci("ci12_35_boot.json");
+  Ring big("ringdegree13_35_boot.json",
+           cheddar::CiLiftHandler<word>::LiftSecret(ci.ui->GetSecretCoeffs()));
+  const int n = ci.Degree();
+  const int k = 32;  // CI lanes: the instances of one group
+  const int d = n / k;  // 128: tokens as blocks, channels as ciphertexts
+  const int half = d / 2;
+  const int level = 2;
+  const double scale = ci.param->GetScale(level);
+  ASSERT_LE(level, ci.param->max_level_);
+
+  cheddar::CiLiftHandler<word> lift(ci.context, big.context);
+  cheddar::BatchCcmmHandler<word> ccmm(*big.param, big.context->ntt_handler_);
+  for (int index : ccmm.RotationIndices(2 * k)) {
+    big.ui->PrepareRotationKey(index, level);
+  }
+
+  // q[t][i][x]: lane t, token i, channel x -- every token live. k[t][l][x]:
+  // key token l, channel x -- live only for l < d/2.
+  std::mt19937_64 gen(0xB47C);
+  std::uniform_real_distribution<double> dist(-0.15, 0.15);
+  RealBatch q(k, std::vector<std::vector<double>>(d, std::vector<double>(d)));
+  RealBatch kk(k, std::vector<std::vector<double>>(d, std::vector<double>(d, 0.0)));
+  for (int t = 0; t < k; t++) {
+    for (int i = 0; i < d; i++) {
+      for (int x = 0; x < d; x++) q[t][i][x] = dist(gen);
+    }
+    for (int l = 0; l < half; l++) {
+      for (int x = 0; x < d; x++) kk[t][l][x] = dist(gen);
+    }
+  }
+  // Ciphertext x = channel x: block i (token), lane t of its CI SinC
+  // message holds m[t][i][x]. Encrypted on R+, lifted.
+  auto encrypt_channels = [&](const RealBatch &m,
+                              std::vector<Ciphertext<word>> &out) {
+    out.resize(d);
+    std::vector<Complex> message(n);
+    for (int x = 0; x < d; x++) {
+      for (int i = 0; i < d; i++) {
+        for (int t = 0; t < k; t++) {
+          message[static_cast<size_t>(i) * k + t] = Complex(m[t][i][x], 0.0);
+        }
+      }
+      Plaintext<word> pt;
+      ci.context->encoder_.EncodeSinC(pt, level, scale, message, k);
+      Ciphertext<word> ct;
+      ci.ui->Encrypt(ct, pt);
+      lift.Lift(out[x], ct);
+    }
+  };
+  std::vector<Ciphertext<word>> lhs, rhs, res;
+  encrypt_channels(q, lhs);
+  encrypt_channels(kk, rhs);
+
+  auto t0 = Sync();
+  ccmm.Multiply(big.context, res, lhs, rhs, 2 * k, big.ui->GetEvkMap(),
+                /*rhs_row_wise=*/true);
+  auto t1 = Sync();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(res.size()), d);
+  std::cout << "  elided Algorithm 4 at d = " << d << ", " << k
+            << " lanes, on the lifted ring: " << Ms(t0, t1) << " ms" << std::endl;
+
+  // Descend, decode: got[l][i * k + t] is score column l (key token), row i
+  // (query token), lane t.
+  double worst_live = 0.0, worst_dead = 0.0, ref_rms = 0.0;
+  size_t n_ref = 0;
+  for (int l = 0; l < d; l++) {
+    Ciphertext<word> down;
+    lift.Descend(down, res[l]);
+    Plaintext<word> out;
+    ci.ui->Decrypt(out, down);
+    std::vector<Complex> got;
+    ci.context->encoder_.DecodeSinC(got, out, k);
+    // The descent's trace doubles the message and records the factor in the
+    // scale; DecodeSinC reads the recorded scale, so `got` is in units.
+    for (int i = 0; i < d; i++) {
+      for (int t = 0; t < k; t++) {
+        double want = 0.0;
+        for (int x = 0; x < d; x++) want += q[t][i][x] * kk[t][l][x];
+        const double g = got[static_cast<size_t>(i) * k + t].real();
+        if (l < half) {
+          worst_live = std::max(worst_live, std::abs(g - want));
+          ref_rms += want * want;
+          n_ref++;
+        } else {
+          worst_dead = std::max(worst_dead, std::abs(g - want));
+        }
+      }
+    }
+  }
+  ref_rms = std::sqrt(ref_rms / static_cast<double>(n_ref));
+  std::cout << "  key tokens < " << half << ": max |error| " << std::scientific
+            << worst_live << " (reference rms " << ref_rms
+            << "); key tokens >= " << half
+            << " (the flipped partners' addresses): max |error| " << worst_dead
+            << std::fixed << std::endl;
+  EXPECT_LT(worst_live, 1e-3)
+      << "the elided product is not Q K^T on the live key tokens";
 }
