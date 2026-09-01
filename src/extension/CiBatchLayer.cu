@@ -444,7 +444,9 @@ void CiBatchLayer<word>::Attention(
   // A projection tile split into its heads.
   auto split_heads = [&](std::vector<Ct> &tile,
                          std::vector<std::vector<Ct>> &heads_out) {
-    heads_out.assign(heads_per_tile, std::vector<Ct>());
+    // (`assign(n, value)` would copy a vector of non-copyable ciphertexts.)
+    heads_out.clear();
+    heads_out.resize(heads_per_tile);
     for (int i = 0; i < heads_per_tile; i++) {
       for (int cc = 0; cc < D; cc++) {
         heads_out[i].push_back(std::move(tile[i * D + cc]));
