@@ -1462,3 +1462,181 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
             << total_s / num_layers / B * 1000.0 << " ms per instance-layer"
             << std::endl;
 }
+
+// ---------------------------------------------------------------------------
+// 8. The split built one column at a time is the split built at once: the
+//    same projection from both, value for value.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheIncrementalSplitProjectsLikeTheWholeOne) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring ring(Param());
+  const CiBatchLayout layout(ring.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  constexpr int kIn = 40, kOut = 24;
+  const int level = 7;
+  std::mt19937_64 gen(11);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0), uw(-0.05, 0.05);
+  HostTensor x{B, kTokens, kIn, {}};
+  x.v.resize(static_cast<size_t>(B) * kTokens * kIn);
+  for (auto &v : x.v) v = ux(gen);
+  std::vector<float> w(static_cast<size_t>(kIn) * kOut);
+  for (auto &v : w) v = static_cast<float>(uw(gen));
+  cheddar::DeviceVector<float> w_dev;
+  ToDevice(w_dev, w);
+  std::vector<Ciphertext<word>> cts;
+  EncryptChannels(ring, layout, x, level, cts);
+
+  typename cheddar::CiBatchProjection<word>::Config cfg;
+  cfg.rows_per_tile = 16;
+  cheddar::CiBatchProjection<word> proj(ring.context, cfg);
+  proj.Prepare("w", w_dev.data(), kIn, kOut, level);
+
+  std::vector<Ciphertext<word>> whole, incremental;
+  proj.Project(whole, cts, "w");
+  {
+    typename cheddar::CiBatchProjection<word>::Source src;
+    proj.BeginSplit(src, kIn, level, layout.num_slots);
+    for (int c = 0; c < kIn; c++) proj.AddColumn(src, c, cts[c]);
+    for (int t = 0; t < proj.NumTiles("w"); t++) {
+      std::vector<Ciphertext<word>> part;
+      proj.Project(part, src, "w", t);
+      for (auto &p : part) incremental.push_back(std::move(p));
+    }
+  }
+  ASSERT_EQ(whole.size(), incremental.size());
+  std::vector<int> all_b(B), all_o(kOut);
+  for (int b = 0; b < B; b++) all_b[b] = b;
+  for (int o = 0; o < kOut; o++) all_o[o] = o;
+  HostTensor a{B, kTokens, kOut, {}}, c2{B, kTokens, kOut, {}};
+  a.v.assign(static_cast<size_t>(B) * kTokens * kOut, 0.0);
+  c2.v = a.v;
+  DecryptChannels(ring, layout, whole, all_o, a);
+  DecryptChannels(ring, layout, incremental, all_o, c2);
+  HostTensor want;
+  HostProject(x, w, kOut, all_b, all_o, want);
+  const Err ew = Compare(a, want, all_b, all_o);
+  const Err ei = Compare(c2, want, all_b, all_o);
+  const Err d = Compare(c2, a, all_b, all_o);
+  std::cout << "  whole split: 2^-" << std::fixed << std::setprecision(2)
+            << Bits(ew.rms_rel) << ", incremental: 2^-" << Bits(ei.rms_rel)
+            << ", the two apart: " << std::scientific << d.max_abs << std::fixed
+            << std::endl;
+  EXPECT_LT(ew.rms_rel, std::ldexp(1.0, -15));
+  EXPECT_LT(ei.rms_rel, std::ldexp(1.0, -15));
+  EXPECT_LT(d.max_abs, 1e-9) << "the two splits must give the same words";
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 9. The norm alone, at a small width: NormTurn -> an identity projection
+//    onto the first channels -> the host's x / sqrt(mean(x^2) + eps).
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheNormTurnMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int model = EnvInt("CHEDDAR_CI_BATCH_NORM_MODEL", 256);
+  const int keep = 32;
+  cheddar::CiBatchLayer<word>::Config cfg;
+  cfg.num_tokens = kTokens;
+  cfg.model = model;
+  cfg.hidden = 512;
+  cfg.rows_per_tile = 32;
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
+  cfg.verbose = true;
+  cheddar::CiBatchLayer<word> layer(bctx, cfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layer.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const CiBatchLayout &layout = layer.GetLayout();
+  const int B = layout.num_instances;
+
+  // Per-token mean squares spread over ~4x, as a calibrated layer's are;
+  // the stream carries `stream_scale` and a per-token sink factor is on.
+  std::mt19937_64 gen(0x407);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0);
+  HostTensor x{B, kTokens, model, {}};
+  x.v.resize(static_cast<size_t>(B) * kTokens * model);
+  std::vector<double> row_scale(kTokens);
+  for (int t = 0; t < kTokens; t++) row_scale[t] = 0.05 * (1.0 + (t % 7) / 3.5);
+  for (int b = 0; b < B; b++) {
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < model; c++) x.At(b, t, c) = row_scale[t] * ux(gen);
+    }
+  }
+  std::vector<double> sink(kTokens, 1.0);
+  sink[0] = 0.5;
+  sink[1] = 2.0;
+  const double eps = 1e-5;
+  // The calibration off the data: alpha at the geometric midpoint of the
+  // rescaled mean squares' range, the window their ratio times 1.3^2.
+  double lo = 1e300, hi = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    const double ms = sink[t] * sink[t] * row_scale[t] * row_scale[t] / 3.0;
+    lo = std::min(lo, ms + eps);
+    hi = std::max(hi, ms + eps);
+  }
+  const double alpha = 1.0 / std::sqrt(lo * hi);
+  const double window = std::max(1.5, hi / lo * 1.69);
+  const double stream_scale = 2.0;
+  std::cout << "  alpha " << alpha << " window " << window << std::endl;
+
+  HostTensor xs{B, kTokens, model, {}};
+  xs.v = x.v;
+  for (auto &v : xs.v) v *= stream_scale;
+  std::vector<Ciphertext<word>> stream;
+  EncryptChannels(boot, layout, xs, 0, stream);
+
+  auto t0 = Sync();
+  typename cheddar::CiBatchProjection<word>::Source src;
+  layer.NormTurn(src, stream, alpha, window, sink, stream_scale,
+                 boot.ui->GetEvkMap());
+  auto t1 = Sync();
+  std::cout << "  NormTurn on " << model << " channels: " << Ms(t0, t1) / 1000.0
+            << " s" << std::endl;
+
+  // The identity onto the first `keep` channels.
+  std::vector<float> eye(static_cast<size_t>(model) * keep, 0.0f);
+  for (int c = 0; c < keep; c++) eye[static_cast<size_t>(c) * keep + c] = 1.0f;
+  cheddar::DeviceVector<float> eye_dev;
+  ToDevice(eye_dev, eye);
+  cheddar::CiBatchProjection<word> &proj = layer.GetProjection();
+  proj.Prepare("eye", eye_dev.data(), model, keep, src.level);
+  std::vector<Ciphertext<word>> y;
+  proj.Project(y, src, "eye", 0);
+  ASSERT_EQ(static_cast<int>(y.size()), keep);
+
+  std::vector<int> bs = {0, B / 2, B - 1}, ks(keep);
+  for (int c = 0; c < keep; c++) ks[c] = c;
+  HostTensor got{B, kTokens, keep, {}};
+  got.v.assign(static_cast<size_t>(B) * kTokens * keep, 0.0);
+  DecryptChannels(boot, layout, y, ks, got);
+  HostTensor want{B, kTokens, keep, {}};
+  want.v.assign(got.v.size(), 0.0);
+  for (int b : bs) {
+    for (int t = 0; t < kTokens; t++) {
+      double ms = 0.0;
+      for (int c = 0; c < model; c++) {
+        const double v = sink[t] * x.At(b, t, c);
+        ms += v * v;
+      }
+      const double r = 1.0 / std::sqrt(ms / model + eps);
+      for (int c = 0; c < keep; c++) want.At(b, t, c) = sink[t] * x.At(b, t, c) * r;
+    }
+  }
+  const Err e = Compare(got, want, bs, ks);
+  std::cout << "  norm vs host: rms rel 2^-" << std::fixed << std::setprecision(2)
+            << Bits(e.rms_rel) << " (max abs " << std::scientific << e.max_abs
+            << ", ref rms " << e.rms_ref << ")" << std::fixed << std::endl;
+  EXPECT_LT(e.rms_rel, std::ldexp(1.0, -10));
+#endif
+}
