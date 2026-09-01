@@ -215,8 +215,15 @@ class CiBatchProjection {
    *        stream or gate scale, a SiLU range's reciprocal, an RMSNorm gain
    *        folded per input channel is the caller's -- see `FoldGain`)
    */
+  /**
+   * @param input_scale_ratio the inputs' recorded scale over the level's
+   *        canonical one -- 2 for what comes back from the CC-MM chain,
+   *        whose descent doubles the recorded scale (Doing.md 1.5bk). The
+   *        weight is encoded at `GetScale(level) / ratio` so that the
+   *        product still lands canonical one level down.
+   */
   void Prepare(const std::string &name, const float *tensor, int in, int out,
-               int level, double w_scale = 1.0);
+               int level, double w_scale = 1.0, double input_scale_ratio = 1.0);
 
   bool Has(const std::string &name) const {
     return operands_.count(name) != 0;

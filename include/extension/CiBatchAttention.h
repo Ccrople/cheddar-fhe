@@ -14,6 +14,7 @@
 #include "core/RingSwitch.h"
 #include "extension/BootContext.h"
 #include "extension/CiBatch.h"
+#include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 
 namespace cheddar {
@@ -164,7 +165,79 @@ class CiBatchAttention {
   void Scores(std::vector<Ct> &res, std::vector<Ct> &q,
               const std::vector<Ct> &k, const Keys &keys) const;
 
+  /** @brief What the softmax walk needs to know about the data, in CHAIN
+   * units: the raw scores times the factor the Q and K weights carried
+   * (`cq * ck`). */
+  struct SoftMaxCalibration {
+    double m_eff = 8.0;   //!< `span_raw / sqrt(D)`, the fitted exp's span
+    double span = 1.0;    //!< the calibrated score span, chain units
+    double shift = 0.0;   //!< the calibrated score max, chain units
+    //! Causal only: [head][row] live-key maximum (chain units) and the
+    //! live row-norm estimate `sum_l exp(m_eff (S - shift) / span)`; the
+    //! latter folds into the mask as `est^-1/2` so the inverse square
+    //! root's interval collapses to the actual / estimate ratio.
+    std::vector<std::vector<double>> row_shift, row_norm;
+    double norm_lo = 0.9, norm_hi = 1.1;  //!< the invsqrt interval (ratio)
+    int exp_degree = 0;   //!< 0 = derive from `m_eff`
+    int inv_degree = 15;
+    bool causal = true;
+  };
+
+  /**
+   * @brief Compile the softmax walk: the two polynomials and the per-head
+   * per-token plaintexts of the causal mask and the row shift. Cheap.
+   */
+  void PrepareSoftMax(const SoftMaxCalibration &calib);
+  //! Where `SoftMax` expects its booted scores: the boot's landing.
+  int GetTopLevel() const { return boot_->GetBootParameter().GetEndLevel(); }
+
+  /**
+   * @brief One head's softmax on the batched layout: the key axis is the
+   * ciphertext index, so the row sums are sums of ciphertexts.
+   *
+   *     u = a1 S + a0[row]  ->  y = exp(m_eff (u - 1) / 4) (.) mask[l]
+   *     sq = sum_l y_l^2 (one relinearization)  ->  r = invsqrt(sq)
+   *     P_l = (y_l r)^2                                  (Cho, k = 1)
+   *
+   * @param P the 128 key-token ciphertexts of P at `forward_level`
+   * @param scores the booted scores at `GetTopLevel()`, read
+   * @param head the head, for its row shift and norm estimate
+   * @param carried the scores' recorded-over-canonical factor before their
+   *        Boot, divided out in the affine map
+   */
+  void SoftMax(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
+               double carried, const EvkMap<word> &evk) const;
+
+  /**
+   * @brief `res = P V` for one head: the 128 attention-output channel
+   * ciphertexts (blocks = query tokens) in slots at `GetOutputLevel()`,
+   * the chain's factor in the recorded scale.
+   *
+   * @param P the head's 128 key-token ciphertexts at `forward_level`,
+   *        CONSUMED
+   * @param v the kv head's 128 channel ciphertexts at `rope_level`, read
+   */
+  void Values(std::vector<Ct> &res, std::vector<Ct> &P,
+              const std::vector<Ct> &v, const Keys &keys) const;
+
  private:
+  //! V's per-call plaintext: the call's key tokens kept, at `rope_level`.
+  Pt call_mask_[2];
+  //! The compiled softmax walk.
+  SoftMaxCalibration calib_;
+  bool softmax_ready_ = false;
+  int exp_in_ = 0, exp_out_ = 0, mask_level_ = 0, sq_level_ = 0,
+      poly_in_ = 0;
+  std::vector<std::unique_ptr<EvalPoly<word>>> polys_;  // [0] exp, [1] invsqrt
+  //! Per head: the row shift's per-token plaintext at `exp_in_`, and the
+  //! 128 per-key-token causal masks (with `est^-1/2` folded) at `exp_out_`.
+  //! The masks are built per head at its call (`BuildMasks`), 128
+  //! plaintexts at a time.
+  std::vector<Pt> a0_;
+  void BuildMasks(std::vector<Pt> &masks, int head) const;
+  //! Zero ciphertexts on the lifted ring, the shape of `like`, `count` of
+  //! them: the contract's dead lhs columns.
+  void ZeroLifted(std::vector<Ct> &res, const Ct &like, int count) const;
   void BuildRope();
   //! RoPE in place on one head's `head_dim` channel ciphertexts, with the
   //! key-token half `call` kept (-1: every token), `rope_level` -> one below.

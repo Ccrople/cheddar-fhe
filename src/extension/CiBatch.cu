@@ -116,21 +116,25 @@ CiBatchProjection<word>::CiBatchProjection(ConstContextPtr<word> context,
 template <typename word>
 void CiBatchProjection<word>::Prepare(const std::string &name,
                                       const float *tensor, int in, int out,
-                                      int level, double w_scale) {
+                                      int level, double w_scale,
+                                      double input_scale_ratio) {
   NvtxScope _nv("batch: Prepare");
   AssertTrue(tensor != nullptr, "CiBatchProjection::Prepare: null tensor");
   AssertTrue(in > 0 && out > 0, "CiBatchProjection::Prepare: bad shape");
   AssertTrue(level >= 1 && level <= context_->param_.max_level_,
              "CiBatchProjection::Prepare: the product needs a level to "
              "rescale from");
+  AssertTrue(input_scale_ratio > 0.0,
+             "CiBatchProjection::Prepare: input_scale_ratio");
 
   Operand op;
   op.in = in;
   op.out = out;
   op.level = level;
   op.w_scale = w_scale;
-  // The one scale that lands the rescaled product canonical (class comment).
-  op.weight_scale = context_->param_.GetScale(level);
+  // The one scale that lands the rescaled product canonical (class comment),
+  // divided by whatever the inputs' recorded scale carries above canonical.
+  op.weight_scale = context_->param_.GetScale(level) / input_scale_ratio;
   op.rows_per_tile = std::min(cfg_.rows_per_tile, out);
 
   const GpuEncoder<word> &encoder = context_->gpu_encoder_;
