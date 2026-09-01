@@ -268,8 +268,12 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   }
   // SiLU on the gate at ly - 1; the product one below its output; down one
   // below that.
+  // The handler fits SiLU(range * v) on [-1, 1] and wants g / range as its
+  // input, which the gate weight carries: so the range it is told is the
+  // calibration's, not 1 (which would evaluate SiLU(g / range) -- bounded,
+  // wrong).
   const int lg = ly - 1;
-  SiLuHandler<word> silu(boot_, 1.0, lg, cfg_.silu_degree);
+  SiLuHandler<word> silu(boot_, c.silu_range, lg, cfg_.silu_degree);
   int lh = -1;  // the level the product lands on, read off the first chunk
   const int chunk = cfg_.rows_per_tile;
   const int num_chunks = hidden / chunk;
