@@ -439,8 +439,19 @@ void CiBatchLayer<word>::Attention(
   // 4. Per kv group: the group's K and V heads and its four Q heads
   //    projected, then per head scores -> Boot -> softmax -> P V.
   std::vector<Ct> attn_out(static_cast<size_t>(heads) * D);
-  std::vector<std::vector<Ct>> k_heads, v_heads;
+  std::vector<std::vector<Ct>> k_heads, v_heads, q_heads;
   const int top = boot_->GetBootParameter().GetEndLevel();
+  // A projection tile split into its heads.
+  auto split_heads = [&](std::vector<Ct> &tile,
+                         std::vector<std::vector<Ct>> &heads_out) {
+    heads_out.assign(heads_per_tile, std::vector<Ct>());
+    for (int i = 0; i < heads_per_tile; i++) {
+      for (int cc = 0; cc < D; cc++) {
+        heads_out[i].push_back(std::move(tile[i * D + cc]));
+      }
+    }
+    tile.clear();
+  };
   for (int kv = 0; kv < kv_heads; kv++) {
     NvtxScope _g("batch: kv group");
     if (kv % heads_per_tile == 0) {
@@ -448,14 +459,8 @@ void CiBatchLayer<word>::Attention(
       std::vector<Ct> kt, vt;
       proj_->Project(kt, src_y, "attn.k", kv / heads_per_tile);
       proj_->Project(vt, src_y, "attn.v", kv / heads_per_tile);
-      k_heads.assign(heads_per_tile, std::vector<Ct>());
-      v_heads.assign(heads_per_tile, std::vector<Ct>());
-      for (int i = 0; i < heads_per_tile; i++) {
-        for (int cc = 0; cc < D; cc++) {
-          k_heads[i].push_back(std::move(kt[i * D + cc]));
-          v_heads[i].push_back(std::move(vt[i * D + cc]));
-        }
-      }
+      split_heads(kt, k_heads);
+      split_heads(vt, v_heads);
       stages_.qkv += SinceSeconds(t0);
     }
     const std::vector<Ct> &k_kv = k_heads[kv % heads_per_tile];
@@ -463,15 +468,14 @@ void CiBatchLayer<word>::Attention(
     for (int hi = 0; hi < group; hi++) {
       const int h = kv * group + hi;
       NvtxScope _h("batch: head");
-      // The head's Q: its 128 channels out of the tile that holds them.
+      // The head's Q: its tile projected when its first head comes up.
       t0 = Clock::now();
-      std::vector<Ct> q_h;
-      {
+      if (h % heads_per_tile == 0) {
         std::vector<Ct> qt;
         proj_->Project(qt, src_y, "attn.q", h / heads_per_tile);
-        const int off = (h % heads_per_tile) * D;
-        for (int cc = 0; cc < D; cc++) q_h.push_back(std::move(qt[off + cc]));
+        split_heads(qt, q_heads);
       }
+      std::vector<Ct> q_h = std::move(q_heads[h % heads_per_tile]);
       stages_.qkv += SinceSeconds(t0);
 
       t0 = Clock::now();

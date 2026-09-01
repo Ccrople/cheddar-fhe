@@ -226,6 +226,26 @@ class CiBatchLayer {
                  const typename CiBatchAttention<word>::Keys &akeys,
                  const EvkMap<word> &evk);
 
+  /** @brief One whole layer: the attention half, then the feed-forward. */
+  void Layer(std::vector<Ct> &res, const std::vector<Ct> &stream,
+             const AttnWeights &aw, const Weights &fw, const Calibration &c,
+             CiBatchAttention<word> &attn,
+             const typename CiBatchAttention<word>::Keys &akeys,
+             const EvkMap<word> &evk) {
+    std::vector<Ct> mid;
+    Attention(mid, stream, aw, c, attn, akeys, evk);
+    const Stages a = stages_;
+    FeedForward(res, mid, fw, c, evk);
+    stages_.boot += a.boot;
+    stages_.norm += a.norm;
+    stages_.qkv = a.qkv;
+    stages_.scores = a.scores;
+    stages_.softmax = a.softmax;
+    stages_.values = a.values;
+    stages_.o = a.o;
+    stages_.total += a.total;
+  }
+
   //! Device seconds of the last half's stages (host clocks around
   //! synchronised spans).
   struct Stages {
