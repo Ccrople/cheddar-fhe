@@ -373,7 +373,7 @@ void PcmmBlasHandler<word>::SplitComponent(
 
 template <typename word>
 void PcmmBlasHandler<word>::ProductComponent(
-    word *const *dst_ptrs, const std::vector<DeviceVector<int8_t>> &split,
+    word *const *dst_ptrs, const std::vector<const int8_t *> &split,
     const SplitMatrix &u, const NPInfo &np, int vec_len, int chunk) const {
   const int rows = u.rows, cols = u.cols, pieces = u.pieces;
   const int num_primes = np.GetNumTotal();
@@ -440,8 +440,7 @@ void PcmmBlasHandler<word>::ProductComponent(
           static_cast<int>(j * static_cast<size_t>(vec_len) + off);
       const size_t src_span = static_cast<size_t>(cols) * span;
       const size_t dst_span = static_cast<size_t>(rows) * span;
-      const int8_t *src =
-          split[static_cast<size_t>(j) * num_chunks + c].data();
+      const int8_t *src = split[static_cast<size_t>(j) * num_chunks + c];
 
       for (int l = 0; l < pieces; l++) {
         const int8_t *b = src + static_cast<size_t>(l) * src_span;
@@ -571,8 +570,10 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
   CopyHostToDevice(d_dst_bx, h_dst_bx);
   CopyHostToDevice(d_dst_ax, h_dst_ax);
 
-  ProductComponent(d_dst_bx.data(), src.b_data, u, np, degree, src.chunk_b);
-  ProductComponent(d_dst_ax.data(), src.a_data, u, np, degree, src.chunk_a);
+  ProductComponent(d_dst_bx.data(), src.Ptrs(false), u, np, degree,
+                   src.chunk_b);
+  ProductComponent(d_dst_ax.data(), src.Ptrs(true), u, np, degree,
+                   src.chunk_a);
 }
 
 template <typename word>
@@ -597,25 +598,40 @@ void PcmmBlasHandler<word>::PrepareSourceBegin(SplitSource &res, int level,
   res.chunk_a = res.chunk_b;
   const int num_primes = res.np.GetNumTotal();
   const int num_chunks = (degree + res.chunk_b - 1) / res.chunk_b;
-  auto size = [&](std::vector<DeviceVector<int8_t>> &bufs) {
-    bufs.clear();
-    bufs.resize(static_cast<size_t>(num_primes) * num_chunks);
-    for (int j = 0; j < num_primes; j++) {
-      for (int c = 0; c < num_chunks; c++) {
-        const size_t off = static_cast<size_t>(c) * res.chunk_b;
-        const int span = static_cast<int>(
-            std::min(static_cast<size_t>(res.chunk_b), degree - off));
-        const size_t words = static_cast<size_t>(res.pieces) * cols * span;
-        AssertTrue(words < (static_cast<size_t>(1) << 31),
-                   "PcmmBlas: the split of one chunk does not fit an int "
-                   "index");
-        bufs[static_cast<size_t>(j) * num_chunks + c].resize(
-            static_cast<int>(words));
-      }
+  // One `cudaMalloc` outside the pool for every chunk of both components
+  // (see `SplitSource::arena`): the chunk sizes, then the pointers.
+  res.b_data.clear();
+  res.a_data.clear();
+  std::vector<size_t> chunk_bytes(static_cast<size_t>(num_primes) * num_chunks);
+  size_t total = 0;
+  for (int j = 0; j < num_primes; j++) {
+    for (int c = 0; c < num_chunks; c++) {
+      const size_t off = static_cast<size_t>(c) * res.chunk_b;
+      const int span = static_cast<int>(
+          std::min(static_cast<size_t>(res.chunk_b), degree - off));
+      const size_t words = static_cast<size_t>(res.pieces) * cols * span;
+      AssertTrue(words < (static_cast<size_t>(1) << 31),
+                 "PcmmBlas: the split of one chunk does not fit an int index");
+      // 256-byte alignment for cuBLAS.
+      chunk_bytes[static_cast<size_t>(j) * num_chunks + c] =
+          (words + 255) / 256 * 256;
+      total += chunk_bytes[static_cast<size_t>(j) * num_chunks + c];
     }
-  };
-  size(res.b_data);
-  size(res.a_data);
+  }
+  int8_t *base = static_cast<int8_t *>(res.arena.Reserve(2 * total));
+  AssertTrue(base != nullptr, "PcmmBlas: the split's arena could not be "
+                              "allocated");
+  res.b_arena.assign(chunk_bytes.size(), nullptr);
+  res.a_arena.assign(chunk_bytes.size(), nullptr);
+  size_t cursor = 0;
+  for (size_t i = 0; i < chunk_bytes.size(); i++) {
+    res.b_arena[i] = base + cursor;
+    cursor += chunk_bytes[i];
+  }
+  for (size_t i = 0; i < chunk_bytes.size(); i++) {
+    res.a_arena[i] = base + cursor;
+    cursor += chunk_bytes[i];
+  }
 }
 
 template <typename word>
@@ -645,13 +661,11 @@ void PcmmBlasHandler<word>::SplitSourceColumn(SplitSource &res, int col,
           static_cast<int>(j * static_cast<size_t>(degree) + off);
       const int grid = (span + block - 1) / block;
       kernel::SplitGatherColumn<word><<<grid, block>>>(
-          res.b_data[static_cast<size_t>(j) * num_chunks + c].data(),
-          ct.bx_.data(), res.cols, col, span, limb_offset, res.pieces,
-          kPieceBits);
+          res.b_arena[static_cast<size_t>(j) * num_chunks + c], ct.bx_.data(),
+          res.cols, col, span, limb_offset, res.pieces, kPieceBits);
       kernel::SplitGatherColumn<word><<<grid, block>>>(
-          res.a_data[static_cast<size_t>(j) * num_chunks + c].data(),
-          ct.ax_.data(), res.cols, col, span, limb_offset, res.pieces,
-          kPieceBits);
+          res.a_arena[static_cast<size_t>(j) * num_chunks + c], ct.ax_.data(),
+          res.cols, col, span, limb_offset, res.pieces, kPieceBits);
     }
   }
 }
@@ -687,9 +701,9 @@ void PcmmBlasHandler<word>::MultiplyInto(word *dst, int dst_ct_stride,
   CopyHostToDevice(d_dst_bx, h_dst_bx);
   CopyHostToDevice(d_dst_ax, h_dst_ax);
 
-  ProductComponent(d_dst_bx.data(), src.b_data, u, src.np, degree,
+  ProductComponent(d_dst_bx.data(), src.Ptrs(false), u, src.np, degree,
                    src.chunk_b);
-  ProductComponent(d_dst_ax.data(), src.a_data, u, src.np, degree,
+  ProductComponent(d_dst_ax.data(), src.Ptrs(true), u, src.np, degree,
                    src.chunk_a);
 }
 
@@ -796,9 +810,9 @@ void PcmmBlasHandler<word>::Multiply(std::vector<MlweCiphertext<word>> &res,
   CopyHostToDevice(d_dst_a, h_dst_a);
   CopyHostToDevice(d_dst_b, h_dst_b);
 
-  ProductComponent(d_dst_b.data(), src.b_data, u, src.np, src.degree,
+  ProductComponent(d_dst_b.data(), src.Ptrs(false), u, src.np, src.degree,
                    src.chunk_b);
-  ProductComponent(d_dst_a.data(), src.a_data, u, src.np, a_stride,
+  ProductComponent(d_dst_a.data(), src.Ptrs(true), u, src.np, a_stride,
                    src.chunk_a);
 }
 

@@ -9,6 +9,7 @@
 #include "core/Container.h"
 #include "core/Parameter.h"
 #include "core/Pcmm.h"
+#include "core/Streams.h"
 
 namespace cheddar {
 
@@ -167,10 +168,31 @@ class PcmmBlasHandler {
     int num_slots = 0;
     std::vector<DeviceVector<int8_t>> b_data;  // [prime * chunks + chunk]
     std::vector<DeviceVector<int8_t>> a_data;
+    // The column-by-column split (`PrepareSourceBegin`) holds its chunks in
+    // ONE `cudaMalloc` outside the pool instead: twenty 1 GiB blocks
+    // allocated through a pool that has just been grown and fragmented by a
+    // setup's transients were the batched layer's out-of-memory (Doing.md
+    // 7.4). `b_arena` / `a_arena` are then the chunk pointers into it and
+    // `b_data` / `a_data` stay empty; `Ptrs` serves either form.
+    DeviceArena arena;
+    std::vector<int8_t *> b_arena, a_arena;
+
+    std::vector<const int8_t *> Ptrs(bool a_part) const {
+      std::vector<const int8_t *> out;
+      const auto &arena_ptrs = a_part ? a_arena : b_arena;
+      const auto &data = a_part ? a_data : b_data;
+      if (!arena_ptrs.empty()) {
+        out.assign(arena_ptrs.begin(), arena_ptrs.end());
+      } else {
+        out.reserve(data.size());
+        for (const auto &d : data) out.push_back(d.data());
+      }
+      return out;
+    }
 
     /** @brief Device bytes held. */
     size_t Bytes() const {
-      size_t n = 0;
+      size_t n = arena.capacity();
       for (const auto &d : b_data) n += d.size();
       for (const auto &d : a_data) n += d.size();
       return n;
@@ -358,7 +380,7 @@ class PcmmBlasHandler {
 
   /** @brief The GEMMs and the recombination, against an already-split source. */
   void ProductComponent(word *const *dst_ptrs,
-                        const std::vector<DeviceVector<int8_t>> &split,
+                        const std::vector<const int8_t *> &split,
                         const SplitMatrix &u, const NPInfo &np, int vec_len,
                         int chunk) const;
 };
