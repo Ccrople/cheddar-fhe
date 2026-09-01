@@ -234,6 +234,13 @@ class CiBatchProjection {
   //! be projected from it.
   void Split(Source &src, const std::vector<Ct> &x,
              const std::string &name) const;
+  //! The same split built one column at a time, so the inputs never all
+  //! exist together: `BeginSplit` for `in` inputs at `level` (their scale
+  //! the level's canonical one), then `AddColumn` per input, which may be
+  //! dropped once added. Any operand with that `in` and level projects
+  //! from it.
+  void BeginSplit(Source &src, int in, int level, int num_slots) const;
+  void AddColumn(Source &src, int col, const Ct &x) const;
   int NumTiles(const std::string &name) const {
     return static_cast<int>(operands_.at(name).tiles.size());
   }

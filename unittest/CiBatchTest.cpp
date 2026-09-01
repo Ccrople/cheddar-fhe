@@ -624,8 +624,9 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   cfg.model = kH;
   cfg.hidden = kI;
   cfg.eps = eps;
-  cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 2048);
+  cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 512);
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
   cfg.verbose = true;
   auto t0 = Sync();
   cheddar::CiBatchLayer<word> layer(bctx, cfg);

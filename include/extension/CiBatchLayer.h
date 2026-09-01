@@ -83,11 +83,20 @@ class CiBatchLayer {
     int hidden = 14336;
     double eps = 1e-5;
     //! Output channels per projection tile, and the hidden chunk the
-    //! feed-forward walks; must divide `hidden`.
-    int rows_per_tile = 2048;
+    //! feed-forward walks; must divide `hidden`. A tile's GEMM output and
+    //! its batched rescale are `2 * rows * limbs * degree` words each, so
+    //! at level 7 (10 limbs) 512 rows is 2.7 + 2.4 GiB in flight.
+    int rows_per_tile = 512;
     //! Where the booted channel and the inverse square root meet; the
-    //! normalised stream lands one below. 8 lands the feed-forward at 0.
+    //! normalised stream lands one below. 8 lands the feed-forward at 0,
+    //! and it is the LOWEST that does: SiLU's four levels, the product and
+    //! the down projection need six below the norm's output.
     int norm_apply_level = 8;
+    //! Keep every booted channel (at `norm_apply_level`, 11 limbs = 23.6
+    //! GiB at the model's width) between the sum of squares and the apply,
+    //! or boot each channel twice and hold nothing. The first is 4096
+    //! bootstraps cheaper a norm, the second 24 GiB smaller.
+    bool hold_channels = true;
     //! SiLU's Chebyshev degree (four levels at 15; the range is folded
     //! into the gate weight, so the polynomial is fitted on [-1, 1]).
     int silu_degree = 15;
@@ -142,15 +151,22 @@ class CiBatchLayer {
    * applied back. The gain is NOT applied -- fold it into the weight that
    * reads `y` (`CiBatchProjection::FoldGain`).
    *
-   * @param y `model` ciphertexts at `Config::norm_apply_level - 1`, in the
-   *        model's own units (the norm is scale invariant; `stream_scale`
-   *        and `sink` are told to the affine map so that they are)
+   * The output is not `model` ciphertexts but their SPLIT -- the int8
+   * source every projection reading the normalised stream takes
+   * (`CiBatchProjection::Source`, at `Config::norm_apply_level - 1`, in
+   * the model's own units: the norm is scale invariant, and `stream_scale`
+   * and `sink` are told to the affine map so that it is). Each normalised
+   * channel is split the moment it exists and dropped, because at the
+   * model's width the channels and their split are 21 GiB each and never
+   * need to coexist.
+   *
    * @param stream `model` ciphertexts, any level, carrying `stream_scale`
    * @param sink the per-token rescale, or empty
    */
-  void NormTurn(std::vector<Ct> &y, const std::vector<Ct> &stream,
-                double alpha, double window, const std::vector<double> &sink,
-                double stream_scale, const EvkMap<word> &evk) const;
+  void NormTurn(typename CiBatchProjection<word>::Source &src,
+                const std::vector<Ct> &stream, double alpha, double window,
+                const std::vector<double> &sink, double stream_scale,
+                const EvkMap<word> &evk) const;
 
   /**
    * @brief The whole feed-forward half: norm, gate/up, SiLU, down, residual.

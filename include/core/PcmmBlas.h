@@ -288,6 +288,21 @@ class PcmmBlasHandler {
                      const std::vector<Ct> &cts, int rows = 0) const;
 
   /**
+   * @brief The RLWE split built one column at a time, so that the
+   * ciphertexts need never all exist at once: `PrepareSourceBegin` sizes the
+   * split for `cols` inputs at `level` (cut for `rows`), `SplitSourceColumn`
+   * writes column `col`'s pieces from one ciphertext, which may then be
+   * dropped. At the model's width the source of a projection is as many
+   * bytes as its split, and the batched layer produces its columns one by
+   * one (`CiBatchLayer::NormTurn`), so this halves the peak.
+   *
+   * @param scale the scale every column will carry (checked per column)
+   */
+  void PrepareSourceBegin(SplitSource &res, int level, int cols, int rows,
+                          double scale, int num_slots) const;
+  void SplitSourceColumn(SplitSource &res, int col, const Ct &ct) const;
+
+  /**
    * @brief The RLWE product against a source split by the overload above.
    * Same contract as `Multiply(res, u, cts)`: no rescaling, the result at
    * `u.scale * cts[0].scale`. Word for word what that overload computes,

@@ -59,7 +59,7 @@ int CiBatchLayer<word>::NormDegree(double window) const {
 }
 
 template <typename word>
-void CiBatchLayer<word>::NormTurn(std::vector<Ct> &y,
+void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
                                   const std::vector<Ct> &stream, double alpha,
                                   double window,
                                   const std::vector<double> &sink,
@@ -85,9 +85,10 @@ void CiBatchLayer<word>::NormTurn(std::vector<Ct> &y,
 
   // Pass A: every channel booted, its square accumulated WITHOUT
   // relinearization (the tensor product's three components add), and the
-  // channel itself brought down to where the apply will meet it.
+  // channel itself either kept at the level the apply will meet it or
+  // dropped to be booted again (`Config::hold_channels`).
   auto t0 = Clock::now();
-  std::vector<Ct> xs(model);
+  std::vector<Ct> xs(cfg_.hold_channels ? model : 0);
   Ct acc;
   {
     NvtxScope _a("batch: norm pass A");
@@ -101,7 +102,7 @@ void CiBatchLayer<word>::NormTurn(std::vector<Ct> &y,
       } else {
         boot_->Add(acc, acc, sq);
       }
-      boot_->LevelDown(xs[c], up, hold);
+      if (cfg_.hold_channels) boot_->LevelDown(xs[c], up, hold);
     }
   }
   stages_.boot += SinceSeconds(t0);
@@ -175,21 +176,38 @@ void CiBatchLayer<word>::NormTurn(std::vector<Ct> &y,
   Ct rh;
   boot_->LevelDown(rh, rs, hold);
 
-  // Pass B: the apply, one relinearization per channel.
+  // Pass B: the apply, one relinearization per channel, each normalised
+  // channel split into the projection source the moment it exists.
+  stages_.norm += SinceSeconds(t0);
+  t0 = Clock::now();
+  proj_->BeginSplit(src, model, hold - 1, layout_.num_slots);
   {
     NvtxScope _b("batch: norm pass B");
-    y.clear();
-    y.resize(model);
     for (int c = 0; c < model; c++) {
-      boot_->HMult(y[c], xs[c], rh, mult_key);
-      xs[c] = Ct();
+      Ct x_c;
+      if (cfg_.hold_channels) {
+        x_c = std::move(xs[c]);
+      } else {
+        Ct up;
+        boot_->Boot(up, stream[c], evk);
+        boot_->LevelDown(x_c, up, hold);
+      }
+      Ct y_c;
+      boot_->HMult(y_c, x_c, rh, mult_key);
+      proj_->AddColumn(src, c, y_c);
     }
   }
-  stages_.norm += SinceSeconds(t0);
+  if (cfg_.hold_channels) {
+    stages_.norm += SinceSeconds(t0);
+  } else {
+    stages_.boot += SinceSeconds(t0);
+  }
   if (cfg_.verbose) {
     std::cout << "  [batch] NormTurn: window " << window << " degree " << used
-              << ", r at level " << lr << ", y at level "
-              << param.NPToLevel(y[0].GetNP()) << std::endl;
+              << ", r at level " << lr << ", y at level " << (hold - 1)
+              << ", split " << (cfg_.hold_channels ? "from held channels"
+                                                    : "from a second boot")
+              << std::endl;
   }
 }
 
@@ -210,10 +228,11 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   stages_ = Stages{};
   auto t_all = Clock::now();
 
-  // 1. The norm.
-  std::vector<Ct> y;
-  NormTurn(y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale, evk);
-  const int ly = param.NPToLevel(y[0].GetNP());
+  // 1. The norm, straight into the split the projections read.
+  typename CiBatchProjection<word>::Source src_y;
+  NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
+           evk);
+  const int ly = src_y.level;
 
   // 2. The weights: the gain on gate and up, 1/range on gate so SiLU's
   //    polynomial sees [-1, 1], and the stream's factor on down so that its
@@ -238,13 +257,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   const int num_chunks = hidden / chunk;
   double t_weights = SinceSeconds(t0);
 
-  // 3. The split of y, shared by gate and up over every chunk.
-  t0 = Clock::now();
-  typename CiBatchProjection<word>::Source src_y;
-  proj_->Split(src_y, y, "ffn.gate");
-  y.clear();
-  stages_.gate_up += SinceSeconds(t0);
-
+  // 3. The split of y is shared by gate and up over every chunk.
   std::vector<Ct> d_acc;
   for (int j = 0; j < num_chunks; j++) {
     NvtxScope _c("batch: ffn chunk");

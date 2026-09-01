@@ -79,6 +79,22 @@ __global__ void SplitGather(int8_t *dst, const word *const *src_ptrs, int cols,
   }
 }
 
+// One column of `SplitGather`'s layout: `dst[(p * degree + x) * cols + col]`
+// for every position x of the limb, from one ciphertext component.
+template <typename word>
+__global__ void SplitGatherColumn(int8_t *dst, const word *src, int cols,
+                                  int col, int degree, int limb_offset,
+                                  int pieces, int piece_bits) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  if (x >= degree) return;
+  const word v = src[limb_offset + x];
+  const size_t n = static_cast<size_t>(cols) * degree;
+  const size_t o = static_cast<size_t>(x) * cols + col;
+  for (int p = 0; p < pieces; p++) {
+    dst[static_cast<size_t>(p) * n + o] = BalancedDigit(v, p, piece_bits);
+  }
+}
+
 // Recombine the shift groups modulo the prime.
 //
 // Group t holds the sum of every piece product whose combined shift is
@@ -548,6 +564,87 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
 
   ProductComponent(d_dst_bx.data(), src.b_data, u, np, degree, src.chunk_b);
   ProductComponent(d_dst_ax.data(), src.a_data, u, np, degree, src.chunk_a);
+}
+
+template <typename word>
+void PcmmBlasHandler<word>::PrepareSourceBegin(SplitSource &res, int level,
+                                               int cols, int rows,
+                                               double scale,
+                                               int num_slots) const {
+  AssertTrue(cols > 0 && rows > 0,
+             "PcmmBlas::PrepareSourceBegin: bad shape");
+  SplitMatrix shape;
+  DescribeSplit(shape, level, scale, rows, cols);
+  const int degree = param_.degree_;
+  res.cols = cols;
+  res.pieces = shape.pieces;
+  res.rank = 1;
+  res.degree = degree;
+  res.rows = rows;
+  res.num_slots = num_slots;
+  res.scale = scale;
+  res.np = shape.np;
+  res.chunk_b = ChunkFor(cols, rows, res.pieces, degree);
+  res.chunk_a = res.chunk_b;
+  const int num_primes = res.np.GetNumTotal();
+  const int num_chunks = (degree + res.chunk_b - 1) / res.chunk_b;
+  auto size = [&](std::vector<DeviceVector<int8_t>> &bufs) {
+    bufs.clear();
+    bufs.resize(static_cast<size_t>(num_primes) * num_chunks);
+    for (int j = 0; j < num_primes; j++) {
+      for (int c = 0; c < num_chunks; c++) {
+        const size_t off = static_cast<size_t>(c) * res.chunk_b;
+        const int span = static_cast<int>(
+            std::min(static_cast<size_t>(res.chunk_b), degree - off));
+        const size_t words = static_cast<size_t>(res.pieces) * cols * span;
+        AssertTrue(words < (static_cast<size_t>(1) << 31),
+                   "PcmmBlas: the split of one chunk does not fit an int "
+                   "index");
+        bufs[static_cast<size_t>(j) * num_chunks + c].resize(
+            static_cast<int>(words));
+      }
+    }
+  };
+  size(res.b_data);
+  size(res.a_data);
+}
+
+template <typename word>
+void PcmmBlasHandler<word>::SplitSourceColumn(SplitSource &res, int col,
+                                              const Ct &ct) const {
+  AssertTrue(res.rank == 1 && res.degree == param_.degree_,
+             "PcmmBlas::SplitSourceColumn: not an RLWE split");
+  AssertTrue(col >= 0 && col < res.cols,
+             "PcmmBlas::SplitSourceColumn: column out of range");
+  AssertTrue(ct.GetNP() == res.np,
+             "PcmmBlas::SplitSourceColumn: the column is not at the split's "
+             "level");
+  AssertFalse(ct.HasRx(), "PcmmBlas::SplitSourceColumn: input has rx");
+  AssertTrue(std::abs(ct.GetScale() / res.scale - 1.0) < 1e-9,
+             "PcmmBlas::SplitSourceColumn: the column's scale differs from "
+             "the split's");
+  const int degree = res.degree;
+  const int num_primes = res.np.GetNumTotal();
+  const int num_chunks = (degree + res.chunk_b - 1) / res.chunk_b;
+  constexpr int block = 256;
+  for (int j = 0; j < num_primes; j++) {
+    for (int c = 0; c < num_chunks; c++) {
+      const size_t off = static_cast<size_t>(c) * res.chunk_b;
+      const int span = static_cast<int>(
+          std::min(static_cast<size_t>(res.chunk_b), degree - off));
+      const int limb_offset =
+          static_cast<int>(j * static_cast<size_t>(degree) + off);
+      const int grid = (span + block - 1) / block;
+      kernel::SplitGatherColumn<word><<<grid, block>>>(
+          res.b_data[static_cast<size_t>(j) * num_chunks + c].data(),
+          ct.bx_.data(), res.cols, col, span, limb_offset, res.pieces,
+          kPieceBits);
+      kernel::SplitGatherColumn<word><<<grid, block>>>(
+          res.a_data[static_cast<size_t>(j) * num_chunks + c].data(),
+          ct.ax_.data(), res.cols, col, span, limb_offset, res.pieces,
+          kPieceBits);
+    }
+  }
 }
 
 template <typename word>

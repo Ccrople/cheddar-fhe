@@ -221,6 +221,23 @@ bool CiBatchProjection<word>::RescaleSerial() {
 }
 
 template <typename word>
+void CiBatchProjection<word>::BeginSplit(Source &src, int in, int level,
+                                         int num_slots) const {
+  AssertTrue(in > 0 && level >= 1 && level <= context_->param_.max_level_,
+             "CiBatchProjection::BeginSplit: bad shape or level");
+  blas_->PrepareSourceBegin(src.split, level, in, cfg_.rows_per_tile,
+                            context_->param_.GetScale(level), num_slots);
+  src.in = in;
+  src.level = level;
+}
+
+template <typename word>
+void CiBatchProjection<word>::AddColumn(Source &src, int col,
+                                        const Ct &x) const {
+  blas_->SplitSourceColumn(src.split, col, x);
+}
+
+template <typename word>
 void CiBatchProjection<word>::Project(std::vector<Ct> &res, const Source &src,
                                       const std::string &name,
                                       int tile) const {
