@@ -25,6 +25,28 @@ CiBatchLayout::CiBatchLayout(int num_slots, int num_tokens)
   num_instances = num_slots / num_tokens;
 }
 
+CiBatchLayout::CiBatchLayout(int num_slots, int num_tokens, int lanes,
+                             int rank)
+    : CiBatchLayout(num_slots, num_tokens) {
+  AssertTrue(lanes > 0 && rank > 0 && IsPowOfTwo(lanes) && IsPowOfTwo(rank),
+             "CiBatchLayout: lanes and rank must be powers of two");
+  AssertTrue(num_tokens * rank * lanes == num_slots,
+             "CiBatchLayout: the chain addressing needs num_slots = "
+             "num_tokens * rank * lanes");
+  this->lanes = lanes;
+  this->rank = rank;
+}
+
+int CiBatchLayout::BlockOf(int token, int group) const {
+  AssertTrue(lanes > 0, "CiBatchLayout::BlockOf: not chain-addressed");
+  const int num_blocks = num_tokens * rank;
+  const int bits = Log2Ceil(num_blocks);
+  const int flat = token * rank + group;
+  int rev = 0;
+  for (int i = 0; i < bits; i++) rev |= ((flat >> i) & 1) << (bits - 1 - i);
+  return rev;
+}
+
 void CiBatchLayout::Pack(std::vector<Complex> &msg,
                          const std::vector<double> &values) const {
   AssertTrue(values.size() ==

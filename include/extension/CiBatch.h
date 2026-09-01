@@ -88,16 +88,32 @@ struct CiBatchLayout {
   int num_slots = 0;
   int num_tokens = 0;
   int num_instances = 0;
+  //! The CC-MM chain's addressing, when the layout serves one (0 = the
+  //! plain map): an instance is (group, lane) with `lanes` lanes per
+  //! group, and a channel ciphertext's SinC blocks at sub-degree `lanes`
+  //! are the (token, group) pairs in the order the chain's forward
+  //! converter reads them -- `CiSwitchedCcmmLayout::LocateSlot`'s primary
+  //! address with row = token and column % rank = group.
+  int lanes = 0;
+  int rank = 0;
 
   CiBatchLayout() = default;
   CiBatchLayout(int num_slots, int num_tokens);
+  //! The chain-addressed layout: `num_slots = num_tokens * rank * lanes`.
+  CiBatchLayout(int num_slots, int num_tokens, int lanes, int rank);
 
-  //! The slot of token `token` of prompt `instance`: the instance fast, the
-  //! token slow -- a per-token constant is then a plaintext that is constant
-  //! over `num_instances` consecutive slots.
+  //! The slot of token `token` of prompt `instance`. Plain: the instance
+  //! fast, the token slow. Chain-addressed: block `BitRev(token * rank +
+  //! group)` of the stride-`lanes` block index, lane untouched. Either way
+  //! a per-token constant is a plaintext, and nothing but the host packing
+  //! and those plaintexts reads this.
   int Slot(int token, int instance) const {
-    return token * num_instances + instance;
+    if (lanes == 0) return token * num_instances + instance;
+    const int group = instance / lanes, lane = instance % lanes;
+    return BlockOf(token, group) * lanes + lane;
   }
+  //! Chain-addressed only: the SinC block of (token, group).
+  int BlockOf(int token, int group) const;
 
   //! `values[instance * num_tokens + token]` -> the slot message.
   void Pack(std::vector<Complex> &msg, const std::vector<double> &values) const;

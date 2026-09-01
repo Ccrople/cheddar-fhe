@@ -98,6 +98,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiLayerPrefetch.cu
     src/extension/CiBatch.cu
     src/extension/CiBatchLayer.cu
+    src/extension/CiBatchAttention.cu
     src/extension/CiModuleBasis.cpp
     src/extension/CiSinCBasis.cpp
     src/extension/BootParameter.cpp

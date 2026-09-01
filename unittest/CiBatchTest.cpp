@@ -45,6 +45,7 @@
 #include "common/ParallelFor.h"
 #include "extension/BootContext.h"
 #include "extension/CiBatch.h"
+#include "extension/CiBatchAttention.h"
 #include "extension/CiBatchLayer.h"
 
 using word = uint32_t;
@@ -857,4 +858,128 @@ TEST(CiBatch, TheElidedScoreProductHoldsUnderTheContract) {
             << std::fixed << std::endl;
   EXPECT_LT(worst_live, 1e-3)
       << "the elided product is not Q K^T on the live key tokens";
+}
+
+// ---------------------------------------------------------------------------
+// 5. One head's scores on the batched layout, end to end: RoPE, the chain
+//    forward, the ring switch, the lift, the elided Algorithm 4 per group,
+//    the descent, the switch back and the return to slots -- against the
+//    host on a sample of instances.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
+  Ring boot("ci16_35.json");
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  cheddar::CiBatchAttention<word>::Config cfg;
+  cfg.verbose = true;
+  auto t0 = Sync();
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, cfg);
+  const int chain_level = attn.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  auto t1 = Sync();
+  std::cout << "  setup (three converters + keys): " << std::fixed
+            << std::setprecision(1) << Ms(t0, t1) / 1000.0 << " s, "
+            << FreeMiB() << " MiB free" << std::endl;
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = layout.num_instances;
+  const int D = cfg.head_dim;
+  const int T = cfg.num_tokens;
+
+  // Random Q and K for one head, every instance its own.
+  std::mt19937_64 gen(0x5C0E);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+  HostTensor q{B, T, D, {}}, k{B, T, D, {}};
+  q.v.resize(static_cast<size_t>(B) * T * D);
+  k.v.resize(q.v.size());
+  for (auto &v : q.v) v = dist(gen);
+  for (auto &v : k.v) v = dist(gen);
+  std::vector<Ciphertext<word>> q_cts, k_cts;
+  EncryptChannels(boot, layout, q, cfg.rope_level, q_cts);
+  EncryptChannels(boot, layout, k, cfg.rope_level, k_cts);
+
+  cheddar::CiBatchAttention<word>::Keys keys;
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
+  keys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+
+  auto t2 = Sync();
+  std::vector<Ciphertext<word>> scores;
+  attn.Scores(scores, q_cts, k_cts, keys);
+  auto t3 = Sync();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(scores.size()), T);
+  std::cout << "  one head's scores for " << B << " instances: "
+            << Ms(t2, t3) / 1000.0 << " s (" << Ms(t2, t3) / B
+            << " ms per instance), out at level "
+            << boot.param->NPToLevel(scores[0].GetNP()) << ", scale / canonical "
+            << scores[0].GetScale() /
+                   boot.param->GetScale(boot.param->NPToLevel(scores[0].GetNP()))
+            << std::endl;
+
+  // Host: RoPE both, S[b][i][l] = sum_c q'[b][i][c] k'[b][l][c].
+  auto rope_host = [&](HostTensor &m) {
+    const int half = D / 2;
+    for (int b = 0; b < B; b++) {
+      for (int t = 0; t < T; t++) {
+        for (int c = 0; c < half; c++) {
+          const double theta = std::pow(cfg.rope_base, -2.0 * c / D);
+          const double a = t * theta;
+          const double lo = m.At(b, t, c), hi = m.At(b, t, c + half);
+          m.At(b, t, c) = lo * std::cos(a) - hi * std::sin(a);
+          m.At(b, t, c + half) = hi * std::cos(a) + lo * std::sin(a);
+        }
+      }
+    }
+  };
+  rope_host(q);
+  rope_host(k);
+  const std::vector<int> bs = {0, B / 3, B / 2, B - 1};
+  std::vector<int> all_l(T);
+  for (int l = 0; l < T; l++) all_l[l] = l;
+  HostTensor got{B, T, T, {}};
+  got.v.assign(static_cast<size_t>(B) * T * T, 0.0);
+  DecryptChannels(boot, layout, scores, all_l, got);
+  HostTensor want{B, T, T, {}};
+  want.v.assign(got.v.size(), 0.0);
+  for (int b : bs) {
+    for (int i = 0; i < T; i++) {
+      for (int l = 0; l < T; l++) {
+        double acc = 0.0;
+        for (int c = 0; c < D; c++) acc += q.At(b, i, c) * k.At(b, l, c);
+        want.At(b, i, l) = acc;
+      }
+    }
+  }
+  const Err e = Compare(got, want, bs, all_l);
+  std::vector<int> lo_l(all_l.begin(), all_l.begin() + T / 2);
+  std::vector<int> hi_l(all_l.begin() + T / 2, all_l.end());
+  const Err e_lo = Compare(got, want, bs, lo_l), e_hi = Compare(got, want, bs, hi_l);
+  std::cout << "  scores vs host: rms rel 2^-" << std::setprecision(2)
+            << Bits(e.rms_rel) << " (max abs " << std::scientific << e.max_abs
+            << ", ref rms " << e.rms_ref << "); key tokens < " << T / 2
+            << ": 2^-" << std::fixed << Bits(e_lo.rms_rel) << ", >= " << T / 2
+            << ": 2^-" << Bits(e_hi.rms_rel) << std::endl;
+  EXPECT_LT(e.rms_rel, std::ldexp(1.0, -8));
 }
