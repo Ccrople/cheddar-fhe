@@ -373,6 +373,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   ASSERT_EQ(num_slots, boot.Degree());
 
   const auto t_setup0 = Tick();
+  MemRow("setup start: the rings, secrets and base keys stand");
   bctx->PrepareEvalMod();
   if (!kFused) {
     // Fused (Doing.md 3.16), ci16_35's native tables serve nothing: the
@@ -850,6 +851,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::cout << "\n================ layer " << L << " ================"
               << std::endl;
 
+    const auto t_files0 = Tick();
     std::vector<double> wq_f, wk_f, wv_f, wo_f, wg_f, wu_f, wd_f, an_f, fn_f;
     ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq_f));
     ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk_f));
@@ -892,6 +894,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_TRUE(load(tg, "wgate.f32", kH, kI));
     ASSERT_TRUE(load(tu, "wup.f32", kH, kI));
     ASSERT_TRUE(load(td, "wdown.f32", kI, kH));
+    std::cout << "  [time] layer " << L
+              << " preparation: weight files read (f32 -> double x9, f32 "
+                 "host + device x7) "
+              << Ms(t_files0, Tick()) << " ms" << std::endl;
     auto device_weights = [&](const Tensor &t, const std::vector<int> &in_slot,
                               const std::vector<int> &out_slot, double scale) {
       DW dw;

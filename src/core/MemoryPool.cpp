@@ -1,8 +1,11 @@
 #include "core/MemoryPool.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 
 #include <thrust/optional.h>
 
@@ -65,15 +68,28 @@ MemoryPool::Usage MemoryPool::GetUsage() {
   return usage;
 }
 
+namespace {
+// Process start, near enough: static initialisation of this translation unit.
+const std::chrono::steady_clock::time_point kProcessStart =
+    std::chrono::steady_clock::now();
+}  // namespace
+
 void MemoryPool::Report(const char *what) {
   if (stats_ == nullptr) return;
   const Usage u = GetUsage();
   size_t free_b = 0, total_b = 0;
   cudaMemGetInfo(&free_b, &total_b);
-  std::cout << "  [mem] " << what << ": live " << (u.current_bytes >> 20)
-            << " MiB, peak " << (u.peak_bytes >> 20) << " MiB, "
-            << u.current_allocations << " allocations; driver "
-            << ((total_b - free_b) >> 20) << " MiB reserved" << std::endl;
+  const double t = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - kProcessStart)
+                       .count();
+  // Its own stream, so the fixed-point flag does not leak into the caller's.
+  std::ostringstream row;
+  row << "  [mem] t=" << std::fixed << std::setprecision(1) << t << "s "
+      << what << ": live " << (u.current_bytes >> 20) << " MiB, peak "
+      << (u.peak_bytes >> 20) << " MiB, " << u.current_allocations
+      << " allocations; driver " << ((total_b - free_b) >> 20)
+      << " MiB reserved";
+  std::cout << row.str() << std::endl;
 }
 
 void MemoryPool::AddBin(int size) {
