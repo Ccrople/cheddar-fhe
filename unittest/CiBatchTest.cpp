@@ -983,3 +983,233 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
             << ": 2^-" << Bits(e_hi.rms_rel) << std::endl;
   EXPECT_LT(e.rms_rel, std::ldexp(1.0, -8));
 }
+
+// ---------------------------------------------------------------------------
+// 6. The attention half of layer 0 on the real weights, B instances at once:
+//    norm, Q/K/V, per head scores -> Boot -> softmax -> P V, O, residual --
+//    against the exporter's clear attention output. RMSNorm is scale
+//    invariant per token, so every instance (the recorded prompt at its own
+//    factor) has the SAME attention output, and the reference is av_L00.f64
+//    times Wo for all of them, plus each instance's own input.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  const char *rdir_env = std::getenv("LLAMA3_REF_DIR");
+  if (wdir_env == nullptr || rdir_env == nullptr) {
+    GTEST_SKIP() << "LLAMA3_ALL_DIR and LLAMA3_REF_DIR must both be set";
+  }
+  const std::string ld = std::string(wdir_env) + "/L00";
+  const std::string rd = rdir_env;
+  constexpr int kH = 4096, kKv = 1024, kHeads = 32, kSinkTokens = 2;
+
+  std::vector<float> x0, wq, wk, wv, wo, gain;
+  std::vector<double> av;
+  ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
+                      static_cast<size_t>(kTokens) * kH, x0));
+  ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
+  ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
+  ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
+  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, gain));
+  ASSERT_TRUE(ReadF64(rd + "/av_L00.f64", static_cast<size_t>(kTokens) * kH, av));
+  // o = av Wo, the clear O output; the reference layer input is x0.
+  std::vector<double> o_ref(static_cast<size_t>(kTokens) * kH);
+  cheddar::ParallelFor(kH, [&](int begin, int end) {
+    for (int c = begin; c < end; c++) {
+      for (int t = 0; t < kTokens; t++) {
+        double acc = 0.0;
+        for (int m = 0; m < kH; m++) {
+          acc += av[static_cast<size_t>(t) * kH + m] *
+                 static_cast<double>(wo[static_cast<size_t>(m) * kH + c]);
+        }
+        o_ref[static_cast<size_t>(t) * kH + c] = acc;
+      }
+    }
+  });
+
+  cheddar::CiBatchLayer<word>::Calibration cal;
+  double in_absmax = 1.0, resid_absmax = 1.0;
+  {
+    std::ifstream f(rd + "/calib.json");
+    ASSERT_TRUE(f.good()) << rd << "/calib.json";
+    nlohmann::json cj = nlohmann::json::parse(f)["layers"][0];
+    cal.attn_alpha = cj["attn_alpha"];
+    cal.attn_norm_window = cj["attn_norm_window"];
+    in_absmax = cj["in_absmax"];
+    resid_absmax = cj["resid_absmax"];
+    cal.attn_sink.assign(kTokens, 1.0);
+    if (cj.contains("attn_sink")) {
+      const auto v = cj["attn_sink"].get<std::vector<double>>();
+      for (size_t i = 0; i < v.size() && i < cal.attn_sink.size(); i++) {
+        cal.attn_sink[i] = v[i];
+      }
+    }
+    const double s_min = cj["s_raw_min"], s_max = cj["s_raw_max"];
+    cal.span_raw = s_max - s_min;
+    cal.s_raw_max = s_max;
+    cal.m_eff = cj["span"];
+    const auto &rs = cj["row_shift_raw"];
+    const auto &rn = cj["row_norm"];
+    cal.row_shift_raw.assign(kHeads, std::vector<double>(kTokens, 0.0));
+    cal.row_norm.assign(kHeads, std::vector<double>(kTokens, 1.0));
+    for (int h = 0; h < kHeads; h++) {
+      for (int t = 0; t < kTokens; t++) {
+        cal.row_shift_raw[h][t] = rs[h][t].get<double>();
+        cal.row_norm[h][t] = rn[h][t].get<double>();
+      }
+    }
+    const double score_ride = [] {
+      const char *e = std::getenv("CHEDDAR_CI_BATCH_SCORE_RIDE");
+      return (e && e[0]) ? std::atof(e) : 0.35;
+    }();
+    const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
+    cal.cq = cal.ck = std::sqrt(cqk);
+  }
+  const double ride = [] {
+    const char *e = std::getenv("CHEDDAR_CI_BATCH_RIDE");
+    return (e && e[0]) ? std::atof(e) : 0.35;
+  }();
+  cal.stream_scale = ride / std::max(in_absmax, resid_absmax);
+  std::cout << "  calibration: attn_alpha " << cal.attn_alpha << " window "
+            << cal.attn_norm_window << " span_raw " << cal.span_raw
+            << " s_raw_max " << cal.s_raw_max << " m_eff " << cal.m_eff
+            << " cq = ck = " << cal.cq << " stream_scale " << cal.stream_scale
+            << std::endl;
+
+  Ring boot("ci16_35.json");
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  auto t0 = Sync();
+  cheddar::CiBatchLayer<word>::Config cfg;
+  cfg.num_tokens = kTokens;
+  cfg.model = kH;
+  cfg.rows_per_tile = 512;
+  cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
+  cfg.verbose = true;
+  cheddar::CiBatchLayer<word> layer(bctx, cfg);
+  cheddar::CiBatchAttention<word>::Config acfg;
+  // y at hold - 1, the projections one below.
+  acfg.rope_level = cfg.norm_apply_level - 2;
+  acfg.verbose = true;
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, acfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const int chain_level = attn.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  auto t1 = Sync();
+  std::cout << "  setup (boot tables, three converters, keys): " << std::fixed
+            << std::setprecision(1) << Ms(t0, t1) / 1000.0 << " s, "
+            << FreeMiB() << " MiB free" << std::endl;
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = layout.num_instances;
+  auto factor = [&](int b) { return 0.5 + static_cast<double>(b) / B; };
+  HostTensor x{B, kTokens, kH, {}};
+  x.v.resize(static_cast<size_t>(B) * kTokens * kH);
+  for (int b = 0; b < B; b++) {
+    const double f = factor(b) * cal.stream_scale;
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < kH; c++) {
+        x.At(b, t, c) =
+            f * static_cast<double>(x0[static_cast<size_t>(t) * kH + c]);
+      }
+    }
+  }
+  std::vector<Ciphertext<word>> stream;
+  EncryptChannels(boot, layout, x, 0, stream);
+  x.v.clear();
+  x.v.shrink_to_fit();
+  auto t2 = Sync();
+  std::cout << "  encrypt the stream: " << Ms(t1, t2) / 1000.0 << " s, "
+            << FreeMiB() << " MiB free" << std::endl;
+
+  cheddar::DeviceVector<float> q_dev, k_dev, v_dev, o_dev;
+  ToDevice(q_dev, wq);
+  ToDevice(k_dev, wk);
+  ToDevice(v_dev, wv);
+  ToDevice(o_dev, wo);
+  cheddar::CiBatchLayer<word>::AttnWeights w;
+  w.q = q_dev.data();
+  w.k = k_dev.data();
+  w.v = v_dev.data();
+  w.o = o_dev.data();
+  w.attn_norm.assign(gain.begin(), gain.end());
+
+  cheddar::CiBatchAttention<word>::Keys akeys;
+  akeys.swtch = &swtch.ui->GetEvkMap();
+  akeys.lifted = &lifted.ui->GetEvkMap();
+  akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
+  akeys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+
+  bctx->ResetBootCounts();
+  auto t3 = Sync();
+  std::vector<Ciphertext<word>> res;
+  layer.Attention(res, stream, w, cal, attn, akeys, boot.ui->GetEvkMap());
+  auto t4 = Sync();
+  const auto st = layer.GetStages();
+  const auto counts = bctx->GetBootCounts();
+  std::cout << "  ATTENTION, " << B << " instances: " << Ms(t3, t4) / 1000.0
+            << " s wall = " << Ms(t3, t4) / B << " ms per instance; boots "
+            << counts.full << " (tables " << layer.GetPrepareSeconds()
+            << " s); stages boot " << st.boot << " norm " << st.norm
+            << " q/k/v " << st.qkv << " scores " << st.scores << " softmax "
+            << st.softmax << " values " << st.values << " o " << st.o
+            << " s; " << FreeMiB() << " MiB free" << std::endl;
+  ASSERT_EQ(static_cast<int>(res.size()), kH);
+
+  std::vector<int> bs = {0, B / 4, B / 2, B - 1};
+  std::vector<int> all_c(kH);
+  for (int c = 0; c < kH; c++) all_c[c] = c;
+  HostTensor got{B, kTokens, kH, {}};
+  got.v.assign(static_cast<size_t>(B) * kTokens * kH, 0.0);
+  DecryptChannels(boot, layout, res, all_c, got);
+  double worst = 0.0;
+  for (int b : bs) {
+    std::vector<double> want(static_cast<size_t>(kTokens) * kH),
+        o_got(want.size()), out_got(want.size());
+    for (int t = 0; t < kTokens; t++) {
+      for (int c = 0; c < kH; c++) {
+        const size_t i = static_cast<size_t>(t) * kH + c;
+        const double xb = factor(b) * x0[i];
+        want[i] = xb + o_ref[i];
+        out_got[i] = got.At(b, t, c) / cal.stream_scale;
+        o_got[i] = out_got[i] - xb;
+      }
+    }
+    const double e_layer = RmsRel(out_got, want, kTokens, kH, kSinkTokens);
+    const double e_o = RmsRel(o_got, o_ref, kTokens, kH, kSinkTokens);
+    std::cout << "  instance " << std::setw(3) << b << " (x" << std::fixed
+              << std::setprecision(3) << factor(b)
+              << "): post-attention residual 2^-" << std::setprecision(2)
+              << Bits(e_layer) << ", the attention output (after O) alone 2^-"
+              << Bits(e_o) << " over user tokens" << std::endl;
+    worst = std::max(worst, e_layer);
+  }
+  EXPECT_LT(worst, std::ldexp(1.0, -6));
+}

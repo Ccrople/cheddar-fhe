@@ -354,6 +354,217 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   }
 }
 
+template <typename word>
+void CiBatchLayer<word>::Attention(
+    std::vector<Ct> &res, const std::vector<Ct> &stream, const AttnWeights &w,
+    const Calibration &c, CiBatchAttention<word> &attn,
+    const typename CiBatchAttention<word>::Keys &akeys,
+    const EvkMap<word> &evk) {
+  NvtxScope _nv("batch: Attention");
+  const int model = cfg_.model;
+  const Parameter<word> &param = boot_->param_;
+  const CiBatchLayout &alayout = attn.GetLayout();
+  AssertTrue(alayout.num_tokens == layout_.num_tokens &&
+                 alayout.num_slots == layout_.num_slots,
+             "CiBatchLayer::Attention: the attention's layout is not this "
+             "layer's shape");
+  AssertTrue(w.q != nullptr && w.k != nullptr && w.v != nullptr &&
+                 w.o != nullptr,
+             "CiBatchLayer::Attention: the four tensors are needed");
+  AssertTrue(static_cast<int>(w.attn_norm.size()) == model,
+             "CiBatchLayer::Attention: one gain per model channel");
+  // The heads: read off the attention's configuration through its layout
+  // is not possible, so the shapes are the layer's contract.
+  const int T = cfg_.num_tokens;
+  const int D = T;  // Algorithm 4 is square: head_dim = tokens
+  const int heads = 32, kv_heads = 8;  // Llama-3-8B; asserted below
+  AssertTrue(cfg_.rows_per_tile % D == 0 && D % 1 == 0,
+             "CiBatchLayer::Attention: a projection tile must hold whole "
+             "heads");
+  const int heads_per_tile = cfg_.rows_per_tile / D;
+  AssertTrue(heads % heads_per_tile == 0 && kv_heads % heads_per_tile == 0,
+             "CiBatchLayer::Attention: the tile must divide the head counts");
+  const int group = heads / kv_heads;
+  stages_ = Stages{};
+  auto t_all = Clock::now();
+
+  // 1. The pre-attention norm, into the split the three projections read.
+  typename CiBatchProjection<word>::Source src_y;
+  NormTurn(src_y, stream, c.attn_alpha, c.attn_norm_window, c.attn_sink,
+           c.stream_scale, evk);
+  const int ly = src_y.level;
+  if (cfg_.verbose) MemoryPool::Report("batch: after the attention norm");
+
+  // 2. The weights: the gain on all three, cq on Q and ck on K (the chain
+  //    factor the softmax works in), and the projections at ly -> ly - 1 =
+  //    the attention's rope_level.
+  auto t0 = Clock::now();
+  {
+    NvtxScope _w("batch: attention weights");
+    std::vector<double> gq(model), gk(model);
+    for (int i = 0; i < model; i++) {
+      gq[i] = w.attn_norm[i] * c.cq;
+      gk[i] = w.attn_norm[i] * c.ck;
+    }
+    DeviceVector<float> q_f, k_f, v_f;
+    CiBatchProjection<word>::FoldGain(q_f, w.q, model, heads * D, gq);
+    CiBatchProjection<word>::FoldGain(k_f, w.k, model, kv_heads * D, gk);
+    CiBatchProjection<word>::FoldGain(v_f, w.v, model, kv_heads * D,
+                                      w.attn_norm);
+    proj_->Prepare("attn.q", q_f.data(), model, heads * D, ly);
+    proj_->Prepare("attn.k", k_f.data(), model, kv_heads * D, ly);
+    proj_->Prepare("attn.v", v_f.data(), model, kv_heads * D, ly);
+  }
+  stages_.qkv += SinceSeconds(t0);
+
+  // 3. The softmax's calibration in chain units.
+  {
+    typename CiBatchAttention<word>::SoftMaxCalibration sc;
+    const double cqk = c.cq * c.ck;
+    sc.m_eff = c.m_eff;
+    sc.span = cqk * c.span_raw;
+    sc.shift = cqk * c.s_raw_max;
+    sc.causal = true;
+    sc.inv_degree = 15;
+    AssertTrue(static_cast<int>(c.row_shift_raw.size()) == heads,
+               "CiBatchLayer::Attention: row_shift_raw is [heads][tokens]");
+    sc.row_shift.assign(heads, std::vector<double>(T, 0.0));
+    for (int h = 0; h < heads; h++) {
+      for (int t = 0; t < T; t++) sc.row_shift[h][t] = cqk * c.row_shift_raw[h][t];
+    }
+    sc.row_norm = c.row_norm;
+    attn.PrepareSoftMax(sc);
+  }
+
+  // 4. Per kv group: the group's K and V heads and its four Q heads
+  //    projected, then per head scores -> Boot -> softmax -> P V.
+  std::vector<Ct> attn_out(static_cast<size_t>(heads) * D);
+  std::vector<std::vector<Ct>> k_heads, v_heads;
+  const int top = boot_->GetBootParameter().GetEndLevel();
+  for (int kv = 0; kv < kv_heads; kv++) {
+    NvtxScope _g("batch: kv group");
+    if (kv % heads_per_tile == 0) {
+      t0 = Clock::now();
+      std::vector<Ct> kt, vt;
+      proj_->Project(kt, src_y, "attn.k", kv / heads_per_tile);
+      proj_->Project(vt, src_y, "attn.v", kv / heads_per_tile);
+      k_heads.assign(heads_per_tile, std::vector<Ct>());
+      v_heads.assign(heads_per_tile, std::vector<Ct>());
+      for (int i = 0; i < heads_per_tile; i++) {
+        for (int cc = 0; cc < D; cc++) {
+          k_heads[i].push_back(std::move(kt[i * D + cc]));
+          v_heads[i].push_back(std::move(vt[i * D + cc]));
+        }
+      }
+      stages_.qkv += SinceSeconds(t0);
+    }
+    const std::vector<Ct> &k_kv = k_heads[kv % heads_per_tile];
+    const std::vector<Ct> &v_kv = v_heads[kv % heads_per_tile];
+    for (int hi = 0; hi < group; hi++) {
+      const int h = kv * group + hi;
+      NvtxScope _h("batch: head");
+      // The head's Q: its 128 channels out of the tile that holds them.
+      t0 = Clock::now();
+      std::vector<Ct> q_h;
+      {
+        std::vector<Ct> qt;
+        proj_->Project(qt, src_y, "attn.q", h / heads_per_tile);
+        const int off = (h % heads_per_tile) * D;
+        for (int cc = 0; cc < D; cc++) q_h.push_back(std::move(qt[off + cc]));
+      }
+      stages_.qkv += SinceSeconds(t0);
+
+      t0 = Clock::now();
+      std::vector<Ct> scores;
+      attn.Scores(scores, q_h, k_kv, akeys);
+      stages_.scores += SinceSeconds(t0);
+
+      // The scores' bootstraps, the chain's factor read off before them.
+      t0 = Clock::now();
+      const int ls = param.NPToLevel(scores[0].GetNP());
+      const double carried = scores[0].GetScale() / param.GetScale(ls);
+      if (!boot_->IsBootPrepared(layout_.num_slots)) {
+        NvtxScope _p("batch: prepare boot tables");
+        boot_->PrepareEvalSpecialFFT(layout_.num_slots);
+        prepare_seconds_ += SinceSeconds(t0);
+        t0 = Clock::now();
+      }
+      std::vector<Ct> booted(T);
+      for (int l = 0; l < T; l++) {
+        boot_->Boot(booted[l], scores[l], evk);
+        scores[l] = Ct();
+      }
+      AssertTrue(param.NPToLevel(booted[0].GetNP()) == top,
+                 "CiBatchLayer::Attention: the score bootstrap did not "
+                 "land at the top level");
+      stages_.boot += SinceSeconds(t0);
+
+      t0 = Clock::now();
+      std::vector<Ct> P;
+      attn.SoftMax(P, booted, h, carried, evk);
+      booted.clear();
+      stages_.softmax += SinceSeconds(t0);
+
+      t0 = Clock::now();
+      std::vector<Ct> out_h;
+      attn.Values(out_h, P, v_kv, akeys);
+      P.clear();
+      for (int cc = 0; cc < D; cc++) {
+        attn_out[static_cast<size_t>(h) * D + cc] = std::move(out_h[cc]);
+      }
+      stages_.values += SinceSeconds(t0);
+      if (cfg_.verbose) {
+        std::cout << "  [batch] head " << h << " done: scores "
+                  << stages_.scores << " boot " << stages_.boot << " softmax "
+                  << stages_.softmax << " values " << stages_.values
+                  << " s so far" << std::endl;
+      }
+    }
+  }
+  k_heads.clear();
+  v_heads.clear();
+  proj_->Release("attn.q");
+  proj_->Release("attn.k");
+  proj_->Release("attn.v");
+  src_y = typename CiBatchProjection<word>::Source();
+  if (cfg_.release_boot_tables) boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
+  if (cfg_.verbose) MemoryPool::Report("batch: before the O projection");
+
+  // 5. The O projection: the stream's factor on the weight, the chain's
+  //    factor of two in the inputs' recorded scale; then the residual.
+  t0 = Clock::now();
+  const int lo_in = param.NPToLevel(attn_out[0].GetNP());
+  const double ratio = attn_out[0].GetScale() / param.GetScale(lo_in);
+  proj_->Prepare("attn.o", w.o, heads * D, model, lo_in, c.stream_scale, ratio);
+  std::vector<Ct> o;
+  proj_->Project(o, attn_out, "attn.o");
+  attn_out.clear();
+  proj_->Release("attn.o");
+  const int ld = param.NPToLevel(o[0].GetNP());
+  const int ls2 = param.NPToLevel(stream[0].GetNP());
+  const int lo = std::min(ld, ls2);
+  res.clear();
+  res.resize(model);
+  for (int i = 0; i < model; i++) {
+    Ct a, b;
+    boot_->LevelDown(a, stream[i], lo);
+    boot_->LevelDown(b, o[i], lo);
+    boot_->Add(res[i], a, b);
+    o[i] = Ct();
+  }
+  stages_.o += SinceSeconds(t0);
+  stages_.total = SinceSeconds(t_all);
+  if (cfg_.verbose) {
+    std::cout << "  [batch] Attention: y at " << ly << ", O in at " << lo_in
+              << " (ratio " << ratio << "), residual at " << lo << "; boot "
+              << stages_.boot << " s, norm " << stages_.norm << " s, q/k/v "
+              << stages_.qkv << " s, scores " << stages_.scores
+              << " s, softmax " << stages_.softmax << " s, values "
+              << stages_.values << " s, o " << stages_.o << " s, total "
+              << stages_.total << " s" << std::endl;
+  }
+}
+
 template class CiBatchLayer<uint32_t>;
 template class CiBatchLayer<uint64_t>;
 

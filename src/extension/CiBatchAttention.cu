@@ -153,8 +153,10 @@ template <typename word>
 void CiBatchAttention<word>::Descend(std::vector<Ct> &lifted, Ct &ct,
                                      int call, const Keys &keys) const {
   NvtxScope _nv("batch attn: descend");
+  // On the LAYER's Context: the switching ring shares ci16_35's levels
+  // 0..4 only, and a channel arrives above them.
   Ct down;
-  switch_ctx_->LevelDown(down, ct, cfg_.forward_level);
+  boot_->LevelDown(down, ct, cfg_.forward_level);
   ct = Ct();
   Ct sinc;
   fwd_[call == 1 ? 1 : 0]->SlotToSinC(switch_ctx_, sinc, down, *keys.swtch);

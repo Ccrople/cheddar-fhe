@@ -10,6 +10,7 @@
 #include "core/EvkRequest.h"
 #include "extension/BootContext.h"
 #include "extension/CiBatch.h"
+#include "extension/CiBatchAttention.h"
 #include "extension/EvalPoly.h"
 
 namespace cheddar {
@@ -127,6 +128,27 @@ class CiBatchLayer {
     double stream_scale = 1.0;
     //! The public per-token sink rescale at each norm; empty = none.
     std::vector<double> attn_sink, ffn_sink;
+
+    //! THE ATTENTION'S OWN. `cq` and `ck` are the factors the Q and K
+    //! weights carry so that the scores ride into their bootstrap at the
+    //! height EvalMod likes: `cq * ck = ride / max|s_raw|`. The softmax
+    //! then works in CHAIN units (raw scores times `cq * ck`): `span_raw =
+    //! s_raw_max - s_raw_min`, the shift `s_raw_max`, the per-(head, row)
+    //! live-key maximum `row_shift_raw`, the live row-norm estimate
+    //! `row_norm` (invariant), and `m_eff = span_raw / sqrt(D)` -- all
+    //! `reference_forward.py`'s.
+    double cq = 1.0, ck = 1.0;
+    double span_raw = 1.0, s_raw_max = 0.0, m_eff = 8.0;
+    std::vector<std::vector<double>> row_shift_raw, row_norm;
+  };
+
+  /** @brief The attention half's tensors on the device, `[in][out]` f32. */
+  struct AttnWeights {
+    const float *q = nullptr;  //!< `[model][heads * D]`
+    const float *k = nullptr;  //!< `[model][kv_heads * D]`
+    const float *v = nullptr;  //!< `[model][kv_heads * D]`
+    const float *o = nullptr;  //!< `[heads * D][model]`
+    std::vector<double> attn_norm;  //!< `model` gains
   };
 
   /** @brief One layer's tensors on the device, `[in][out]` f32. */
@@ -186,9 +208,29 @@ class CiBatchLayer {
                    const Weights &w, const Calibration &c,
                    const EvkMap<word> &evk);
 
-  //! Device seconds of the last `FeedForward`'s stages (event pairs).
+  /**
+   * @brief The whole attention half: norm, the Q/K/V projections, per head
+   * the scores, their bootstraps, the softmax and P V, the O projection,
+   * the residual. One kv group (four heads) is in flight at a time.
+   *
+   * @param res the post-attention residual, `model` ciphertexts at level 0,
+   *        carrying `stream_scale`
+   * @param stream the layer's input, `model` ciphertexts at level 0,
+   *        carrying `stream_scale`
+   * @param attn the attention products, whose layout this layer's is
+   * @param akeys the attention's keys on its three rings
+   */
+  void Attention(std::vector<Ct> &res, const std::vector<Ct> &stream,
+                 const AttnWeights &w, const Calibration &c,
+                 CiBatchAttention<word> &attn,
+                 const typename CiBatchAttention<word>::Keys &akeys,
+                 const EvkMap<word> &evk);
+
+  //! Device seconds of the last half's stages (host clocks around
+  //! synchronised spans).
   struct Stages {
     double boot = 0.0, norm = 0.0, gate_up = 0.0, silu = 0.0, down = 0.0;
+    double qkv = 0.0, scores = 0.0, softmax = 0.0, values = 0.0, o = 0.0;
     double total = 0.0;
   };
   const Stages &GetStages() const { return stages_; }
