@@ -168,47 +168,78 @@ size_t CiBatchProjection<word>::Bytes() const {
 }
 
 template <typename word>
-void CiBatchProjection<word>::Project(std::vector<Ct> &res,
-                                      const std::vector<Ct> &x,
-                                      const std::string &name) const {
-  NvtxScope _nv("batch: Project");
+void CiBatchProjection<word>::Split(Source &src, const std::vector<Ct> &x,
+                                    const std::string &name) const {
+  NvtxScope _nv("batch: split source");
   auto it = operands_.find(name);
   AssertTrue(it != operands_.end(),
-             "CiBatchProjection::Project: no operand named " + name);
+             "CiBatchProjection::Split: no operand named " + name);
   const Operand &op = it->second;
   AssertTrue(static_cast<int>(x.size()) == op.in,
-             "CiBatchProjection::Project: " + name + " contracts " +
+             "CiBatchProjection::Split: " + name + " contracts " +
                  std::to_string(op.in) + " channels, given " +
                  std::to_string(x.size()));
   const NPInfo np = context_->param_.LevelToNP(op.level);
   for (const auto &c : x) {
     AssertTrue(c.GetNP() == np,
-               "CiBatchProjection::Project: an input is not at the operand's "
+               "CiBatchProjection::Split: an input is not at the operand's "
                "level");
-    AssertFalse(c.HasRx(), "CiBatchProjection::Project: input has rx");
+    AssertFalse(c.HasRx(), "CiBatchProjection::Split: input has rx");
   }
+  // Cut for the largest tile any operand of this handler has, so that every
+  // operand sharing the split's (in, level) can be projected from it.
+  blas_->PrepareSource(src.split, op.tiles.front(), x,
+                       std::min(cfg_.rows_per_tile, op.out) > op.rows_per_tile
+                           ? cfg_.rows_per_tile
+                           : op.rows_per_tile);
+  src.in = op.in;
+  src.level = op.level;
+}
 
-  // The source split once, cut for the largest tile (the first).
-  SplitSource src;
+template <typename word>
+void CiBatchProjection<word>::Project(std::vector<Ct> &res, const Source &src,
+                                      const std::string &name,
+                                      int tile) const {
+  NvtxScope _nv("batch: Project tile");
+  auto it = operands_.find(name);
+  AssertTrue(it != operands_.end(),
+             "CiBatchProjection::Project: no operand named " + name);
+  const Operand &op = it->second;
+  AssertTrue(src.in == op.in && src.level == op.level,
+             "CiBatchProjection::Project: the split source is not " + name +
+                 "'s shape");
+  AssertTrue(tile >= 0 && tile < static_cast<int>(op.tiles.size()),
+             "CiBatchProjection::Project: no tile " + std::to_string(tile) +
+                 " in " + name);
+  std::vector<Ct> part;
   {
-    NvtxScope _s("batch: split source");
-    blas_->PrepareSource(src, op.tiles.front(), x, op.rows_per_tile);
+    NvtxScope _g("batch: gemm");
+    blas_->Multiply(part, op.tiles[tile], src.split);
   }
+  NvtxScope _r("batch: rescale");
+  res.clear();
+  res.reserve(part.size());
+  for (auto &p : part) {
+    Ct r;
+    context_->Rescale(r, p);
+    res.push_back(std::move(r));
+  }
+}
 
+template <typename word>
+void CiBatchProjection<word>::Project(std::vector<Ct> &res,
+                                      const std::vector<Ct> &x,
+                                      const std::string &name) const {
+  NvtxScope _nv("batch: Project");
+  Source src;
+  Split(src, x, name);
+  const Operand &op = operands_.at(name);
   res.clear();
   res.reserve(op.out);
-  for (const auto &tile : op.tiles) {
+  for (int t = 0; t < static_cast<int>(op.tiles.size()); t++) {
     std::vector<Ct> part;
-    {
-      NvtxScope _g("batch: gemm");
-      blas_->Multiply(part, tile, src);
-    }
-    NvtxScope _r("batch: rescale");
-    for (auto &p : part) {
-      Ct r;
-      context_->Rescale(r, p);
-      res.push_back(std::move(r));
-    }
+    Project(part, src, name, t);
+    for (auto &p : part) res.push_back(std::move(p));
   }
 }
 

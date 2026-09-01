@@ -220,6 +220,33 @@ class CiBatchProjection {
                const std::string &name) const;
 
   /**
+   * @brief A source split once, for every tile of every operand that reads
+   * the same `in` ciphertexts at the same level -- the feed-forward's gate
+   * and up, tile by tile, against one split of the normalised stream.
+   */
+  struct Source {
+    SplitSource split;
+    int in = 0;
+    int level = 0;
+  };
+  //! Split `x` for the operand `name` (whose pieces and level it takes), cut
+  //! for `rows_per_tile`; any operand with the same `in` and level may then
+  //! be projected from it.
+  void Split(Source &src, const std::vector<Ct> &x,
+             const std::string &name) const;
+  int NumTiles(const std::string &name) const {
+    return static_cast<int>(operands_.at(name).tiles.size());
+  }
+  //! First output channel of `tile` of `name`.
+  int TileStart(const std::string &name, int tile) const {
+    return tile * operands_.at(name).rows_per_tile;
+  }
+  //! The output channels of one tile of `name` from a split source: one
+  //! GEMM and its rescales.
+  void Project(std::vector<Ct> &res, const Source &src,
+               const std::string &name, int tile) const;
+
+  /**
    * @brief `diag(g) W` on the host side of a tensor: RMSNorm's per-channel
    * gain folded into the projection that reads the normalised stream,
    * exactly (`W^T diag(g) y = (diag(g) W)^T y`). The folded tensor is a new
