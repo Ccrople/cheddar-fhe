@@ -341,10 +341,20 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
   // nonzero positions and signs is drawn either way.
   // `T,h` overrides the module hamming weight (the wrap-around's std grows
   // as sqrt(h), and the module product carries ~3x the native's terms).
+  // `T:k_i,h` samples in the TOWER basis of `CiSinCBasis` instead (the
+  // parts' own module structure over the lane ring, Doing.md 3.16): each
+  // tower nonzero at (i, j, t) is the banded map applied twice, up to four
+  // native coefficients. That is what `BootContext::HalfBootTower`'s
+  // wrap-around is bounded by.
   const char *module_env = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
   int module_small_degree = 0;
+  int tower_inner_rank = 0;
   if (module_env != nullptr && module_env[0] != 0) {
     module_small_degree = std::atoi(module_env);
+    const char *colon = std::strchr(module_env, ':');
+    if (colon != nullptr && std::atoi(colon + 1) > 0) {
+      tower_inner_rank = std::atoi(colon + 1);
+    }
     const char *comma = std::strchr(module_env, ',');
     if (comma != nullptr && std::atoi(comma + 1) > 0) {
       hamming_weight = std::atoi(comma + 1);
@@ -359,7 +369,14 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
                "UserInterface: CHEDDAR_MODULE_SPARSE_SECRET must divide the "
                "degree");
     const int rank = degree / small_degree;
+    AssertTrue(tower_inner_rank == 0 ||
+                   (IsPowOfTwo(tower_inner_rank) && tower_inner_rank >= 2 &&
+                    small_degree % tower_inner_rank == 0 &&
+                    tower_inner_rank < small_degree),
+               "UserInterface: CHEDDAR_MODULE_SPARSE_SECRET's inner rank must "
+               "divide the small degree");
     std::vector<int> native(degree, 0);
+    std::vector<int> parts(degree, 0);
     for (int attempt = 0;; attempt++) {
       AssertTrue(attempt < 1000,
                  "UserInterface: could not sample a collision-free module "
@@ -369,13 +386,42 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
                                        degree - 1);
       Random::SampleUniformWord<word>(ternary_values.data(), hamming_weight, 0,
                                       1);
-      for (int j = 0; j < hamming_weight; j++) {
-        const int flat = indices[j];
-        const int i = flat % rank;
-        const int t = flat / rank;
-        const int v = ternary_values[j] ? -1 : 1;
-        native[flat] += v;
-        if (i != 0 && t >= 1) native[(t - 1) * rank + (rank - i)] += v;
+      if (tower_inner_rank == 0) {
+        for (int j = 0; j < hamming_weight; j++) {
+          const int flat = indices[j];
+          const int i = flat % rank;
+          const int t = flat / rank;
+          const int v = ternary_values[j] ? -1 : 1;
+          native[flat] += v;
+          if (i != 0 && t >= 1) native[(t - 1) * rank + (rank - i)] += v;
+        }
+      } else {
+        // Tower coordinate flat = (t * k_i + j) * rank + i: the inner map
+        // lands part i's coefficients t' = t * k_i + j (and the partner
+        // (t - 1, k_i - j)), the outer map then recomposes the parts.
+        const int ki = tower_inner_rank;
+        std::fill(parts.begin(), parts.end(), 0);
+        for (int q = 0; q < hamming_weight; q++) {
+          const int flat = indices[q];
+          const int i = flat % rank;
+          const int rest = flat / rank;
+          const int j = rest % ki;
+          const int t = rest / ki;
+          const int v = ternary_values[q] ? -1 : 1;
+          parts[(t * ki + j) * rank + i] += v;
+          if (j != 0 && t >= 1) {
+            parts[((t - 1) * ki + (ki - j)) * rank + i] += v;
+          }
+        }
+        for (int tp = 0; tp < small_degree; tp++) {
+          for (int i = 0; i < rank; i++) {
+            int v = parts[tp * rank + i];
+            if (i != 0 && tp + 1 < small_degree) {
+              v += parts[(tp + 1) * rank + (rank - i)];
+            }
+            native[tp * rank + i] = v;
+          }
+        }
       }
       bool ternary = true;
       for (int v : native) ternary &= (v >= -1 && v <= 1);
@@ -389,9 +435,12 @@ void UserInterface<word>::PrepareSecrets(const std::vector<int> *given) {
       ternary_values.push_back(static_cast<word>(native[pos] < 0 ? 1 : 0));
     }
     hamming_weight = static_cast<int>(indices.size());
-    std::cout << "UserInterface: sparse secret sampled in the module basis "
-              << "(T = " << small_degree << "): " << hamming_weight
-              << " native coefficients" << std::endl;
+    std::cout << "UserInterface: sparse secret sampled in the "
+              << (tower_inner_rank > 0 ? "tower" : "module") << " basis "
+              << "(T = " << small_degree;
+    if (tower_inner_rank > 0) std::cout << ", inner rank " << tower_inner_rank;
+    std::cout << "): " << hamming_weight << " native coefficients"
+              << std::endl;
   }
   HostVector<word> sparse_s(num_total_primes * degree, 0);
   for (int i = 0; i < num_total_primes; i++) {

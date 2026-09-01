@@ -228,6 +228,19 @@ class Encoder {
                   int num_aux = 0) const;
 
   /**
+   * @brief One SinC block's transform on the conjugate-invariant ring, on the
+   * host: `lanes` (k real slots) -> `comp` (the k coefficients of the
+   * subring element that decodes to them), which is `EncodeSinC`'s per-block
+   * step -- SpecialIFFT at size k and the real part. `CiBlockDecode` is its
+   * inverse (DecodeSinC's per-block step). Exposed for the tower basis's
+   * host references (`CiSinCBasis`).
+   */
+  void CiBlockEncode(std::vector<double> &comp,
+                     const std::vector<double> &lanes) const;
+  void CiBlockDecode(std::vector<double> &lanes,
+                     const std::vector<double> &comp) const;
+
+  /**
    * @brief Decode a SinC-encoded plaintext. Inverse of EncodeSinC, and it must
    * be given the same `sub_degree` -- the encoding does not record it, exactly
    * as the coefficient encoding does not record that it is one.

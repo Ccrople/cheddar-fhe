@@ -10,6 +10,7 @@
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
 #include "extension/BootContext.h"
+#include "extension/CiSinCBasis.h"
 #include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
@@ -105,6 +106,19 @@ class CiSinCAttention {
     //! `stc / landing_scale` times their scale, which moves the integers
     //! and the declared scale together and leaves the message alone.
     double landing_scale = 0.0;
+    //! THE FUSED CONVERSIONS (Doing.md 3.16, [SYLPH] 2.1.2/3.3). The three
+    //! converters are replaced by `CiSinCBasis`: the descents are the tower
+    //! StC' without its lane group (two real phases at `forward_level`,
+    //! Q's premap folded, K's a phase of its own one level above), and the
+    //! return is `HalfBootTower` on the TOWER ring plus the lane prefix --
+    //! no `SinCToSlot`, no caller `Boot`: `Scores`/`Values` then hand back
+    //! SLOTS at `GetTopLevel()`, carrying the chain's `carried` factor as a
+    //! `Boot` would have. The chain runs at `chain_level = forward_level -
+    //! 2` and lands at level 0. Needs the constructor's `tower` (a
+    //! landing ring with three CtS levels and K = 64, its SSE secret
+    //! sampled in the tower basis) with `PrepareEvalMod` done, and
+    //! `Keys::tower`.
+    bool fused = false;
     //! The merge and the 63-diagonal exchange. This is a DIAL, not the
     //! landing: `Merge` drops the halves onto it, and a key switch pays
     //! for the limbs it carries -- measured on an A100 at 4.51 ms per
@@ -195,6 +209,9 @@ class CiSinCAttention {
     const EvkMap<word> *boot = nullptr;    //!< the big CI ring
     const EvkMap<word> *swtch = nullptr;   //!< the switching ring (descents)
     const EvkMap<word> *lifted = nullptr;  //!< the lifted ordinary ring
+    //! The tower ring (fused mode): the tower CtS' and prefix rotations,
+    //! from `AddTowerRotations`, plus its own SSE keys.
+    const EvkMap<word> *tower = nullptr;
     const Evk *ring_switch = nullptr;
     const Evk *inverse_ring_switch = nullptr;
   };
@@ -207,11 +224,16 @@ class CiSinCAttention {
    *        and secret (the _boot trio of Doing.md 1.5bt)
    * @param small_ctx the conjugate-invariant product ring
    * @param lifted_ctx the ordinary ring of the small ring's conductor
+   * @param tower fused mode only: the landing ring whose `HalfBootTower`
+   *        returns the chain's outputs (`ci16_35_land17c3e10`), a
+   *        sub-ladder of `boot`'s sharing its levels 0..17, its
+   *        `PrepareEvalMod` done
    */
   CiSinCAttention(std::shared_ptr<const BootContext<word>> boot,
                   ConstContextPtr<word> switch_ctx,
                   ConstContextPtr<word> small_ctx,
-                  ConstContextPtr<word> lifted_ctx, const Config &cfg);
+                  ConstContextPtr<word> lifted_ctx, const Config &cfg,
+                  std::shared_ptr<const BootContext<word>> tower = nullptr);
 
   // disable copying (or moving also)
   CiSinCAttention(const CiSinCAttention &) = delete;
@@ -220,16 +242,31 @@ class CiSinCAttention {
   const CiSwitchedCcmmLayout &GetLayout() const { return ccmm_.GetLayout(); }
   /// Ciphertexts one operand occupies, and one result.
   int GetNumCiphertexts() const { return ccmm_.GetLayout().num_cts; }
-  /// Where SoftMax expects its booted input.
-  int GetTopLevel() const { return boot_->GetBootParameter().GetEndLevel(); }
+  /// Where SoftMax expects its booted input: the leg ring's full-Boot
+  /// landing, or in fused mode the tower's HalfBoot landing less the prefix
+  /// (16 on both `ci16_35` and `ci16_35_land17c3e10`).
+  int GetTopLevel() const {
+    if (cfg_.fused) {
+      return tower_->GetBootParameter().GetEvalModEndLevel() -
+             basis_->GetPrefixNumLevels();
+    }
+    return boot_->GetBootParameter().GetEndLevel();
+  }
+  /// Fused mode: the tower basis (its forwards, CtS' and prefix).
+  const CiSinCBasis<word> *GetBasis() const { return basis_.get(); }
 
   /// Rotations on the boot ring: the exchange and its window return, the
   /// merge, K's cross and V's alignment, and the softmax reduction tree
   /// (whose indices the bootstrap's own FFT keys already hold). The Boot's
   /// own rotations are the caller's business.
   void AddRequiredRotations(EvkRequest &req) const;
-  /// Rotations on the switching ring: the three converters.
+  /// Rotations on the switching ring: the three converters, or in fused
+  /// mode the three tower forwards.
   void AddSwitchRotations(EvkRequest &req) const;
+  /// Fused mode: rotations on the tower ring (its CtS' and the prefix).
+  /// The tower runs no native transform, so these plus its SSE keys are all
+  /// it needs -- no `PrepareEvalSpecialFFT` there.
+  void AddTowerRotations(EvkRequest &req) const;
   /// Automorphism indices on the lifted ring.
   std::vector<int> LiftedRotationIndices() const {
     return ccmm_.LiftedRotationIndices();
@@ -245,14 +282,20 @@ class CiSinCAttention {
    * @param q_a,q_b the queries' 8 + 8 half-images at `land_level`, heads
    *        0..15 / 16..31; CONSUMED (they are the walk's workspace)
    * @param k_a,k_b the keys' half-images, likewise consumed
+   * @param carried when non-null receives the chain's message factor
+   *        (`res`'s scale over the base scale before the return), which
+   *        is what `SoftMax` divides out; in fused mode the return has
+   *        already happened and this is the only way to read it
    */
   void Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
               std::vector<Ct> &q_b, std::vector<Ct> &k_a,
-              std::vector<Ct> &k_b, const Keys &keys) const;
+              std::vector<Ct> &k_b, const Keys &keys,
+              double *carried = nullptr) const;
   /// The dense form (`Config::dense_images`): 8 dense images a tensor at
-  /// `land_level`, consumed.
+  /// `land_level`, consumed. In fused mode `res` is the booted scores in
+  /// slots at `GetTopLevel()`.
   void Scores(std::vector<Ct> &res, std::vector<Ct> &q, std::vector<Ct> &k,
-              const Keys &keys) const;
+              const Keys &keys, double *carried = nullptr) const;
 
   /**
    * @brief Compile the softmax walk for one calibration. Rebuilds the two
@@ -288,10 +331,12 @@ class CiSinCAttention {
    * @param v_a,v_b the values' half-images at `land_level`; consumed
    */
   void Values(std::vector<Ct> &res, std::vector<Ct> &p, std::vector<Ct> &v_a,
-              std::vector<Ct> &v_b, const Keys &keys) const;
-  /// The dense form: 8 dense value images at `land_level`, consumed.
+              std::vector<Ct> &v_b, const Keys &keys,
+              double *carried = nullptr) const;
+  /// The dense form: 8 dense value images at `land_level`, consumed. In
+  /// fused mode `res` is the attention output in slots at `GetTopLevel()`.
   void Values(std::vector<Ct> &res, std::vector<Ct> &p, std::vector<Ct> &v,
-              const Keys &keys) const;
+              const Keys &keys, double *carried = nullptr) const;
 
  private:
   //! RoPE on dense images: the (lo, lo + 4) pairs of one vector, no kill;
@@ -324,15 +369,20 @@ class CiSinCAttention {
   // V's per-call alignment: mask the call bit, odd call shifts by 128.
   std::vector<Ct> VCall(const std::vector<Ct> &v_cts, int call,
                         const EvkMap<word> &evk) const;
-  // LevelDown to forward_level, then the converter's forward.
-  void Convert(const CiSinCConverter<word> &conv, std::vector<Ct> &cts,
+  // The descent of one operand ("q", "k" or "pv"), in place: LevelDown to
+  // its level, then the converter of that name -- or in fused mode the tower
+  // forward of that name ("pv" is the "p" forward).
+  void Convert(const std::string &which, std::vector<Ct> &cts,
                const EvkMap<word> &evk) const;
-  // Two chain calls with per-call rhs, summed; then SinCToSlot to level 0.
+  // Two chain calls with per-call rhs, summed; then the return: SinCToSlot
+  // to level 0, or in fused mode HalfBootTower + prefix to GetTopLevel().
   void ChainAndReturn(std::vector<Ct> &res, std::vector<Ct> &lhs_sinc,
                       const std::vector<Ct> &rhs_source, bool rhs_is_k,
-                      const Keys &keys) const;
+                      const Keys &keys, double *carried) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
+  std::shared_ptr<const BootContext<word>> tower_;  // fused mode
+  std::unique_ptr<CiSinCBasis<word>> basis_;       // fused mode
   ConstContextPtr<word> switch_ctx_;
   Config cfg_;
   int num_slots_ = 0;

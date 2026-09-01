@@ -258,13 +258,21 @@ class MlweHandler {
    * CoeffToSlot reads module coordinates, so the representatives are centred
    * there -- scan, lift, recompose. Both maps are integer and linear, so per
    * residue is exact. Conjugate-invariant rings only.
+   *
+   * With `inner_rank > 0` the scan is taken TWICE, into the tower basis of
+   * `CiSinCBasis`: after the outer scan into `rank = degree / small_degree`
+   * parts, each part (its coefficient `t'` at `[t' * rank + i]`) is scanned
+   * again as a module of rank `inner_rank` over the lane ring of degree
+   * `small_degree / inner_rank` -- `t' = t * inner_rank + j`, class pairs
+   * `(j, inner_rank - j)` within the same part. `RecomposeInPlace` undoes
+   * the inner one first.
    */
   void ScanInPlace(DvView<word> &poly, const NPInfo &np,
-                   int small_degree) const;
+                   int small_degree, int inner_rank = 0) const;
 
   /** @brief The banded recomposition (P), in place; the inverse of the above. */
   void RecomposeInPlace(DvView<word> &poly, const NPInfo &np,
-                        int small_degree) const;
+                        int small_degree, int inner_rank = 0) const;
 
   /**
    * @brief Inverse-transform a ciphertext component into the coefficient

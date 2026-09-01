@@ -223,9 +223,16 @@ class Testbed : public testing::TestWithParam<const char *> {
 
     if (enable_boot && UseBootContext()) {
       std::cout << "Bootstrapping enabled" << std::endl;
+      // A preset may pin EvalMod's double-angle count (`num_double_angle`,
+      // the K = 32 / K = 64 landing ladders); 0 leaves the process default.
+      const int num_double_angle =
+          json_data.contains("num_double_angle")
+              ? int(json_data["num_double_angle"])
+              : 0;
       context_ = BootContext<word>::Create(
           *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
-                                 num_stc_levels_, 5, BootSlackLevels()));
+                                 num_stc_levels_, 5, BootSlackLevels(),
+                                 num_double_angle));
     } else {
       context_ = Context<word>::Create(*param_);
     }

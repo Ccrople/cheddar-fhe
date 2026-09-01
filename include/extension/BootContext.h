@@ -33,6 +33,8 @@ enum class BootVariant {
  */
 template <typename word>
 class CiModuleBasis;
+template <typename word>
+class CiSinCBasis;
 
 template <typename word>
 class BootContext : public Context<word>,
@@ -339,7 +341,8 @@ class BootContext : public Context<word>,
    * where the parameter set put it.
    */
   void ModUpToLevel(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
-                    int target_level = -1, int module_small_degree = 0) const;
+                    int target_level = -1, int module_small_degree = 0,
+                    int tower_inner_rank = 0) const;
   void CoeffToSlot(Ct &res, int num_slots, const Ct &input,
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
   void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
@@ -485,6 +488,23 @@ class BootContext : public Context<word>,
    */
   void HalfBootModule(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
                       const CiModuleBasis<word> &basis) const;
+
+  /**
+   * @brief `HalfBoot` reading the TOWER basis of `CiSinCBasis`: the nested
+   * SinC operand of the conjugate-invariant CC-MM chain in, the parts' SinC
+   * coefficients out in the slots -- the return half of [SYLPH]'s fused
+   * conversion (Doing.md 3.16). The ModRaise centres in tower coordinates
+   * (the scan twice, `MlweHandler::ScanInPlace` with the inner rank), which
+   * needs the SSE secret sampled sparse in the tower
+   * (`CHEDDAR_MODULE_SPARSE_SECRET=<small_degree>:<inner_rank>,<h>`), and
+   * CoeffToSlot is `basis.EvaluateCtS`, compiled at `GetCtSStartLevel()`
+   * with `cts_const = MaxNumSlots() * GetCtSConst()` over exactly
+   * `num_cts_levels_` levels. `basis.Prefix` then finishes the trip to the
+   * message at the chain layout's primary addresses. Same scale
+   * bookkeeping as `HalfBoot`.
+   */
+  void HalfBootTower(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
+                     const CiSinCBasis<word> &basis) const;
 
   /**
    * @brief Two real-payload coefficient ciphertexts through ONE HalfBoot.

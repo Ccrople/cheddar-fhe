@@ -52,8 +52,10 @@ template <typename word>
 CiSinCAttention<word>::CiSinCAttention(
     std::shared_ptr<const BootContext<word>> boot,
     ConstContextPtr<word> switch_ctx, ConstContextPtr<word> small_ctx,
-    ConstContextPtr<word> lifted_ctx, const Config &cfg)
+    ConstContextPtr<word> lifted_ctx, const Config &cfg,
+    std::shared_ptr<const BootContext<word>> tower)
     : boot_{std::move(boot)},
+      tower_{std::move(tower)},
       switch_ctx_{std::move(switch_ctx)},
       cfg_{cfg},
       ccmm_{switch_ctx_, small_ctx, lifted_ctx, cfg.sub_degree} {
@@ -80,13 +82,17 @@ CiSinCAttention<word>::CiSinCAttention(
   AssertTrue(cfg_.cross_level == cfg_.exchange_level - 1,
              "CiSinCAttention: the exchange rescales onto the cross's "
              "level, so cross_level must be exchange_level - 1");
+  // The descent spends one level (a converter) or two (the tower forward's
+  // inner and outer phases); K's standalone premap sits one above the
+  // forward, still below the cross's output.
+  const int descent_levels = cfg_.fused ? 2 : 1;
   AssertTrue(cfg_.land_level > cfg_.exchange_level &&
                  cfg_.exchange_level > cfg_.cross_level &&
-                 cfg_.cross_level > cfg_.forward_level &&
-                 cfg_.forward_level == cfg_.chain_level + 1 &&
+                 cfg_.cross_level - 1 >= cfg_.forward_level + (cfg_.fused ? 1 : 0) &&
+                 cfg_.forward_level == cfg_.chain_level + descent_levels &&
                  cfg_.chain_level == cfg_.inverse_level + 1,
              "CiSinCAttention: the level ladder is land > exchange > cross "
-             "and forward = chain + 1 = inverse + 2");
+             "and forward = chain + descent = inverse + descent + 1");
 
   // The canonicalising fold of Doing.md 1.5cb: HalfBoot declares its output
   // at GetStCInputScale() (~2^58), and riding that into the Boot boundary
@@ -109,16 +115,77 @@ CiSinCAttention<word>::CiSinCAttention(
 
   BuildPremaps();
 
-  conv_q_ = MakeConverter("q", /*inverse_level=*/-1, layout, &pre_q_);
-  conv_k_ = MakeConverter("k", /*inverse_level=*/-1, layout, &pre_k_);
-  conv_pv_ = MakeConverter("pv", cfg_.inverse_level, layout,
-                           /*premap=*/nullptr);
+  if (cfg_.fused) {
+    // THE FUSED CONVERSIONS (Doing.md 3.16). The three descents are tower
+    // forwards on the switching ring -- Q's premap folded into its first
+    // phase (441 diagonals at the Llama shape), K's as a phase of its own
+    // (479; folded it would fill the lattice), P's plain (255) -- and the
+    // return is the tower ring's HalfBoot with its CtS' plus the lane
+    // prefix. The prefix carries two folds, as the ordinary track's
+    // (`SinCAttention::BuildPrefixes`): the inverse of the tower's message
+    // ratio, so the scores come back as a `Boot` would have left them
+    // (`carried * m`, the softmax dividing `carried` out), and the
+    // plaintext scale that lands them CANONICAL at GetTopLevel() from the
+    // tower's own EvalMod end scale.
+    AssertTrue(tower_ != nullptr,
+               "CiSinCAttention: the fused return needs the tower ring's "
+               "BootContext");
+    AssertTrue(tower_->GetStCInputScale() > 0.0 &&
+                   tower_->GetMessageRatio() != 0.0,
+               "CiSinCAttention: PrepareEvalMod must run on the tower ring "
+               "before construction");
+    // What crosses between the rings: the chain's output at level 0 into
+    // the tower's HalfBoot, and the prefix's output at the tower's landing
+    // less one back onto the leg ring for the softmax -- so the two must
+    // agree on every level up to there.
+    const int prefix_out = tower_->GetBootParameter().GetEvalModEndLevel() - 1;
+    for (int L = 0; L <= prefix_out; L++) {
+      AssertTrue(boot_->param_.GetPrimeVector(boot_->param_.LevelToNP(L)) ==
+                     tower_->param_.GetPrimeVector(tower_->param_.LevelToNP(L)),
+                 "CiSinCAttention: the tower ring must share the leg ring's "
+                 "levels up to the prefix's landing (" + std::to_string(L) +
+                     ")");
+    }
+    basis_ = std::make_unique<CiSinCBasis<word>>(degree_, layout.small_degree,
+                                                 cfg_.sub_degree);
+    basis_->PrepareForward(switch_ctx_, "q", cfg_.forward_level, &pre_q_);
+    basis_->PrepareForward(switch_ctx_, "k", cfg_.forward_level + 1, &pre_k_,
+                           typename CiSinCBasis<word>::Phases(),
+                           /*fold_premap=*/false);
+    basis_->PrepareForward(switch_ctx_, "p", cfg_.forward_level);
+    const auto &tp = tower_->GetBootParameter();
+    basis_->PrepareCtS(tower_, tp.GetCtSStartLevel(),
+                       num_slots_ * tower_->GetCtSConst());
+    const int prefix_level = tp.GetEvalModEndLevel();
+    const double target = boot_->param_.GetScale(prefix_level - 1);
+    const double pt_scale = target *
+                            boot_->param_.GetRescalePrimeProd(prefix_level) /
+                            tower_->GetStCInputScale();
+    basis_->PreparePrefix(tower_, prefix_level,
+                          /*constant=*/1.0 / tower_->GetMessageRatio(),
+                          pt_scale);
+    if (cfg_.verbose) {
+      std::cout << "CiSinCAttention: fused conversions -- forwards at "
+                << cfg_.forward_level << " (q), " << cfg_.forward_level + 1
+                << " (k), " << cfg_.forward_level << " (p); the tower CtS' at "
+                << tp.GetCtSStartLevel() << ", the prefix at " << prefix_level
+                << " landing " << GetTopLevel() << " at scale 2^"
+                << std::log2(target) << " from the tower's 2^"
+                << std::log2(tower_->GetStCInputScale()) << ", ratio "
+                << tower_->GetMessageRatio() << std::endl;
+    }
+  } else {
+    conv_q_ = MakeConverter("q", /*inverse_level=*/-1, layout, &pre_q_);
+    conv_k_ = MakeConverter("k", /*inverse_level=*/-1, layout, &pre_k_);
+    conv_pv_ = MakeConverter("pv", cfg_.inverse_level, layout,
+                             /*premap=*/nullptr);
+  }
 
   // THE CONVERTERS' RESIDENCY (Doing.md 3.9). Each is read once a layer (pv
   // twice) and is the largest object the leg owns, so `host` takes q and k
   // off the device between uses and `host_all` pv too; the plaintexts come
   // back through `HoldConverter` for the use and go again after it.
-  {
+  if (!cfg_.fused) {
     const char *env = std::getenv("CHEDDAR_CONVERTER_RESIDENCY");
     const std::string mode = (env != nullptr) ? env : "";
     converter_residency_ = (mode == "host") ? 1 : (mode == "host_all") ? 2 : 0;
@@ -397,9 +464,20 @@ void CiSinCAttention<word>::AddRequiredRotations(EvkRequest &req) const {
 
 template <typename word>
 void CiSinCAttention<word>::AddSwitchRotations(EvkRequest &req) const {
+  if (cfg_.fused) {
+    basis_->AddForwardRotations(req);
+    return;
+  }
   conv_q_->AddRequiredRotations(req);
   conv_k_->AddRequiredRotations(req);
   conv_pv_->AddRequiredRotations(req);
+}
+
+template <typename word>
+void CiSinCAttention<word>::AddTowerRotations(EvkRequest &req) const {
+  AssertTrue(cfg_.fused, "CiSinCAttention: no tower ring without fused");
+  basis_->AddCtSRotations(req);
+  basis_->AddPrefixRotations(req);
 }
 
 template <typename word>
@@ -608,15 +686,35 @@ void CiSinCAttention<word>::HoldConverter(const CiSinCConverter<word> &conv,
 }
 
 template <typename word>
-void CiSinCAttention<word>::Convert(const CiSinCConverter<word> &conv,
+void CiSinCAttention<word>::Convert(const std::string &which,
                                     std::vector<Ct> &cts,
                                     const EvkMap<word> &evk) const {
+  if (cfg_.fused) {
+    const std::string name = (which == "pv") ? "p" : which;
+    const int level = basis_->GetForwardLevel(name);
+    for (auto &ct : cts) {
+      if (boot_->param_.NPToLevel(ct.GetNP()) > level) {
+        Ct at_level;
+        boot_->LevelDown(at_level, ct, level);
+        ct = std::move(at_level);
+      }
+      Ct sinc;
+      basis_->Forward(name, sinc, ct, evk);
+      ct = std::move(sinc);
+    }
+    return;
+  }
+  const CiSinCConverter<word> &conv =
+      (which == "q") ? *conv_q_ : (which == "k") ? *conv_k_ : *conv_pv_;
   HoldConverter(conv, /*on_device=*/true);
   for (auto &ct : cts) {
-    Ct at_level;
-    boot_->LevelDown(at_level, ct, cfg_.forward_level);
+    if (boot_->param_.NPToLevel(ct.GetNP()) > cfg_.forward_level) {
+      Ct at_level;
+      boot_->LevelDown(at_level, ct, cfg_.forward_level);
+      ct = std::move(at_level);
+    }
     Ct sinc;
-    conv.SlotToSinC(switch_ctx_, sinc, at_level, evk);
+    conv.SlotToSinC(switch_ctx_, sinc, ct, evk);
     ct = std::move(sinc);
   }
   HoldConverter(conv, /*on_device=*/false);
@@ -626,15 +724,15 @@ template <typename word>
 void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
                                            std::vector<Ct> &lhs_sinc,
                                            const std::vector<Ct> &rhs_source,
-                                           bool rhs_is_k,
-                                           const Keys &keys) const {
+                                           bool rhs_is_k, const Keys &keys,
+                                           double *carried) const {
   const auto &layout = ccmm_.GetLayout();
   std::vector<Ct> acc;
   for (int call = 0; call < 2; call++) {
     std::vector<Ct> rhs = rhs_is_k ? Cross(rhs_source, call, *keys.boot)
                                    : VCall(rhs_source, call, *keys.boot);
     // V rides Q's converter (1.5cb): same block function of (token, channel).
-    Convert(rhs_is_k ? *conv_k_ : *conv_q_, rhs, *keys.swtch);
+    Convert(rhs_is_k ? "k" : "q", rhs, *keys.swtch);
     std::vector<Ct> lhs;
     for (int i = 0; i < layout.num_cts / 2; i++) {
       lhs.push_back(std::move(lhs_sinc[call * layout.num_cts / 2 + i]));
@@ -652,6 +750,22 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
   }
   res.clear();
   res.resize(layout.num_cts);
+  // The chain's message factor (1.5bu): its output scale over the base
+  // scale, which the bootstrap reads its input against.
+  if (carried != nullptr) {
+    *carried = acc[0].GetScale() / boot_->param_.base_scale_;
+  }
+  if (cfg_.fused) {
+    AssertTrue(keys.tower != nullptr,
+               "CiSinCAttention: the fused return needs Keys::tower");
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      Ct half;
+      tower_->HalfBootTower(half, acc[bi], *keys.tower, *basis_);
+      acc[bi] = Ct{};
+      basis_->Prefix(res[bi], half, *keys.tower);
+    }
+    return;
+  }
   HoldConverter(*conv_pv_, /*on_device=*/true);
   for (int bi = 0; bi < layout.num_cts; bi++) {
     conv_pv_->SinCToSlot(switch_ctx_, res[bi], acc[bi], *keys.swtch);
@@ -661,42 +775,43 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
 
 template <typename word>
 void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
-                                   std::vector<Ct> &k, const Keys &keys) const {
+                                   std::vector<Ct> &k, const Keys &keys,
+                                   double *carried) const {
   Rope(q, /*with_angles=*/true);
   Rope(k, /*with_angles=*/true);
   ExchangeAll(q, *keys.boot);
   ExchangeAll(k, *keys.boot);
-  Convert(*conv_q_, q, *keys.swtch);
-  ChainAndReturn(res, q, k, /*rhs_is_k=*/true, keys);
+  Convert("q", q, *keys.swtch);
+  double f = 0.0;
+  ChainAndReturn(res, q, k, /*rhs_is_k=*/true, keys, &f);
+  if (carried != nullptr) *carried = f;
   if (cfg_.verbose) {
     std::cout << "CiSinCAttention::Scores (dense): out @"
-              << boot_->param_.NPToLevel(res[0].GetNP()) << ", carried "
-              << res[0].GetScale() / boot_->param_.base_scale_ << std::endl;
+              << boot_->param_.NPToLevel(res[0].GetNP()) << ", carried " << f
+              << std::endl;
   }
 }
 
 template <typename word>
 void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
-                                   std::vector<Ct> &v, const Keys &keys) const {
-  const auto &layout = ccmm_.GetLayout();
+                                   std::vector<Ct> &v, const Keys &keys,
+                                   double *carried) const {
   AssertTrue(boot_->param_.NPToLevel(p[0].GetNP()) == cfg_.forward_level,
              "CiSinCAttention: Values expects P at forward_level");
   Rope(v, /*with_angles=*/false);
   ExchangeAll(v, *keys.boot);
-  std::vector<Ct> p_sinc(layout.num_cts);
-  HoldConverter(*conv_pv_, /*on_device=*/true);
-  for (int bi = 0; bi < layout.num_cts; bi++) {
-    conv_pv_->SlotToSinC(switch_ctx_, p_sinc[bi], p[bi], *keys.swtch);
-  }
-  HoldConverter(*conv_pv_, /*on_device=*/false);
-  ChainAndReturn(res, p_sinc, v, /*rhs_is_k=*/false, keys);
+  // P is read, not consumed: its descent works on copies.
+  std::vector<Ct> p_sinc(p.size());
+  for (size_t bi = 0; bi < p.size(); bi++) boot_->Copy(p_sinc[bi], p[bi]);
+  Convert("pv", p_sinc, *keys.swtch);
+  ChainAndReturn(res, p_sinc, v, /*rhs_is_k=*/false, keys, carried);
 }
 
 template <typename word>
 void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
                                    std::vector<Ct> &q_b, std::vector<Ct> &k_a,
-                                   std::vector<Ct> &k_b,
-                                   const Keys &keys) const {
+                                   std::vector<Ct> &k_b, const Keys &keys,
+                                   double *carried) const {
   AssertTrue(!cfg_.dense_images,
              "CiSinCAttention::Scores: this leg was built for dense images; "
              "call the 8-ciphertext form");
@@ -706,12 +821,14 @@ void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
   Merge(k_a, k_b, *keys.boot);
   ExchangeAll(q_a, *keys.boot);
   ExchangeAll(k_a, *keys.boot);
-  Convert(*conv_q_, q_a, *keys.swtch);
-  ChainAndReturn(res, q_a, k_a, /*rhs_is_k=*/true, keys);
+  Convert("q", q_a, *keys.swtch);
+  double f = 0.0;
+  ChainAndReturn(res, q_a, k_a, /*rhs_is_k=*/true, keys, &f);
+  if (carried != nullptr) *carried = f;
   if (cfg_.verbose) {
     std::cout << "CiSinCAttention::Scores: out @"
-              << boot_->param_.NPToLevel(res[0].GetNP()) << ", carried "
-              << res[0].GetScale() / boot_->param_.base_scale_ << std::endl;
+              << boot_->param_.NPToLevel(res[0].GetNP()) << ", carried " << f
+              << std::endl;
   }
 }
 
@@ -977,21 +1094,18 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
 template <typename word>
 void CiSinCAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &p,
                                    std::vector<Ct> &v_a, std::vector<Ct> &v_b,
-                                   const Keys &keys) const {
-  const auto &layout = ccmm_.GetLayout();
+                                   const Keys &keys, double *carried) const {
   AssertTrue(boot_->param_.NPToLevel(p[0].GetNP()) == cfg_.forward_level,
              "CiSinCAttention: Values expects P at forward_level");
   RopeAndKill(v_a, v_b, /*with_angles=*/false);
   Merge(v_a, v_b, *keys.boot);
   ExchangeAll(v_a, *keys.boot);
-  // P's own ciphertexts are the two calls' lhs halves verbatim (1.5bw).
-  std::vector<Ct> p_sinc(layout.num_cts);
-  HoldConverter(*conv_pv_, /*on_device=*/true);
-  for (int bi = 0; bi < layout.num_cts; bi++) {
-    conv_pv_->SlotToSinC(switch_ctx_, p_sinc[bi], p[bi], *keys.swtch);
-  }
-  HoldConverter(*conv_pv_, /*on_device=*/false);
-  ChainAndReturn(res, p_sinc, v_a, /*rhs_is_k=*/false, keys);
+  // P's own ciphertexts are the two calls' lhs halves verbatim (1.5bw); P
+  // is read, not consumed, so its descent works on copies.
+  std::vector<Ct> p_sinc(p.size());
+  for (size_t bi = 0; bi < p.size(); bi++) boot_->Copy(p_sinc[bi], p[bi]);
+  Convert("pv", p_sinc, *keys.swtch);
+  ChainAndReturn(res, p_sinc, v_a, /*rhs_is_k=*/false, keys, carried);
 }
 
 template class CiSinCAttention<uint32_t>;

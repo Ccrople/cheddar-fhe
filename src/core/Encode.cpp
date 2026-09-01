@@ -535,6 +535,39 @@ std::vector<std::vector<double>> CiSinCDecompose(
 }  // namespace
 
 template <typename word>
+void Encoder<word>::CiBlockEncode(std::vector<double> &comp,
+                                  const std::vector<double> &lanes) const {
+  AssertTrue(param_.conjugate_invariant_,
+             "CiBlockEncode: a conjugate-invariant object");
+  const int k = static_cast<int>(lanes.size());
+  AssertTrue(k >= 2 && IsPowOfTwo(k) && k <= param_.degree_,
+             "CiBlockEncode: the block size must be a power of two up to the "
+             "degree");
+  std::vector<Complex> block(k);
+  for (int t = 0; t < k; t++) block[t] = Complex(lanes[t], 0.0);
+  SpecialIFFT(block);
+  comp.resize(k);
+  for (int t = 0; t < k; t++) comp[t] = block[t].real();
+}
+
+template <typename word>
+void Encoder<word>::CiBlockDecode(std::vector<double> &lanes,
+                                  const std::vector<double> &comp) const {
+  AssertTrue(param_.conjugate_invariant_,
+             "CiBlockDecode: a conjugate-invariant object");
+  const int k = static_cast<int>(comp.size());
+  AssertTrue(k >= 2 && IsPowOfTwo(k) && k <= param_.degree_,
+             "CiBlockDecode: the block size must be a power of two up to the "
+             "degree");
+  std::vector<Complex> block(k);
+  block[0] = Complex(comp[0], 0.0);
+  for (int t = 1; t < k; t++) block[t] = Complex(comp[t], -comp[k - t]);
+  SpecialFFT(block);
+  lanes.resize(k);
+  for (int t = 0; t < k; t++) lanes[t] = block[t].real();
+}
+
+template <typename word>
 void Encoder<word>::EncodeSinC(Plaintext<word> &ptxt, int level, double scale,
                                const std::vector<Complex> &message,
                                int sub_degree, int num_aux /*= 0*/) const {

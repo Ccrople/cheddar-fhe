@@ -276,6 +276,79 @@ __global__ void CiRecomposeInPlace(word *data, const word *primes, int rank,
   }
 }
 
+// The tower's INNER scan (CiSinCBasis): after the outer scan the parts sit
+// interleaved, part i's coefficient t' at [t' * rank + i]; the inner module
+// over the lane ring reads t' = t * inner_rank + j and pairs the classes
+// (j, inner_rank - j) OF THE SAME PART, so a chain runs down t at a stride of
+// rank * inner_rank. One thread per (limb, part, class pair); the pure class
+// j = 0 is left alone, as above.
+//
+// grid: 1D over num_limbs * rank * (inner_rank / 2 + 1) threads
+template <typename word>
+__global__ void CiScanInPlaceInner(word *data, const word *primes, int rank,
+                                   int inner_rank, int lane_degree, int degree,
+                                   int num_limbs) {
+  const int num_chains = inner_rank / 2 + 1;
+  const int per_limb = rank * num_chains;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * per_limb) return;
+  const int limb = tid / per_limb;
+  const int rem = tid - limb * per_limb;
+  const int part = rem / num_chains;
+  const int chain = rem - part * num_chains;
+  if (chain == 0) return;
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  word *d = data + limb * degree;
+  const int j = chain;
+  const int mj = inner_rank - chain;
+  const int stride = rank * inner_rank;
+  word acc_j = 0;
+  word acc_m = 0;
+  for (int t = lane_degree - 1; t >= 0; t--) {
+    const int pj = t * stride + j * rank + part;
+    const int pm = t * stride + mj * rank + part;
+    const word vj = d[pj];
+    const word vm = d[pm];
+    const word new_j = basic::Sub(vj, acc_m, prime);
+    const word new_m = basic::Sub(vm, acc_j, prime);
+    d[pj] = new_j;
+    d[pm] = new_m;
+    acc_j = new_j;
+    acc_m = new_m;
+  }
+}
+
+template <typename word>
+__global__ void CiRecomposeInPlaceInner(word *data, const word *primes,
+                                        int rank, int inner_rank,
+                                        int lane_degree, int degree,
+                                        int num_limbs) {
+  const int num_chains = inner_rank / 2 + 1;
+  const int per_limb = rank * num_chains;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_limbs * per_limb) return;
+  const int limb = tid / per_limb;
+  const int rem = tid - limb * per_limb;
+  const int part = rem / num_chains;
+  const int chain = rem - part * num_chains;
+  if (chain == 0) return;
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  word *d = data + limb * degree;
+  const int j = chain;
+  const int mj = inner_rank - chain;
+  const int stride = rank * inner_rank;
+  for (int t = 0; t < lane_degree; t++) {
+    const int pj = t * stride + j * rank + part;
+    const int pm = t * stride + mj * rank + part;
+    const word xj = d[pj];
+    const word xm = d[pm];
+    const word xj_next = (t + 1 < lane_degree) ? d[pj + stride] : 0;
+    const word xm_next = (t + 1 < lane_degree) ? d[pm + stride] : 0;
+    d[pj] = basic::Add(xj, xm_next, prime);
+    d[pm] = basic::Add(xm, xj_next, prime);
+  }
+}
+
 // The a-part of the i-th output is not a shifted slice of a's components as
 // it is on the power basis. With s = sum_j sigma_j c_j, the module components
 // of a * s follow from c_i c_j = c_{i+j} + c_{|i-j|} and, once i + j crosses
@@ -746,7 +819,7 @@ void MlweHandler<word>::ModPack(ConstContextPtr<word> context, Ct &res,
 
 template <typename word>
 void MlweHandler<word>::ScanInPlace(DvView<word> &poly, const NPInfo &np,
-                                    int small_degree) const {
+                                    int small_degree, int inner_rank) const {
   AssertTrue(param_.conjugate_invariant_,
              "ScanInPlace: the scan is a conjugate-invariant object");
   const int degree = param_.degree_;
@@ -763,11 +836,22 @@ void MlweHandler<word>::ScanInPlace(DvView<word> &poly, const NPInfo &np,
   kernel::CiScanInPlace<word><<<grid_dim, block_dim>>>(
       poly.data(), param_.GetPrimesPtr(np), rank, small_degree, degree,
       num_limbs);
+  if (inner_rank <= 0) return;
+  AssertTrue(IsPowOfTwo(inner_rank) && inner_rank >= 2 &&
+                 small_degree % inner_rank == 0 && inner_rank < small_degree,
+             "ScanInPlace: bad inner_rank");
+  const int lane_degree = small_degree / inner_rank;
+  const int inner_chains = rank * (inner_rank / 2 + 1);
+  const int inner_grid = DivCeil(num_limbs * inner_chains, block_dim);
+  kernel::CiScanInPlaceInner<word><<<inner_grid, block_dim>>>(
+      poly.data(), param_.GetPrimesPtr(np), rank, inner_rank, lane_degree,
+      degree, num_limbs);
 }
 
 template <typename word>
 void MlweHandler<word>::RecomposeInPlace(DvView<word> &poly, const NPInfo &np,
-                                         int small_degree) const {
+                                         int small_degree,
+                                         int inner_rank) const {
   AssertTrue(param_.conjugate_invariant_,
              "RecomposeInPlace: the recomposition is a conjugate-invariant "
              "object");
@@ -780,6 +864,17 @@ void MlweHandler<word>::RecomposeInPlace(DvView<word> &poly, const NPInfo &np,
   AssertTrue(poly.TotalSize() == num_limbs * degree,
              "RecomposeInPlace: the view does not match np");
   constexpr int block_dim = 128;
+  if (inner_rank > 0) {
+    AssertTrue(IsPowOfTwo(inner_rank) && inner_rank >= 2 &&
+                   small_degree % inner_rank == 0 && inner_rank < small_degree,
+               "RecomposeInPlace: bad inner_rank");
+    const int lane_degree = small_degree / inner_rank;
+    const int inner_chains = rank * (inner_rank / 2 + 1);
+    const int inner_grid = DivCeil(num_limbs * inner_chains, block_dim);
+    kernel::CiRecomposeInPlaceInner<word><<<inner_grid, block_dim>>>(
+        poly.data(), param_.GetPrimesPtr(np), rank, inner_rank, lane_degree,
+        degree, num_limbs);
+  }
   const int num_chains = rank / 2 + 1;
   const int grid_dim = DivCeil(num_limbs * num_chains, block_dim);
   kernel::CiRecomposeInPlace<word><<<grid_dim, block_dim>>>(

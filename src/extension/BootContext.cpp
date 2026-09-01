@@ -2,6 +2,7 @@
 
 #include "core/Mlwe.h"
 #include "extension/CiModuleBasis.h"
+#include "extension/CiSinCBasis.h"
 
 #include <cmath>
 #include <memory>
@@ -289,8 +290,8 @@ void BootContext<word>::AddRequiredRotations(EvkRequest &req, int num_slots,
 template <typename word>
 void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
                                      const EvkMap<word> &evk_map,
-                                     int target_level,
-                                     int module_small_degree) const {
+                                     int target_level, int module_small_degree,
+                                     int tower_inner_rank) const {
   if (target_level < 0) target_level = boot_param_.GetMaxLevel();
   AssertTrue(target_level > 0 && target_level <= this->param_.max_level_,
              "ModUpToLevel: target level out of range");
@@ -351,10 +352,15 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
   this->ntt_handler_.INTTAndMultConst(res_bx_view, np,
                                       working_ct->BxConstView(),
                                       mod_max_intt_const_.ConstView(0));
-  if (mlwe) mlwe->ScanInPlace(res_bx_view, np, module_small_degree);
+  if (mlwe) {
+    mlwe->ScanInPlace(res_bx_view, np, module_small_degree, tower_inner_rank);
+  }
   this->elem_handler_.ModUpToLevel(tmp_bx_view, res.BxConstView(),
                                    target_level);
-  if (mlwe) mlwe->RecomposeInPlace(tmp_bx_view, max_level_np, module_small_degree);
+  if (mlwe) {
+    mlwe->RecomposeInPlace(tmp_bx_view, max_level_np, module_small_degree,
+                           tower_inner_rank);
+  }
   this->ntt_handler_.NTT(tmp_bx_view, max_level_np, tmp_bx.ConstView(0), true);
 
   // ModUpToLevel(ax)
@@ -362,10 +368,15 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
   this->ntt_handler_.INTTAndMultConst(res_ax_view, np,
                                       working_ct->AxConstView(),
                                       mod_max_intt_const_.ConstView(0));
-  if (mlwe) mlwe->ScanInPlace(res_ax_view, np, module_small_degree);
+  if (mlwe) {
+    mlwe->ScanInPlace(res_ax_view, np, module_small_degree, tower_inner_rank);
+  }
   this->elem_handler_.ModUpToLevel(tmp_ax_view, res.AxConstView(),
                                    target_level);
-  if (mlwe) mlwe->RecomposeInPlace(tmp_ax_view, max_level_np, module_small_degree);
+  if (mlwe) {
+    mlwe->RecomposeInPlace(tmp_ax_view, max_level_np, module_small_degree,
+                           tower_inner_rank);
+  }
   this->ntt_handler_.NTT(tmp_ax_view, max_level_np,
                          tmp_ax.ConstView(tmp_ax_num_aux * degree), true);
 
@@ -793,8 +804,9 @@ void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
   counts_.half++;
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();
-  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
-  AssertTrue(num_slots == max_num_slots,
+  // Not `GetBootEnabledNumSlots`: that reads the native tables, and a ring
+  // whose crossings are all module ones need not build them.
+  AssertTrue(input_num_slots == max_num_slots,
              "HalfBootModule: the module basis is a full-slot object");
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
   AssertTrue(basis.GetCtSNumLevels() == boot_param_.num_cts_levels_,
@@ -819,6 +831,51 @@ void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
 
   Ct slots;
   basis.EvaluateCtS(GetContext(), slots, main_ct, evk_map);
+
+  EvaluateModAfterCtS(res, slots, /*full_slot=*/true, evk_map);
+  res.SetNumSlots(input_num_slots);
+  res.SetScale(eval_mod_->end_scale_);
+}
+
+template <typename word>
+void BootContext<word>::HalfBootTower(Ct &res, const Ct &input,
+                                      const EvkMap<word> &evk_map,
+                                      const CiSinCBasis<word> &basis) const {
+  counts_.half++;
+  const int max_num_slots = this->param_.MaxNumSlots();
+  const int input_num_slots = input.GetNumSlots();
+  // Not `GetBootEnabledNumSlots`: that reads the native tables, and a ring
+  // whose only crossing is this one never builds them (`PrepareEvalMod`
+  // alone; the tower CtS' is the basis's).
+  AssertTrue(input_num_slots == max_num_slots,
+             "HalfBootTower: the tower basis is a full-slot object");
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  AssertTrue(basis.GetNumSlots() == max_num_slots,
+             "HalfBootTower: the basis was built for another ring");
+  AssertTrue(basis.GetCtSLevel() == boot_param_.GetCtSStartLevel() &&
+                 basis.GetCtSNumLevels() == boot_param_.num_cts_levels_,
+             "HalfBootTower: the tower CtS must be compiled at the CtS start "
+             "level and spend exactly the boot parameter's CtS levels, or "
+             "EvalMod starts at the wrong level");
+
+  Ct main_ct;
+  const int input_level = this->param_.NPToLevel(input.GetNP());
+  if (input_level > 0) {
+    this->LevelDown(main_ct, input, 0);
+    HalfBootTower(res, main_ct, evk_map, basis);
+    return;
+  }
+
+  NPInfo min_np = this->param_.LevelToNP(-1);
+  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+
+  ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel(),
+               basis.GetOuterSmallDegree(), basis.GetInnerRank());
+  main_ct.SetNumSlots(max_num_slots);
+
+  Ct slots;
+  basis.EvaluateCtS(slots, main_ct, evk_map);
 
   EvaluateModAfterCtS(res, slots, /*full_slot=*/true, evk_map);
   res.SetNumSlots(input_num_slots);

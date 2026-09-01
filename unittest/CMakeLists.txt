@@ -244,6 +244,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_module_basis_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # The SinC conversions fused into the bootstrap on R+ (Doing.md 3.16): the
+  # tower basis's forward, CtS' and prefix on the device against the host
+  # encoder, and the fused return (HalfBootTower + prefix) on the K = 64
+  # landing ring under the tower-sparse secret.
+  add_executable(ci_sinc_basis_test CiSinCBasisTest.cpp)
+  target_link_libraries(ci_sinc_basis_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)
@@ -465,6 +473,11 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19c2.json
 # module-sparse secret's wrap-around wants (Doing.md 3.9).
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9.json COPYONLY)
+# The leg's fused-return ring (Doing.md 3.16): L = 17, three CtS levels for
+# the tower CtS', ten EvalMod levels (K = 64) for the tower-sparse secret's
+# wrap-around.
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

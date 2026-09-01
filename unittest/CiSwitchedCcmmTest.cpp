@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <memory>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -568,6 +569,10 @@ constexpr const char *kBootParam = "ci16_35.json";
 constexpr const char *kBootSwitchParam = "ci_ringswitch16_35_boot.json";
 constexpr const char *kBootSmallParam = "ci12_35_boot.json";
 constexpr const char *kBootLiftedParam = "ringdegree13_35_boot.json";
+// The leg's fused-return ring (Doing.md 3.16): ci16_35's sub-ladder at L = 17
+// with three CtS levels for the tower CtS' and K = 64 for the tower-sparse
+// secret's wrap-around.
+constexpr const char *kTowerParam = "ci16_35_land17c3e10.json";
 
 TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
   Ring boot(kBootParam);
@@ -6428,8 +6433,38 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   ASSERT_NE(bctx, nullptr);
 
+  // THE FUSED CONVERSIONS (Doing.md 3.16): `CHEDDAR_CI_FUSED=1` descends
+  // through the tower forwards instead of the converters and returns the
+  // chain's outputs through the tower ring's HalfBoot plus the lane prefix
+  // instead of SinCToSlot + Boot. The tower ring's SSE secret is sampled in
+  // the tower basis, so its Ring is built under that setting; the chain
+  // then runs at level 1 (the forward spends two).
+  const bool fused = [] {
+    const char *e = std::getenv("CHEDDAR_CI_FUSED");
+    return e != nullptr && e[0] != 0 && e[0] != '0';
+  }();
+  std::unique_ptr<Ring> tower;
+  std::shared_ptr<BootContext<word>> tctx;
+  if (fused) {
+    const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    const std::string saved = prev ? prev : "";
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", /*overwrite=*/1);
+    tower = std::make_unique<Ring>(kTowerParam, boot.ui->GetSecretCoeffs());
+    if (prev) {
+      setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+    } else {
+      unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    }
+    tctx = std::dynamic_pointer_cast<BootContext<word>>(tower->context);
+    ASSERT_NE(tctx, nullptr);
+    tctx->PrepareEvalMod();
+    std::cout << "FUSED conversions: tower ring " << kTowerParam
+              << ", HalfBoot lands "
+              << tctx->GetBootParameter().GetEvalModEndLevel() << std::endl;
+  }
+
   const int pcmm_level = 1;
-  const int chain_level = 2;
+  const int chain_level = fused ? 1 : 2;
   const int n = boot.Degree();
   const int proj_rank = 512;
   const int proj_small = n / proj_rank;  // 128 = T
@@ -6723,8 +6758,14 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
   typename cheddar::CiSinCAttention<word>::Config acfg;
   acfg.restore = 1.0 / hb_const;
   acfg.rope_base = rope_theta;
+  if (fused) {
+    acfg.fused = true;
+    acfg.chain_level = chain_level;
+    acfg.inverse_level = chain_level - 1;
+    acfg.verbose = true;
+  }
   cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
-                                      lifted.context, acfg);
+                                      lifted.context, acfg, tctx);
   const auto &layout = attn.GetLayout();
 
   swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
@@ -6745,10 +6786,16 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
     attn.AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  if (fused) {
+    EvkRequest req;
+    attn.AddTowerRotations(req);
+    tower->ui->PrepareRotationKey(req);
+  }
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch.ui->GetEvkMap();
   keys.lifted = &lifted.ui->GetEvkMap();
+  keys.tower = fused ? &tower->ui->GetEvkMap() : nullptr;
   keys.ring_switch = &swtch.ui->GetRingSwitchKey(layout.rank);
   keys.inverse_ring_switch = &swtch.ui->GetInverseRingSwitchKey(layout.rank);
 
@@ -6801,17 +6848,26 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
 
   // ---- the leg ---------------------------------------------------------
   std::vector<Ciphertext<word>> s0;
-  attn.Scores(s0, q_a, q_b, k_a, k_b, keys);
+  double carried = 0.0;
+  attn.Scores(s0, q_a, q_b, k_a, k_b, keys, &carried);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-  const double carried = s0[0].GetScale() / boot.param->base_scale_;
   ASSERT_LT(carried * std::max(std::abs(smax), std::abs(smin)), 0.95)
       << "the size_q/size_k fold missed EvalMod's range";
 
   std::vector<Ciphertext<word>> scores(layout.num_cts);
-  for (int bi = 0; bi < layout.num_cts; bi++) {
-    s0[bi].SetNumSlots(num_slots);
-    bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
+  if (fused) {
+    // The fused return has already booted them, to GetTopLevel().
+    scores = std::move(s0);
+    std::cout << "  fused: the scores returned at level "
+              << boot.param->NPToLevel(scores[0].GetNP()) << ", scale 2^"
+              << std::log2(scores[0].GetScale()) << ", carried " << carried
+              << std::endl;
+  } else {
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      s0[bi].SetNumSlots(num_slots);
+      bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap());
+    }
   }
   std::vector<Ciphertext<word>> P;
   attn.SoftMax(P, scores, carried, boot.ui->GetEvkMap());
@@ -6854,7 +6910,10 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
   }
 
   std::vector<Ciphertext<word>> out;
-  attn.Values(out, P, v_a, v_b, keys);
+  // Fused, the return leaves the chain's factor IN THE MESSAGE (as a Boot
+  // would), where the converter route left it in the declared scale.
+  double carried_v = 1.0;
+  attn.Values(out, P, v_a, v_b, keys, fused ? &carried_v : nullptr);
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
@@ -6862,7 +6921,8 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
   double worst_true = 0.0, worst_incoming = 0.0, worst_plain = 0.0;
   double transposed = 0.0, biggest = 0.0;
   for (int bi = 0; bi < layout.num_cts; bi++) {
-    ASSERT_EQ(boot.param->NPToLevel(out[bi].GetNP()), 0);
+    ASSERT_EQ(boot.param->NPToLevel(out[bi].GetNP()),
+              fused ? attn.GetTopLevel() : 0);
     Plaintext<word> pt;
     boot.ui->Decrypt(pt, out[bi]);
     std::vector<Complex> slots;
@@ -6897,7 +6957,7 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
           }
           int ct_idx, slot, copy_slot;
           layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
-          const double got = slots[slot].real();
+          const double got = slots[slot].real() / carried_v;
           biggest = std::max(biggest, std::abs(want));
           worst_true = std::max(worst_true, std::abs(got - want));
           worst_incoming =

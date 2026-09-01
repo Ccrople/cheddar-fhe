@@ -95,6 +95,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiLlamaSeam.cu
     src/extension/CiLlamaLayer.cu
     src/extension/CiModuleBasis.cpp
+    src/extension/CiSinCBasis.cpp
     src/extension/BootParameter.cpp
     src/extension/ComplexLinearTransform.cpp
     src/extension/EvalMod.cpp

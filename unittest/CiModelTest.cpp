@@ -111,6 +111,16 @@ const bool kModule = [] {
   return e != nullptr && e[0] == '1';
 }();
 const int kDensity = kModule ? 1 : 2;
+// `CHEDDAR_CI_FUSED=1` (Doing.md 3.16): the leg's SinC conversions fused into
+// the bootstrap. The leg's landing ring (`CHEDDAR_CI_LEG_PARAM`, the K = 64
+// `ci16_35_land17c3e10`) becomes the TOWER ring whose HalfBoot and lane
+// prefix return the scores and the attention output at 16, and the three
+// converters become the tower forwards on the switching ring; the 8 score
+// Boots and the 8 chain-output Boots go with them.
+const bool kFused = [] {
+  const char *e = std::getenv("CHEDDAR_CI_FUSED");
+  return e != nullptr && e[0] != 0 && e[0] != '0';
+}();
 const int kPerModel = kModule ? kRank : kRank / 2 - 1;   // 512 or 255
 const int kPerHidden = kModule ? kRank : kRank / 2;      // 512 or 256
 const int kNumH = (kH + kPerModel - 1) / kPerModel;       // 8 or 17
@@ -372,8 +382,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
   const auto t_setup0 = Tick();
   bctx->PrepareEvalMod();
-  bctx->PrepareEvalSpecialFFT(num_slots);
-  {
+  if (!kFused) {
+    // Fused (Doing.md 3.16), ci16_35's native tables serve nothing: the
+    // scores and the attention output return through the tower ring, the
+    // q/k/v and the stream cross through HalfBootModule (no native table),
+    // and the seam runs on the FFN ring. Not building them keeps ~6 GiB
+    // and their rotation keys off the card.
+    bctx->PrepareEvalSpecialFFT(num_slots);
     EvkRequest req;
     bctx->AddRequiredRotations(req, num_slots, min_ks);
     boot.ui->PrepareRotationKey(req);
@@ -477,16 +492,37 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   std::unique_ptr<Ring> leg_land;
   std::shared_ptr<BootContext<word>> lctx = bctx;
   const cheddar::EvkMap<word> *levk = &boot.ui->GetEvkMap();
+  ASSERT_TRUE(!kFused || leg_own_ring)
+      << "the fused leg needs CHEDDAR_CI_LEG_PARAM = the tower ring";
   if (leg_own_ring) {
-    leg_land = std::make_unique<Ring>(leg_param, boot.ui->GetSecretCoeffs(),
-                                      /*slack=*/0);
+    {
+      // The tower ring's SSE secret is sampled in the TOWER basis (the fused
+      // return's wrap-around is bounded there); every other ring keeps the
+      // module setting.
+      const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+      const std::string saved = prev ? prev : "";
+      if (kFused) setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
+      leg_land = std::make_unique<Ring>(leg_param, boot.ui->GetSecretCoeffs(),
+                                        /*slack=*/0);
+      if (kFused) {
+        if (prev) {
+          setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+        } else {
+          unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+        }
+      }
+    }
     lctx = std::dynamic_pointer_cast<BootContext<word>>(leg_land->context);
     ASSERT_NE(lctx, nullptr);
     lctx->PrepareEvalMod();
-    lctx->PrepareEvalSpecialFFT(num_slots);
-    EvkRequest req;
-    lctx->AddRequiredRotations(req, num_slots, min_ks);
-    leg_land->ui->PrepareRotationKey(req);
+    if (!kFused) {
+      // The tower ring runs no native transform: its rotations are the
+      // attention's `AddTowerRotations`, below.
+      lctx->PrepareEvalSpecialFFT(num_slots);
+      EvkRequest req;
+      lctx->AddRequiredRotations(req, num_slots, min_ks);
+      leg_land->ui->PrepareRotationKey(req);
+    }
     levk = &leg_land->ui->GetEvkMap();
     ASSERT_NEAR(lctx->GetMessageRatio() / crossing, 1.0, 1e-9)
         << "the landing ring's crossing constant differs from ci16_35's";
@@ -519,17 +555,27 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // And the scale they arrive at: the crossing ring's EvalMod end scale.
   acfg.landing_scale = kModule ? fctx->GetStCInputScale()
                                : lctx->GetStCInputScale();
+  // Fused: the forward spends two levels, so the chain runs at 1.
+  const int chain_level = kFused ? 1 : 2;
+  if (kFused) {
+    acfg.fused = true;
+    acfg.chain_level = chain_level;
+    acfg.inverse_level = chain_level - 1;
+  }
   auto attn = std::make_unique<cheddar::CiSinCAttention<word>>(
-      bctx, swtch->context, small->context, lifted->context, acfg);
+      bctx, swtch->context, small->context, lifted->context, acfg,
+      kFused ? lctx : nullptr);
   const auto layout = attn->GetLayout();
 
-  MemRow("setup: + CiSinCAttention (the three converters)");
+  MemRow(kFused ? "setup: + CiSinCAttention (the tower basis)"
+                : "setup: + CiSinCAttention (the three converters)");
   swtch->ui->PrepareRingSwitchKey(small->Degree(),
-                                  small->ui->GetSecretCoeffs(), 2);
+                                  small->ui->GetSecretCoeffs(), chain_level);
   swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
-                                         small->ui->GetSecretCoeffs(), 2);
+                                         small->ui->GetSecretCoeffs(),
+                                         chain_level);
   for (int idx : attn->LiftedRotationIndices()) {
-    lifted->ui->PrepareRotationKey(idx, 2);
+    lifted->ui->PrepareRotationKey(idx, chain_level);
   }
   {
     EvkRequest req;
@@ -541,11 +587,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     attn->AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  if (kFused) {
+    EvkRequest req;
+    attn->AddTowerRotations(req);
+    leg_land->ui->PrepareRotationKey(req);
+  }
   MemRow("setup: + the switch/lifted/leg attention keys");
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch->ui->GetEvkMap();
   keys.lifted = &lifted->ui->GetEvkMap();
+  keys.tower = kFused ? levk : nullptr;
   keys.ring_switch = &swtch->ui->GetRingSwitchKey(layout.rank);
   keys.inverse_ring_switch = &swtch->ui->GetInverseRingSwitchKey(layout.rank);
 
@@ -1538,19 +1590,23 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
 
     // ---- the leg ----------------------------------------------------------
     std::vector<Ciphertext<word>> s0;
+    double carried = 0.0;
     if (kModule) {
-      attn->Scores(s0, qd, kd, keys);
+      attn->Scores(s0, qd, kd, keys, &carried);
     } else {
-      attn->Scores(s0, q_a, q_b, k_a, k_b, keys);
+      attn->Scores(s0, q_a, q_b, k_a, k_b, keys, &carried);
     }
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-    const double carried = s0[0].GetScale() / boot.param->base_scale_;
     ASSERT_LT(carried * cqk * s_abs, 0.95)
         << "the size_q/size_k fold missed EvalMod's range";
     std::vector<Ciphertext<word>> scores(layout.num_cts);
-    for (int bi = 0; bi < layout.num_cts; bi++) {
-      s0[bi].SetNumSlots(num_slots);
-      bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap(), min_ks);
+    if (kFused) {
+      scores = std::move(s0);  // returned booted, at GetTopLevel()
+    } else {
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        s0[bi].SetNumSlots(num_slots);
+        bctx->Boot(scores[bi], s0[bi], boot.ui->GetEvkMap(), min_ks);
+      }
     }
     std::vector<Ciphertext<word>> P;
     attn->SoftMax(P, scores, carried, boot.ui->GetEvkMap());
@@ -1585,8 +1641,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           boot.context->encoder_.DecodeCoeff(before, pt);
         }
         // On the leg's landing ring these land at `GetEndLevel()`, which must
-        // be at or above where the seam starts.
-        lctx->Boot(booted[bi], attn_out[bi], *levk, min_ks);
+        // be at or above where the seam starts. Fused, the leg returned them
+        // booted already (the tower's HalfBoot + prefix, at 16).
+        if (kFused) {
+          boot.context->Copy(booted[bi], attn_out[bi]);
+        } else {
+          lctx->Boot(booted[bi], attn_out[bi], *levk, min_ks);
+        }
         if (bi == 0) {
           ASSERT_GE(boot.param->NPToLevel(booted[bi].GetNP()),
                     layer.GetSeamInputLevel())
