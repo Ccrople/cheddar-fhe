@@ -10,6 +10,7 @@
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "core/EncodeGpu.h"
+#include "core/MemoryPool.h"
 #include "extension/ChebyshevFit.h"
 #include "extension/Profile.h"
 #include "extension/SiLu.h"
@@ -27,7 +28,7 @@ double SinceSeconds(Clock::time_point t0) {
 }  // namespace
 
 template <typename word>
-CiBatchLayer<word>::CiBatchLayer(std::shared_ptr<const BootContext<word>> boot,
+CiBatchLayer<word>::CiBatchLayer(std::shared_ptr<BootContext<word>> boot,
                                  const Config &cfg)
     : boot_{std::move(boot)},
       cfg_{cfg},
@@ -83,11 +84,19 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
              "CiBatchLayer::NormTurn: norm_apply_level is above the boot's "
              "landing");
 
+  // The boot's tables, if the previous norm dropped them.
+  auto t0 = Clock::now();
+  if (!boot_->IsBootPrepared(layout_.num_slots)) {
+    NvtxScope _p("batch: prepare boot tables");
+    boot_->PrepareEvalSpecialFFT(layout_.num_slots);
+    prepare_seconds_ += SinceSeconds(t0);
+    t0 = Clock::now();
+  }
+
   // Pass A: every channel booted, its square accumulated WITHOUT
   // relinearization (the tensor product's three components add), and the
   // channel itself either kept at the level the apply will meet it or
   // dropped to be booted again (`Config::hold_channels`).
-  auto t0 = Clock::now();
   std::vector<Ct> xs(cfg_.hold_channels ? model : 0);
   Ct acc;
   {
@@ -104,6 +113,11 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       }
       if (cfg_.hold_channels) boot_->LevelDown(xs[c], up, hold);
     }
+  }
+  // The last bootstrap of this norm, when the channels are held: the
+  // tables can go now.
+  if (cfg_.hold_channels && cfg_.release_boot_tables) {
+    boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
   stages_.boot += SinceSeconds(t0);
   t0 = Clock::now();
@@ -197,6 +211,9 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       proj_->AddColumn(src, c, y_c);
     }
   }
+  if (!cfg_.hold_channels && cfg_.release_boot_tables) {
+    boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
+  }
   if (cfg_.hold_channels) {
     stages_.norm += SinceSeconds(t0);
   } else {
@@ -233,6 +250,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
            evk);
   const int ly = src_y.level;
+  if (cfg_.verbose) MemoryPool::Report("batch: after the norm");
 
   // 2. The weights: the gain on gate and up, 1/range on gate so SiLU's
   //    polynomial sees [-1, 1], and the stream's factor on down so that its
@@ -287,6 +305,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
       AssertTrue(lh >= 1,
                  "CiBatchLayer::FeedForward: no level left for the down "
                  "projection; raise norm_apply_level");
+      if (cfg_.verbose) MemoryPool::Report("batch: before the first down");
     }
     // The down operand for this chunk's rows: a contiguous row slice of
     // the `[hidden][model]` tensor, the stream's factor folded in.

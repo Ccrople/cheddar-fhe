@@ -97,6 +97,11 @@ class CiBatchLayer {
     //! or boot each channel twice and hold nothing. The first is 4096
     //! bootstraps cheaper a norm, the second 24 GiB smaller.
     bool hold_channels = true;
+    //! Drop the boot's CoeffToSlot/SlotToCoeff tables (6.4 GiB on
+    //! `ci16_35`) once a norm's bootstraps are done and rebuild them at the
+    //! next norm: nothing between two norms bootstraps, and the tables are
+    //! the largest single object the Context holds.
+    bool release_boot_tables = true;
     //! SiLU's Chebyshev degree (four levels at 15; the range is folded
     //! into the gate weight, so the polynomial is fitted on [-1, 1]).
     int silu_degree = 15;
@@ -134,8 +139,9 @@ class CiBatchLayer {
     std::vector<double> ffn_norm, attn_norm;
   };
 
-  CiBatchLayer(std::shared_ptr<const BootContext<word>> boot,
-               const Config &cfg);
+  //! `boot` is not const: the layer prepares and drops its transform
+  //! tables around each norm (`Config::release_boot_tables`).
+  CiBatchLayer(std::shared_ptr<BootContext<word>> boot, const Config &cfg);
 
   CiBatchLayer(const CiBatchLayer &) = delete;
   CiBatchLayer &operator=(const CiBatchLayer &) = delete;
@@ -190,11 +196,16 @@ class CiBatchLayer {
  private:
   int NormDegree(double window) const;
 
-  std::shared_ptr<const BootContext<word>> boot_;
+  std::shared_ptr<BootContext<word>> boot_;
   Config cfg_;
   CiBatchLayout layout_;
   std::unique_ptr<CiBatchProjection<word>> proj_;
   mutable Stages stages_;
+  //! Seconds spent (re)building the boot tables, apart from the arithmetic.
+  mutable double prepare_seconds_ = 0.0;
+
+ public:
+  double GetPrepareSeconds() const { return prepare_seconds_; }
 };
 
 #endif  // USE_CUBLAS
