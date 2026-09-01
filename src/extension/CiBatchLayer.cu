@@ -32,7 +32,11 @@ CiBatchLayer<word>::CiBatchLayer(std::shared_ptr<BootContext<word>> boot,
                                  const Config &cfg)
     : boot_{std::move(boot)},
       cfg_{cfg},
-      layout_{boot_->param_.MaxNumSlots(), cfg.num_tokens} {
+      layout_{cfg.lanes > 0
+                  ? CiBatchLayout(boot_->param_.MaxNumSlots(), cfg.num_tokens,
+                                  cfg.lanes, cfg.rank)
+                  : CiBatchLayout(boot_->param_.MaxNumSlots(),
+                                  cfg.num_tokens)} {
   AssertTrue(boot_->param_.conjugate_invariant_,
              "CiBatchLayer: the batched layout is written for R+");
   AssertTrue(cfg_.hidden % cfg_.rows_per_tile == 0,
@@ -167,21 +171,25 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   const int used =
       EvalPoly<word>(coeffs, lv, in_scale, in_scale, true).GetPolyDegree();
   const int lr = lv - Log2Ceil(used + 1);
-  AssertTrue(lr >= hold + (sink.empty() ? 0 : 1),
+  AssertTrue(lr >= hold + 1,
              "CiBatchLayer::NormTurn: the inverse square root lands below "
-             "norm_apply_level");
+             "norm_apply_level + 1");
   EvalPoly<word> inv(coeffs, lv, in_scale, param.GetScale(lr), true);
   inv.Compile(boot_);
   Ct r;
   inv.Evaluate(boot_, r, v, mult_key);
 
-  // The per-token factor onto r: y = (sink x) r = x (sink r).
+  // The per-token factor onto r, and the stream's factor OUT: the channel
+  // the apply reads still carries `stream_scale`, and the norm is to land
+  // in the model's units -- y = (sink x) r = (s x) (sink r / s).
   Ct rs;
-  if (sink.empty()) {
-    rs = std::move(r);
-  } else {
+  {
+    std::vector<double> f(T);
+    for (int t = 0; t < T; t++) {
+      f[t] = (sink.empty() ? 1.0 : sink[t]) / stream_scale;
+    }
     Pt ps;
-    layout_.PackPerToken(msg, sink);
+    layout_.PackPerToken(msg, f);
     boot_->gpu_encoder_.Encode(ps, lr, param.GetScale(lr), msg);
     Ct tmp;
     boot_->Mult(tmp, r, ps);
@@ -369,9 +377,10 @@ void CiBatchLayer<word>::Attention(
   const Parameter<word> &param = boot_->param_;
   const CiBatchLayout &alayout = attn.GetLayout();
   AssertTrue(alayout.num_tokens == layout_.num_tokens &&
-                 alayout.num_slots == layout_.num_slots,
+                 alayout.num_slots == layout_.num_slots &&
+                 alayout.lanes == layout_.lanes && alayout.rank == layout_.rank,
              "CiBatchLayer::Attention: the attention's layout is not this "
-             "layer's shape");
+             "layer's (Config::lanes / rank must be the chain's)");
   AssertTrue(w.q != nullptr && w.k != nullptr && w.v != nullptr &&
                  w.o != nullptr,
              "CiBatchLayer::Attention: the four tensors are needed");
@@ -441,9 +450,14 @@ void CiBatchLayer<word>::Attention(
   }
 
   // 4. Per kv group: the group's K and V heads and its four Q heads
-  //    projected, then per head scores -> Boot -> softmax -> P V.
-  std::vector<Ct> attn_out(static_cast<size_t>(heads) * D);
+  //    projected, then per head scores -> Boot -> softmax -> P V, and the
+  //    group's slice of the O projection accumulated at once (the attention
+  //    output never stands whole: 4096 ciphertexts at level 1 are 6 GiB).
+  std::vector<Ct> o_acc;
+  std::vector<Ct> attn_out(static_cast<size_t>(group) * D);
   std::vector<std::vector<Ct>> k_heads, v_heads, q_heads;
+  double o_ratio = 0.0;
+  int o_level = -1;
   const int top = boot_->GetBootParameter().GetEndLevel();
   // A projection tile split into its heads.
   auto split_heads = [&](std::vector<Ct> &tile,
@@ -520,7 +534,7 @@ void CiBatchLayer<word>::Attention(
       attn.Values(out_h, P, v_kv, akeys);
       P.clear();
       for (int cc = 0; cc < D; cc++) {
-        attn_out[static_cast<size_t>(h) * D + cc] = std::move(out_h[cc]);
+        attn_out[static_cast<size_t>(hi) * D + cc] = std::move(out_h[cc]);
       }
       stages_.values += SinceSeconds(t0);
       if (cfg_.verbose) {
@@ -530,6 +544,30 @@ void CiBatchLayer<word>::Attention(
                   << " s so far" << std::endl;
       }
     }
+    // 5. The group's slice of the O projection: rows kv * group * D .. of
+    //    the `[heads * D][model]` tensor, the stream's factor on the weight,
+    //    the chain's factor in the inputs' recorded scale.
+    t0 = Clock::now();
+    if (o_level < 0) {
+      o_level = param.NPToLevel(attn_out[0].GetNP());
+      o_ratio = attn_out[0].GetScale() / param.GetScale(o_level);
+      if (cfg_.verbose) {
+        MemoryPool::Report("batch: before the first O projection");
+      }
+    }
+    const std::string on = "attn.o." + std::to_string(kv);
+    proj_->Prepare(on, w.o + static_cast<size_t>(kv) * group * D * model,
+                   group * D, model, o_level, c.stream_scale, o_ratio);
+    std::vector<Ct> o_part;
+    proj_->Project(o_part, attn_out, on);
+    proj_->Release(on);
+    for (auto &a : attn_out) a = Ct();
+    if (kv == 0) {
+      o_acc = std::move(o_part);
+    } else {
+      for (int i = 0; i < model; i++) boot_->Add(o_acc[i], o_acc[i], o_part[i]);
+    }
+    stages_.o += SinceSeconds(t0);
   }
   k_heads.clear();
   v_heads.clear();
@@ -538,18 +576,12 @@ void CiBatchLayer<word>::Attention(
   proj_->Release("attn.v");
   src_y = typename CiBatchProjection<word>::Source();
   if (cfg_.release_boot_tables) boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
-  if (cfg_.verbose) MemoryPool::Report("batch: before the O projection");
 
-  // 5. The O projection: the stream's factor on the weight, the chain's
-  //    factor of two in the inputs' recorded scale; then the residual.
+  // 6. The residual.
   t0 = Clock::now();
-  const int lo_in = param.NPToLevel(attn_out[0].GetNP());
-  const double ratio = attn_out[0].GetScale() / param.GetScale(lo_in);
-  proj_->Prepare("attn.o", w.o, heads * D, model, lo_in, c.stream_scale, ratio);
-  std::vector<Ct> o;
-  proj_->Project(o, attn_out, "attn.o");
-  attn_out.clear();
-  proj_->Release("attn.o");
+  const int lo_in = o_level;
+  const double ratio = o_ratio;
+  std::vector<Ct> o = std::move(o_acc);
   const int ld = param.NPToLevel(o[0].GetNP());
   const int ls2 = param.NPToLevel(stream[0].GetNP());
   const int lo = std::min(ld, ls2);

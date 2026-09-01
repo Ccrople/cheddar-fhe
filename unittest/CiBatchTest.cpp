@@ -60,7 +60,7 @@ namespace {
 
 const char *Param() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_PARAM");
-  return (env && env[0]) ? env : "ci16_35.json";
+  return (env && env[0]) ? env : "ci16_35_stc2.json";
 }
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
@@ -867,7 +867,7 @@ TEST(CiBatch, TheElidedScoreProductHoldsUnderTheContract) {
 //    host on a sample of instances.
 // ---------------------------------------------------------------------------
 TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
-  Ring boot("ci16_35.json");
+  Ring boot(Param());
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   Ring small("ci12_35_boot.json");
   Ring lifted("ringdegree13_35_boot.json",
@@ -895,6 +895,11 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
     attn.AddSwitchRotations(req);
     swtch.ui->PrepareRotationKey(req);
   }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
   auto t1 = Sync();
   std::cout << "  setup (three converters + keys): " << std::fixed
             << std::setprecision(1) << Ms(t0, t1) / 1000.0 << " s, "
@@ -918,6 +923,7 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
   EncryptChannels(boot, layout, k, cfg.rope_level, k_cts);
 
   cheddar::CiBatchAttention<word>::Keys keys;
+  keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch.ui->GetEvkMap();
   keys.lifted = &lifted.ui->GetEvkMap();
   keys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
@@ -1076,7 +1082,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
             << " cq = ck = " << cal.cq << " stream_scale " << cal.stream_scale
             << std::endl;
 
-  Ring boot("ci16_35.json");
+  Ring boot(Param());
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   Ring small("ci12_35_boot.json");
   Ring lifted("ringdegree13_35_boot.json",
@@ -1093,6 +1099,8 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
   cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
   cfg.verbose = true;
+  cfg.lanes = 32;  // the chain: 32 lanes a group, rank 16
+  cfg.rank = 16;
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   cheddar::CiBatchAttention<word>::Config acfg;
   // y at hold - 1, the projections one below.
@@ -1120,6 +1128,11 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     cheddar::EvkRequest req;
     attn.AddSwitchRotations(req);
     swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
   }
   auto t1 = Sync();
   std::cout << "  setup (boot tables, three converters, keys): " << std::fixed
@@ -1161,6 +1174,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   w.attn_norm.assign(gain.begin(), gain.end());
 
   cheddar::CiBatchAttention<word>::Keys akeys;
+  akeys.boot = &boot.ui->GetEvkMap();
   akeys.swtch = &swtch.ui->GetEvkMap();
   akeys.lifted = &lifted.ui->GetEvkMap();
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
@@ -1266,7 +1280,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   ASSERT_TRUE(ReadF32(wd + "/input_nosink.f32",
                       static_cast<size_t>(kTokens) * kH, x0));
 
-  Ring boot("ci16_35.json");
+  Ring boot(Param());
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   Ring small("ci12_35_boot.json");
   Ring lifted("ringdegree13_35_boot.json",
@@ -1283,6 +1297,8 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
   cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
   cfg.verbose = EnvInt("CHEDDAR_CI_BATCH_VERBOSE", 1) != 0;
+  cfg.lanes = 32;  // the chain: 32 lanes a group, rank 16
+  cfg.rank = 16;
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.rope_level = cfg.norm_apply_level - 2;
@@ -1310,7 +1326,13 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     attn.AddSwitchRotations(req);
     swtch.ui->PrepareRotationKey(req);
   }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
   cheddar::CiBatchAttention<word>::Keys akeys;
+  akeys.boot = &boot.ui->GetEvkMap();
   akeys.swtch = &swtch.ui->GetEvkMap();
   akeys.lifted = &lifted.ui->GetEvkMap();
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);

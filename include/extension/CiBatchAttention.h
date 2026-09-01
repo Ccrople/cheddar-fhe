@@ -115,6 +115,7 @@ class CiBatchAttention {
 
   /** @brief The keys one call needs, on three rings. */
   struct Keys {
+    const EvkMap<word> *boot = nullptr;    //!< the layer's ring (the shift)
     const EvkMap<word> *swtch = nullptr;   //!< the switching ring
     const EvkMap<word> *lifted = nullptr;  //!< the lifted ordinary ring
     const Evk *ring_switch = nullptr;
@@ -144,8 +145,14 @@ class CiBatchAttention {
   //! The level a product's output lands at, in slots.
   int GetOutputLevel() const { return cfg_.inverse_level - 1; }
 
-  //! Rotations on the switching ring: the three converters.
+  //! Rotations on the switching ring: the two converters.
   void AddSwitchRotations(EvkRequest &req) const;
+  //! Rotations on the layer's ring: the key-token shift of the second
+  //! call. Under the chain addressing token t + T/2 sits at block + 1, so
+  //! the shift down is ONE slot rotation by `lanes` -- no second forward
+  //! converter (3.8 GiB of plaintexts) for it.
+  void AddBootRotations(EvkRequest &req) const;
+  int GetShiftRotation() const { return cfg_.sub_degree; }
   //! Automorphism indices on the lifted ring.
   std::vector<int> LiftedRotationIndices() const {
     return ccmm_.RotationIndices(2 * cfg_.sub_degree);
@@ -179,7 +186,11 @@ class CiBatchAttention {
     std::vector<std::vector<double>> row_shift, row_norm;
     double norm_lo = 0.9, norm_hi = 1.1;  //!< the invsqrt interval (ratio)
     int exp_degree = 0;   //!< 0 = derive from `m_eff`
-    int inv_degree = 15;
+    //! 7 (three levels): on a ring whose Boot lands at 17 the walk has
+    //! exactly 13 levels above `forward_level` 4, and exp's four, the
+    //! mask, the square, the affine, three here and the closing two are
+    //! those. Degree 7 on [0.9, 1.1] is 2^-13.
+    int inv_degree = 7;
     bool causal = true;
   };
 
@@ -242,8 +253,8 @@ class CiBatchAttention {
   //! RoPE in place on one head's `head_dim` channel ciphertexts, with the
   //! key-token half `call` kept (-1: every token), `rope_level` -> one below.
   void Rope(std::vector<Ct> &cts, int call) const;
-  //! One channel ciphertext down to the lifted ring: LevelDown, the forward
-  //! converter of `call` (-1 or 0: plain; 1: the shifted one), the ring
+  //! One channel ciphertext down to the lifted ring: LevelDown, for call 1
+  //! the key-token shift (one rotation), the forward converter, the ring
   //! switch, the lift. `lifted[g]` is group `g`'s part. `ct` is consumed.
   void Descend(std::vector<Ct> &lifted, Ct &ct, int call,
                const Keys &keys) const;
@@ -261,9 +272,8 @@ class CiBatchAttention {
   RingSwitchHandler<word> switcher_;
   CiLiftHandler<word> lift_;
   BatchCcmmHandler<word> ccmm_;
-  //! [0]: the plain forward; [1]: the forward with the key-token shift
-  //! folded in; the inverse.
-  std::unique_ptr<CiSinCConverter<word>> fwd_[2];
+  //! The forward (slots -> SinC) and the inverse converter.
+  std::unique_ptr<CiSinCConverter<word>> fwd_;
   std::unique_ptr<CiSinCConverter<word>> inv_;
   //! RoPE's per-token plaintexts at `rope_level`: [mask][pair], mask 0 =
   //! every token (Q), 1 / 2 = the key-token halves (K's two calls).

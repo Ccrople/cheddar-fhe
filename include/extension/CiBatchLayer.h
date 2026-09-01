@@ -83,6 +83,13 @@ class CiBatchLayer {
     int model = 4096;
     int hidden = 14336;
     double eps = 1e-5;
+    //! The CC-MM chain's addressing (`CiBatchLayout` chain-addressed):
+    //! the lanes of an instance group and the ring switch's rank, as the
+    //! attention's `GetChain()` has them. Both 0 = the plain map. A layer
+    //! that feeds `CiBatchAttention` MUST use its map, or the per-token
+    //! plaintexts of the norms address the wrong slots.
+    int lanes = 0;
+    int rank = 0;
     //! Output channels per projection tile, and the hidden chunk the
     //! feed-forward walks; must divide `hidden`. A tile's GEMM output and
     //! its batched rescale are `2 * rows * limbs * degree` words each, so

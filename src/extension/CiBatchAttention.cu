@@ -51,22 +51,22 @@ CiBatchAttention<word>::CiBatchAttention(
                  cfg_.rope_level - 1 >= cfg_.forward_level,
              "CiBatchAttention: the level ladder does not close");
 
-  // The three converters. The shifted forward's premap moves token t to
-  // token (t + T/2) % T inside every group, so that the second call's key
-  // tokens 64..127 sit at blocks 0..63 where the contract wants them.
+  // The two converters. The second call's key tokens 64..127 must sit at
+  // blocks 0..63 where the contract wants them: under the chain addressing
+  // `BlockOf(t + T/2, g) = BlockOf(t, g) + 1` (bit T/2 of the token is bit
+  // 0 of the block index), so the shift down is one slot rotation by
+  // `lanes` on the masked ciphertext -- checked here, so a layout change
+  // fails loudly rather than in the product.
   const int T = cfg_.num_tokens;
-  std::vector<int> premap(chain_.rank * T);
-  for (int t = 0; t < T; t++) {
+  for (int t = 0; t < T / 2; t++) {
     for (int g = 0; g < chain_.rank; g++) {
-      premap[layout_.BlockOf(t, g)] = layout_.BlockOf((t + T / 2) % T, g);
+      AssertTrue(layout_.BlockOf(t + T / 2, g) == layout_.BlockOf(t, g) + 1,
+                 "CiBatchAttention: the key-token shift is not one block");
     }
   }
-  fwd_[0] = std::make_unique<CiSinCConverter<word>>(
+  fwd_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, cfg_.forward_level, /*inverse_level=*/-1,
       &chain_, nullptr, cfg_.converter_baby_steps);
-  fwd_[1] = std::make_unique<CiSinCConverter<word>>(
-      switch_ctx_, cfg_.sub_degree, cfg_.forward_level, /*inverse_level=*/-1,
-      &chain_, &premap, cfg_.converter_baby_steps);
   inv_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, /*forward_level=*/-1, cfg_.inverse_level,
       &chain_, nullptr, cfg_.converter_baby_steps);
@@ -81,9 +81,13 @@ CiBatchAttention<word>::CiBatchAttention(
 
 template <typename word>
 void CiBatchAttention<word>::AddSwitchRotations(EvkRequest &req) const {
-  fwd_[0]->AddRequiredRotations(req);
-  fwd_[1]->AddRequiredRotations(req);
+  fwd_->AddRequiredRotations(req);
   inv_->AddRequiredRotations(req);
+}
+
+template <typename word>
+void CiBatchAttention<word>::AddBootRotations(EvkRequest &req) const {
+  req.AddRequest(GetShiftRotation(), cfg_.forward_level);
 }
 
 template <typename word>
@@ -158,8 +162,18 @@ void CiBatchAttention<word>::Descend(std::vector<Ct> &lifted, Ct &ct,
   Ct down;
   boot_->LevelDown(down, ct, cfg_.forward_level);
   ct = Ct();
+  if (call == 1) {
+    // The second call's key tokens, one block up, brought down: slot s ->
+    // s - lanes (`HRot` by r moves slot i + r to i).
+    AssertTrue(keys.boot != nullptr,
+               "CiBatchAttention::Descend: the shift needs Keys::boot");
+    const int r = GetShiftRotation();
+    Ct shifted;
+    boot_->HRot(shifted, down, keys.boot->GetRotationKey(r), r);
+    down = std::move(shifted);
+  }
   Ct sinc;
-  fwd_[call == 1 ? 1 : 0]->SlotToSinC(switch_ctx_, sinc, down, *keys.swtch);
+  fwd_->SlotToSinC(switch_ctx_, sinc, down, *keys.swtch);
   down = Ct();
   std::vector<Ct> parts;
   switcher_.Switch(parts, sinc, *keys.ring_switch);
