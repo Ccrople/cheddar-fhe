@@ -5,6 +5,7 @@
 #include <complex>
 #include <iostream>
 #include <numeric>
+#include <memory>
 
 #include "common/Assert.h"
 #include "extension/EvalSpecialFFT.h"
@@ -404,6 +405,81 @@ void CiModuleBasis<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
     res = std::move(out);
   }
   res.SetNumSlots(num_slots_);
+}
+
+// ---------------------------------------------------------------------------
+// THE ARCHIVE. Shape first, then the groups in evaluation order; every
+// transform through its own `Save`, which carries its plaintexts and BSGS
+// structure. The read order is the write order, tag by tag.
+// ---------------------------------------------------------------------------
+
+template <typename word>
+void CiModuleBasis<word>::Save(ArchiveWriter &ar) const {
+  ar.Tag("CiModuleBasis");
+  ar.Pod<int32_t>(num_slots_);
+  ar.Pod<int32_t>(small_degree_);
+  ar.Pod<int32_t>(rank_);
+  ar.Pod<int32_t>(log_slots_);
+  ar.Pod<int32_t>(log_small_);
+  ar.Pod<int32_t>(log_rank_);
+  ar.Pod<int32_t>(stc_level_);
+  ar.Pod<int32_t>(cts_level_);
+  ar.Pod<int32_t>(stc_shift_);
+  ar.Pod<int32_t>(cts_shift_);
+  ar.Vec<int>(stc_diagonals_);
+  ar.Vec<int>(cts_diagonals_);
+  for (const auto *groups : {&stc_groups_, &cts_groups_}) {
+    ar.Tag("groups");
+    ar.Pod<uint32_t>(static_cast<uint32_t>(groups->size()));
+    for (const auto &g : *groups) {
+      ar.Pod<uint32_t>(static_cast<uint32_t>(g.real.size()));
+      for (const auto &t : g.real) t.Save(ar);
+      ar.Pod<uint32_t>(static_cast<uint32_t>(g.pair.size()));
+      for (const auto &t : g.pair) t.Save(ar);
+    }
+  }
+  ar.Tag("end");
+}
+
+template <typename word>
+CiModuleBasis<word>::CiModuleBasis(FromArchive, ArchiveReader &ar) {
+  ar.Tag("CiModuleBasis");
+  num_slots_ = ar.Pod<int32_t>();
+  small_degree_ = ar.Pod<int32_t>();
+  rank_ = ar.Pod<int32_t>();
+  log_slots_ = ar.Pod<int32_t>();
+  log_small_ = ar.Pod<int32_t>();
+  log_rank_ = ar.Pod<int32_t>();
+  stc_level_ = ar.Pod<int32_t>();
+  cts_level_ = ar.Pod<int32_t>();
+  stc_shift_ = ar.Pod<int32_t>();
+  cts_shift_ = ar.Pod<int32_t>();
+  stc_diagonals_ = ar.Vec<int>();
+  cts_diagonals_ = ar.Vec<int>();
+  for (auto *groups : {&stc_groups_, &cts_groups_}) {
+    ar.Tag("groups");
+    const uint32_t count = ar.Pod<uint32_t>();
+    for (uint32_t i = 0; i < count; i++) {
+      Group g;
+      const uint32_t nr = ar.Pod<uint32_t>();
+      for (uint32_t j = 0; j < nr; j++) {
+        g.real.push_back(LinearTransform<word>::Load(ar));
+      }
+      const uint32_t np = ar.Pod<uint32_t>();
+      for (uint32_t j = 0; j < np; j++) {
+        g.pair.push_back(Transform::Load(ar));
+      }
+      groups->push_back(std::move(g));
+    }
+  }
+  ar.Tag("end");
+}
+
+template <typename word>
+std::unique_ptr<CiModuleBasis<word>> CiModuleBasis<word>::Load(
+    ArchiveReader &ar) {
+  return std::unique_ptr<CiModuleBasis<word>>(
+      new CiModuleBasis<word>(FromArchive{}, ar));
 }
 
 template class CiModuleBasis<uint32_t>;

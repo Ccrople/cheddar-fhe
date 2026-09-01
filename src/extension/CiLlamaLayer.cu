@@ -2,6 +2,10 @@
 #include "extension/CiLlamaLayer.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -10,6 +14,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "core/Serialization.h"
 
 namespace cheddar {
 
@@ -141,11 +146,63 @@ CiLlamaLayer<word>::CiLlamaLayer(
     }
     const int stc_levels = static_cast<int>(phases.stc_small.size()) +
                            static_cast<int>(phases.stc_twist.size());
-    basis_ = std::make_unique<CiModuleBasis<word>>(
-        boot_, cfg_.num_tokens, sched_.GetStCLevel(),
-        boot_->GetBootParameter().GetCtSStartLevel(), phases,
-        sched_.ModuleStCConst(stc_levels),
-        num_slots_ * boot_->GetCtSConst());
+    const double stc_const = sched_.ModuleStCConst(stc_levels);
+    const double cts_const = num_slots_ * boot_->GetCtSConst();
+    const int cts_level = boot_->GetBootParameter().GetCtSStartLevel();
+    // THE COMPILE, CACHED (Doing.md 3.20/3.21): 37.7 s of the 76 s setup is
+    // this constructor, and every input to it is in the recipe below or in
+    // the parameter set, which `ArchiveIdentity` guards. Written aside and
+    // renamed, as the converter cache is, so the file is whole or absent.
+    std::string cache_path;
+    if (const char *dir = std::getenv("CHEDDAR_MODULE_BASIS_CACHE");
+        dir != nullptr && *dir != 0) {
+      auto bits = [](double v) {
+        uint64_t u = 0;
+        std::memcpy(&u, &v, sizeof(u));
+        std::ostringstream s;
+        s << std::hex << u;
+        return s.str();
+      };
+      std::ostringstream os;
+      os << dir << "/ci_module_basis_T" << cfg_.num_tokens << "_stc"
+         << sched_.GetStCLevel() << "_cts" << cts_level << "_p";
+      for (const auto *g : {&phases.stc_small, &phases.stc_twist,
+                            &phases.cts_twist, &phases.cts_small}) {
+        for (int c : *g) os << c;
+        os << "-";
+      }
+      os << "_s" << bits(stc_const) << "_c" << bits(cts_const) << "_n"
+         << num_slots_ << ".bin";
+      cache_path = os.str();
+    }
+    const auto id = IdentityOf(boot_->param_);
+    if (!cache_path.empty() &&
+        ArchiveReader::PeekIdentity(cache_path) == id) {
+      ArchiveReader ar(cache_path, id);
+      basis_ = CiModuleBasis<word>::Load(ar);
+      std::cout << "CiLlamaLayer: module basis read, "
+                << (ArchiveReader::FileSize(cache_path) >> 20) << " MiB from "
+                << cache_path << std::endl;
+    } else {
+      basis_ = std::make_unique<CiModuleBasis<word>>(
+          boot_, cfg_.num_tokens, sched_.GetStCLevel(), cts_level, phases,
+          stc_const, cts_const);
+      if (!cache_path.empty()) {
+        const std::string tmp = cache_path + ".tmp";
+        int64_t written = 0;
+        {
+          ArchiveWriter ar(tmp, id);
+          basis_->Save(ar);
+          ar.Close();
+          written = ar.Written();
+        }
+        AssertTrue(std::rename(tmp.c_str(), cache_path.c_str()) == 0,
+                   "CiLlamaLayer: could not move the module basis cache into "
+                   "place at " + cache_path);
+        std::cout << "CiLlamaLayer: module basis written, " << (written >> 20)
+                  << " MiB to " << cache_path << std::endl;
+      }
+    }
     sched_.SetModuleBasis(basis_.get());
     MemoryPool::Report("layer ctor: + the module basis (StC'/CtS' plaintexts)");
   }
@@ -394,7 +451,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
                                   double alpha, double window,
                                   double stream_scale,
                                   const std::vector<double> &sink,
-                                  const EvkMap<word> &evk) {
+                                  const EvkMap<word> &evk, bool ffn) {
   NvtxScope _nv("layer: NormTurn");
   AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
              "CiLlamaLayer: the residual stream is " +
@@ -480,13 +537,31 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   // which at `beta = sqrt(alpha)` is `sqrt(ratio)` -- the declared-width
   // leftover the comment above names, and nothing else.
   const double b2 = beta * beta;
-  RmsNormHandler<word> rms(boot_, cfg_.num_tokens, cfg_.model_declared,
-                           alpha * ratio / b2, op_level_, b2 * cfg_.eps / ratio,
-                           window, NormDegree(window), channel_stride_);
+  // The handler `PrepareNormAhead` built for exactly these inputs, if there
+  // is one (the previous layer built it in one of its windows); otherwise
+  // the same handler built here, as before.
+  NormAhead &ahead = norm_ahead_[ffn ? 1 : 0];
+  std::unique_ptr<RmsNormHandler<word>> own;
+  std::vector<std::vector<Complex>> wts;
+  RmsNormHandler<word> *rms_ptr = nullptr;
+  if (ahead.valid && ahead.alpha == alpha && ahead.window == window &&
+      ahead.gain == gain) {
+    own = std::move(ahead.rms);
+    wts = std::move(ahead.wts);
+    ahead.valid = false;
+    rms_ptr = own.get();
+  } else {
+    own = std::make_unique<RmsNormHandler<word>>(
+        boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
+        op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
+        channel_stride_);
+    wts = NormWeights(gain, alpha / b2);
+    own->Prepare(wts);
+    rms_ptr = own.get();
+  }
+  RmsNormHandler<word> &rms = *rms_ptr;
   AssertTrue(rms.GetNumCiphertexts() == num_model_cts_,
              "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
-  const auto wts = NormWeights(gain, alpha / b2);
-  rms.Prepare(wts);
   prepare_timer_.End();
   // The reduction on its own, before anything fitted touches it. `Apply`
   // computes the same thing internally; recomputing it here keeps the
@@ -507,6 +582,29 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   for (int k = 0; k < num_model_cts_; k++) {
     sched_.ToCoeff(res[k], outv[k], evk, cfg_.min_ks);
   }
+}
+
+template <typename word>
+void CiLlamaLayer<word>::PrepareNormAhead(bool ffn,
+                                          const std::vector<double> &gain,
+                                          double alpha, double window) const {
+  NvtxScope _nv("prep: RMSNorm ahead");
+  // The same arithmetic as `NormTurn`'s, so that its match is exact.
+  const double ratio =
+      static_cast<double>(cfg_.model_declared) / cfg_.model_live;
+  const double beta = std::sqrt(alpha);
+  const double b2 = beta * beta;
+  NormAhead &ahead = norm_ahead_[ffn ? 1 : 0];
+  ahead.rms = std::make_unique<RmsNormHandler<word>>(
+      boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
+      op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
+      channel_stride_);
+  ahead.wts = NormWeights(gain, alpha / b2);
+  ahead.rms->Prepare(ahead.wts);
+  ahead.gain = gain;
+  ahead.alpha = alpha;
+  ahead.window = window;
+  ahead.valid = true;
 }
 
 template <typename word>
@@ -589,7 +687,7 @@ void CiLlamaLayer<word>::AttentionNorm(std::vector<Ct> &res,
                                        const EvkMap<word> &evk) {
   NvtxScope _nv("layer: AttentionNorm");
   NormTurn(res, stream, gain, c.attn_alpha, c.attn_norm_window,
-           c.stream_scale, c.attn_sink, evk);
+           c.stream_scale, c.attn_sink, evk, /*ffn=*/false);
 }
 
 template <typename word>
@@ -639,7 +737,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
   std::vector<Ct> normed;
   NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window,
-           c.stream_scale, c.ffn_sink, evk);
+           c.stream_scale, c.ffn_sink, evk, /*ffn=*/true);
   MemoryPool::Report("ffn: after the norm turn (crossings, RMSNorm, StC)");
 
   // ---- gate and up -------------------------------------------------------

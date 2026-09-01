@@ -54,6 +54,7 @@ set(CKKS_GPU_SOURCES
   src/core/Container.cpp
   src/core/Context.cpp
   src/core/DeviceVector.cpp
+  src/core/Streams.cpp
   src/core/Encode.cpp
   src/core/EncodeGpu.cu
   src/core/EvkMap.cpp
@@ -94,6 +95,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiSinCAttention.cu
     src/extension/CiLlamaSeam.cu
     src/extension/CiLlamaLayer.cu
+    src/extension/CiLayerPrefetch.cu
     src/extension/CiModuleBasis.cpp
     src/extension/CiSinCBasis.cpp
     src/extension/BootParameter.cpp

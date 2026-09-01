@@ -4,6 +4,7 @@
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "extension/Profile.h"
 
 namespace cheddar {
 
@@ -165,9 +166,11 @@ void CiSwitchedCcmmHandler<word>::Multiply(std::vector<Ct> &res,
   AssertTrue(static_cast<int>(rhs.size()) == layout_.num_cts,
              "CiSwitchedCcmm: the rhs operand is num_cts big ciphertexts");
 
+  NvtxScope *_d = new NvtxScope("ccmm: DescendAndLift (ring switch + lift)");
   std::vector<Ct> lifted_lhs, lifted_rhs;
   DescendAndLift(lifted_lhs, lhs, swk);
   DescendAndLift(lifted_rhs, rhs, swk);
+  delete _d;
 
   std::vector<Ct> lifted_res;
   ccmm_.Multiply(lifted_ctx_, lifted_res, lifted_lhs, lifted_rhs,
@@ -182,6 +185,7 @@ void CiSwitchedCcmmHandler<word>::Multiply(std::vector<Ct> &res,
 
   res.clear();
   res.resize(layout_.num_cts);
+  NvtxScope _b("ccmm: Descend + SwitchBack");
   std::vector<Ct> parts(layout_.rank);
   for (int b = 0; b < layout_.num_cts; b++) {
     for (int j = 0; j < layout_.rank; j++) {

@@ -115,6 +115,18 @@ class PcmmBlasHandler {
     NPInfo np;
     // pieces * primes * rows * cols int8 values, piece-major
     DeviceVector<int8_t> data;
+    // A prefetched operand does not own its device bytes: they sit in a
+    // staging arena outside the pool (`CoeffLinearLeg`'s), and this is the
+    // window onto them while the operand is staged. Null when `data` holds
+    // the bytes, or when the operand is off the device.
+    const int8_t *view = nullptr;
+
+    const int8_t *Ptr() const { return view != nullptr ? view : data.data(); }
+    /// The bytes the split holds or will hold: `pieces * primes * rows *
+    /// cols`, a function of the shape alone.
+    size_t Bytes() const {
+      return static_cast<size_t>(pieces) * np.GetNumTotal() * rows * cols;
+    }
   };
 
   /**
@@ -192,9 +204,25 @@ class PcmmBlasHandler {
                                int num_aux = 0) const;
 
   /** @brief Device bytes the split matrix holds. */
-  static size_t SplitBytes(const SplitMatrix &m) {
-    return m.data.size() * sizeof(int8_t);
-  }
+  static size_t SplitBytes(const SplitMatrix &m) { return m.Bytes(); }
+
+  /**
+   * @brief Fill a `SplitMatrix`'s shape -- pieces, NPInfo, scale -- without
+   * building it, so a caller can size a buffer for it before any encode.
+   */
+  void DescribeSplit(SplitMatrix &res, int level, double scale, int rows,
+                     int cols, int num_aux = 0) const;
+
+  /**
+   * @brief `SplitMatrixFromResidues` into memory the caller owns, on the
+   * caller's stream: the prefetch path, whose bytes go to a pinned mirror
+   * on the copy stream and never live in the pool. `res.data` stays empty
+   * and `res.view` is left for the caller to set when the operand is
+   * staged.
+   */
+  void SplitResiduesInto(SplitMatrix &res, int level, double scale,
+                         const word *residues, int rows, int cols, int8_t *dst,
+                         cudaStream_t stream, int num_aux = 0) const;
 
   /**
    * @brief res[i] = sum_j u[i][j] * cts[j], through cuBLAS.

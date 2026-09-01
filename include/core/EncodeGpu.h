@@ -100,6 +100,14 @@ class GpuEncoder {
   // onto [1, max_slots) -- one table serves every slot count, exactly as the
   // host's does, because the entry depends on (stride, j) and not on how many
   // slots the message happens to fill.
+  // The stream every launch and copy below goes to. The Context's encoder
+  // runs on the legacy stream like the rest of the library; the next layer's
+  // weight prefetch owns a second encoder on the pipeline's encode stream
+  // (`PipelineStreams::Encode`), with scratch of its own, so its kernels
+  // overlap the compute stream instead of queueing behind it. Declared
+  // before the scratch members because they are allocated on it.
+  const cudaStream_t stream_;
+
   rmm::device_uvector<double> twiddle_;
 
   // Scratch, grown on demand and reused: the transform's working buffer
@@ -148,7 +156,20 @@ class GpuEncoder {
   void WaitForStaging() const;
 
  public:
-  GpuEncoder(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);
+  GpuEncoder(const Parameter<word> &param, const NTTHandler<word> &ntt_handler,
+             cudaStream_t stream = cudaStreamLegacy);
+
+  cudaStream_t GetStream() const { return stream_; }
+
+  /**
+   * @brief Build and cache the per-prime constants of `level` now.
+   *
+   * `PrimeConstants` builds its table with a SYNCHRONOUS copy the first time
+   * a level is seen, which drains the legacy stream. An encoder that runs
+   * beside the compute stream calls this at setup for every level it will
+   * encode at, so that no first use inside a layer synchronises anything.
+   */
+  void PrepareLevel(int level, int num_aux = 0) const;
   ~GpuEncoder();
 
   // Owns device state, like every other handler here.

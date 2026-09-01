@@ -55,6 +55,7 @@ CoeffLinearLeg<word>::CoeffLinearLeg(
   // The environment wins over the Config, as elsewhere in this tree.
   cfg_.residency = ResolveResidency(cfg.residency);
   cache_weights_ = cfg_.residency != Config::WeightResidency::kNone;
+  balanced_tiles_ = EnvOn("CHEDDAR_BALANCED_TILES", false);
   const int degree = context_->param_.degree_;
   const int num_slots = context_->param_.MaxNumSlots();
 
@@ -345,14 +346,14 @@ template <typename word>
 void CoeffLinearLeg<word>::BuildOperandsOnDevice(
     Operands &res, const DeviceWeights &w, int in_channels, int out_channels,
     double w_scale, int first_parent, int num_parents, int groups) const {
-  AssertTrue(w.data != nullptr && w.in_slot != nullptr && w.out_slot != nullptr,
+  AssertTrue(w.Data() != nullptr && w.in_slot != nullptr && w.out_slot != nullptr,
              "CoeffLinearLeg: DeviceWeights needs the tensor and both maps");
   AssertTrue(static_cast<int>(w.in_slot->size()) == in_channels &&
                  static_cast<int>(w.out_slot->size()) == out_channels,
              "CoeffLinearLeg: DeviceWeights maps must cover every declared "
              "channel");
   AssertTrue(static_cast<size_t>(w.in_live) * w.out_live ==
-                 static_cast<size_t>(w.data->size()),
+                 w.Count(),
              "CoeffLinearLeg: DeviceWeights tensor is not [in_live][out_live]");
   const GpuEncoder<word> &encoder = product_context_->gpu_encoder_;
   const int level = cfg_.product_level;
@@ -394,7 +395,7 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
         residues_.resize(static_cast<int>(n));
       }
       encoder.template EncodeResiduesGathered<float>(
-          residues_.data(), level, scale, w.data->data(), w.out_live,
+          residues_.data(), level, scale, w.Data(), w.out_live,
           row_map_.data(), col_map_.data(), rows, cols, w_scale);
       typename PcmmBlasHandler<word>::SplitMatrix s;
       product_blas_->SplitMatrixFromResidues(s, level, scale, residues_.data(),
@@ -405,7 +406,7 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
     } else {
       PlainMatrix<word> u;
       encoder.template EncodeMatrixGathered<float>(
-          u, level, scale, w.data->data(), w.out_live, row_map_.data(),
+          u, level, scale, w.Data(), w.out_live, row_map_.data(),
           col_map_.data(), rows, cols, w_scale);
       res.bytes += static_cast<size_t>(u.data_.size()) * sizeof(word);
       res.u.push_back(std::move(u));
@@ -622,6 +623,16 @@ void CoeffLinearLeg<word>::UnstageOperands(const Operands &ops) const {
   if (cfg_.residency != Config::WeightResidency::kHost || !ops.on_device) {
     return;
   }
+  if (ops.prefetched) {
+    // Its bytes are an arena slot's: give the slot back (its reuse waits on
+    // the compute stream, where every reader was) and drop the views.
+#ifdef USE_CUBLAS
+    for (auto &s : ops.split) const_cast<const int8_t *&>(s.view) = nullptr;
+#endif
+    FreeSlotOf(ops);
+    ops.on_device = false;
+    return;
+  }
   // Move-assigning an empty vector, not `resize(0)`: rmm's resize is free to
   // keep the allocation, and the point here is to give it back.
 #ifdef USE_CUBLAS
@@ -806,9 +817,7 @@ void CoeffLinearLeg<word>::RunProjection(
   // ciphertext before the pack halves the pack, while doing it after would buy
   // nothing. The product runs twice either way; it is the cheap half.
   const int out_groups = merge ? groups / 2 : groups;
-  const int tile = (cfg_.parents_per_tile > 0 && cfg_.parents_per_tile < parents)
-                       ? cfg_.parents_per_tile
-                       : parents;
+  const int tile = TileFor(parents);
 
   // Model conversion, once. Without the cache the operands are rebuilt tile by
   // tile inside the loop, which is what the layer used to do on every call.
@@ -823,8 +832,36 @@ void CoeffLinearLeg<word>::RunProjection(
                           groups, tile);
     convert_timer_.End();
     const auto c1 = std::chrono::steady_clock::now();
-    // Lend the device this projection's operands for as long as it runs.
-    StageOperands(*cached);
+    if (cached->prefetched) {
+      // Converted during the previous layer. `StageAhead` normally has it in
+      // an arena slot already; if not (the job was still queued, or both
+      // slots were held), it is staged now and counted as late.
+      if (!cached->on_device) {
+        NvtxScope _late("prep: wait_for_ready (late stage)");
+        DrainPrefetchUpTo(std::string(name) + "@" +
+                          std::to_string(cfg_.input_density) + "x" +
+                          std::to_string(cfg_.output_density));
+        StageAhead();
+        AssertTrue(cached->on_device,
+                   std::string("CoeffLinearLeg::Project(") + name +
+                       "): the prefetched operands could not be staged -- "
+                       "both arena slots are held");
+        pf_stats_.late_stages++;
+      }
+      // The compute stream waits for the staging copy; the wait's GPU-side
+      // length is bracketed by a timing pair and resolved with the stats.
+      NvtxScope _w("prep: wait_for_ready");
+      cudaEvent_t t0 = nullptr, t1 = nullptr;
+      cudaEventCreate(&t0);
+      cudaEventCreate(&t1);
+      cudaEventRecord(t0, PipelineStreams::Compute());
+      cached->staged_ev.WaitOn(PipelineStreams::Compute());
+      cudaEventRecord(t1, PipelineStreams::Compute());
+      pf_wait_spans_.emplace_back(t0, t1);
+    } else {
+      // Lend the device this projection's operands for as long as it runs.
+      StageOperands(*cached);
+    }
     const auto c2 = std::chrono::steady_clock::now();
     stage_seconds_ += std::chrono::duration<double>(c2 - c1).count();
   }
@@ -984,7 +1021,464 @@ void CoeffLinearLeg<word>::RunProjection(
 
   // And take them back. The result is already out, so this frees the largest
   // object the projection held before the next one asks for its own.
-  if (cached != nullptr) UnstageOperands(*cached);
+  if (cached != nullptr) {
+    UnstageOperands(*cached);
+    // A freed arena slot is the next operand set's chance to land early.
+    if (cached->prefetched) StageAhead();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// THE PREFETCH PIPELINE. See the header. Everything below runs on the host
+// thread that runs the layer; the work it issues goes to the encode and copy
+// streams and the host never waits on it.
+// ---------------------------------------------------------------------------
+
+template <typename word>
+bool CoeffLinearLeg<word>::PrefetchEnabled() {
+  static const bool on = EnvOn("CHEDDAR_WEIGHT_PREFETCH", false);
+  return on;
+}
+
+template <typename word>
+int CoeffLinearLeg<word>::TileFor(int parents) const {
+  if (cfg_.parents_per_tile <= 0 || cfg_.parents_per_tile >= parents) {
+    return parents;
+  }
+  int tile = cfg_.parents_per_tile;
+  if (balanced_tiles_) {
+    const int tiles = (parents + tile - 1) / tile;
+    tile = (parents + tiles - 1) / tiles;
+  }
+  return tile;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ReservePrefetchFor(int in_channels,
+                                              int out_channels, int in_density,
+                                              int out_density) const {
+#ifndef USE_CUBLAS
+  Fail("CoeffLinearLeg: the weight prefetch needs the cuBLAS product");
+#else
+  AssertTrue(use_blas_,
+             "CoeffLinearLeg: the weight prefetch is built on the int8 split "
+             "(CHEDDAR_PCMM_BLAS=1)");
+  AssertTrue(cfg_.residency == Config::WeightResidency::kHost,
+             "CoeffLinearLeg: the weight prefetch needs "
+             "CHEDDAR_WEIGHT_RESIDENCY=host -- its operands live in pinned "
+             "host mirrors between conversion and use");
+  const auto &streams = PipelineStreams::Get();
+  if (!pf_encoder_) {
+    pf_encoder_ = std::make_unique<GpuEncoder<word>>(
+        *product_param_, product_context_->ntt_handler_, streams.Encode());
+    pf_encoder_->PrepareLevel(cfg_.product_level);
+    pf_slots_.resize(2);
+  }
+  const int parents = in_channels / rank_;
+  const int groups = out_channels / rank_;
+  const int tile = TileFor(parents);
+  const int live = rank_ / in_density;
+  const int rows = rank_ / out_density;
+  const int level = cfg_.product_level;
+  const double scale = product_param_->GetScale(level);
+  size_t set_bytes = 0, max_operand = 0, max_residues = 0, max_cols = 0;
+  for (int base = 0; base < parents; base += tile) {
+    const int span = std::min(tile, parents - base);
+    const int cols = span * live;
+    typename PcmmBlasHandler<word>::SplitMatrix s;
+    product_blas_->DescribeSplit(s, level, scale, rows, cols);
+    set_bytes += static_cast<size_t>(groups) * s.Bytes();
+    max_operand = std::max(max_operand, s.Bytes());
+    max_residues = std::max(
+        max_residues, static_cast<size_t>(s.np.GetNumTotal()) * rows * cols *
+                          sizeof(word));
+    max_cols = std::max(max_cols, static_cast<size_t>(cols));
+  }
+  for (auto &slot : pf_slots_) slot.buf.Reserve(set_bytes);
+  pf_residues_.Reserve(max_residues);
+  for (auto &b : pf_split_) b.Reserve(max_operand);
+  pf_col_map_.Reserve(max_cols * sizeof(int32_t));
+  pf_row_map_.Reserve(static_cast<size_t>(rows) * sizeof(int32_t));
+  pf_stats_.arena_bytes = 2 * pf_slots_[0].buf.capacity() +
+                          pf_residues_.capacity() +
+                          2 * pf_split_[0].capacity() +
+                          pf_col_map_.capacity() + pf_row_map_.capacity();
+#endif
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ReserveMirrors(int in_channels, int out_channels,
+                                          int in_density, int out_density,
+                                          int copies) const {
+#ifdef USE_CUBLAS
+  const int parents = in_channels / rank_;
+  const int groups = out_channels / rank_;
+  const int tile = TileFor(parents);
+  const int live = rank_ / in_density;
+  const int rows = rank_ / out_density;
+  const int level = cfg_.product_level;
+  const double scale = product_param_->GetScale(level);
+  size_t set_bytes = 0;
+  for (int base = 0; base < parents; base += tile) {
+    const int span = std::min(tile, parents - base);
+    typename PcmmBlasHandler<word>::SplitMatrix s;
+    product_blas_->DescribeSplit(s, level, scale, rows, span * live);
+    set_bytes += static_cast<size_t>(groups) * s.Bytes();
+  }
+  for (int c = 0; c < copies; c++) {
+    spare_mirrors_.emplace_back(set_bytes);
+    AssertTrue(spare_mirrors_.back().pinned(),
+               "CoeffLinearLeg::ReserveMirrors: could not pin " +
+                   std::to_string(set_bytes >> 20) + " MiB");
+  }
+#else
+  (void)in_channels; (void)out_channels; (void)in_density; (void)out_density;
+  (void)copies;
+#endif
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::BeginPrefetch(const PrefetchRequest &req) const {
+#ifdef USE_CUBLAS
+  AssertTrue(pf_encoder_ != nullptr,
+             "CoeffLinearLeg::BeginPrefetch: ReservePrefetchFor first");
+  AssertTrue(req.w.Data() != nullptr && req.w.in_slot != nullptr &&
+                 req.w.out_slot != nullptr,
+             "CoeffLinearLeg::BeginPrefetch: the tensor and both maps");
+  AssertTrue(static_cast<int>(req.w.in_slot->size()) == req.in_channels &&
+                 static_cast<int>(req.w.out_slot->size()) == req.out_channels,
+             "CoeffLinearLeg::BeginPrefetch: the maps must cover every "
+             "declared channel");
+  AssertTrue(req.in_channels % rank_ == 0 && req.out_channels % rank_ == 0,
+             "CoeffLinearLeg::BeginPrefetch: both widths are whole groups");
+  PrefetchJob job;
+  job.name = req.name;
+  job.key = req.name + "@" + std::to_string(req.in_density) + "x" +
+            std::to_string(req.out_density);
+  AssertTrue(operands_.find(job.key) == operands_.end(),
+             "CoeffLinearLeg::BeginPrefetch: \"" + req.name +
+                 "\" is already converted");
+  for (const auto &j : pf_jobs_) {
+    AssertTrue(j.key != job.key, "CoeffLinearLeg::BeginPrefetch: \"" +
+                                     req.name + "\" is already queued");
+  }
+  job.w = req.w;
+  job.in_slot = *req.w.in_slot;
+  job.out_slot = *req.w.out_slot;
+  job.w.in_slot = &job.in_slot;  // re-pointed once the job is in place below
+  job.w.out_slot = &job.out_slot;
+  job.in_channels = req.in_channels;
+  job.out_channels = req.out_channels;
+  job.w_scale = req.w_scale;
+  job.in_density = req.in_density;
+  job.out_density = req.out_density;
+  job.parents = req.in_channels / rank_;
+  job.groups = req.out_channels / rank_;
+  job.tile = TileFor(job.parents);
+  job.tiles = (job.parents + job.tile - 1) / job.tile;
+  job.tensors_ready = req.tensors_ready;
+
+  Operands &ops = job.ops;
+  ops.groups = job.groups;
+  ops.tile = job.tile;
+  ops.tiles = job.tiles;
+  ops.in_channels = job.in_channels;
+  ops.out_channels = job.out_channels;
+  ops.w_scale = job.w_scale;
+  ops.fingerprint = req.w.fingerprint;
+  ops.prefetched = true;
+  ops.on_device = false;
+  const int level = cfg_.product_level;
+  const double scale = product_param_->GetScale(level);
+  const int live = rank_ / job.in_density;
+  const int rows = rank_ / job.out_density;
+  size_t total = 0;
+  for (int t = 0; t < job.tiles; t++) {
+    const int span = std::min(job.tile, job.parents - t * job.tile);
+    const int cols = span * live;
+    for (int g = 0; g < job.groups; g++) {
+      typename PcmmBlasHandler<word>::SplitMatrix s;
+      product_blas_->DescribeSplit(s, level, scale, rows, cols);
+      const size_t bytes = s.Bytes();
+      AssertTrue(bytes <= pf_split_[0].capacity(),
+                 "CoeffLinearLeg::BeginPrefetch: an operand exceeds the "
+                 "split scratch -- ReservePrefetchFor this shape first");
+      ops.host_offset.push_back(total);
+      ops.host_bytes.push_back(bytes);
+      ops.split.push_back(std::move(s));
+      job.chunks.emplace_back(t, g);
+      total += bytes;
+    }
+  }
+  ops.bytes = total;
+  AssertTrue(total <= pf_slots_[0].buf.capacity(),
+             "CoeffLinearLeg::BeginPrefetch: the operand set exceeds an arena "
+             "slot -- ReservePrefetchFor this shape first");
+  // The mirror: a released one of exactly this size first.
+  bool reused = false;
+  for (auto it = spare_mirrors_.begin(); it != spare_mirrors_.end(); ++it) {
+    if (it->size() == total) {
+      ops.host_mirror = std::move(*it);
+      spare_mirrors_.erase(it);
+      reused = true;
+      break;
+    }
+  }
+  if (!reused) ops.host_mirror = PinnedHostBuffer(total);
+  AssertTrue(ops.host_mirror.pinned(),
+             "CoeffLinearLeg::BeginPrefetch: the mirror must be pinned -- a "
+             "pageable copy would synchronise the copy stream");
+  if (reused) {
+    // A reused mirror's last reader may have been the compute stream (an
+    // operand converted in-run under host residency is staged from there):
+    // the copy stream's first write into it waits for everything the
+    // compute stream has queued at this point. A GPU-side wait, once per
+    // job, and only when the mirror is second-hand.
+    pf_fence_.Record(PipelineStreams::Compute());
+    pf_fence_.WaitOn(PipelineStreams::Get().Copy());
+  }
+  pf_jobs_.push_back(std::move(job));
+  // The map pointers point into the job that now lives in the deque.
+  PrefetchJob &placed = pf_jobs_.back();
+  placed.w.in_slot = &placed.in_slot;
+  placed.w.out_slot = &placed.out_slot;
+#else
+  (void)req;
+  Fail("CoeffLinearLeg: the weight prefetch needs the cuBLAS product");
+#endif
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::FillMaps(const PrefetchJob &job, int tile_index,
+                                    int group, HostVector<int32_t> *col_map,
+                                    HostVector<int32_t> &row_map, int &rows,
+                                    int &cols) const {
+  const int log_rank = Log2Ceil(rank_);
+  const int live = rank_ / job.in_density;
+  rows = rank_ / job.out_density;
+  const int first_parent = tile_index * job.tile;
+  const int span = std::min(job.tile, job.parents - first_parent);
+  cols = span * live;
+  // The same two maps `BuildOperandsOnDevice` builds, stated once more here
+  // because that function runs on the compute stream and this one does not.
+  if (col_map != nullptr) {
+    col_map->resize(cols);
+    for (int p = 0; p < span; p++) {
+      for (int i = 0; i < live; i++) {
+        const int in_channel =
+            (first_parent + p) * rank_ +
+            static_cast<int>(BitReverseInt(Component(i), log_rank));
+        (*col_map)[static_cast<size_t>(p) * live + i] = job.in_slot[in_channel];
+      }
+    }
+  }
+  row_map.resize(rows);
+  for (int r = 0; r < rows; r++) {
+    const int out_channel =
+        group * rank_ + static_cast<int>(BitReverseInt(Component(r), log_rank));
+    row_map[r] = job.out_slot[out_channel];
+  }
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::IssueOneOperand(PrefetchJob &job) const {
+#ifdef USE_CUBLAS
+  const auto &streams = PipelineStreams::Get();
+  cudaStream_t enc = streams.Encode();
+  cudaStream_t cpy = streams.Copy();
+  if (!job.waited) {
+    if (job.tensors_ready != nullptr) job.tensors_ready->WaitOn(enc);
+    job.waited = true;
+  }
+  const auto [tile_index, group] = job.chunks[job.next];
+  const size_t idx = job.next;
+  int rows = 0, cols = 0;
+  HostVector<int32_t> col_map, row_map;
+  const bool new_tile = (tile_index != job.last_tile);
+  FillMaps(job, tile_index, group, new_tile ? &col_map : nullptr, row_map,
+           rows, cols);
+  auto *d_col = static_cast<int32_t *>(pf_col_map_.data());
+  auto *d_row = static_cast<int32_t *>(pf_row_map_.data());
+  // The maps go up on the encode stream: the previous operand's encode read
+  // the old ones and is ahead of this upload in the same stream.
+  if (new_tile) {
+    StagedUpload(d_col, col_map.data(), col_map.size() * sizeof(int32_t), enc);
+    job.last_tile = tile_index;
+  }
+  StagedUpload(d_row, row_map.data(), row_map.size() * sizeof(int32_t), enc);
+
+  const int level = cfg_.product_level;
+  const double scale = product_param_->GetScale(level);
+  auto *residues = static_cast<word *>(pf_residues_.data());
+  {
+    NvtxScope _n("prep: device encode");
+    pf_encoder_->template EncodeResiduesGathered<float>(
+        residues, level, scale, job.w.Data(), job.w.out_live, d_row, d_col,
+        rows, cols, job.w_scale);
+    // The split scratch alternates; the slot's previous D2H (copy stream)
+    // must have read it out before it is overwritten.
+    const int s = pf_split_next_;
+    pf_split_next_ ^= 1;
+    pf_split_free_[s].WaitOn(enc);
+    auto *split = static_cast<int8_t *>(pf_split_[s].data());
+    typename PcmmBlasHandler<word>::SplitMatrix &sm = job.ops.split[idx];
+    product_blas_->SplitResiduesInto(sm, level, scale, residues, rows, cols,
+                                     split, enc);
+    AssertTrue(sm.Bytes() == job.ops.host_bytes[idx],
+               "CoeffLinearLeg: the split's size moved between BeginPrefetch "
+               "and its encode");
+    // Encode stream -> copy stream: the mirror copy runs behind the split.
+    pf_fence_.Record(enc);
+    pf_fence_.WaitOn(cpy);
+    NvtxScope _m("prep: pinned mirror");
+    cudaMemcpyAsync(job.ops.host_mirror.data() + job.ops.host_offset[idx],
+                    split, sm.Bytes(), cudaMemcpyDeviceToHost, cpy);
+    pf_split_free_[s].Record(cpy);
+    pf_stats_.d2h_bytes += sm.Bytes();
+  }
+  job.next++;
+  pf_stats_.operands_issued++;
+#else
+  (void)job;
+#endif
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::FinishJob(PrefetchJob &job) const {
+  AssertTrue(job.next == job.chunks.size(), "CoeffLinearLeg: job not done");
+  const std::string key = job.key;
+  if (EnvOn("CHEDDAR_PREFETCH_VERBOSE", false)) {
+    std::cout << "weight prefetch: converted " << job.name << " ("
+              << job.in_channels << " x " << job.out_channels << ") into "
+              << job.tiles << " x " << job.groups << " operands, "
+              << job.ops.bytes / 1048576 << " MiB in its pinned mirror"
+              << std::endl;
+  }
+  operands_.emplace(key, std::move(job.ops));
+  pf_stage_queue_.push_back(key);
+}
+
+template <typename word>
+int CoeffLinearLeg<word>::PumpPrefetch(int max_operands) const {
+  if (pf_jobs_.empty() || max_operands <= 0) return 0;
+  const auto t0 = std::chrono::steady_clock::now();
+  int issued = 0;
+  while (issued < max_operands && !pf_jobs_.empty()) {
+    PrefetchJob &job = pf_jobs_.front();
+    IssueOneOperand(job);
+    issued++;
+    if (job.next == job.chunks.size()) {
+      FinishJob(job);
+      pf_jobs_.pop_front();
+      StageAhead();
+    }
+  }
+  pf_stats_.pumps++;
+  pf_stats_.issue_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  return issued;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::DrainPrefetch() const {
+  while (!pf_jobs_.empty()) PumpPrefetch(1 << 20);
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::DrainPrefetchUpTo(const std::string &key) const {
+  while (!pf_jobs_.empty()) {
+    const bool last = (pf_jobs_.front().key == key);
+    const size_t left = pf_jobs_.front().chunks.size() - pf_jobs_.front().next;
+    PumpPrefetch(static_cast<int>(left));
+    if (last) return;
+  }
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::StageIntoSlot(Operands &ops, const std::string &key,
+                                         ArenaSlot &slot, int index) const {
+#ifdef USE_CUBLAS
+  NvtxScope _n("prep: H2D (stage operands)");
+  cudaStream_t cpy = PipelineStreams::Get().Copy();
+  // The slot's last reader was a product on the compute stream; the copy
+  // stream waits for it there, not here.
+  slot.free_ev.WaitOn(cpy);
+  auto *base = static_cast<int8_t *>(slot.buf.data());
+  for (size_t i = 0; i < ops.split.size(); i++) {
+    cudaMemcpyAsync(base + ops.host_offset[i],
+                    ops.host_mirror.data() + ops.host_offset[i],
+                    ops.host_bytes[i], cudaMemcpyHostToDevice, cpy);
+    ops.split[i].view = base + ops.host_offset[i];
+  }
+  ops.staged_ev.Record(cpy);
+  ops.on_device = true;
+  ops.slot = index;
+  slot.busy = true;
+  slot.holder = key;
+  pf_stats_.h2d_bytes += ops.bytes;
+#else
+  (void)ops; (void)key; (void)slot; (void)index;
+#endif
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::StageAhead() const {
+  while (!pf_stage_queue_.empty()) {
+    int free_index = -1;
+    for (size_t s = 0; s < pf_slots_.size(); s++) {
+      if (!pf_slots_[s].busy) {
+        free_index = static_cast<int>(s);
+        break;
+      }
+    }
+    if (free_index < 0) return;
+    const std::string key = pf_stage_queue_.front();
+    pf_stage_queue_.pop_front();
+    auto it = operands_.find(key);
+    if (it == operands_.end() || it->second.on_device) continue;
+    StageIntoSlot(it->second, key, pf_slots_[free_index], free_index);
+  }
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::FreeSlotOf(const Operands &ops) const {
+  if (ops.slot < 0) return;
+  ArenaSlot &slot = pf_slots_[ops.slot];
+  // Every reader of the slot -- the products -- is on the compute stream;
+  // the next staging into it waits on this mark from the copy stream.
+  slot.free_ev.Record(PipelineStreams::Compute());
+  slot.busy = false;
+  slot.holder.clear();
+  ops.slot = -1;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::RecordEncodeStreamDone(Event &ev) const {
+  ev.Record(PipelineStreams::Get().Encode());
+}
+
+template <typename word>
+typename CoeffLinearLeg<word>::PrefetchStats
+CoeffLinearLeg<word>::GetPrefetchStats() const {
+  for (auto &[t0, t1] : pf_wait_spans_) {
+    cudaEventSynchronize(t1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, t0, t1);
+    pf_stats_.stage_wait_seconds += ms / 1000.0;
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+  }
+  pf_wait_spans_.clear();
+  return pf_stats_;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ResetPrefetchStats() const {
+  const size_t arena = pf_stats_.arena_bytes;
+  (void)GetPrefetchStats();
+  pf_stats_ = PrefetchStats{};
+  pf_stats_.arena_bytes = arena;
 }
 
 template class CoeffLinearLeg<uint32_t>;

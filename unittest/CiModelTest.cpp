@@ -63,7 +63,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -72,6 +74,8 @@
 #include "core/MemoryPool.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
+#include "core/Streams.h"
+#include "extension/CiLayerPrefetch.h"
 #include "extension/CiLlamaLayer.h"
 #include "extension/CiSinCAttention.h"
 
@@ -273,6 +277,37 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   g_tok_pos = EnvInt("CHEDDAR_CI_TOKPOS", 1);
   const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
   const int first_layer = EnvInt("CHEDDAR_CI_FIRST_LAYER", 0);
+
+  // ---- THE PIPELINE'S KNOBS (Doing.md 3.21) --------------------------------
+  //
+  // `CHEDDAR_WEIGHT_PREFETCH=1`: the next layer's weights are read, uploaded
+  // and converted while this layer runs (`CiLayerPrefetcher` + the leg's
+  // prefetch jobs), its RMSNorm handlers built ahead, the seam's T1 kept
+  // resident. `CHEDDAR_CI_LEDGER`: `all` (default) is every stage probe and
+  // the per-layer comparison, as before; `last` keeps only the last layer's
+  // closing comparison; `none` decrypts nothing. Without the stage-2 probe
+  // the O projection's carried factor -- fitted there, in-run -- has to be
+  // GIVEN (`CHEDDAR_CI_O_CARRIED`), and O can then be prefetched too.
+  const bool prefetch = cheddar::CoeffLinearLeg<word>::PrefetchEnabled();
+  const std::string ledger = [] {
+    const char *e = std::getenv("CHEDDAR_CI_LEDGER");
+    return std::string(e != nullptr ? e : "all");
+  }();
+  const bool ledger_all = (ledger == "all");
+  const bool seam_resident =
+      EnvInt("CHEDDAR_CI_SEAM_RESIDENT", prefetch ? 1 : 0) != 0;
+  const double o_carried_env = EnvDouble("CHEDDAR_CI_O_CARRIED", 0.0);
+  ASSERT_TRUE(ledger_all || o_carried_env > 0.0)
+      << "CHEDDAR_CI_LEDGER=" << ledger
+      << " skips the stage-2 fit of the O projection's carried factor: set "
+         "CHEDDAR_CI_O_CARRIED (the fitted value, e.g. 2.128 at layer 0)";
+  std::cout << "pipeline: weight prefetch " << (prefetch ? "ON" : "off")
+            << ", ledger " << ledger << ", seam T1 "
+            << (seam_resident ? "resident" : "per layer")
+            << (o_carried_env > 0.0
+                    ? ", O carried GIVEN " + std::to_string(o_carried_env)
+                    : ", O carried fitted in-run")
+            << std::endl;
 
   json calib_all;
   {
@@ -645,7 +680,49 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     layer.AddSeamHalfRotations(req);
     fui.PrepareRotationKey(req);
   }
-  layer.DropSeamHalf();
+  if (seam_resident && kModule) {
+    // One half on the module basis, the same stages every layer: it stands
+    // for the run instead of being rebuilt (0.09 s) inside every layer.
+    layer.PrepareSeamHalf(0);
+    MemRow("setup: the seam's T1 kept resident (CHEDDAR_CI_SEAM_RESIDENT)");
+  } else {
+    layer.DropSeamHalf();
+  }
+
+  // ---- THE WEIGHT PREFETCH PIPELINE'S BUFFERS ------------------------------
+  using Prefetcher = cheddar::CiLayerPrefetcher<word>;
+  std::unique_ptr<Prefetcher> pf;
+  const int kQkvOutPf = (kModule ? 8 : 16) * kRank;
+  const int attn_declared_pf = (kModule ? 1 : 2) * layout.num_cts * kRank;
+  if (prefetch) {
+    auto &plg = layer.GetProjectionLeg();
+    plg.ReservePrefetchFor(kDeclaredH, kQkvOutPf, kDensity, kDensity);
+    plg.ReservePrefetchFor(attn_declared_pf, kDeclaredH, kDensity, kDensity);
+    plg.ReservePrefetchFor(kDeclaredH, kDeclaredHid, kDensity, kDensity);
+    plg.ReservePrefetchFor(kDeclaredHid, kDeclaredH, kDensity, kDensity);
+    // Two layers' pinned mirrors up front (three q/k/v-shaped, two gate/up
+    // and one down per layer; O only when it is prefetched): the jobs of
+    // the first two layers then take them from the spare list, as every
+    // later layer's do from the released ones.
+    plg.ReserveMirrors(kDeclaredH, kQkvOutPf, kDensity, kDensity, 2 * 3);
+    if (o_carried_env > 0.0) {
+      plg.ReserveMirrors(attn_declared_pf, kDeclaredH, kDensity, kDensity, 2);
+    }
+    plg.ReserveMirrors(kDeclaredH, kDeclaredHid, kDensity, kDensity, 2 * 2);
+    plg.ReserveMirrors(kDeclaredHid, kDeclaredH, kDensity, kDensity, 2);
+    // In the order the layer reads them; `wo` is late (its scale is the
+    // stage-2 fit), the two norms are read for the handlers built ahead.
+    std::vector<typename Prefetcher::TensorSpec> specs = {
+        {"wq.f32", kH, kH, false},        {"wk.f32", kH, kKv, false},
+        {"wv.f32", kH, kKv, false},       {"wo.f32", kH, kH, true},
+        {"wgate.f32", kH, kI, false},     {"wup.f32", kH, kI, false},
+        {"wdown.f32", kI, kH, false},     {"attn_norm.f32", 1, kH, false},
+        {"ffn_norm.f32", 1, kH, false}};
+    pf = std::make_unique<Prefetcher>(plg, specs, [wdir](int L) {
+      return wdir + "/L" + (L < 10 ? "0" : "") + std::to_string(L);
+    });
+    MemRow("setup: + the prefetch arenas and the tensor buffers");
+  }
   const auto t_setup1 = Tick();
   MemRow("after the one-time setup (keys, converters, tables, the layer)");
   std::cout << "[time] ONE-TIME setup (keys, converters, the layer): "
@@ -831,8 +908,176 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   fctx->ResetBootCounts();
   const auto t_run0 = Tick();
 
+  // ---- THE PREFETCH ORCHESTRATION (Doing.md 3.21) --------------------------
+  //
+  // Static, phase-aware: the library names its windows (`IdleWindow`) and
+  // this table says how many operands of the next layer go out at each. The
+  // stage is the test's own (`cur_stage`); the phase is the library's.
+  // Defaults: the leg's EvalMods and the CC-MM chain (the ~30%-busy
+  // stretch), the seam's EvalMods, and the FFN's EvalMods lightly -- never
+  // the PC-MM products or the GEMM-heavy stretches. Whatever is left is
+  // drained at the end of the layer.
+  std::string cur_stage = "norm";
+  std::map<std::string, int> pump_policy = {{"leg:evalmod", 2},
+                                            {"leg:chain", 8},
+                                            {"seam:evalmod", 2},
+                                            {"ffn:evalmod", 1}};
+  if (const char *pol = std::getenv("CHEDDAR_PREFETCH_POLICY");
+      pol != nullptr && *pol != 0) {
+    // "leg:evalmod=2,leg:chain=8,ffn:evalmod=0"
+    std::stringstream ss(pol);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      const auto eq = item.find('=');
+      ASSERT_NE(eq, std::string::npos) << "CHEDDAR_PREFETCH_POLICY: " << item;
+      pump_policy[item.substr(0, eq)] = std::stoi(item.substr(eq + 1));
+    }
+  }
+  const int chunk_scale = EnvInt("CHEDDAR_PREFETCH_CHUNK", 1);
+  std::map<std::string, int> pump_log;
+  if (prefetch) {
+    cheddar::IdleWindow::Set([&](const char *phase) {
+      const auto it = pump_policy.find(cur_stage + ":" + phase);
+      if (it == pump_policy.end() || it->second <= 0) return;
+      const int n = layer.GetProjectionLeg().PumpPrefetch(it->second *
+                                                          chunk_scale);
+      if (n > 0) pump_log[it->first] += n;
+    });
+  }
+  // The maps a prefetch job needs, the same ones the layer states below.
+  std::vector<int> pf_model_map, pf_hidden_map, pf_q_out, pf_kv_out;
+  cheddar::CiLlamaLayer<word>::ModelMap(pf_model_map, kDeclaredH, kRank, kH,
+                                        kDensity);
+  cheddar::CiLlamaLayer<word>::HiddenMap(pf_hidden_map, kDeclaredHid, kRank,
+                                         kI, kDensity);
+  {
+    const int groups = kModule ? 8 : 16, heads = kModule ? 32 : 16;
+    auto out_map = [&](int width, std::vector<int> &out_slot) {
+      out_slot.assign(groups * kRank, -1);
+      const int heads_w = width / kD;
+      for (int g = 0; g < groups; g++) {
+        for (int hh = 0; hh < heads; hh++) {
+          for (int cp = 0; cp < 16; cp++) {
+            const int l = kModule ? g : g / 2;
+            const int head = kModule ? hh : (g % 2) * 16 + hh;
+            const int chan = l * 16 + cp;
+            const int row = hh * 16 + cp;
+            const int oc = g * kRank + Rev(row, 9);
+            out_slot[oc] =
+                (heads_w == kHeads ? head : head / (kHeads / heads_w)) * kD +
+                chan;
+          }
+        }
+      }
+    };
+    out_map(kH, pf_q_out);
+    out_map(kKv, pf_kv_out);
+  }
+  std::vector<int> pf_attn_map(attn_declared_pf, -1);
+  for (int bi = 0; bi < layout.num_cts; bi++) {
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lane = 0; lane < layout.lanes; lane++) {
+        const int k = kModule ? bi : 2 * bi + lane / 16;
+        const int cc = Rev(col, 4) * 32 + Rev(kModule ? lane : lane % 16, 5);
+        pf_attn_map[k * kRank + cc] =
+            Rev(lane, 5) * kD + bi * layout.rank + col;
+      }
+    }
+  }
+  // The q/k/v sizing of a layer, from its calibration alone (the same
+  // arithmetic as the layer's own, below).
+  auto qkv_scales = [&](const json &c, double &cq, double &ck, double &cv) {
+    const double img_max = 0.45;
+    const double qmax = c["q_absmax"].get<double>();
+    const double kmax = c["k_absmax"].get<double>();
+    const double vmax = c["v_absmax"].get<double>();
+    const double s_raw_min = c["s_raw_min"].get<double>();
+    const double s_raw_max = c["s_raw_max"].get<double>();
+    cq = img_max / qmax;
+    ck = img_max / kmax;
+    const double s_abs = std::max(std::abs(s_raw_max), std::abs(s_raw_min));
+    const double prod_cap = 0.36 / s_abs;
+    if (cq * ck > prod_cap) {
+      const double sh = std::sqrt(prod_cap / (cq * ck));
+      cq *= sh;
+      ck *= sh;
+    }
+    cv = std::min(1.0, img_max / vmax);
+  };
+  // Layer `L`'s weights: the tensors up (copy stream), six or seven
+  // conversion jobs queued (encode stream, pumped in the windows), the two
+  // RMSNorm handlers built. Called for L+1 as layer L enters its leg.
+  auto begin_layer_prefetch = [&](int L) {
+    cheddar::NvtxScope _n("prep: begin layer prefetch");
+    auto &plg = layer.GetProjectionLeg();
+    const cheddar::Event &ready = pf->Upload(L);
+    const json &c = calib_all["layers"][L];
+    double cq = 0.0, ck = 0.0, cv = 0.0;
+    qkv_scales(c, cq, ck, cv);
+    const double gate_scale =
+        ride / std::max(c["gate_absmax"].get<double>(), 1e-12);
+    const std::string ltag = "L" + std::to_string(L);
+    auto req = [&](const char *suffix, int which, const std::vector<int> *in,
+                   const std::vector<int> *out, int in_ch, int out_ch,
+                   double scale) {
+      typename cheddar::CoeffLinearLeg<word>::PrefetchRequest r;
+      r.name = ltag + suffix;
+      r.w = pf->Weights(L, which, in, out, scale);
+      r.in_channels = in_ch;
+      r.out_channels = out_ch;
+      r.w_scale = scale;
+      r.in_density = kDensity;
+      r.out_density = kDensity;
+      r.tensors_ready = &ready;
+      plg.BeginPrefetch(r);
+    };
+    req(".q", 0, &pf_model_map, &pf_q_out, kDeclaredH, kQkvOutPf, cq);
+    req(".k", 1, &pf_model_map, &pf_kv_out, kDeclaredH, kQkvOutPf, ck);
+    req(".v", 2, &pf_model_map, &pf_kv_out, kDeclaredH, kQkvOutPf, cv);
+    if (o_carried_env > 0.0) {
+      req(".o", 3, &pf_attn_map, &pf_model_map, attn_declared_pf, kDeclaredH,
+          stream_scale / (cv * o_carried_env));
+    }
+    req(".gate", 4, &pf_model_map, &pf_hidden_map, kDeclaredH, kDeclaredHid,
+        gate_scale);
+    req(".up", 5, &pf_model_map, &pf_hidden_map, kDeclaredH, kDeclaredHid,
+        gate_scale);
+    req(".down", 6, &pf_hidden_map, &pf_model_map, kDeclaredHid, kDeclaredH,
+        stream_scale);
+    // The norms' handlers, on the compute stream in this window (~40 ms of
+    // encodes that used to sit in the norm's own row).
+    std::vector<double> an_dec(kDeclaredH, 0.0), fn_dec(kDeclaredH, 0.0);
+    const float *an = pf->Host(L, 7);
+    const float *fn = pf->Host(L, 8);
+    for (int ch = 0; ch < kH; ch++) {
+      an_dec[ModelSlot(ch)] = an[ch];
+      fn_dec[ModelSlot(ch)] = fn[ch];
+    }
+    layer.PrepareNormAhead(false, an_dec, c["attn_alpha"].get<double>(),
+                           c["attn_norm_window"].get<double>());
+    layer.PrepareNormAhead(true, fn_dec, c["alpha"].get<double>(),
+                           c["norm_window"].get<double>());
+  };
+  if (prefetch) {
+    // The pipeline's warm-up: the first layer has no predecessor to hide
+    // behind, so its preparation is visible once, here.
+    const auto tw0 = Tick();
+    pf->RequestRead(first_layer);
+    begin_layer_prefetch(first_layer);
+    layer.GetProjectionLeg().DrainPrefetch();
+    pf->MarkEncodeIssued();
+    std::cout << "[time] pipeline warm-up (layer " << first_layer
+              << " read, uploaded, converted ahead, norms built): "
+              << Ms(tw0, Tick()) << " ms" << std::endl;
+    MemRow("after the pipeline warm-up");
+  }
+
   for (int L = first_layer; L < first_layer + num_layers; L++) {
     const auto t_layer0 = Tick();
+    cur_stage = "norm";
+    // The worker starts on the next layer's files now; its tensors go up
+    // and its jobs are queued when this layer enters the leg.
+    if (prefetch && L + 1 < first_layer + num_layers) pf->RequestRead(L + 1);
     std::unique_ptr<cheddar::NvtxScope> stage =
         std::make_unique<cheddar::NvtxScope>("stage: attention norm");
     MemRow("layer start");
@@ -852,14 +1097,30 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << std::endl;
 
     const auto t_files0 = Tick();
+    const bool host_weights = HostWeightsFromEnv();
     std::vector<double> wq_f, wk_f, wv_f, wo_f, wg_f, wu_f, wd_f, an_f, fn_f;
-    ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq_f));
-    ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk_f));
-    ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv_f));
-    ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo_f));
-    ASSERT_TRUE(ReadF32(ld + "/wgate.f32", static_cast<size_t>(kH) * kI, wg_f));
-    ASSERT_TRUE(ReadF32(ld + "/wup.f32", static_cast<size_t>(kH) * kI, wu_f));
-    ASSERT_TRUE(ReadF32(ld + "/wdown.f32", static_cast<size_t>(kI) * kH, wd_f));
+    // The double forms are read only where something reads them: the
+    // declared matrices under `CHEDDAR_CI_HOST_WEIGHTS`, and `wq` for the
+    // stage-1.5 probe (and `wk`/`wv` for the exact-operand substitution).
+    // Reading all seven every layer was 1.6 s of f32 -> double for nothing
+    // (Doing.md 3.20).
+    const bool exact_qkv = !kModule && EnvInt("CHEDDAR_CI_EXACT_QKV", 0) != 0;
+    // `CHEDDAR_CI_READ_ALL=1` restores the nine reads, for a baseline that
+    // pays what the test paid before (Doing.md 3.21's "before" column).
+    const bool read_all = EnvInt("CHEDDAR_CI_READ_ALL", 0) != 0;
+    if (host_weights || ledger_all || read_all) {
+      ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq_f));
+    }
+    if (host_weights || exact_qkv || read_all) {
+      ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk_f));
+      ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv_f));
+    }
+    if (host_weights || read_all) {
+      ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo_f));
+      ASSERT_TRUE(ReadF32(ld + "/wgate.f32", static_cast<size_t>(kH) * kI, wg_f));
+      ASSERT_TRUE(ReadF32(ld + "/wup.f32", static_cast<size_t>(kH) * kI, wu_f));
+      ASSERT_TRUE(ReadF32(ld + "/wdown.f32", static_cast<size_t>(kI) * kH, wd_f));
+    }
     ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an_f));
     ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, fn_f));
 
@@ -868,7 +1129,6 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // below are built instead.
     using Leg = cheddar::CoeffLinearLeg<word>;
     using DW = typename Leg::DeviceWeights;
-    const bool host_weights = HostWeightsFromEnv();
     struct Tensor {
       cheddar::HostVector<float> host;
       cheddar::DeviceVector<float> dev;
@@ -878,7 +1138,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     auto load = [&](Tensor &t, const char *name, int rows, int cols) {
       t.rows = rows;
       t.cols = cols;
-      if (host_weights) return true;
+      // Under the prefetch the tensors are the prefetcher's, already up.
+      if (host_weights || prefetch) return true;
       if (!ReadF32Host(ld + "/" + name, static_cast<size_t>(rows) * cols,
                        t.host)) {
         return false;
@@ -898,8 +1159,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << " preparation: weight files read (f32 -> double x9, f32 "
                  "host + device x7) "
               << Ms(t_files0, Tick()) << " ms" << std::endl;
-    auto device_weights = [&](const Tensor &t, const std::vector<int> &in_slot,
+    auto device_weights = [&](const Tensor &t, int which,
+                              const std::vector<int> &in_slot,
                               const std::vector<int> &out_slot, double scale) {
+      if (prefetch) return pf->Weights(L, which, &in_slot, &out_slot, scale);
       DW dw;
       dw.data = &t.dev;
       dw.in_live = t.rows;
@@ -997,6 +1260,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const auto t_norm = Tick();
     stage.reset();
     stage = std::make_unique<cheddar::NvtxScope>("stage: q/k/v");
+    cur_stage = "qkv";
     MemRow("after the attention norm");
 
     // ---- STAGE 1: the pre-attention norm, against the host ---------------
@@ -1004,7 +1268,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // A staged check, because guessing at the closing number costs a run of
     // several minutes each time and this tree has paid that bill repeatedly.
     // `CHEDDAR_CI_STOP_AFTER=1` stops here.
-    {
+    if (ledger_all) {
       std::vector<double> want(static_cast<size_t>(kT) * kH, 0.0);
       std::vector<double> hin;
       if (L == 0) {
@@ -1379,7 +1643,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
           pw.host = &wdec;
         } else {
           qkv_out_map(widths[j], out_slot);
-          dw = device_weights(*tens[j], model_map, out_slot, scales[j]);
+          dw = device_weights(*tens[j], j, model_map, out_slot, scales[j]);
           pw.device = &dw;
         }
         layer.Project(raw, ins, kDeclaredH, kQkvOut, pw, scales[j],
@@ -1402,7 +1666,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const auto t_proj = Tick();
     stage.reset();
     stage = std::make_unique<cheddar::NvtxScope>("stage: leg");
+    cur_stage = "leg";
     MemRow("after the q/k/v emissions and their HalfBoots");
+    // The next layer's tensors up and its jobs queued: from here the leg's
+    // windows carry them.
+    if (prefetch && L + 1 < first_layer + num_layers) {
+      begin_layer_prefetch(L + 1);
+    }
 
     // ---- STAGE 1.5: one Q half-image, at the doorstep addresses ----------
     //
@@ -1413,7 +1683,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // difference is visible. The doorstep (Doing.md 1.5bx): entry
     // (token t, channel c, head i) sits at slot
     // `rev4(c mod 16) << 12 | rev5(i) << 7 | rev7(t)` of half-image `c / 16`.
-    {
+    if (ledger_all) {
       std::vector<double> hin;
       if (L == 0) {
         hin = x0;
@@ -1632,6 +1902,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const auto t_leg = Tick();
     stage.reset();
     stage = std::make_unique<cheddar::NvtxScope>("stage: seam");
+    cur_stage = "seam";
 
     // ---- the seam ---------------------------------------------------------
     //
@@ -1649,7 +1920,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       double n = 0.0, d = 0.0, mx = 0.0, e = 0.0, q = 0.0, in_mx = 0.0;
       for (int bi = 0; bi < layout.num_cts; bi++) {
         std::vector<double> before, after;
-        {
+        if (ledger_all) {
           Plaintext<word> pt;
           boot.ui->Decrypt(pt, attn_out[bi]);
           boot.context->encoder_.DecodeCoeff(before, pt);
@@ -1667,19 +1938,20 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                     layer.GetSeamInputLevel())
               << "the chain-output Boots land below the seam's input level";
         }
-        {
+        if (ledger_all) {
           Plaintext<word> pt;
           boot.ui->Decrypt(pt, booted[bi]);
           boot.context->encoder_.DecodeCoeff(after, pt);
-        }
-        ASSERT_EQ(before.size(), after.size());
-        for (size_t i = 0; i < before.size(); i++) {
-          n += after[i] * before[i];
-          d += before[i] * before[i];
-          mx = std::max(mx, std::abs(before[i]));
-          in_mx = std::max(in_mx, std::abs(after[i]));
+          ASSERT_EQ(before.size(), after.size());
+          for (size_t i = 0; i < before.size(); i++) {
+            n += after[i] * before[i];
+            d += before[i] * before[i];
+            mx = std::max(mx, std::abs(before[i]));
+            in_mx = std::max(in_mx, std::abs(after[i]));
+          }
         }
       }
+      if (ledger_all) {
       const double f = n / d;
       for (int bi = 0; bi < layout.num_cts; bi++) {
         std::vector<double> before, after;
@@ -1704,6 +1976,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                 << 0.5 * std::log2(q / d) << ", carried " << f
                 << " -- the leg leaves |.| <= " << mx << ", Boot returns |.| <= "
                 << in_mx << std::endl;
+      }
     }
     attn_out.clear();
     // THE SEAM'S IMAGES: two half-density ones per booted ciphertext on the
@@ -1740,12 +2013,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         layer.Seam(h_cts[bi * seam_halves + half], booted[bi], fevk);
       }
     }
-    layer.DropSeamHalf();
+    if (!(seam_resident && kModule)) layer.DropSeamHalf();
     booted.clear();
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_seam = Tick();
     stage.reset();
     stage = std::make_unique<cheddar::NvtxScope>("stage: ffn");
+    cur_stage = "ffn";
     MemRow("after the leg, the Boots and the seam");
 
     // ---- STAGE 2: the seam's images, against the clear attention output ---
@@ -1756,7 +2030,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // the residual add, so it is fitted here the same way, on the ONE
     // quantity that cannot be derived from a BootParameter.
     double o_carried = 1.0;
-    {
+    if (!ledger_all) {
+      // No probe, no fit: the factor is the caller's (the value a ledger run
+      // fitted; the run's accuracy is then that of the given constant).
+      o_carried = o_carried_env;
+    } else {
       std::vector<double> av;
       ASSERT_TRUE(ReadF64(rdir + "/av_L" + (L < 10 ? "0" : "") +
                               std::to_string(L) + ".f64",
@@ -2036,10 +2314,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       lw.up.host = &wu_dec;
       lw.down.host = &wd_dec;
     } else {
-      dw_o = device_weights(to, attn_map, model_map, cal.res_scale);
-      dw_g = device_weights(tg, model_map, hidden_map, cal.gate_scale);
-      dw_u = device_weights(tu, model_map, hidden_map, cal.gate_scale);
-      dw_d = device_weights(td, hidden_map, model_map, stream_scale);
+      dw_o = device_weights(to, 3, attn_map, model_map, cal.res_scale);
+      dw_g = device_weights(tg, 4, model_map, hidden_map, cal.gate_scale);
+      dw_u = device_weights(tu, 5, model_map, hidden_map, cal.gate_scale);
+      dw_d = device_weights(td, 6, hidden_map, model_map, stream_scale);
       lw.o.device = &dw_o;
       lw.gate.device = &dw_g;
       lw.up.device = &dw_u;
@@ -2048,8 +2326,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     lw.ffn_norm = &fn_dec;
     lw.tag = tag;
 
+    // The O tensor is read by THIS layer's compute (its operands are built
+    // here, with the fitted factor): the compute stream waits for its upload
+    // -- a GPU-side wait that in steady state passed a layer ago.
+    if (prefetch) pf->Uploaded(L).WaitOn(cheddar::PipelineStreams::Compute());
     std::vector<Ciphertext<word>> next;
     layer.FeedForward(next, h_cts, stream, lw, cal, fevk);
+    if (prefetch) pf->MarkLateDone(L);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_ffn = Tick();
     stage.reset();
@@ -2058,8 +2341,22 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // The layer's weights are read once: their operands go, their pinned
     // mirrors stay for the next layer's (same shapes).
     layer.ReleaseWeights(lw.tag);
+    // Whatever of the next layer's conversion the windows did not carry goes
+    // out now, before the next layer can ask for it; the shared tensor
+    // buffer is then free for the layer after.
+    if (prefetch) {
+      cheddar::NvtxScope _d("prep: drain");
+      layer.GetProjectionLeg().DrainPrefetch();
+      pf->MarkEncodeIssued();
+    }
+    const auto t_drained = Tick();
 
     // ---- against the same layer in float64 --------------------------------
+    const bool compare_layer =
+        ledger_all || (ledger == "last" && L + 1 == first_layer + num_layers);
+    const auto bl = bctx->GetBootCounts();
+    const auto bf = fctx->GetBootCounts();
+    if (compare_layer) {
     std::vector<double> ref;
     const std::string rp = rdir + "/h_L" + (L < 10 ? "0" : "") +
                            std::to_string(L) + ".f64";
@@ -2098,13 +2395,15 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
         qerr += d * d;
       }
     }
-    const auto bl = bctx->GetBootCounts();
-    const auto bf = fctx->GetBootCounts();
     std::cout << "LAYER " << L << ": " << err << " against |h| <= " << absmax
               << " (relative " << (err / absmax) << " = 2^"
               << std::log2(err / absmax) << ", rms 2^"
               << 0.5 * std::log2(qerr / den) << "), carried " << fit
               << std::endl;
+    EXPECT_LT(err / absmax, 0.25)
+        << "layer " << L << " disagrees with the same layer in double by more "
+        << "than the circuit can explain";
+    }
     std::cout << "  [boot] leg Context full " << bl.full << ", half "
               << bl.half << " | FFN Context full " << bf.full << ", half "
               << bf.half << " | total " << (bl.Total() + bf.Total())
@@ -2133,13 +2432,30 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       std::cout << "  [mem] " << ((total_b - free_b) >> 20) << " MiB reserved"
                 << std::endl;
     }
-    EXPECT_LT(err / absmax, 0.25)
-        << "layer " << L << " disagrees with the same layer in double by more "
-        << "than the circuit can explain";
+    if (prefetch) {
+      const auto ps = layer.GetProjectionLeg().GetPrefetchStats();
+      std::ostringstream windows;
+      for (const auto &[k, v] : pump_log) windows << " " << k << "=" << v;
+      std::cout << "  [prefetch] issued for layer " << L + 1 << ": "
+                << ps.operands_issued << " operands in " << ps.pumps
+                << " pumps (" << windows.str() << " ), host issue time "
+                << 1000.0 * ps.issue_seconds << " ms, mirror D2H "
+                << (ps.d2h_bytes >> 20) << " MiB; this layer: staged H2D "
+                << (ps.h2d_bytes >> 20) << " MiB, stage wait on the compute "
+                << "stream " << 1000.0 * ps.stage_wait_seconds << " ms, late "
+                << ps.late_stages << "; worker read " << 1000.0 * pf->LastReadSeconds()
+                << " ms; drain " << Ms(t_ffn, t_drained) << " ms; arenas "
+                << (ps.arena_bytes >> 20) << " MiB + tensors "
+                << (pf->DeviceBytes() >> 20) << " MiB on the device, pinned "
+                << (pf->PinnedBytes() >> 20) << " MiB" << std::endl;
+      layer.GetProjectionLeg().ResetPrefetchStats();
+      pump_log.clear();
+    }
     (void)resid_absmax;
 
     stream = std::move(next);
   }
+  cheddar::IdleWindow::Set(nullptr);
 
   const auto t_run1 = Tick();
   const auto bl = bctx->GetBootCounts();

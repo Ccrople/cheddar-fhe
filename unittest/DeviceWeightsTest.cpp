@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <string>
@@ -30,6 +31,7 @@
 #include "RingFixture.h"
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
+#include "core/Streams.h"
 #include "extension/BootContext.h"
 #include "extension/LlamaLinear.h"
 
@@ -224,4 +226,130 @@ TEST(DeviceWeights, TheSameOnThePlainMatrixProduct) {
   setenv("CHEDDAR_PCMM_BLAS", "0", 1);
   RunBothAndCompare("accum");
   unsetenv("CHEDDAR_PCMM_BLAS");
+}
+
+// THE PREFETCHED OPERANDS ARE THE IN-RUN ONES, WORD FOR WORD. The pipeline
+// encodes on the encode stream, splits into its own scratch, mirrors on the
+// copy stream and stages into an arena slot; the product then reads the slot.
+// Against the same weight converted on the compute stream in the ordinary way
+// the output ciphertexts must agree in every word, or a stream ordering is
+// wrong somewhere in between.
+TEST(DeviceWeights, ThePrefetchedProjectionIsTheInRunOneWordForWord) {
+  setenv("CHEDDAR_WEIGHT_PREFETCH", "1", 1);
+  setenv("CHEDDAR_WEIGHT_RESIDENCY", "host", 1);
+  Ring boot(Param());
+  boot.ui->PrepareModPackKeys(kTokens, kProductLevel);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys(kRank);
+  for (int j = 0; j < kRank; j++) {
+    pack_keys[j] = &boot.ui->GetModPackKey(kRank, j);
+  }
+  typename cheddar::CoeffLinearLeg<word>::Config lcfg;
+  lcfg.num_tokens = kTokens;
+  lcfg.product_level = kProductLevel;
+  lcfg.parents_per_tile = 1;  // two tiles, so the tile loop is exercised
+  lcfg.input_density = 2;
+  lcfg.output_density = 2;
+  ProjectOnlyLeg leg(boot.context, lcfg, pack_keys);
+
+  std::vector<int> in_slot, out_slot;
+  int in_live = 0, out_live = 0;
+  ModelMap(in_slot, kInDeclared, in_live);
+  HiddenMap(out_slot, kOutDeclared, out_live);
+
+  std::mt19937_64 gen(0xBEEF);
+  std::normal_distribution<double> nd(0.0, 0.02);
+  cheddar::HostVector<float> w32(static_cast<size_t>(in_live) * out_live);
+  for (auto &v : w32) v = static_cast<float>(nd(gen));
+  const double w_scale = 0.41;
+
+  // The in-run form: the tensor in the pool, converted on first Project.
+  cheddar::DeviceVector<float> d_w;
+  d_w.resize(static_cast<int>(w32.size()));
+  cheddar::CopyHostToDevice(d_w, w32);
+  typename cheddar::CoeffLinearLeg<word>::DeviceWeights dw;
+  dw.data = &d_w;
+  dw.in_live = in_live;
+  dw.out_live = out_live;
+  dw.in_slot = &in_slot;
+  dw.out_slot = &out_slot;
+  dw.fingerprint = cheddar::CoeffLinearLeg<word>::Fingerprint(
+      w32.data(), w32.size(), w_scale);
+
+  // The prefetched form: the tensor in an arena outside the pool, uploaded on
+  // the copy stream, converted in three pumps on the encode stream.
+  cheddar::DeviceArena arena;
+  float *d_pf = static_cast<float *>(arena.Reserve(w32.size() * sizeof(float)));
+  cheddar::PinnedHostBuffer pinned(w32.size() * sizeof(float));
+  std::memcpy(pinned.data(), w32.data(), w32.size() * sizeof(float));
+  cheddar::Event ready;
+  cudaMemcpyAsync(d_pf, pinned.data(), w32.size() * sizeof(float),
+                  cudaMemcpyHostToDevice, cheddar::PipelineStreams::Get().Copy());
+  ready.Record(cheddar::PipelineStreams::Get().Copy());
+  leg.ReservePrefetchFor(kInDeclared, kOutDeclared, 2, 2);
+  typename cheddar::CoeffLinearLeg<word>::PrefetchRequest req;
+  req.name = "pf.device";
+  req.w = dw;
+  req.w.data = nullptr;
+  req.w.ptr = d_pf;
+  req.w.count = w32.size();
+  req.in_channels = kInDeclared;
+  req.out_channels = kOutDeclared;
+  req.w_scale = w_scale;
+  req.in_density = 2;
+  req.out_density = 2;
+  req.tensors_ready = &ready;
+  leg.BeginPrefetch(req);
+  ASSERT_TRUE(leg.PrefetchPending());
+  ASSERT_EQ(leg.PumpPrefetch(1), 1);  // one operand
+  ASSERT_EQ(leg.PumpPrefetch(2), 2);  // two more
+  leg.DrainPrefetch();                // the last one
+  ASSERT_FALSE(leg.PrefetchPending());
+
+  std::vector<Ciphertext<word>> x(kParents);
+  std::uniform_real_distribution<double> ud(-0.5, 0.5);
+  for (int p = 0; p < kParents; p++) {
+    std::vector<double> coeffs(boot.Degree());
+    for (auto &v : coeffs) v = ud(gen);
+    Plaintext<word> pt;
+    boot.context->encoder_.EncodeCoeff(pt, kProductLevel,
+                                       boot.param->GetScale(kProductLevel),
+                                       coeffs);
+    boot.ui->Encrypt(x[p], pt);
+  }
+
+  std::vector<Ciphertext<word>> in_run, prefetched;
+  leg.Project(in_run, x, kInDeclared, kOutDeclared, dw, w_scale, "inrun.device");
+  leg.Project(prefetched, x, kInDeclared, kOutDeclared, dw, w_scale,
+              "pf.device");
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto st = leg.GetPrefetchStats();
+  std::cout << "prefetch: " << st.operands_issued << " operands in "
+            << st.pumps << " pumps, " << st.late_stages << " late, stage wait "
+            << 1000.0 * st.stage_wait_seconds << " ms, mirror "
+            << (st.d2h_bytes >> 20) << " MiB, staged " << (st.h2d_bytes >> 20)
+            << " MiB, arena " << (st.arena_bytes >> 20) << " MiB" << std::endl;
+  EXPECT_EQ(st.operands_issued, 4);
+  EXPECT_EQ(st.late_stages, 0);
+
+  size_t compared = 0, differ = 0;
+  for (int g = 0; g < kGroups; g++) {
+    const Words a = Read(in_run[g]);
+    const Words b = Read(prefetched[g]);
+    ASSERT_EQ(a.bx.size(), b.bx.size());
+    ASSERT_EQ(a.ax.size(), b.ax.size());
+    for (size_t i = 0; i < a.bx.size(); i++) differ += (a.bx[i] != b.bx[i]);
+    for (size_t i = 0; i < a.ax.size(); i++) differ += (a.ax[i] != b.ax[i]);
+    compared += a.bx.size() + a.ax.size();
+  }
+  std::cout << "prefetch: " << differ << " of " << compared
+            << " output words differ between the in-run and the prefetched "
+               "projection" << std::endl;
+  EXPECT_EQ(differ, 0u);
+  ASSERT_GT(compared, 0u);
+  // Twice more, through the release path: the mirrors go to the spare list
+  // and the next job takes one back.
+  leg.ReleaseOperands("pf.");
+  leg.ReleaseOperands("inrun.");
+  unsetenv("CHEDDAR_WEIGHT_PREFETCH");
+  unsetenv("CHEDDAR_WEIGHT_RESIDENCY");
 }

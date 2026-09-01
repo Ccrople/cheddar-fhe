@@ -1,10 +1,12 @@
 #pragma once
 
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include "common/CommonUtils.h"
 #include "core/Context.h"
+#include "core/Serialization.h"
 #include "core/EvkMap.h"
 #include "core/EvkRequest.h"
 #include "extension/ComplexLinearTransform.h"
@@ -155,6 +157,24 @@ class CiModuleBasis {
   CiModuleBasis(const CiModuleBasis &) = delete;
   CiModuleBasis &operator=(const CiModuleBasis &) = delete;
   CiModuleBasis(CiModuleBasis &&) = default;
+
+  /**
+   * @brief Write the compiled transforms -- every group's plaintexts and the
+   * shape around them. What this caches is the constructor: 37.7 s of a
+   * 76 s setup on the A100 (Doing.md 3.20), all of it a function of the
+   * parameter set, the phases and the two constants -- which the caller
+   * puts in the file name, while `ArchiveIdentity` guards the parameters.
+   */
+  void Save(ArchiveWriter &ar) const;
+
+  /** @brief Rebuild a basis written by `Save`. */
+  static std::unique_ptr<CiModuleBasis> Load(ArchiveReader &ar);
+
+ private:
+  struct FromArchive {};
+  CiModuleBasis(FromArchive, ArchiveReader &ar);
+
+ public:
 
   int GetSmallDegree() const { return small_degree_; }
   int GetRank() const { return rank_; }

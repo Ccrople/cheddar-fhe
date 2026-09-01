@@ -472,6 +472,22 @@ class CiLlamaLayer {
   double GetPrepareSeconds() const { return prepare_timer_.Seconds(); }
   void ResetPrepareTimer() const { prepare_timer_.Reset(); }
 
+  /**
+   * @brief Build one of the two RMSNorm handlers AHEAD of the norm that
+   * uses it -- the next layer's, during this layer (Doing.md 3.21).
+   *
+   * The handler is a function of (alpha, window, the gains, the layer's
+   * fixed shape): its polynomial is fitted on the host and its eight weight
+   * plaintexts encoded on the device, ~40 ms a layer that sat in the
+   * norm's own row. `NormTurn` takes the prepared handler when its inputs
+   * match exactly, and builds its own otherwise, so a stale or wrong
+   * preparation can only cost time, never a different answer.
+   *
+   * @param ffn false for the pre-attention norm, true for the FFN's
+   */
+  void PrepareNormAhead(bool ffn, const std::vector<double> &gain,
+                        double alpha, double window) const;
+
  private:
   //! The RMSNorm weight plaintexts for one layer, duplicates included: at an
   //! ODD declared channel the weight carries the PARTNER channel's gain,
@@ -493,7 +509,18 @@ class CiLlamaLayer {
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain, double alpha, double window,
                 double stream_scale, const std::vector<double> &sink,
-                const EvkMap<word> &evk);
+                const EvkMap<word> &evk, bool ffn);
+
+  //! A handler `PrepareNormAhead` built, with the inputs it was built from.
+  struct NormAhead {
+    std::unique_ptr<RmsNormHandler<word>> rms;
+    std::vector<std::vector<Complex>> wts;
+    std::vector<double> gain;
+    double alpha = 0.0;
+    double window = 0.0;
+    bool valid = false;
+  };
+  mutable NormAhead norm_ahead_[2];
 
   //! Multiply by a constant at `GetSlotLevel()` and rescale, landing the
   //! result canonical one level below. Duplicate-preserving by construction:

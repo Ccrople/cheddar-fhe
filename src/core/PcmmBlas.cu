@@ -219,9 +219,9 @@ __global__ void SplitResidues(int8_t *dst, const word *src, size_t per_prime,
 }  // namespace kernel
 
 template <typename word>
-void PcmmBlasHandler<word>::SplitMatrixFromResidues(
-    SplitMatrix &res, int level, double scale, const word *residues, int rows,
-    int cols, int num_aux /*= 0*/) const {
+void PcmmBlasHandler<word>::DescribeSplit(SplitMatrix &res, int level,
+                                          double scale, int rows, int cols,
+                                          int num_aux /*= 0*/) const {
   AssertTrue(rows > 0 && cols > 0, "PcmmBlas: invalid matrix shape");
   NPInfo np = param_.LevelToNP(level, num_aux);
   auto primes = param_.GetPrimeVector(np);
@@ -232,20 +232,43 @@ void PcmmBlasHandler<word>::SplitMatrixFromResidues(
     for (word p = primes[j]; p != 0; p >>= 1) b++;
     max_bits = b > max_bits ? b : max_bits;
   }
-  const int pieces = PiecesFor(max_bits);
-  const size_t per_prime = static_cast<size_t>(rows) * cols;
-  const size_t n = per_prime * num_primes;
   res.rows = rows;
   res.cols = cols;
-  res.pieces = pieces;
+  res.pieces = PiecesFor(max_bits);
   res.scale = scale;
   res.np = np;
-  res.data.resize(static_cast<int>(static_cast<size_t>(pieces) * n));
+  res.view = nullptr;
+}
+
+template <typename word>
+void PcmmBlasHandler<word>::SplitMatrixFromResidues(
+    SplitMatrix &res, int level, double scale, const word *residues, int rows,
+    int cols, int num_aux /*= 0*/) const {
+  DescribeSplit(res, level, scale, rows, cols, num_aux);
+  const size_t per_prime = static_cast<size_t>(rows) * cols;
+  const size_t n = per_prime * res.np.GetNumTotal();
+  res.data.resize(static_cast<int>(static_cast<size_t>(res.pieces) * n));
   const int block = 256;
   const int grid = static_cast<int>((n + block - 1) / block);
   kernel::SplitResidues<word><<<grid, block>>>(res.data.data(), residues,
-                                               per_prime, num_primes, pieces,
-                                               kPieceBits);
+                                               per_prime, res.np.GetNumTotal(),
+                                               res.pieces, kPieceBits);
+}
+
+template <typename word>
+void PcmmBlasHandler<word>::SplitResiduesInto(SplitMatrix &res, int level,
+                                              double scale,
+                                              const word *residues, int rows,
+                                              int cols, int8_t *dst,
+                                              cudaStream_t stream,
+                                              int num_aux /*= 0*/) const {
+  DescribeSplit(res, level, scale, rows, cols, num_aux);
+  const size_t per_prime = static_cast<size_t>(rows) * cols;
+  const size_t n = per_prime * res.np.GetNumTotal();
+  const int block = 256;
+  const int grid = static_cast<int>((n + block - 1) / block);
+  kernel::SplitResidues<word><<<grid, block, 0, stream>>>(
+      dst, residues, per_prime, res.np.GetNumTotal(), res.pieces, kPieceBits);
 }
 
 namespace {
@@ -398,7 +421,7 @@ void PcmmBlasHandler<word>::ProductComponent(
       for (int l = 0; l < pieces; l++) {
         const int8_t *b = src + static_cast<size_t>(l) * src_span;
         for (int k = 0; k < pieces; k++) {
-          const int8_t *a = u.data.data() +
+          const int8_t *a = u.Ptr() +
                             (static_cast<size_t>(k) * num_primes + j) *
                                 static_cast<size_t>(rows) * cols;
           int32_t *c_out =

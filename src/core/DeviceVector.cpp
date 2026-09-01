@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common/Assert.h"
+#include "core/Streams.h"
 
 namespace cheddar {
 
@@ -228,6 +229,13 @@ void CopyHostToDevice(DeviceVector<word> &dst, const HostVector<word> &src) {
   }
   cudaMemcpyAsync(dst.data(), src.data(), bytes, cudaMemcpyHostToDevice,
                   dst.stream());
+}
+
+void StagedUpload(void *dst, const void *src, size_t bytes,
+                  cudaStream_t stream) {
+  if (bytes == 0) return;
+  if (PinnedStaging::Get().Upload(dst, src, bytes, stream)) return;
+  cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
 }
 
 template <typename word>

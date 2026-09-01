@@ -1,5 +1,7 @@
 #include "extension/CiSinCAttention.h"
 
+#include "core/Streams.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -742,6 +744,9 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
   const auto &layout = ccmm_.GetLayout();
   std::vector<Ct> acc;
   for (int call = 0; call < 2; call++) {
+    // The chain is the layer's most host-bound stretch (~30% busy, 192k
+    // launches a layer): a window for the next layer's preparation.
+    IdleWindow::Notify("chain");
     std::vector<Ct> rhs = rhs_is_k ? Cross(rhs_source, call, *keys.boot)
                                    : VCall(rhs_source, call, *keys.boot);
     // V rides Q's converter (1.5cb): same block function of (token, channel).

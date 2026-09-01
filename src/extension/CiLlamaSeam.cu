@@ -243,6 +243,10 @@ void CiLlamaSeam<word>::PrepareHalf(int half) {
   AssertTrue(!cfg_.module_basis || half == 0,
              "CiLlamaSeam: on the module basis one booted ciphertext is one "
              "dense image -- there is only half 0");
+  // The stages are a function of the layout and the half alone -- the same
+  // object every layer -- so a half that is already standing is kept. A
+  // caller that wants the memory back drops it explicitly.
+  if (prepared_half_ == half && !t1_.empty()) return;
   DropHalf();
 
   const int dim = layout_.dim;

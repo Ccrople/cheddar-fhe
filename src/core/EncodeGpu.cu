@@ -283,17 +283,19 @@ __global__ void ExpandRealKernel(double2 *dst, const double *src, int n) {
 
 template <typename word>
 GpuEncoder<word>::GpuEncoder(const Parameter<word> &param,
-                             const NTTHandler<word> &ntt_handler)
+                             const NTTHandler<word> &ntt_handler,
+                             cudaStream_t stream /*= cudaStreamLegacy*/)
     : param_{param},
       ntt_handler_{ntt_handler},
       degree_{param.degree_},
       max_slots_{param.MaxNumSlots()},
       cyclotomic_index_{param.CyclotomicIndex()},
-      twiddle_(static_cast<size_t>(2) * param.MaxNumSlots(), cudaStreamLegacy),
-      fft_(0, cudaStreamLegacy),
-      coeff_(static_cast<size_t>(param.degree_), cudaStreamLegacy),
-      value_stage_(0, cudaStreamLegacy),
-      real_stage_(0, cudaStreamLegacy) {
+      stream_{stream},
+      twiddle_(static_cast<size_t>(2) * param.MaxNumSlots(), stream_),
+      fft_(0, stream_),
+      coeff_(static_cast<size_t>(param.degree_), stream_),
+      value_stage_(0, stream_),
+      real_stage_(0, stream_) {
   // The same entry the host reads out of its length-M table, computed the same
   // way so that the two transforms differ in nothing but where they run.
   HostVector<double> host(static_cast<size_t>(2) * max_slots_, 0.0);
@@ -331,7 +333,7 @@ void GpuEncoder<word>::WaitForStaging() const {
 template <typename word>
 void GpuEncoder<word>::EnsureScratch(int num_slots) const {
   const size_t need = static_cast<size_t>(2) * num_slots;
-  if (fft_.size() < need) fft_.resize(need, cudaStreamLegacy);
+  if (fft_.size() < need) fft_.resize(need, stream_);
   if (host_stage_size_ < need) {
     WaitForStaging();
     if (host_stage_ != nullptr) cudaFreeHost(host_stage_);
@@ -411,20 +413,20 @@ void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
   if (!real) {
     cudaMemcpyAsync(fft_.data(), host_stage_,
                     static_cast<size_t>(2) * num_slots * sizeof(double),
-                    cudaMemcpyHostToDevice, cudaStreamLegacy);
-    cudaEventRecord(staged_, cudaStreamLegacy);
+                    cudaMemcpyHostToDevice, stream_);
+    cudaEventRecord(staged_, stream_);
     return;
   }
   if (real_stage_.size() < static_cast<size_t>(num_slots)) {
-    real_stage_.resize(num_slots, cudaStreamLegacy);
+    real_stage_.resize(num_slots, stream_);
   }
   cudaMemcpyAsync(real_stage_.data(), host_stage_,
                   static_cast<size_t>(num_slots) * sizeof(double),
-                  cudaMemcpyHostToDevice, cudaStreamLegacy);
-  cudaEventRecord(staged_, cudaStreamLegacy);
+                  cudaMemcpyHostToDevice, stream_);
+  cudaEventRecord(staged_, stream_);
   const int threads = 256;
   const int blocks = (num_slots + threads - 1) / threads;
-  kernel::ExpandRealKernel<<<blocks, threads, 0, cudaStreamLegacy>>>(
+  kernel::ExpandRealKernel<<<blocks, threads, 0, stream_>>>(
       reinterpret_cast<double2 *>(fft_.data()), real_stage_.data(), num_slots);
 }
 
@@ -446,7 +448,7 @@ void GpuEncoder<word>::SpecialIFFT(double *data, int num_slots) const {
     const int threads = std::min(chunk >> 1, 256);
     const size_t smem = static_cast<size_t>(chunk) * sizeof(double2);
     kernel::SpecialIfftStagesKernel<<<blocks, std::max(threads, 1), smem,
-                                      cudaStreamLegacy>>>(d, tw, log_chunk,
+                                      stream_>>>(d, tw, log_chunk,
                                                           log_elem_stride);
   };
 
@@ -475,11 +477,11 @@ void GpuEncoder<word>::FftToCoeff(double *coeff, const double *fft,
   const int gap = (ci ? degree_ : half_degree) / num_slots;
   if (gap > 1) {
     cudaMemsetAsync(coeff, 0, static_cast<size_t>(degree_) * sizeof(double),
-                    cudaStreamLegacy);
+                    stream_);
   }
   const int threads = 256;
   const int blocks = (num_slots + threads - 1) / threads;
-  kernel::FftToCoeffKernel<<<blocks, threads, 0, cudaStreamLegacy>>>(
+  kernel::FftToCoeffKernel<<<blocks, threads, 0, stream_>>>(
       coeff, reinterpret_cast<const double2 *>(fft), num_slots, log_slots, gap,
       half_degree, ci);
 }
@@ -505,13 +507,18 @@ const uint64_t *GpuEncoder<word>::PrimeConstants(const NPInfo &np) const {
         static_cast<word>(2), 16 * static_cast<int64_t>(sizeof(word)),
         static_cast<word>(p)));
   }
-  rmm::device_uvector<uint64_t> dv(host.size(), cudaStreamLegacy);
+  rmm::device_uvector<uint64_t> dv(host.size(), stream_);
   // Synchronous, once per (level, aux) -- the table is cached below and the
   // source dies with this scope.
   cudaMemcpy(dv.data(), host.data(), host.size() * sizeof(uint64_t),
              cudaMemcpyHostToDevice);
   auto inserted = prime_constants_.emplace(key, std::move(dv));
   return inserted.first->second.data();
+}
+
+template <typename word>
+void GpuEncoder<word>::PrepareLevel(int level, int num_aux /*= 0*/) const {
+  PrimeConstants(param_.LevelToNP(level, num_aux));
 }
 
 template <typename word>
@@ -524,7 +531,7 @@ void GpuEncoder<word>::RnsDecompose(word *dst, const double *src, int n,
   const int blocks = (n + threads - 1) / threads;
   const size_t smem = static_cast<size_t>(num_primes) *
                       (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
-  kernel::RnsDecomposeKernel<word><<<blocks, threads, smem, cudaStreamLegacy>>>(
+  kernel::RnsDecomposeKernel<word><<<blocks, threads, smem, stream_>>>(
       dst, src, n, num_primes, consts, param_.GetInvPrimesPtr(np), scale,
       montgomery);
 }
@@ -596,11 +603,11 @@ void GpuEncoder<word>::EncodeCoeff(Plaintext<word> &ptxt, int level,
   if (num_coeffs < degree_) {
     cudaMemsetAsync(coeff_.data(), 0,
                     static_cast<size_t>(degree_) * sizeof(double),
-                    cudaStreamLegacy);
+                    stream_);
   }
   cudaMemcpyAsync(coeff_.data(), coeffs.data(),
                   static_cast<size_t>(num_coeffs) * sizeof(double),
-                  cudaMemcpyHostToDevice, cudaStreamLegacy);
+                  cudaMemcpyHostToDevice, stream_);
 
   const NPInfo np = param_.LevelToNP(level, num_aux);
   ptxt.ModifyNP(np);
@@ -654,7 +661,7 @@ void GpuEncoder<word>::EncodeMatrixGathered(PlainMatrix<word> &res, int level,
   const size_t smem = static_cast<size_t>(num_primes) *
                       (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
   kernel::RnsGatherKernel<word, src_t>
-      <<<static_cast<int>(blocks), threads, smem, cudaStreamLegacy>>>(
+      <<<static_cast<int>(blocks), threads, smem, stream_>>>(
           res.data_.data(), weight, out_channels, row_map, col_map, rows, cols,
           num_primes, PrimeConstants(np), param_.GetInvPrimesPtr(np), w_scale,
           scale, true);
@@ -679,7 +686,7 @@ void GpuEncoder<word>::EncodeResiduesGathered(word *dst, int level, double scale
   const size_t smem = static_cast<size_t>(num_primes) *
                       (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
   kernel::RnsGatherKernel<word, src_t>
-      <<<static_cast<int>(blocks), threads, smem, cudaStreamLegacy>>>(
+      <<<static_cast<int>(blocks), threads, smem, stream_>>>(
           dst, weight, out_channels, row_map, col_map, rows, cols, num_primes,
           PrimeConstants(np), param_.GetInvPrimesPtr(np), w_scale, scale,
           false);
@@ -693,9 +700,9 @@ void GpuEncoder<word>::EncodeMatrix(PlainMatrix<word> &res, int level,
   AssertTrue(static_cast<int>(values.size()) == rows * cols,
              "GpuEncoder::EncodeMatrix: values size does not match rows*cols");
   const size_t n = static_cast<size_t>(rows) * cols;
-  if (value_stage_.size() < n) value_stage_.resize(n, cudaStreamLegacy);
+  if (value_stage_.size() < n) value_stage_.resize(n, stream_);
   cudaMemcpyAsync(value_stage_.data(), values.data(), n * sizeof(double),
-                  cudaMemcpyHostToDevice, cudaStreamLegacy);
+                  cudaMemcpyHostToDevice, stream_);
   EncodeMatrixFromDevice(res, level, scale, value_stage_.data(), rows, cols,
                          num_aux);
 }

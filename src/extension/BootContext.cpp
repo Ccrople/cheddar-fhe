@@ -2,6 +2,7 @@
 #include "extension/BootContext.h"
 
 #include "core/Mlwe.h"
+#include "core/Streams.h"
 #include "extension/CiModuleBasis.h"
 #include "extension/CiSinCBasis.h"
 
@@ -508,6 +509,9 @@ void BootContext<word>::EvaluateMod(Ct &res, const Ct &input,
                                     const Evk &mult_key) const {
   NvtxScope _nv("boot: EvalMod");
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  // A launch-bound window (EvalMod keeps the card ~20% busy, Doing.md
+  // 3.18): the next layer's preparation may issue a bounded chunk here.
+  IdleWindow::Notify("evalmod");
   this->AssertSameScale(input, eval_mod_->start_scale_);
   eval_mod_->Evaluate(GetContext(), res, input, mult_key);
   this->AssertSameScale(res, eval_mod_->end_scale_);

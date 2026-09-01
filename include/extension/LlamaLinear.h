@@ -1,14 +1,17 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/GpuTimer.h"
 #include "core/Container.h"
 #include "core/Context.h"
+#include "core/Streams.h"
 #include "core/EvkMap.h"
 #include "core/Mlwe.h"
 #include "core/Pcmm.h"
@@ -322,6 +325,7 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
    */
   void ReleaseOperands(const std::string &prefix) const;
 
+
   /**
    * @brief Restate the density contract for the projections that follow.
    *
@@ -366,8 +370,20 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     //! `[in_live][out_live]` row-major -- `reference/export_layers.py`'s
     //! layout, `w[c * out_live + o]`.
     const DeviceVector<float> *data = nullptr;
+    //! Or a raw device pointer with its length -- the prefetch pipeline's
+    //! tensor buffer lives outside the pool (`DeviceArena`). Exactly one of
+    //! `data` and `ptr` is set.
+    const float *ptr = nullptr;
+    size_t count = 0;
     int in_live = 0;
     int out_live = 0;
+
+    const float *Data() const {
+      return ptr != nullptr ? ptr : (data != nullptr ? data->data() : nullptr);
+    }
+    size_t Count() const {
+      return ptr != nullptr ? count : (data != nullptr ? data->size() : 0);
+    }
     //! Declared input channel -> row of `data`, or -1 for a dead channel.
     //! `in_channels` entries.
     const std::vector<int> *in_slot = nullptr;
@@ -391,6 +407,86 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! Size, scale and a strided sample of the entries of an f32 tensor: what
   //! `DeviceWeights::fingerprint` should carry.
   static uint64_t Fingerprint(const float *w, size_t count, double w_scale);
+  // ---- THE WEIGHT PREFETCH PIPELINE (Doing.md 3.21) ----------------------
+  //
+  // A layer's operands are converted DURING THE PREVIOUS LAYER, on the
+  // pipeline's encode stream, one operand (one `(tile, group)` plaintext) at
+  // a time, and each goes straight to its pinned host mirror on the copy
+  // stream; nothing of it touches the memory pool. When the layer arrives,
+  // the operand set is staged -- pinned mirror to a device ARENA slot on the
+  // copy stream -- one projection ahead of its use, and the compute stream
+  // waits on the staging event just before the product. The host waits on
+  // nothing. `CHEDDAR_WEIGHT_PREFETCH=1` turns it on; off, every path below
+  // is inert and `Project` converts on first call as before.
+
+  static bool PrefetchEnabled();
+
+  struct PrefetchRequest {
+    std::string name;  //!< the cache name `Project` will ask for
+    DeviceWeights w;   //!< the tensor (its maps are copied)
+    int in_channels = 0;
+    int out_channels = 0;
+    double w_scale = 0.0;
+    int in_density = 1;
+    int out_density = 1;
+    //! Recorded on the copy stream after the tensor's upload; the encode
+    //! stream waits on it before the job's first kernel. Null = ready.
+    const Event *tensors_ready = nullptr;
+  };
+
+  /// Size the arenas for a projection of this shape (grow-only; call at
+  /// setup for every projection the run will prefetch), and build the
+  /// prefetch encoder if it does not exist yet.
+  void ReservePrefetchFor(int in_channels, int out_channels, int in_density,
+                          int out_density) const;
+
+  /// Put `copies` pinned mirrors of this projection's operand-set size on the
+  /// spare list now, so the first layers' jobs do not `cudaMallocHost` them
+  /// inside a layer (2.6 GB a layer, ~0.5 s of host time in the leg's
+  /// window until the release path starts recycling them).
+  void ReserveMirrors(int in_channels, int out_channels, int in_density,
+                      int out_density, int copies) const;
+
+  /// Queue a projection's conversion. Nothing is issued until `PumpPrefetch`.
+  void BeginPrefetch(const PrefetchRequest &req) const;
+
+  /// Issue up to `max_operands` operands of the queued jobs, in order, on the
+  /// encode and copy streams. Returns how many were issued (0 = nothing
+  /// left). Host cost is a few launches per operand.
+  int PumpPrefetch(int max_operands) const;
+
+  /// Issue everything still queued.
+  void DrainPrefetch() const;
+
+  bool PrefetchPending() const { return !pf_jobs_.empty(); }
+
+  /// Stage the next converted operand sets into free arena slots, in use
+  /// order. Called by the leg itself when a job completes and when a
+  /// projection ends; callers may call it at a phase boundary too.
+  void StageAhead() const;
+
+  /// Record `ev` on the encode stream: everything issued so far has been
+  /// read from its inputs once it passes (the tensor buffer's reuse guard).
+  void RecordEncodeStreamDone(Event &ev) const;
+
+  struct PrefetchStats {
+    int operands_issued = 0;
+    int pumps = 0;
+    int late_stages = 0;              //!< operand sets staged only at use
+    double issue_seconds = 0.0;       //!< host time inside PumpPrefetch
+    double stage_wait_seconds = 0.0;  //!< GPU-side wait on staging events
+    size_t d2h_bytes = 0;             //!< mirror traffic
+    size_t h2d_bytes = 0;             //!< staging traffic
+    size_t arena_bytes = 0;           //!< the arenas' device footprint
+  };
+  PrefetchStats GetPrefetchStats() const;
+  void ResetPrefetchStats() const;
+
+  /// `parents_per_tile` applied to `parents` -- balanced across the tiles it
+  /// implies when `CHEDDAR_BALANCED_TILES=1` (28 parents at 17 become 14 +
+  /// 14 rather than 17 + 11: the same tile count, and the peak the first tile
+  /// sets shrinks with it).
+  int TileFor(int parents) const;
 
   /// The pair merged where it is worth something: before ModPack, not after.
   void ProjectMerged(std::vector<Ct> &res, const std::vector<Ct> &x,
@@ -461,6 +557,12 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     //! Mutable because staging is a property of where the bytes are, not of
     //! what they mean, and `RunProjection` is const.
     mutable bool on_device = true;
+    //! Built by the prefetch pipeline: its device bytes live in an arena
+    //! slot while staged (`slot`), and `staged_ev` is the copy stream's mark
+    //! that the staging has landed.
+    bool prefetched = false;
+    mutable int slot = -1;
+    mutable Event staged_ev;
   };
 
   //! `CHEDDAR_WEIGHT_RESIDENCY=device|host|none`, with the older
@@ -649,6 +751,54 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! rows; see `GetConvertSeconds`.
   mutable EventSpanTimer convert_timer_;
   mutable double stage_seconds_ = 0.0;
+  bool balanced_tiles_ = false;
+
+  // ---- prefetch state ----
+  struct PrefetchJob {
+    std::string key;
+    std::string name;
+    DeviceWeights w;
+    std::vector<int> in_slot, out_slot;
+    int in_channels = 0, out_channels = 0;
+    double w_scale = 0.0;
+    int in_density = 1, out_density = 1;
+    int parents = 0, groups = 0, tile = 0, tiles = 0;
+    std::vector<std::pair<int, int>> chunks;  // (tile index, group)
+    size_t next = 0;
+    int last_tile = -1;  // whose column map is on the device
+    Operands ops;
+    const Event *tensors_ready = nullptr;
+    bool waited = false;
+  };
+  struct ArenaSlot {
+    DeviceArena buf;
+    Event free_ev;  // recorded on the compute stream after its last reader
+    bool busy = false;
+    std::string holder;
+  };
+  mutable std::deque<PrefetchJob> pf_jobs_;
+  mutable std::deque<std::string> pf_stage_queue_;
+  mutable std::vector<ArenaSlot> pf_slots_;
+  mutable std::unique_ptr<GpuEncoder<word>> pf_encoder_;
+  mutable DeviceArena pf_residues_, pf_row_map_, pf_col_map_;
+  mutable DeviceArena pf_split_[2];
+  mutable Event pf_split_free_[2];
+  mutable int pf_split_next_ = 0;
+  mutable Event pf_fence_;
+  mutable PrefetchStats pf_stats_;
+  // Timing-event pairs bracketing each compute-stream wait on a staging
+  // event, resolved when the stats are read.
+  mutable std::vector<std::pair<cudaEvent_t, cudaEvent_t>> pf_wait_spans_;
+
+  void FillMaps(const PrefetchJob &job, int tile_index, int group,
+                HostVector<int32_t> *col_map, HostVector<int32_t> &row_map,
+                int &rows, int &cols) const;
+  void IssueOneOperand(PrefetchJob &job) const;
+  void FinishJob(PrefetchJob &job) const;
+  void DrainPrefetchUpTo(const std::string &key) const;
+  void StageIntoSlot(Operands &ops, const std::string &key, ArenaSlot &slot,
+                     int index) const;
+  void FreeSlotOf(const Operands &ops) const;
 #ifdef USE_CUBLAS
   std::unique_ptr<PcmmBlasHandler<word>> blas_;
   std::unique_ptr<PcmmBlasHandler<word>> small_blas_;

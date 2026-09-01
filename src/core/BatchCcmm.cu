@@ -1,6 +1,7 @@
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
 #include "core/BatchCcmm.h"
+#include "extension/Profile.h"
 
 namespace cheddar {
 
@@ -48,8 +49,12 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
 
   // 1. The second operand becomes row-wise. This is the step that makes the
   //    contraction of step 2 line up; everything else follows from it.
+  NvtxScope _nv("ccmm: Multiply (lifted ring)");
   std::vector<Ct> rhs_transposed;
-  cmt_.Cmt(context, rhs_transposed, rhs, sub_degree, evk_map);
+  {
+    NvtxScope _c("ccmm: Cmt (rhs)");
+    cmt_.Cmt(context, rhs_transposed, rhs, sub_degree, evk_map);
+  }
 
   SubringCoeffMatrix<word> b_bar, a_bar;
   matrix_.ToMatrices(b_bar, a_bar, rhs_transposed, sub_degree, true);
@@ -60,10 +65,12 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
   // 2. [B; A] * [B_bar | A_bar], the only multiplicative level in the whole
   //    algorithm.
   SubringCoeffMatrix<word> c00, c01, c10, c11;
+  NvtxScope *_m = new NvtxScope("ccmm: MultiplyMatrices x4");
   matrix_.MultiplyMatrices(c00, b_mat, b_bar);
   matrix_.MultiplyMatrices(c01, b_mat, a_bar);
   matrix_.MultiplyMatrices(c10, a_mat, b_bar);
   matrix_.MultiplyMatrices(c11, a_mat, a_bar);
+  delete _m;
 
   // 3, 4. Back to column-wise. Reading the rows as ciphertexts presents the
   //       row-wise pair to CMT as a column-wise encryption of the transpose.
@@ -72,8 +79,11 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
   matrix_.ToCiphertexts(c1_cts, c10, c11, product_scale, num_slots, true);
 
   std::vector<Ct> d01, d23;
+  NvtxScope *_c2 = new NvtxScope("ccmm: Cmt (products)");
   cmt_.Cmt(context, d01, c0_cts, sub_degree, evk_map);
   cmt_.Cmt(context, d23, c1_cts, sub_degree, evk_map);
+  delete _c2;
+  NvtxScope _r("ccmm: Relinearize + Rescale per column");
 
   res.resize(d);
   Ct relin_input, relinearized, combined;
