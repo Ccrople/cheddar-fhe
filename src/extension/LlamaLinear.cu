@@ -411,7 +411,8 @@ void CoeffLinearLeg<word>::BuildOperandsOnDevice(
       res.u.push_back(std::move(u));
     }
   }
-  cudaDeviceSynchronize();
+  // No synchronise: the encodes are on the stream, and `Project` times them
+  // with an event pair (`convert_timer_`) rather than by draining the card.
 }
 
 template <typename word>
@@ -533,22 +534,47 @@ CoeffLinearLeg<word>::ResolveResidency(
 template <typename word>
 void CoeffLinearLeg<word>::MirrorOperands(Operands &ops) const {
   if (cfg_.residency != Config::WeightResidency::kHost) return;
+  // Every operand's device bytes, in order, into one pinned buffer.
+  std::vector<std::pair<const void *, size_t>> sources;
 #ifdef USE_CUBLAS
   if (use_blas_) {
-    ops.host_split.resize(ops.split.size());
-    for (size_t i = 0; i < ops.split.size(); i++) {
-      CopyDeviceToHost(ops.host_split[i], ops.split[i].data);
+    for (const auto &s : ops.split) {
+      sources.emplace_back(s.data.data(), s.data.size() * sizeof(int8_t));
     }
   }
 #endif
   if (!use_blas_) {
-    ops.host_u.resize(ops.u.size());
-    for (size_t i = 0; i < ops.u.size(); i++) {
-      CopyDeviceToHost(ops.host_u[i], ops.u[i].data_);
+    for (const auto &u : ops.u) {
+      sources.emplace_back(u.data_.data(), u.data_.size() * sizeof(word));
     }
   }
-  // The copies are asynchronous; nothing may free the source before they land.
-  cudaStreamSynchronize(cudaStreamLegacy);
+  size_t total = 0;
+  for (const auto &s : sources) total += s.second;
+  // A released mirror of exactly this size first (the previous layer's
+  // operand of the same shape), a fresh pinned buffer otherwise.
+  bool reused = false;
+  for (auto it = spare_mirrors_.begin(); it != spare_mirrors_.end(); ++it) {
+    if (it->size() == total) {
+      ops.host_mirror = std::move(*it);
+      spare_mirrors_.erase(it);
+      reused = true;
+      break;
+    }
+  }
+  if (!reused) ops.host_mirror = PinnedHostBuffer(total);
+  ops.host_offset.clear();
+  ops.host_bytes.clear();
+  size_t off = 0;
+  for (const auto &s : sources) {
+    ops.host_offset.push_back(off);
+    ops.host_bytes.push_back(s.second);
+    cudaMemcpyAsync(ops.host_mirror.data() + off, s.first, s.second,
+                    cudaMemcpyDeviceToHost, cudaStreamLegacy);
+    off += s.second;
+  }
+  // No synchronise: the frees in `UnstageOperands` are stream-ordered behind
+  // these copies, and the mirror's only readers are `StageOperands`'s
+  // uploads on the same stream.
   ops.on_device = true;
   UnstageOperands(ops);
 }
@@ -557,21 +583,37 @@ template <typename word>
 void CoeffLinearLeg<word>::StageOperands(const Operands &ops) const {
   if (cfg_.residency != Config::WeightResidency::kHost || ops.on_device) return;
   NvtxScope _n("pcmm: stage weights to the device");
+  AssertTrue(ops.host_offset.size() == ops.host_bytes.size(),
+             "CoeffLinearLeg: the host mirror is not laid out");
+  auto upload = [&](size_t i, void *dst) {
+    cudaMemcpyAsync(dst, ops.host_mirror.data() + ops.host_offset[i],
+                    ops.host_bytes[i], cudaMemcpyHostToDevice,
+                    cudaStreamLegacy);
+  };
 #ifdef USE_CUBLAS
   if (use_blas_) {
+    AssertTrue(ops.host_bytes.size() == ops.split.size(),
+               "CoeffLinearLeg: the host mirror does not match the operands");
     for (size_t i = 0; i < ops.split.size(); i++) {
-      CopyHostToDevice(const_cast<DeviceVector<int8_t> &>(ops.split[i].data),
-                       ops.host_split[i]);
+      auto &dev = const_cast<DeviceVector<int8_t> &>(ops.split[i].data);
+      dev = DeviceVector<int8_t>(static_cast<int>(ops.host_bytes[i]));
+      upload(i, dev.data());
     }
   }
 #endif
   if (!use_blas_) {
+    AssertTrue(ops.host_bytes.size() == ops.u.size(),
+               "CoeffLinearLeg: the host mirror does not match the operands");
     for (size_t i = 0; i < ops.u.size(); i++) {
-      CopyHostToDevice(const_cast<DeviceVector<word> &>(ops.u[i].data_),
-                       ops.host_u[i]);
+      auto &dev = const_cast<DeviceVector<word> &>(ops.u[i].data_);
+      dev = DeviceVector<word>(
+          static_cast<int>(ops.host_bytes[i] / sizeof(word)));
+      upload(i, dev.data());
     }
   }
-  cudaStreamSynchronize(cudaStreamLegacy);
+  // No synchronise: the mirror stands until the operands are dropped, and
+  // the product that reads the device copies is behind them on the stream.
+  // The DMAs overlap whatever the card is still doing.
   ops.on_device = true;
 }
 
@@ -596,6 +638,26 @@ void CoeffLinearLeg<word>::UnstageOperands(const Operands &ops) const {
     }
   }
   ops.on_device = false;
+}
+
+template <typename word>
+void CoeffLinearLeg<word>::ReleaseOperands(const std::string &prefix) const {
+  for (auto it = operands_.begin(); it != operands_.end();) {
+    if (it->first.compare(0, prefix.size(), prefix) != 0) {
+      ++it;
+      continue;
+    }
+    Operands &ops = it->second;
+    // Off the device first (a no-op under host residency, where the
+    // projection already gave the buffers back), then the mirror to the
+    // spare list. The next writer of that mirror is a device-to-host copy
+    // on the same stream as any upload still reading it: ordered.
+    UnstageOperands(ops);
+    if (ops.host_mirror.size() > 0) {
+      spare_mirrors_.push_back(std::move(ops.host_mirror));
+    }
+    it = operands_.erase(it);
+  }
 }
 
 template <typename word>
@@ -753,14 +815,17 @@ void CoeffLinearLeg<word>::RunProjection(
   const Operands *cached = nullptr;
   if (cache_weights_) {
     NvtxScope _n("pcmm: convert weights (first call only)");
-    const auto c0 = std::chrono::steady_clock::now();
+    // Timed by an event pair, resolved when the ledger is read: the device
+    // time from the first encode to the mirror's last copy, without the
+    // `cudaDeviceSynchronize` that used to close the bracket.
+    convert_timer_.Begin();
     cached = &GetOperands(name, w, in_channels, out_channels, w_scale, parents,
                           groups, tile);
+    convert_timer_.End();
     const auto c1 = std::chrono::steady_clock::now();
     // Lend the device this projection's operands for as long as it runs.
     StageOperands(*cached);
     const auto c2 = std::chrono::steady_clock::now();
-    convert_seconds_ += std::chrono::duration<double>(c1 - c0).count();
     stage_seconds_ += std::chrono::duration<double>(c2 - c1).count();
   }
 
@@ -786,6 +851,12 @@ void CoeffLinearLeg<word>::RunProjection(
     //    memory; see `Decompose`.
     std::vector<MlweCiphertext<word>> columns;
     Decompose(columns, x, base, span);
+    // The tile's footprint, stage by stage, when `CHEDDAR_MEM_STATS=1`: the
+    // decomposition is `rank` module components per parent and is what the
+    // tile bounds.
+    const std::string mem_tag =
+        std::string("pcmm ") + name + " tile " + std::to_string(tile_index);
+    MemoryPool::Report((mem_tag + ": after ModDecomp").c_str());
 
     // Uncached: this tile's operands, discarded when the tile is done.
     Operands scratch;
@@ -809,6 +880,7 @@ void CoeffLinearLeg<word>::RunProjection(
       NvtxScope _n("pcmm: split source (once per tile)");
       product_blas_->PrepareSource(prepared, ops.split[first], columns);
       columns.clear();
+      MemoryPool::Report((mem_tag + ": after the int8 split").c_str());
     }
 #endif
 
@@ -876,6 +948,7 @@ void CoeffLinearLeg<word>::RunProjection(
       }
     }
     started = true;
+    MemoryPool::Report((mem_tag + ": after its groups (partials held)").c_str());
   }
 
   // 3. One rescale, after the whole contraction. The product carries scale

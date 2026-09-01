@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 
 #include <thrust/optional.h>
 
@@ -62,6 +63,17 @@ MemoryPool::Usage MemoryPool::GetUsage() {
   usage.current_allocations = allocs.value;
   usage.peak_allocations = allocs.peak;
   return usage;
+}
+
+void MemoryPool::Report(const char *what) {
+  if (stats_ == nullptr) return;
+  const Usage u = GetUsage();
+  size_t free_b = 0, total_b = 0;
+  cudaMemGetInfo(&free_b, &total_b);
+  std::cout << "  [mem] " << what << ": live " << (u.current_bytes >> 20)
+            << " MiB, peak " << (u.peak_bytes >> 20) << " MiB, "
+            << u.current_allocations << " allocations; driver "
+            << ((total_b - free_b) >> 20) << " MiB reserved" << std::endl;
 }
 
 void MemoryPool::AddBin(int size) {

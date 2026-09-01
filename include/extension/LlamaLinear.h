@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "common/GpuTimer.h"
 #include "core/Container.h"
 #include "core/Context.h"
 #include "core/EvkMap.h"
@@ -296,12 +297,30 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
    * is the other half of the same question -- what `WeightResidency::kHost`
    * pays to move an operand onto the card for the projection that needs it.
    */
-  double GetConvertSeconds() const { return convert_seconds_; }
+  //! Device seconds of the conversions, from event pairs around them
+  //! (`EventSpanTimer`): the number the old host clock behind a
+  //! `cudaDeviceSynchronize` was measuring, without the drain.
+  double GetConvertSeconds() const { return convert_timer_.Seconds(); }
+  //! Host seconds spent ISSUING the staging copies; the DMAs themselves
+  //! overlap the projection that follows.
   double GetStageSeconds() const { return stage_seconds_; }
   void ResetProjectionTimers() const {
-    convert_seconds_ = 0.0;
+    convert_timer_.Reset();
     stage_seconds_ = 0.0;
   }
+
+  /**
+   * @brief Drop every converted operand whose name starts with `prefix`
+   *        (a layer's tag and its dot), keeping their pinned host mirrors
+   *        for the next layer's operands of the same size.
+   *
+   * A layer's weights are read once, so holding 32 layers' operands is 109
+   * GB of page-locked memory for nothing, and pinning 3.4 GB afresh every
+   * layer cost 1.5 s of `cudaMallocHost` (measured 2026-09-01). The next
+   * layer's q/k/v/o and gate/up/down are the same shapes, so their mirrors
+   * are the ones this returns to the spare list.
+   */
+  void ReleaseOperands(const std::string &prefix) const;
 
   /**
    * @brief Restate the density contract for the projections that follow.
@@ -426,14 +445,19 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
     std::vector<typename PcmmBlasHandler<word>::SplitMatrix> split;
 #endif
 
-    //! The host mirror, under `WeightResidency::kHost`. Same bytes, same
-    //! order; the device buffers above are emptied while `on_device` is false
-    //! and everything else in them -- shapes, scale, NPInfo -- is left alone,
-    //! because that is what makes staging a copy rather than a re-encode.
-    std::vector<HostVector<word>> host_u;
-#ifdef USE_CUBLAS
-    std::vector<HostVector<int8_t>> host_split;
-#endif
+    //! The host mirror, under `WeightResidency::kHost`: ONE page-locked
+    //! buffer holding every operand of the projection back to back
+    //! (`host_offset[i]`, `host_bytes[i]` locate the i-th, in the order of
+    //! `split` or `u`). Same bytes; the device buffers above are emptied
+    //! while `on_device` is false and everything else in them -- shapes,
+    //! scale, NPInfo -- is left alone, because that is what makes staging a
+    //! copy rather than a re-encode. Pinned and contiguous so that staging
+    //! is a run of real DMAs at the bus's rate with no synchronise anywhere:
+    //! a pageable copy is served by synchronising the stream first and moves
+    //! at a third of the speed.
+    PinnedHostBuffer host_mirror;
+    std::vector<size_t> host_offset;
+    std::vector<size_t> host_bytes;
     //! Mutable because staging is a property of where the bytes are, not of
     //! what they mean, and `RunProjection` is const.
     mutable bool on_device = true;
@@ -619,9 +643,11 @@ class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
   //! in a build without USE_CUBLAS.
   bool use_blas_;
   mutable std::map<std::string, Operands> operands_;
+  //! Pinned mirrors of released operands, reused by size (`ReleaseOperands`).
+  mutable std::vector<PinnedHostBuffer> spare_mirrors_;
   //! Model conversion and host-to-device staging, kept apart from the online
   //! rows; see `GetConvertSeconds`.
-  mutable double convert_seconds_ = 0.0;
+  mutable EventSpanTimer convert_timer_;
   mutable double stage_seconds_ = 0.0;
 #ifdef USE_CUBLAS
   std::unique_ptr<PcmmBlasHandler<word>> blas_;

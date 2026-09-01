@@ -148,6 +148,14 @@ class MemoryPool {
   static Usage GetUsage();
 
   /**
+   * @brief One `[mem]` row on stdout -- live, peak, allocation count and the
+   *        driver's reservation -- labelled `what`. Nothing unless
+   *        statistics are enabled, so a library stage can print its own row
+   *        at no cost to a run that is not measuring.
+   */
+  static void Report(const char *what);
+
+  /**
    * @brief Override RMM's initial pool size, in MiB. Zero primes nothing.
    *
    * Must be called before the first Context, and like

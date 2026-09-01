@@ -153,16 +153,7 @@ int Rev(int v, int bits) {
 // -- the driver's number is the pool's reservation and says nothing (the class
 // comment in MemoryPool.h). Printed at every stage boundary, so an
 // out-of-memory names the stage that asked and the objects standing under it.
-void MemRow(const char *what) {
-  if (!cheddar::MemoryPool::StatisticsEnabled()) return;
-  const auto u = cheddar::MemoryPool::GetUsage();
-  size_t free_b = 0, total_b = 0;
-  cudaMemGetInfo(&free_b, &total_b);
-  std::cout << "  [mem] " << what << ": live " << (u.current_bytes >> 20)
-            << " MiB, peak " << (u.peak_bytes >> 20) << " MiB, "
-            << u.current_allocations << " allocations; driver "
-            << ((total_b - free_b) >> 20) << " MiB reserved" << std::endl;
-}
+void MemRow(const char *what) { cheddar::MemoryPool::Report(what); }
 
 int g_tok_pos = 1;
 int Pos(int t) { return g_tok_pos != 0 ? t : Rev(t, 7); }
@@ -454,21 +445,25 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     boot_ffn.context->PrepareNarrowKeySwitch(kPcmmLevel, pack_aux);
   }
   fctx->PrepareEvalMod();
+  MemRow("setup: + the FFN ring's EvalMod (its constants)");
   // The native CtS/StC tables: donated by the leg's Context when the two
   // share a ring (the tables are encoded against the primes), compiled here
   // otherwise.
   fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal,
                               ffn_own_ring ? nullptr : bctx.get());
+  MemRow("setup: + the FFN ring's native CtS/StC tables");
   {
     EvkRequest req;
     fctx->AddRequiredRotations(req, num_slots, min_ks);
     fui.PrepareRotationKey(req);
   }
+  MemRow("setup: + the FFN ring's boot rotation keys");
   if (kModule && ffn_own_ring) {
     // On the module basis this Context crosses through HalfBootModule, whose
     // CoeffToSlot is the CiModuleBasis; its native CtS tables are never read
     // and the seam's native StC is all it keeps.
     fctx->ReleaseCtS(num_slots);
+    MemRow("setup: - the FFN ring's native CtS (released)");
   }
 
   MemRow("setup: + the FFN ring's EvalMod, native StC (CtS released) and boot rotation keys");
@@ -574,25 +569,29 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   swtch->ui->PrepareInverseRingSwitchKey(small->Degree(),
                                          small->ui->GetSecretCoeffs(),
                                          chain_level);
+  MemRow("setup: + the ring-switch key pair");
   for (int idx : attn->LiftedRotationIndices()) {
     lifted->ui->PrepareRotationKey(idx, chain_level);
   }
+  MemRow("setup: + the lifted ring's rotation keys");
   {
     EvkRequest req;
     attn->AddSwitchRotations(req);
     swtch->ui->PrepareRotationKey(req);
   }
+  MemRow("setup: + the switching ring's rotation keys (the forwards)");
   {
     EvkRequest req;
     attn->AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  MemRow("setup: + the leg ring's attention rotation keys");
   if (kFused) {
     EvkRequest req;
     attn->AddTowerRotations(req);
     leg_land->ui->PrepareRotationKey(req);
+    MemRow("setup: + the tower ring's rotation keys (CtS', prefix)");
   }
-  MemRow("setup: + the switch/lifted/leg attention keys");
   typename cheddar::CiSinCAttention<word>::Keys keys;
   keys.boot = &boot.ui->GetEvkMap();
   keys.swtch = &swtch->ui->GetEvkMap();
@@ -2037,6 +2036,9 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     const auto t_ffn = Tick();
     MemRow("after the feed-forward");
+    // The layer's weights are read once: their operands go, their pinned
+    // mirrors stay for the next layer's (same shapes).
+    layer.ReleaseWeights(lw.tag);
 
     // ---- against the same layer in float64 --------------------------------
     std::vector<double> ref;

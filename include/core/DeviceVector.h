@@ -124,6 +124,47 @@ class DeviceVector : public rmm::device_uvector<word> {
   DvConstView<word> ConstView(int aux_size = 0, int front_offset = 0) const;
 };
 
+/**
+ * @brief A page-locked host buffer (`cudaMallocHost`), for a host mirror that
+ *        is copied to and from the device asynchronously.
+ *
+ * A DMA out of pageable memory is not asynchronous -- the runtime
+ * synchronises the stream and stages the bytes itself -- and moves at a
+ * third of the bus. `CoeffLinearLeg`'s weight operands under host residency
+ * live in one of these per projection, back to back.
+ */
+class PinnedHostBuffer {
+ public:
+  PinnedHostBuffer() = default;
+  explicit PinnedHostBuffer(size_t bytes);
+  ~PinnedHostBuffer();
+  PinnedHostBuffer(const PinnedHostBuffer &) = delete;
+  PinnedHostBuffer &operator=(const PinnedHostBuffer &) = delete;
+  PinnedHostBuffer(PinnedHostBuffer &&other) noexcept;
+  PinnedHostBuffer &operator=(PinnedHostBuffer &&other) noexcept;
+
+  char *data() { return data_; }
+  const char *data() const { return data_; }
+  size_t size() const { return bytes_; }
+  //! Whether the memory is page-locked; false when `cudaMallocHost` refused
+  //! and the buffer fell back to ordinary memory.
+  bool pinned() const { return pinned_; }
+
+ private:
+  void Release();
+  char *data_ = nullptr;
+  size_t bytes_ = 0;
+  bool pinned_ = false;
+};
+
+/**
+ * @brief Host to device, asynchronously on `dst`'s stream.
+ *
+ * A source that fits a slot of the pinned staging ring (4 MiB) is copied
+ * through it, which makes the transfer a real DMA the host does not wait for
+ * (`PinnedStaging` in DeviceVector.cpp); a larger source takes the direct,
+ * pageable path. Either way the source may be freed as soon as this returns.
+ */
 template <typename word>
 void CopyHostToDevice(DeviceVector<word> &dst, const HostVector<word> &src);
 

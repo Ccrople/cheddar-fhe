@@ -149,13 +149,17 @@ CiSinCAttention<word>::CiSinCAttention(
     basis_ = std::make_unique<CiSinCBasis<word>>(degree_, layout.small_degree,
                                                  cfg_.sub_degree);
     basis_->PrepareForward(switch_ctx_, "q", cfg_.forward_level, &pre_q_);
+    MemoryPool::Report("attn ctor: + the tower forward q (premap folded)");
     basis_->PrepareForward(switch_ctx_, "k", cfg_.forward_level + 1, &pre_k_,
                            typename CiSinCBasis<word>::Phases(),
                            /*fold_premap=*/false);
+    MemoryPool::Report("attn ctor: + the tower forward k (premap standalone)");
     basis_->PrepareForward(switch_ctx_, "p", cfg_.forward_level);
+    MemoryPool::Report("attn ctor: + the tower forward p");
     const auto &tp = tower_->GetBootParameter();
     basis_->PrepareCtS(tower_, tp.GetCtSStartLevel(),
                        num_slots_ * tower_->GetCtSConst());
+    MemoryPool::Report("attn ctor: + the tower CtS' (outer/inner/lane)");
     const int prefix_level = tp.GetEvalModEndLevel();
     const double target = boot_->param_.GetScale(prefix_level - 1);
     const double pt_scale = target *
@@ -164,6 +168,7 @@ CiSinCAttention<word>::CiSinCAttention(
     basis_->PreparePrefix(tower_, prefix_level,
                           /*constant=*/1.0 / tower_->GetMessageRatio(),
                           pt_scale);
+    MemoryPool::Report("attn ctor: + the lane prefix");
     if (cfg_.verbose) {
       std::cout << "CiSinCAttention: fused conversions -- forwards at "
                 << cfg_.forward_level << " (q), " << cfg_.forward_level + 1

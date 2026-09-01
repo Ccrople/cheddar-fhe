@@ -427,6 +427,12 @@ class CiLlamaLayer {
   const SylphSchedule<word> &GetSchedule() const { return sched_; }
   //! The projection leg, for a caller that wants its own `Project` calls.
   CoeffLinearLeg<word> &GetProjectionLeg() { return *leg_; }
+  //! Drop a layer's converted weights (`CoeffLinearLeg::ReleaseOperands` on
+  //! `tag + "."`) once the layer is done with them; their pinned host
+  //! mirrors go to the next layer's.
+  void ReleaseWeights(const std::string &tag) {
+    leg_->ReleaseOperands(tag + ".");
+  }
   //! The level the seam brings a booted chain-layout ciphertext down to
   //! before its first stage: a caller landing those Boots elsewhere must land
   //! them at or above it.
@@ -462,8 +468,9 @@ class CiLlamaLayer {
       double alpha, double window,
       const std::vector<double> &mean_square) const;
 
-  double GetPrepareSeconds() const { return prepare_seconds_; }
-  void ResetPrepareTimer() const { prepare_seconds_ = 0.0; }
+  //! Device seconds of the RMSNorm handlers' preparation (event pairs).
+  double GetPrepareSeconds() const { return prepare_timer_.Seconds(); }
+  void ResetPrepareTimer() const { prepare_timer_.Reset(); }
 
  private:
   //! The RMSNorm weight plaintexts for one layer, duplicates included: at an
@@ -542,7 +549,7 @@ class CiLlamaLayer {
   mutable std::vector<Ct> norm_slots_;
 
   //! Per-layer operator preparation; see `GetPrepareSeconds`.
-  mutable double prepare_seconds_ = 0.0;
+  mutable EventSpanTimer prepare_timer_;
   //! The crossing's plaintext when it carries a sink rescale; built once per
   //! `NormTurn` off the first ciphertext's scale.
   Plaintext<word> crossing_pt_;

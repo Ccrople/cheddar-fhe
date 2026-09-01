@@ -146,6 +146,7 @@ CiLlamaLayer<word>::CiLlamaLayer(
         sched_.ModuleStCConst(stc_levels),
         num_slots_ * boot_->GetCtSConst());
     sched_.SetModuleBasis(basis_.get());
+    MemoryPool::Report("layer ctor: + the module basis (StC'/CtS' plaintexts)");
   }
 
   typename CiLlamaSeam<word>::Config scfg;
@@ -154,6 +155,7 @@ CiLlamaLayer<word>::CiLlamaLayer(
   scfg.verbose = cfg_.verbose;
   seam_ = std::make_unique<CiLlamaSeam<word>>(boot_, layout,
                                               sched_.GetStCLevel(), scfg);
+  MemoryPool::Report("layer ctor: + the seam (T2/rev stages)");
 
   typename CoeffLinearLeg<word>::Config lcfg;
   lcfg.num_tokens = cfg_.num_tokens;
@@ -173,6 +175,7 @@ CiLlamaLayer<word>::CiLlamaLayer(
   lcfg.output_density = GetDensity();
   leg_ = std::make_unique<CiProjectionLeg<word>>(boot_, lcfg,
                                                  std::move(modpack_keys));
+  MemoryPool::Report("layer ctor: + the projection leg (PC-MM handlers)");
 
   if (cfg_.verbose) {
     std::cout << "CiLlamaLayer: slot " << sched_.GetSlotLevel() << ", StC "
@@ -463,7 +466,10 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   // plaintexts in `Prepare`; both are per-layer preparation, so they are
   // timed apart from the arithmetic below. `Apply` would do the encode on its
   // own at first use, which is what hid it inside the online row.
-  const auto prep0 = std::chrono::steady_clock::now();
+  // An event pair rather than a host clock behind `cudaDeviceSynchronize`:
+  // the encode is on the device now and the drain cost the arithmetic
+  // behind it an idle card.
+  prepare_timer_.Begin();
   // `beta` above scaled the input, so the bracket has to be told: the handler
   // sees `S = beta^2 * sum(x^2)`, and `u = L * (S/n + e)` is the same `u` as
   // before exactly when `L = alpha * ratio / beta^2` and `e = beta^2 * eps /
@@ -478,10 +484,7 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
              "CiLlamaLayer: RmsNormHandler disagrees about the stream width");
   const auto wts = NormWeights(gain, alpha / b2);
   rms.Prepare(wts);
-  cudaDeviceSynchronize();
-  prepare_seconds_ +=
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - prep0)
-          .count();
+  prepare_timer_.End();
   // The reduction on its own, before anything fitted touches it. `Apply`
   // computes the same thing internally; recomputing it here keeps the
   // measured path untouched and costs one extra reduction, which only runs
@@ -626,11 +629,13 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->Add(h_ct[k], stream[k], out[k]);
     }
   }
+  MemoryPool::Report("ffn: after the O projection and the residual");
 
   // ---- the crossing, RMSNorm, and back to coefficients --------------------
   std::vector<Ct> normed;
   NormTurn(normed, h_ct, *w.ffn_norm, c.alpha, c.norm_window,
            c.stream_scale, c.ffn_sink, evk);
+  MemoryPool::Report("ffn: after the norm turn (crossings, RMSNorm, StC)");
 
   // ---- gate and up -------------------------------------------------------
   std::vector<Ct> gate, upv;
@@ -648,6 +653,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
                  static_cast<int>(upv.size()) == num_hidden_cts_,
              "CiLlamaLayer: the gate and up projections did not land in " +
                  std::to_string(num_hidden_cts_) + " ciphertexts");
+  MemoryPool::Report("ffn: after gate and up (2 x 28 coefficient images)");
 
   // ---- SiLU and the gate multiply ----------------------------------------
   std::vector<Ct> prod(num_hidden_cts_);
@@ -677,6 +683,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->HMult(prod[i], sv, u_low, evk.GetMultiplicationKey());
     }
   }
+  MemoryPool::Report("ffn: after SiLU and the gate multiply (28 products)");
 
   // ---- the down projection ------------------------------------------------
   {
@@ -704,6 +711,7 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->Add(res[k], h_ct[k], y[k]);
     }
   }
+  MemoryPool::Report("ffn: after the down projection and the residual");
 }
 
 template class CiProjectionLeg<uint32_t>;

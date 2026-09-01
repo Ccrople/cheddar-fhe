@@ -18,6 +18,56 @@ constexpr void constexpr_for(Func &&func) {
 }  // namespace
 
 namespace cheddar {
+
+namespace {
+
+// ONE UPLOAD FOR A LAUNCH'S POINTER TABLES. Each fused kernel took its
+// tables -- baby-step pointers, plaintext pointers, destinations, galois
+// factors -- as five to eight separate device vectors: that many pool
+// allocations and that many host-to-device copies of a few hundred bytes,
+// each out of pageable memory, which the runtime serves by synchronising the
+// stream first. The upstream comment at every one of those sites said "we can
+// call copy only once if we pack the pointers"; this is that. The tables are
+// laid out back to back in one host buffer (8-byte aligned), uploaded once
+// into the handler's persistent scratch through the pinned ring, and the
+// kernel is handed the device address of each. `Device(p)` maps a host table
+// to its device twin by offset.
+class TableUpload {
+ public:
+  explicit TableUpload(size_t max_bytes) : host_((max_bytes + 7) / 8 + 1) {}
+
+  template <typename T>
+  T *Add(size_t count) {
+    const size_t bytes = (count * sizeof(T) + 7) & ~static_cast<size_t>(7);
+    AssertTrue(used_ + bytes <= host_.size() * 8,
+               "TableUpload: the tables outgrew their reservation");
+    T *p = reinterpret_cast<T *>(reinterpret_cast<char *>(host_.data()) + used_);
+    used_ += bytes;
+    return p;
+  }
+
+  void Upload(DeviceVector<uint64_t> &scratch) {
+    host_.resize((used_ + 7) / 8);
+    CopyHostToDevice(scratch, host_);
+    device_ = reinterpret_cast<char *>(scratch.data());
+  }
+
+  template <typename T>
+  T *Device(T *host_table) const {
+    AssertTrue(device_ != nullptr, "TableUpload: Device before Upload");
+    const ptrdiff_t off = reinterpret_cast<const char *>(host_table) -
+                          reinterpret_cast<const char *>(host_.data());
+    return reinterpret_cast<T *>(device_ + off);
+  }
+
+ private:
+  HostVector<uint64_t> host_;
+  size_t used_ = 0;
+  char *device_ = nullptr;
+};
+
+}  // namespace
+
 namespace kernel {
 
 // Fused kernel for KeyMult, MAC, and Aut in the baby step.
@@ -271,14 +321,23 @@ void HoistHandler<word>::Unstage() const {
       i++;
     }
   }
-  // The copies are asynchronous; nothing may free the source before they
-  // land. Then a move-assigned empty vector rather than `resize(0)`: rmm's
-  // resize is free to keep the allocation, and the point is to give it back.
-  cudaStreamSynchronize(cudaStreamLegacy);
+  // The frees below are stream-ordered behind the copies (rmm gives a buffer
+  // back on the stream it was used on), so no synchronise stands here; the
+  // one thing that must wait for the copies is the driver registration of
+  // the host buffers, which the event below carries. A move-assigned empty
+  // vector rather than `resize(0)`: rmm's resize is free to keep the
+  // allocation, and the point is to give it back.
+  cudaEvent_t landed = nullptr;
+  if (first) {
+    cudaEventCreateWithFlags(&landed, cudaEventDisableTiming);
+    cudaEventRecord(landed, cudaStreamLegacy);
+  }
   for (auto &[_, pt_map] : hoist_pt_map_) {
     for (auto &[__, pt] : pt_map) pt.mx_ = DeviceVector<word>(0);
   }
   if (first) {
+    cudaEventSynchronize(landed);
+    cudaEventDestroy(landed);
     // PINNED, once: a pageable copy of 5 GiB moves at ~4 GB/s and the leg's
     // converters are read every layer; registered memory goes at the bus's
     // ~12. The vectors are never resized after this, so the registration
@@ -316,7 +375,8 @@ void HoistHandler<word>::Stage() const {
       i++;
     }
   }
-  cudaStreamSynchronize(cudaStreamLegacy);
+  // No synchronise: the host copies stand until the handler dies, and every
+  // reader of the device plaintexts is behind these copies on the stream.
   on_device_ = true;
 }
 
@@ -448,19 +508,18 @@ void HoistHandler<word>::BSFusedKeyMult(
   int num_q_primes = a_orig.GetNP().GetNumQ();
   int num_rotations = rotations.size();
 
-  // We can further optimize this part. We can call copy only once if we pack
-  // the pointers for all accumulators together.
-  // We can also consider passing the pointers as kernel arguments.
-
-  // ready ptrs to copy to device.
-  HostVector<const word *> modup_ptrs(num_accum, nullptr);
-  HostVector<const word *> key_a_ptrs(num_accum * num_rotations, nullptr);
-  HostVector<const word *> key_b_ptrs(num_accum * num_rotations, nullptr);
-  HostVector<word *> dst_b_ptrs(num_rotations, nullptr);
-  HostVector<word *> dst_a_ptrs(num_rotations, nullptr);
-  HostVector<word> key_extra(num_rotations, 0);
-  HostVector<word> galois_factors_h(num_rotations, 0);
-  HostVector<word> galois_offsets_h(num_rotations, 0);
+  // The pointer tables, packed and uploaded once (`TableUpload`).
+  TableUpload tab(static_cast<size_t>(8) *
+                  (num_accum + 2 * num_accum * num_rotations +
+                   5 * num_rotations + 8));
+  const word **modup_ptrs = tab.Add<const word *>(num_accum);
+  const word **key_a_ptrs = tab.Add<const word *>(num_accum * num_rotations);
+  const word **key_b_ptrs = tab.Add<const word *>(num_accum * num_rotations);
+  word **dst_b_ptrs = tab.Add<word *>(num_rotations);
+  word **dst_a_ptrs = tab.Add<word *>(num_rotations);
+  word *key_extra = tab.Add<word>(num_rotations);
+  word *galois_factors_h = tab.Add<word>(num_rotations);
+  word *galois_offsets_h = tab.Add<word>(num_rotations);
 
   for (int i = 0; i < num_rotations; i++) {
     // keys
@@ -497,22 +556,15 @@ void HoistHandler<word>::BSFusedKeyMult(
   }
   int num_primes = np.GetNumTotal();
 
-  DeviceVector<const word *> modup_d_ptrs(num_accum);
-  DeviceVector<const word *> key_a_d_ptrs(num_accum * num_rotations);
-  DeviceVector<const word *> key_b_d_ptrs(num_accum * num_rotations);
-  DeviceVector<word *> dst_b_d_ptrs(num_rotations);
-  DeviceVector<word *> dst_a_d_ptrs(num_rotations);
-  DeviceVector<word> key_extra_d(num_rotations);
-  DeviceVector<word> galois_factors(num_rotations);
-  DeviceVector<word> galois_offsets(num_rotations);
-  CopyHostToDevice(modup_d_ptrs, modup_ptrs);
-  CopyHostToDevice(key_a_d_ptrs, key_a_ptrs);
-  CopyHostToDevice(key_b_d_ptrs, key_b_ptrs);
-  CopyHostToDevice(dst_b_d_ptrs, dst_b_ptrs);
-  CopyHostToDevice(dst_a_d_ptrs, dst_a_ptrs);
-  CopyHostToDevice(key_extra_d, key_extra);
-  CopyHostToDevice(galois_factors, galois_factors_h);
-  CopyHostToDevice(galois_offsets, galois_offsets_h);
+  tab.Upload(table_scratch_);
+  const word **modup_d_ptrs = tab.Device(modup_ptrs);
+  const word **key_a_d_ptrs = tab.Device(key_a_ptrs);
+  const word **key_b_d_ptrs = tab.Device(key_b_ptrs);
+  word **dst_b_d_ptrs = tab.Device(dst_b_ptrs);
+  word **dst_a_d_ptrs = tab.Device(dst_a_ptrs);
+  word *key_extra_d = tab.Device(key_extra);
+  word *galois_factors = tab.Device(galois_factors_h);
+  word *galois_offsets = tab.Device(galois_offsets_h);
 
   const word *primes = context->param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
@@ -535,11 +587,10 @@ void HoistHandler<word>::BSFusedKeyMult(
     if (num_accum > num_accum_padded) return;
     if (i > 0 && num_accum <= (1 << (i - 1))) return;
     kernel::BSFusedKernel<word, num_accum_padded><<<grid_dim, block_dim>>>(
-        dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), modup_d_ptrs.data(),
-        key_b_d_ptrs.data(), key_a_d_ptrs.data(), num_accum, num_rotations,
-        primes, inv_primes, num_q_primes, key_extra_d.data(),
-        input_bx_pseudo_modup.data(), galois_factors.data(),
-        galois_offsets.data(), context->param_.log_degree_);
+        dst_b_d_ptrs, dst_a_d_ptrs, modup_d_ptrs, key_b_d_ptrs, key_a_d_ptrs,
+        num_accum, num_rotations, primes, inv_primes, num_q_primes,
+        key_extra_d, input_bx_pseudo_modup.data(), galois_factors,
+        galois_offsets, context->param_.log_degree_);
   });
 }
 
@@ -581,18 +632,16 @@ void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
     res.second.SetNumSlots(num_slots);
   }
 
-  // We can further optimize this part. We can call copy only once if we pack
-  // the pointers for all accumulators together.
-  // We can also consider passing the pointers as kernel arguments.
-
-  // Ready ptrs to copy to device
+  // The pointer tables, packed and uploaded once (`TableUpload`).
   int num_bs = bs_indices_.size();
   int num_gs = gs_indices.size();
-  HostVector<const word *> bx_ptrs(num_bs);
-  HostVector<const word *> ax_ptrs(num_bs);
-  HostVector<const word *> mx_ptrs(num_gs * num_bs);
-  HostVector<word *> dst_b_ptrs(num_gs);
-  HostVector<word *> dst_a_ptrs(num_gs);
+  TableUpload tab(static_cast<size_t>(8) *
+                  (2 * num_bs + num_gs * num_bs + 2 * num_gs + 8));
+  const word **bx_ptrs = tab.Add<const word *>(num_bs);
+  const word **ax_ptrs = tab.Add<const word *>(num_bs);
+  const word **mx_ptrs = tab.Add<const word *>(num_gs * num_bs);
+  word **dst_b_ptrs = tab.Add<word *>(num_gs);
+  word **dst_a_ptrs = tab.Add<word *>(num_gs);
   int num_primes = np.GetNumTotal();
 
   // ptrs for (b,a) of each bs
@@ -626,17 +675,13 @@ void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
     idx++;
   }
 
-  // Copy to device
-  DeviceVector<const word *> bx_d_ptrs(num_bs);
-  DeviceVector<const word *> ax_d_ptrs(num_bs);
-  DeviceVector<const word *> mx_d_ptrs(num_gs * num_bs);
-  DeviceVector<word *> dst_b_d_ptrs(num_gs);
-  DeviceVector<word *> dst_a_d_ptrs(num_gs);
-  CopyHostToDevice(bx_d_ptrs, bx_ptrs);
-  CopyHostToDevice(ax_d_ptrs, ax_ptrs);
-  CopyHostToDevice(mx_d_ptrs, mx_ptrs);
-  CopyHostToDevice(dst_b_d_ptrs, dst_b_ptrs);
-  CopyHostToDevice(dst_a_d_ptrs, dst_a_ptrs);
+  // One upload for the lot.
+  tab.Upload(table_scratch_);
+  const word **bx_d_ptrs = tab.Device(bx_ptrs);
+  const word **ax_d_ptrs = tab.Device(ax_ptrs);
+  const word **mx_d_ptrs = tab.Device(mx_ptrs);
+  word **dst_b_d_ptrs = tab.Device(dst_b_ptrs);
+  word **dst_a_d_ptrs = tab.Device(dst_a_ptrs);
 
   const word *primes = context->param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
@@ -648,9 +693,8 @@ void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
     if (num_bs > num_bs_padded) return;
     if (num_bs <= (1 << (i - 1))) return;
     kernel::GSFusedKernel<word, num_bs_padded><<<grid_dim, block_dim>>>(
-        dst_b_d_ptrs.data(), dst_a_d_ptrs.data(), bx_d_ptrs.data(),
-        ax_d_ptrs.data(), mx_d_ptrs.data(), num_bs, num_gs, primes, inv_primes,
-        context->param_.log_degree_);
+        dst_b_d_ptrs, dst_a_d_ptrs, bx_d_ptrs, ax_d_ptrs, mx_d_ptrs, num_bs,
+        num_gs, primes, inv_primes, context->param_.log_degree_);
   });
 }
 
@@ -1285,11 +1329,14 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
   // one table per matrix half with nullptr in the empty slots; outputs
   // interleave (re bx, re ax[, im bx, im ax]) per giant step.
   const int out_stride = has_im_out ? 4 : 2;
-  HostVector<const word *> bs_re_ptrs(2 * num_bs);
-  HostVector<const word *> bs_im_ptrs(has_im_in ? 2 * num_bs : 1);
-  HostVector<const word *> mx_re_ptrs(num_gs * num_bs);
-  HostVector<const word *> mx_im_ptrs(num_gs * num_bs);
-  HostVector<word *> dst_ptrs(num_gs * out_stride);
+  TableUpload tab(static_cast<size_t>(8) *
+                  (4 * num_bs + 2 * num_gs * num_bs + num_gs * out_stride + 8));
+  const word **bs_re_ptrs = tab.Add<const word *>(2 * num_bs);
+  const word **bs_im_ptrs = tab.Add<const word *>(has_im_in ? 2 * num_bs : 1);
+  const word **mx_re_ptrs = tab.Add<const word *>(num_gs * num_bs);
+  const word **mx_im_ptrs = tab.Add<const word *>(num_gs * num_bs);
+  word **dst_ptrs = tab.Add<word *>(num_gs * out_stride);
+  if (!has_im_in) bs_im_ptrs[0] = nullptr;
 
   int idx = 0;
   for (int bs_idx : bs_indices) {
@@ -1330,16 +1377,13 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
     idx++;
   }
 
-  DeviceVector<const word *> bs_re_d(bs_re_ptrs.size());
-  DeviceVector<const word *> bs_im_d(bs_im_ptrs.size());
-  DeviceVector<const word *> mx_re_d(mx_re_ptrs.size());
-  DeviceVector<const word *> mx_im_d(mx_im_ptrs.size());
-  DeviceVector<word *> dst_d(dst_ptrs.size());
-  CopyHostToDevice(bs_re_d, bs_re_ptrs);
-  CopyHostToDevice(bs_im_d, bs_im_ptrs);
-  CopyHostToDevice(mx_re_d, mx_re_ptrs);
-  CopyHostToDevice(mx_im_d, mx_im_ptrs);
-  CopyHostToDevice(dst_d, dst_ptrs);
+  // One upload for the lot, into the real half's scratch.
+  tab.Upload(re_h.table_scratch_);
+  const word **bs_re_d = tab.Device(bs_re_ptrs);
+  const word **bs_im_d = tab.Device(bs_im_ptrs);
+  const word **mx_re_d = tab.Device(mx_re_ptrs);
+  const word **mx_im_d = tab.Device(mx_im_ptrs);
+  word **dst_d = tab.Device(dst_ptrs);
 
   const word *primes = context->param_.GetPrimesPtr(np);
   const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
@@ -1355,10 +1399,9 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
       if (num_bs > num_bs_padded) return;
       if (num_bs <= (1 << (i - 1))) return;
       kernel::GSFusedComplexKernel<word, num_bs_padded, kImIn, kImOut>
-          <<<grid_dim, block_dim>>>(dst_d.data(), bs_re_d.data(),
-                                    bs_im_d.data(), mx_re_d.data(),
-                                    mx_im_d.data(), num_bs, num_gs, primes,
-                                    inv_primes, context->param_.log_degree_);
+          <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d, mx_im_d,
+                                    num_bs, num_gs, primes, inv_primes,
+                                    context->param_.log_degree_);
     });
   };
   if (has_im_in && has_im_out) {

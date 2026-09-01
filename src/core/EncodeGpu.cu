@@ -309,9 +309,10 @@ GpuEncoder<word>::GpuEncoder(const Parameter<word> &param,
       host[2 * (stride + j) + 1] = w.imag();
     }
   }
-  cudaMemcpyAsync(twiddle_.data(), host.data(), host.size() * sizeof(double),
-                  cudaMemcpyHostToDevice, cudaStreamLegacy);
-  cudaStreamSynchronize(cudaStreamLegacy);
+  // A synchronous copy, once, at construction: the table is the source's
+  // only copy and dies with this scope.
+  cudaMemcpy(twiddle_.data(), host.data(), host.size() * sizeof(double),
+             cudaMemcpyHostToDevice);
   cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming);
 }
 
@@ -505,9 +506,10 @@ const uint64_t *GpuEncoder<word>::PrimeConstants(const NPInfo &np) const {
         static_cast<word>(p)));
   }
   rmm::device_uvector<uint64_t> dv(host.size(), cudaStreamLegacy);
-  cudaMemcpyAsync(dv.data(), host.data(), host.size() * sizeof(uint64_t),
-                  cudaMemcpyHostToDevice, cudaStreamLegacy);
-  cudaStreamSynchronize(cudaStreamLegacy);
+  // Synchronous, once per (level, aux) -- the table is cached below and the
+  // source dies with this scope.
+  cudaMemcpy(dv.data(), host.data(), host.size() * sizeof(uint64_t),
+             cudaMemcpyHostToDevice);
   auto inserted = prime_constants_.emplace(key, std::move(dv));
   return inserted.first->second.data();
 }

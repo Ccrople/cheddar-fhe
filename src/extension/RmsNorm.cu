@@ -129,8 +129,13 @@ void RmsNormHandler<word>::Prepare(
   weight_pt_.clear();
   weight_pt_.resize(num_ct_);
   const double scale = context_->param_.GetScale(weight_level_);
+  // On the device: the host encoder is one thread and a GMP reduction per
+  // (slot, prime), which made the two handlers' weights 2.7 s of every
+  // layer, and its plaintexts then went up as pageable copies. `GpuEncoder`
+  // is the same encoding up to the half-ulp its header concedes.
   for (int i = 0; i < num_ct_; i++) {
-    context_->encoder_.Encode(weight_pt_[i], weight_level_, scale, weight[i]);
+    context_->gpu_encoder_.Encode(weight_pt_[i], weight_level_, scale,
+                                  weight[i]);
   }
   cached_weight_ = weight;
   cached_weight_level_ = weight_level_;

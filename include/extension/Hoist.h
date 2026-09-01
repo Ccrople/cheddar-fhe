@@ -57,6 +57,11 @@ class HoistHandler {
   // The host copies' buffers registered with the driver (pinned), to be
   // unregistered when the handler dies. A moved-from handler keeps none.
   mutable std::vector<void *> registered_;
+  // The fused kernels' pointer tables, uploaded as one buffer per launch
+  // (`TableUpload` in Hoist.cu) and kept: the next launch's copy is behind
+  // this launch's kernel on the stream, so the buffer is reused without a
+  // wait.
+  mutable DeviceVector<uint64_t> table_scratch_;
 
   // initialization-related methods
   void ExtractBSIndices(const PlainHoistMap &hoist_map);
