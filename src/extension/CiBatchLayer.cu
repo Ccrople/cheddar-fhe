@@ -51,6 +51,49 @@ CiBatchLayer<word>::CiBatchLayer(std::shared_ptr<BootContext<word>> boot,
 }
 
 template <typename word>
+void CiBatchLayer<word>::Park(ParkedStream &parked,
+                              std::vector<Ct> &stream) const {
+  NvtxScope _nv("batch: park the stream");
+  const size_t n = stream.size();
+  parked.bx.resize(n);
+  parked.ax.resize(n);
+  parked.np.resize(n);
+  parked.scale.resize(n);
+  parked.slots.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    Ct &ct = stream[i];
+    AssertFalse(ct.HasRx(), "CiBatchLayer::Park: a stream ciphertext has rx");
+    parked.np[i] = ct.GetNP();
+    parked.scale[i] = ct.GetScale();
+    parked.slots[i] = ct.GetNumSlots();
+    CopyDeviceToHost(parked.bx[i], ct.bx_);
+    CopyDeviceToHost(parked.ax[i], ct.ax_);
+    ct = Ct();
+  }
+}
+
+template <typename word>
+void CiBatchLayer<word>::Unpark(std::vector<Ct> &stream,
+                                ParkedStream &parked) const {
+  NvtxScope _nv("batch: unpark the stream");
+  const size_t n = parked.bx.size();
+  stream.clear();
+  stream.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    Ct &ct = stream[i];
+    ct.RemoveRx();
+    ct.ModifyNP(parked.np[i]);
+    ct.SetScale(parked.scale[i]);
+    ct.SetNumSlots(parked.slots[i]);
+    CopyHostToDevice(ct.bx_, parked.bx[i]);
+    CopyHostToDevice(ct.ax_, parked.ax[i]);
+    parked.bx[i] = HostVector<word>();
+    parked.ax[i] = HostVector<word>();
+  }
+  parked = ParkedStream();
+}
+
+template <typename word>
 void CiBatchLayer<word>::AddRequiredRotations(EvkRequest &req) const {
   boot_->AddRequiredRotations(req, layout_.num_slots);
 }
@@ -241,7 +284,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
 
 template <typename word>
 void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
-                                     const std::vector<Ct> &stream,
+                                     std::vector<Ct> &stream,
                                      const Weights &w, const Calibration &c,
                                      const EvkMap<word> &evk) {
   NvtxScope _nv("batch: FeedForward");
@@ -261,6 +304,8 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
            evk, cfg_.hold_channels_ffn);
   const int ly = src_y.level;
+  ParkedStream parked;
+  Park(parked, stream);
   if (cfg_.verbose) MemoryPool::Report("batch: after the norm");
 
   // 2. The weights: the gain on gate and up, 1/range on gate so SiLU's
@@ -344,6 +389,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
 
   // 4. The residual, both sides at the lower of the two levels.
   t0 = Clock::now();
+  Unpark(stream, parked);
   const int ld = param.NPToLevel(d_acc[0].GetNP());
   const int ls = param.NPToLevel(stream[0].GetNP());
   const int lo = std::min(ld, ls);
@@ -371,7 +417,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
 
 template <typename word>
 void CiBatchLayer<word>::Attention(
-    std::vector<Ct> &res, const std::vector<Ct> &stream, const AttnWeights &w,
+    std::vector<Ct> &res, std::vector<Ct> &stream, const AttnWeights &w,
     const Calibration &c, CiBatchAttention<word> &attn,
     const typename CiBatchAttention<word>::Keys &akeys,
     const EvkMap<word> &evk) {
@@ -409,6 +455,8 @@ void CiBatchLayer<word>::Attention(
   NormTurn(src_y, stream, c.attn_alpha, c.attn_norm_window, c.attn_sink,
            c.stream_scale, evk, cfg_.hold_channels);
   const int ly = src_y.level;
+  ParkedStream parked;
+  Park(parked, stream);
   if (cfg_.verbose) MemoryPool::Report("batch: after the attention norm");
 
   // 2. The weights: the gain on all three, cq on Q and ck on K (the chain
@@ -585,6 +633,7 @@ void CiBatchLayer<word>::Attention(
   const int lo_in = o_level;
   const double ratio = o_ratio;
   std::vector<Ct> o = std::move(o_acc);
+  Unpark(stream, parked);
   const int ld = param.NPToLevel(o[0].GetNP());
   const int ls2 = param.NPToLevel(stream[0].GetNP());
   const int lo = std::min(ld, ls2);

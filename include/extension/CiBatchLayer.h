@@ -216,9 +216,10 @@ class CiBatchLayer {
    * @param res the next residual stream, `model` ciphertexts at level 0,
    *        carrying `stream_scale`
    * @param stream the post-attention residual, `model` ciphertexts at
-   *        level 0, carrying `stream_scale`
+   *        level 0, carrying `stream_scale`; PARKED in host memory while
+   *        the half runs and put back, word for word, for the residual
    */
-  void FeedForward(std::vector<Ct> &res, const std::vector<Ct> &stream,
+  void FeedForward(std::vector<Ct> &res, std::vector<Ct> &stream,
                    const Weights &w, const Calibration &c,
                    const EvkMap<word> &evk);
 
@@ -234,14 +235,14 @@ class CiBatchLayer {
    * @param attn the attention products, whose layout this layer's is
    * @param akeys the attention's keys on its three rings
    */
-  void Attention(std::vector<Ct> &res, const std::vector<Ct> &stream,
+  void Attention(std::vector<Ct> &res, std::vector<Ct> &stream,
                  const AttnWeights &w, const Calibration &c,
                  CiBatchAttention<word> &attn,
                  const typename CiBatchAttention<word>::Keys &akeys,
                  const EvkMap<word> &evk);
 
   /** @brief One whole layer: the attention half, then the feed-forward. */
-  void Layer(std::vector<Ct> &res, const std::vector<Ct> &stream,
+  void Layer(std::vector<Ct> &res, std::vector<Ct> &stream,
              const AttnWeights &aw, const Weights &fw, const Calibration &c,
              CiBatchAttention<word> &attn,
              const typename CiBatchAttention<word>::Keys &akeys,
@@ -271,6 +272,23 @@ class CiBatchLayer {
 
  private:
   int NormDegree(double window) const;
+
+  /**
+   * @brief The residual stream parked in host memory while a half runs.
+   *
+   * A half reads the stream at its norm and again at its residual add, and
+   * between the two it needs every byte the card has: 4096 level-0
+   * ciphertexts are 4.3 GiB. `Park` copies them out and frees them,
+   * `Unpark` puts the same words back.
+   */
+  struct ParkedStream {
+    std::vector<HostVector<word>> bx, ax;
+    std::vector<NPInfo> np;
+    std::vector<double> scale;
+    std::vector<int> slots;
+  };
+  void Park(ParkedStream &parked, std::vector<Ct> &stream) const;
+  void Unpark(std::vector<Ct> &stream, ParkedStream &parked) const;
 
   std::shared_ptr<BootContext<word>> boot_;
   Config cfg_;
