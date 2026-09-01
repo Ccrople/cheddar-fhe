@@ -434,6 +434,10 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)
+# ci16_35 with two SlotToCoeff levels: its Boot lands at 17, which is what
+# the batched attention's softmax walk needs above the chain (Doing.md 7.6).
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_stc2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_stc2.json COPYONLY)
 # Landing sub-ladders of ci16_35 (gen_landing.py, L in [5,19]); the test
 # defaults to land13 and reaches the rest via CHEDDAR_LAND_PARAM.
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land5.json
