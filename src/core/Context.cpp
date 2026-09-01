@@ -1,6 +1,7 @@
 #include "extension/Profile.h"
 #include "core/Context.h"
 
+#include <cstdlib>
 #include <tuple>
 #include <utility>
 
@@ -775,19 +776,21 @@ void Context<word>::ModUpForKeySwitchBatch(
              "ModUpForKeySwitchBatch: coefficient buffer size mismatch");
   buffer.resize(batch * beta * limb_words);
 
-  // DvConstView holds const members, so it is copy-constructible but not
-  // assignable: build the rows rather than assigning them.
+  // Digit-major (`ModUpFromCoeffBatch`'s layout): digit i of switch s at
+  // (i * batch + s). DvConstView holds const members, so it is
+  // copy-constructible but not assignable: build the rows rather than
+  // assigning them.
   mod_up_views.clear();
   mod_up_views.resize(batch);
   for (int s = 0; s < batch; s++) {
     for (int i = 0; i < beta; i++) {
-      mod_up_views[s].emplace_back(buffer.data() + (s * beta + i) * limb_words,
+      mod_up_views[s].emplace_back(buffer.data() + (i * batch + s) * limb_words,
                                    limb_words, num_aux * degree);
     }
   }
 
-  if (beta == 1) {
-    DvView<word> dst(buffer.data(), batch * limb_words, 0);
+  if (level >= 0 && !modup_coeff_serial_) {
+    DvView<word> dst(buffer.data(), batch * beta * limb_words, 0);
     mod_switcher.ModUpFromCoeffBatch(dst, a_coeffs, batch);
     return;
   }
@@ -795,12 +798,22 @@ void Context<word>::ModUpForKeySwitchBatch(
   for (int s = 0; s < batch; s++) {
     std::vector<DvView<word>> dst_views;
     for (int i = 0; i < beta; i++) {
-      dst_views.emplace_back(buffer.data() + (s * beta + i) * limb_words,
+      dst_views.emplace_back(buffer.data() + (i * batch + s) * limb_words,
                              limb_words, num_aux * degree);
     }
     DvConstView<word> coeff_s(a_coeffs.data() + s * q_words, q_words, 0);
     mod_switcher.ModUpFromCoeff(dst_views, coeff_s);
   }
+}
+
+template <typename word>
+bool Context<word>::modup_coeff_serial_ =
+    (std::getenv("CHEDDAR_MODUP_COEFF_SERIAL") != nullptr &&
+     std::getenv("CHEDDAR_MODUP_COEFF_SERIAL")[0] == '1');
+
+template <typename word>
+void Context<word>::SetModUpCoeffSerial(bool serial) {
+  modup_coeff_serial_ = serial;
 }
 
 template <typename word>
@@ -936,14 +949,57 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
                                  int src_ct_stride, const NPInfo &np,
                                  const std::vector<const Evk *> &keys,
                                  int batch) const {
+  const int q_words = np.GetNumQ() * param_.degree_;
+  AssertTrue(src_ct_stride >= 2 * q_words, "MultKeyBatch: the ciphertexts overlap");
+  MultKeyBatch(dst, dst_ct_stride, src + q_words, src_ct_stride, src, nullptr,
+               src_ct_stride, np, keys, batch);
+}
+
+template <typename word>
+void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride,
+                                 const word *switched, int switched_stride,
+                                 const word *add_b, const word *add_a,
+                                 int add_stride, const NPInfo &np,
+                                 const std::vector<const Evk *> &keys,
+                                 int batch) const {
   NvtxScope _nv("ks: MultKeyBatch");
+  const int degree = param_.degree_;
+  const int num_q = np.GetNumQ();
+  const int q_words = num_q * degree;
+  AssertTrue(!keys.empty(), "MultKeyBatch: no keys");
+  const int num_aux = keys.at(0)->GetNP().num_aux_;
+  const int ext_words = (num_q + num_aux) * degree;
+  AssertTrue(dst_ct_stride >= 2 * q_words, "MultKeyBatch: the ciphertexts overlap");
+  DeviceVector<word> accum(static_cast<size_t>(batch) * 2 * ext_words);
+  MultKeyBatchNoModDown(accum.data(), 2 * ext_words, switched, switched_stride,
+                        add_b, add_a, add_stride, np, keys, batch);
+
+  // Mod-down of both parts. With the parts contiguous on both sides the
+  // 2 * batch polynomials are one strided group.
+  int level = param_.NPToLevel(np);
+  AdjustLevelForMultKey(level, num_q, num_aux);
+  const auto &mod_switcher = GetModSwitchHandler(level, num_aux);
+  if (dst_ct_stride == 2 * q_words) {
+    mod_switcher.ModDownBatch(dst, q_words, accum.data(), ext_words,
+                              2 * batch);
+  } else {
+    mod_switcher.ModDownBatch(dst, dst_ct_stride, accum.data(), 2 * ext_words,
+                              batch);
+    mod_switcher.ModDownBatch(dst + q_words, dst_ct_stride,
+                              accum.data() + ext_words, 2 * ext_words, batch);
+  }
+}
+
+template <typename word>
+void Context<word>::MultKeyBatchNoModDown(
+    word *dst, int dst_ct_stride, const word *switched, int switched_stride,
+    const word *add_b, const word *add_a, int add_stride, const NPInfo &np,
+    const std::vector<const Evk *> &keys, int batch) const {
+  NvtxScope _nv("ks: MultKeyBatchNoModDown");
   AssertTrue(batch >= 1 && static_cast<int>(keys.size()) == batch,
              "MultKeyBatch: one key per ciphertext");
   AssertTrue(np.num_aux_ == 0,
              "MultKeyBatch is not supported for ciphertexts with p primes");
-  AssertTrue(!param_.conjugate_invariant_,
-             "MultKeyBatch: the conjugate-invariant ring is not batched");
-
   const int degree = param_.degree_;
   const int num_q = np.GetNumQ();
   const int q_words = num_q * degree;
@@ -956,10 +1012,12 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
   const int beta = DivCeil(padded_num_q, num_aux);
   const auto &mod_switcher = GetModSwitchHandler(level, num_aux);
   const int ext_words = (num_q + num_aux) * degree;
-  AssertTrue(src_ct_stride >= 2 * q_words && dst_ct_stride >= 2 * q_words,
-             "MultKeyBatch: the ciphertexts overlap");
+  AssertTrue(switched_stride >= q_words && dst_ct_stride >= 2 * ext_words &&
+                 (add_b == nullptr || add_stride >= q_words),
+             "MultKeyBatchNoModDown: the ciphertexts overlap");
 
   // 1. Mod-up of every a-part, one buffer per digit.
+  NvtxScope *_d = new NvtxScope("mkb: digit buffers");
   std::vector<DeviceVector<word>> digits;
   std::vector<DvView<word>> digit_views;
   std::vector<int> used;
@@ -980,12 +1038,20 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
                  static_cast<int>(used.size()) <=
                      ElementWiseHandler<word>::max_batch_digits_,
              "MultKeyBatch: digit count out of range");
-  mod_switcher.ModUpBatch(digit_views, src + q_words, src_ct_stride, batch);
+  delete _d;
+  {
+    NvtxScope _s("mkb: modup");
+    mod_switcher.ModUpBatch(digit_views, switched, switched_stride, batch);
+  }
 
   // 2. The key multiply, every switch with its own key.
+  NvtxScope _t("mkb: table + keymult");
   const NPInfo ext_np(np.num_main_, np.num_ter_, num_aux, degree);
-  HostVector<uint64_t> key_table(static_cast<size_t>(batch) * used.size() * 2);
-  int key_extra = -1;
+  // Four pointers per (switch, digit): the q limbs and the auxiliary limbs of
+  // the key's b and a parts. A key made at another level carries more q
+  // limbs than this switch reads, so its auxiliary part sits at its own
+  // offset -- the same view arithmetic `KeyMult` does per key.
+  HostVector<uint64_t> key_table(static_cast<size_t>(batch) * used.size() * 4);
   for (int b = 0; b < batch; b++) {
     const Evk &key = *keys.at(b);
     AssertTrue(key.GetNP().num_aux_ == num_aux,
@@ -994,15 +1060,15 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
     for (size_t k = 0; k < used.size(); k++) {
       const DvConstView<word> kb = key.BxConstView(used[k], prime_offset);
       const DvConstView<word> ka = key.AxConstView(used[k], prime_offset);
-      const int extra = kb.QSize() - q_words;
-      AssertTrue(ka.QSize() - q_words == extra &&
-                     (key_extra == -1 || key_extra == extra),
-                 "MultKeyBatch: keys differ in limb layout");
-      key_extra = extra;
-      key_table[(b * used.size() + k) * 2] =
-          reinterpret_cast<uint64_t>(kb.data());
-      key_table[(b * used.size() + k) * 2 + 1] =
-          reinterpret_cast<uint64_t>(ka.data());
+      AssertTrue(kb.QSize() >= q_words && ka.QSize() == kb.QSize() &&
+                     kb.AuxSize() == num_aux * degree &&
+                     ka.AuxSize() == num_aux * degree,
+                 "MultKeyBatch: a key does not cover this switch's limbs");
+      uint64_t *row = key_table.data() + (b * used.size() + k) * 4;
+      row[0] = reinterpret_cast<uint64_t>(kb.data());
+      row[1] = reinterpret_cast<uint64_t>(ka.data());
+      row[2] = reinterpret_cast<uint64_t>(kb.data() + kb.QSize());
+      row[3] = reinterpret_cast<uint64_t>(ka.data() + ka.QSize());
     }
   }
   DeviceVector<uint64_t> key_table_dev;
@@ -1012,23 +1078,10 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
   NPInfo p_prod_np = np;
   const DvConstView<word> p_prod = GetPProd(p_prod_np, num_aux);
 
-  DeviceVector<word> accum(static_cast<size_t>(batch) * 2 * ext_words);
   elem_handler_.KeyMultBatch(
-      accum.data(), 2 * ext_words, ext_np, modup_ptrs, ext_words,
-      reinterpret_cast<const word *const *>(key_table_dev.data()), key_extra,
-      src, src_ct_stride, p_prod.data(), batch);
-
-  // 3. Mod-down of both parts. With the parts contiguous on both sides the
-  //    2 * batch polynomials are one strided group.
-  if (dst_ct_stride == 2 * q_words) {
-    mod_switcher.ModDownBatch(dst, q_words, accum.data(), ext_words,
-                              2 * batch);
-  } else {
-    mod_switcher.ModDownBatch(dst, dst_ct_stride, accum.data(), 2 * ext_words,
-                              batch);
-    mod_switcher.ModDownBatch(dst + q_words, dst_ct_stride,
-                              accum.data() + ext_words, 2 * ext_words, batch);
-  }
+      dst, dst_ct_stride, ext_np, modup_ptrs, ext_words,
+      reinterpret_cast<const word *const *>(key_table_dev.data()), add_b,
+      add_a, add_stride, p_prod.data(), batch);
 }
 
 template <typename word>

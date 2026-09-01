@@ -141,16 +141,18 @@ class ElementWiseHandler {
    * the first `ext_words = np.GetNumTotal() * degree` words and its a-part on
    * the next. `modup[i] + b * modup_batch_stride` is its digit `i`
    * (`ModSwitchHandler::ModUpBatch`'s layout), `key_table` holds, per switch
-   * and per digit, the key's b and a limb pointers (already offset by the
-   * terminal-prime padding, as `EvaluationKey::ConstViewVector(i, offset)`
-   * gives them) and `key_extra` the limb offset their auxiliary part carries.
-   * `bx + b * bx_batch_stride` is the switch's original b-part, added in
-   * times the per-prime `p_prod` on the q limbs.
+   * and per digit, FOUR pointers: the key's b and a q limbs (already offset
+   * by the terminal-prime padding, as `EvaluationKey::ConstViewVector(i,
+   * offset)` gives them) and its b and a auxiliary limbs -- every key with
+   * its own limb layout. `bx + b * bx_batch_stride` is the switch's original b-part, added in
+   * times the per-prime `p_prod` on the q limbs; `add_a` (null or the same
+   * layout) is added to the a-part the same way -- the relinearization's
+   * (D0, D1 + D2), whose P-multiple the mod-down returns exactly.
    */
   void KeyMultBatch(word *dst, int dst_batch_stride, const NPInfo &np,
                     const std::vector<const word *> &modup,
                     int modup_batch_stride, const word *const *key_table,
-                    int key_extra, const word *bx, int bx_batch_stride,
+                    const word *bx, const word *add_a, int bx_batch_stride,
                     const word *p_prod, int batch) const;
 
   /**

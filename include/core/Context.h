@@ -510,6 +510,42 @@ class Context {
                     const std::vector<const Evk *> &keys, int batch) const;
 
   /**
+   * @brief The general form: switch polynomial `switched + b * switched_stride`
+   * with `keys[b]` and add ciphertext (`add_b`, `add_a`) `+ b * add_stride`
+   * to the result (either may be null). `MultKey` is `switched = a-part,
+   * add_b = b-part, add_a = null`; `Relinearize` of `(bx, ax, rx)` is
+   * `switched = rx, add_b = bx, add_a = ax`. The addends enter the extended
+   * basis as their P-multiples, which the mod-down returns exactly (they are
+   * 0 mod P), so the words are `MultKey`'s followed by `Add`'s.
+   */
+  void MultKeyBatch(word *dst, int dst_ct_stride, const word *switched,
+                    int switched_stride, const word *add_b, const word *add_a,
+                    int add_stride, const NPInfo &np,
+                    const std::vector<const Evk *> &keys, int batch) const;
+
+  /**
+   * @brief The general form without the mod-down: the accumulators on the
+   * extended basis, ciphertext `b` at `dst + b * dst_ct_stride` as its b-part
+   * followed by its a-part, `(num_q + num_aux) * degree` words each -- what
+   * `MultKeyNoModDown` leaves, for a caller that goes on accumulating there.
+   */
+  void MultKeyBatchNoModDown(word *dst, int dst_ct_stride,
+                             const word *switched, int switched_stride,
+                             const word *add_b, const word *add_a,
+                             int add_stride, const NPInfo &np,
+                             const std::vector<const Evk *> &keys,
+                             int batch) const;
+
+  /**
+   * @brief `ModUpForKeySwitchBatch` raises its group in one
+   * `ModUpFromCoeffBatch` at any digit count; `true` restores the per-switch
+   * loop (`CHEDDAR_MODUP_COEFF_SERIAL=1`), the A/B baseline. The two are
+   * word-for-word equal (`CiMlweTest`).
+   */
+  static void SetModUpCoeffSerial(bool serial);
+  static bool modup_coeff_serial_;
+
+  /**
    * @brief Build the mod-switch machinery for key switches at `level` against
    * keys carrying `num_aux` auxiliary primes instead of `alpha_`.
    *

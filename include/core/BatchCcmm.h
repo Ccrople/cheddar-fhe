@@ -71,8 +71,17 @@ class BatchCcmmHandler {
   const Parameter<word> &param_;
   CmtHandler<word> cmt_;
   SubringCtMatrixHandler<word> matrix_;
+  // Steps 5-7 column by column (the old loop; `CHEDDAR_CCMM_RELIN_SERIAL=1`)
+  // instead of as one group.
+  bool relin_serial_ = false;
 
  public:
+  /**
+   * @brief Run steps 5-7 per column (the serial loop) or as one batched
+   * group; the two are word-for-word equal (`BatchCcmmTest`).
+   */
+  void SetRelinSerial(bool serial);
+
   BatchCcmmHandler(const Parameter<word> &param,
                    const NTTHandler<word> &ntt_handler);
 

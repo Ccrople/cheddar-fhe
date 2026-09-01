@@ -45,6 +45,50 @@ TEST_P(Testbed32, Bootstrap) {
   CompareMessages(msg1, res);
 }
 
+// The hoisted transform's giant steps as one batched key switch against the
+// per-rotation loop: the same kernels, and a modular sum in either order, so
+// StC's words must agree exactly.
+TEST_P(Testbed32, TheBatchedGiantStepsAreTheSerialOnesWordForWord) {
+  using word = uint32_t;
+  const int num_slots = param_->MaxNumSlots();
+  std::shared_ptr<BootContext<word>> boot_context =
+      std::dynamic_pointer_cast<BootContext<word>>(context_);
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<Complex> msg;
+  GenerateRandomMessage(msg, num_slots, -1.0, 1.0,
+                        /*complex=*/!param_->conjugate_invariant_);
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, msg,
+                   boot_context->GetBootParameter().GetStCStartLevel());
+
+  Ciphertext<word> serial, batched;
+  HoistHandler<word>::SetGiantStepSerial(true);
+  boot_context->SlotToCoeff(serial, num_slots, ct, interface_->GetEvkMap());
+  HoistHandler<word>::SetGiantStepSerial(false);
+  boot_context->SlotToCoeff(batched, num_slots, ct, interface_->GetEvkMap());
+
+  size_t differ = 0, total = 0;
+  const DeviceVector<word> *got[2] = {&batched.bx_, &batched.ax_};
+  const DeviceVector<word> *want[2] = {&serial.bx_, &serial.ax_};
+  for (int p = 0; p < 2; p++) {
+    HostVector<word> a, b;
+    CopyDeviceToHost(a, *got[p]);
+    CopyDeviceToHost(b, *want[p]);
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); i++) differ += (a[i] != b[i]);
+    total += a.size();
+  }
+  std::cout << "StC giant steps: " << differ << " of " << total
+            << " words differ between the batched and the serial key switches"
+            << std::endl;
+  ASSERT_EQ(differ, 0u);
+}
+
 // [SYLPH] section 3.1.3 states the bootstrap requirement as one number and a
 // rule, and neither is the SNR this suite has always printed:
 //

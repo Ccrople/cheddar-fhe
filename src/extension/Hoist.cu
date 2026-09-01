@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <string>
 
 #include "common/Basic.cuh"
@@ -67,6 +68,29 @@ class TableUpload {
 };
 
 }  // namespace
+
+namespace hoist_kernel {
+
+// dst[z] = *src_ptrs[z], `words` each: the giant steps' a-parts side by side.
+template <typename word>
+__global__ void GatherPolys(word *dst, int words, const word *const *src_ptrs) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= words) return;
+  const int z = blockIdx.z;
+  dst[static_cast<size_t>(z) * words + i] = src_ptrs[z][i];
+}
+
+}  // namespace hoist_kernel
+
+template <typename word>
+bool HoistHandler<word>::gs_serial_ =
+    (std::getenv("CHEDDAR_HOIST_GS_SERIAL") != nullptr &&
+     std::getenv("CHEDDAR_HOIST_GS_SERIAL")[0] == '1');
+
+template <typename word>
+void HoistHandler<word>::SetGiantStepSerial(bool serial) {
+  gs_serial_ = serial;
+}
 
 namespace kernel {
 
@@ -1205,7 +1229,70 @@ void HoistHandler<word>::EvaluateGiantStepOptimized(
   Dv tmp_moddown(num_q_primes * degree);
 
   bool first = true;
-  {
+  int num_gs = 0;
+  for (const auto &[gs_idx, ct] : accum) num_gs += (gs_idx != 0);
+  if (!gs_serial_ && num_gs >= 2 && pt_level_ >= 0) {
+    // Every giant step is the same key switch at the same level with its own
+    // key, and its result is permuted by its own rotation and added: one
+    // group -- the a-parts gathered, mod-down, mod-up, key multiply as a batch
+    // (`Context::MultKeyBatchNoModDown`), then `PermuteAccum` folds every
+    // rotation into `final_accum` in one pass. Word for word the loop below:
+    // the same kernels, and the modular sum in either order.
+    NvtxScope nvtx_scope("hoist giant ks");
+    const int ext_words = ref_ct_np.GetNumTotal() * degree;
+    const int q_words = num_q_primes * degree;
+    const int p_words = num_p_primes * degree;
+    const NPInfo q_np(ref_ct_np.num_main_, ref_ct_np.num_ter_, 0, degree);
+    std::vector<const Evk *> keys;
+    std::vector<int> rot_indices;
+    HostVector<uint64_t> ptrs(num_gs);
+    for (const auto &[gs_idx, ct] : accum) {
+      if (gs_idx == 0) continue;
+      ptrs[keys.size()] = reinterpret_cast<uint64_t>(ct.ax_.data());
+      keys.push_back(&evk_map.GetRotationKey(gs_idx));
+      rot_indices.push_back(gs_idx);
+    }
+    DeviceVector<uint64_t> ptrs_dev;
+    CopyHostToDevice(ptrs_dev, ptrs);
+    Dv gathered(static_cast<size_t>(num_gs) * ext_words);
+    {
+      ProfileScope s2("giant ks: gather");
+      constexpr int block = 256;
+      hoist_kernel::GatherPolys<word><<<dim3(DivCeil(ext_words, block), 1,
+                                             num_gs),
+                                        block>>>(
+          gathered.data(), ext_words,
+          reinterpret_cast<const word *const *>(ptrs_dev.data()));
+    }
+    Dv moddown(static_cast<size_t>(num_gs) * q_words);
+    {
+      ProfileScope s2("giant ks: moddown");
+      mod_switcher.ModDownBatch(moddown.data(), q_words, gathered.data(),
+                                ext_words, num_gs);
+    }
+    Dv switched(static_cast<size_t>(num_gs) * 2 * ext_words);
+    {
+      ProfileScope s2("giant ks: modup+keymult");
+      context->MultKeyBatchNoModDown(switched.data(), 2 * ext_words,
+                                     moddown.data(), q_words, nullptr, nullptr,
+                                     0, q_np, keys, num_gs);
+    }
+    {
+      ProfileScope s2("giant ks: permute+add");
+      std::vector<std::vector<DvConstView<word>>> views;
+      for (int g = 0; g < num_gs; g++) {
+        const word *base = switched.data() + static_cast<size_t>(g) * 2 * ext_words;
+        views.push_back({DvConstView<word>(base, ext_words, p_words),
+                         DvConstView<word>(base + ext_words, ext_words, p_words)});
+      }
+      // in place: the accumulator itself is the extra, unrotated term
+      views.push_back(final_accum->ConstViewVector());
+      auto final_accum_view = final_accum->ViewVector();
+      context->elem_handler_.PermuteAccum(final_accum_view, ref_ct_np,
+                                          rot_indices, views);
+    }
+    first = false;
+  } else {
     NvtxScope nvtx_scope("hoist giant ks");
     for (const auto &[gs_idx, ct] : accum) {
       if (gs_idx == 0) continue;

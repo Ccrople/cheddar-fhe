@@ -46,6 +46,19 @@ class HoistHandler {
 
   constexpr static int max_log_beta_ = 4;
   constexpr static int max_log_bs_ = 7;
+  // The giant-step key switches one rotation at a time (the old loop;
+  // `CHEDDAR_HOIST_GS_SERIAL=1`) instead of as one batched group.
+  static bool gs_serial_;
+
+ public:
+  /**
+   * @brief Run the giant steps' key switches one by one (the serial loop) or
+   * as one group (`Context::MultKeyBatchNoModDown` + `PermuteAccum`); the two
+   * are word-for-word equal (`boot_test`).
+   */
+  static void SetGiantStepSerial(bool serial);
+
+ private:
 
   // `mutable`: residency (`Stage`/`Unstage`) is not a logical change to the
   // transform, and every reader of the map is const.

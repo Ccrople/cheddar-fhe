@@ -467,6 +467,57 @@ TEST_P(Testbed32, ModPackInvertsModDecomp) {
   ASSERT_LT(max_abs, 1e-3);
 }
 
+// ModPack's group mod-up (`ModUpFromCoeffBatch` at any digit count) against
+// the per-switch loop it replaced: the same kernels over a batch, so the
+// packed words must agree exactly, on both rings.
+TEST_P(Testbed32, TheBatchedModPackIsTheSerialOneWordForWord) {
+  const int degree = 1 << log_degree_;
+  const int rank = 4;
+  const int small_degree = degree / rank;
+
+  MlweHandler<word> mlwe(*param_, context_->ntt_handler_);
+
+  const int level = std::min(2, param_->max_level_);
+  interface_->PrepareModPackKeys(small_degree, level);
+  std::vector<const EvaluationKey<word> *> keys;
+  for (int j = 0; j < rank; j++) {
+    keys.push_back(&interface_->GetModPackKey(rank, j));
+  }
+
+  std::vector<double> coeffs(degree);
+  Random::SampleUniformReal(coeffs.data(), degree, -1.0, 1.0);
+  Plaintext<word> pt;
+  context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), coeffs);
+  Ciphertext<word> ct;
+  interface_->Encrypt(ct, pt);
+  std::vector<MlweCiphertext<word>> parts;
+  mlwe.ModDecomp(parts, ct, small_degree);
+
+  Ciphertext<word> serial, batched;
+  Context<word>::SetModUpCoeffSerial(true);
+  mlwe.ModPack(context_, serial, parts, keys);
+  Context<word>::SetModUpCoeffSerial(false);
+  mlwe.ModPack(context_, batched, parts, keys);
+
+  size_t differ = 0, total = 0;
+  const DeviceVector<word> *got[2] = {&batched.bx_, &batched.ax_};
+  const DeviceVector<word> *want[2] = {&serial.bx_, &serial.ax_};
+  for (int p = 0; p < 2; p++) {
+    HostVector<word> a, b;
+    CopyDeviceToHost(a, *got[p]);
+    CopyDeviceToHost(b, *want[p]);
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); i++) differ += (a[i] != b[i]);
+    total += a.size();
+  }
+  std::cout << (param_->conjugate_invariant_ ? "CI" : "ordinary")
+            << " ModPack, rank " << rank << ", level " << level << ": "
+            << differ << " of " << total
+            << " words differ between the batched and the per-switch mod-up"
+            << std::endl;
+  ASSERT_EQ(differ, 0u);
+}
+
 // The product between decomposition and packing: res_l = sum_j U[l][j] *
 // parts[j] over the module components, then packed and decrypted, against the
 // same map on the host. `PcmmHandler::Multiply` is a scalar combination and

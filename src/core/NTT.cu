@@ -1114,7 +1114,11 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
   AssertTrue(batch == 1 || (src.AuxSize() == dst.AuxSize() &&
                             src.QSize() == dst.QSize()),
              "NTTForModUp: a batched transform is in place over one buffer");
-  AssertTrue(batch == 1 || !param_.conjugate_invariant_ || skip_start == skip_end,
+  // The batched fold takes skipped limbs like the single one does (the kernel
+  // reads its skip range per limb, the stride per blockIdx.z); a prefolded
+  // caller runs no fold at all.
+  AssertTrue(batch == 1 || !param_.conjugate_invariant_ || ci_prefolded ||
+                 skip_start == skip_end,
              "NTTForModUp: a batched transform cannot skip limbs");
 
   // Extra handling for skip primes

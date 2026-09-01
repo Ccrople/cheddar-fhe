@@ -110,6 +110,15 @@ class ModSwitchHandler {
   void ModDownBatch(word *dst, int dst_batch_stride, const word *src,
                     int src_batch_stride, int batch) const;
 
+  /**
+   * @brief Rescale for `batch` polynomials at once: polynomial `b` is read at
+   * `src + b * src_batch_stride` (this level's q limbs) and written to
+   * `dst + b * dst_batch_stride` (the next level's), word for word what
+   * `Rescale` gives. Ordinary ring only.
+   */
+  void RescaleBatch(word *dst, int dst_batch_stride, const word *src,
+                    int src_batch_stride, int batch) const;
+
   void ModDown(DvView<word> &dst, const DvConstView<word> &src) const;
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
   void ModDownAndRescale(DvView<word> &dst, const DvConstView<word> &src) const;

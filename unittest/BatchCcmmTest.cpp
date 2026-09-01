@@ -196,6 +196,67 @@ TEST_P(Testbed32, BatchCcmmLanesStayIndependent) {
   ASSERT_GT(live_mean, 1e-3) << "no lane produced output";
 }
 
+// Steps 5-7 as one group must be the per-column loop word for word: the same
+// kernels, and the addend's P-multiple is returned exactly by the mod-down.
+TEST_P(Testbed32, TheBatchedRelinearizationIsTheSerialOneWordForWord) {
+  const int degree = param_->degree_;
+  const int d = degree / kSubDegree;
+  const int lanes = kSubDegree / 2;
+  const int level = param_->max_level_;
+  const double scale = DetermineScale(level);
+
+  BatchCcmmHandler<word> ccmm(*param_, context_->ntt_handler_);
+  for (int index : ccmm.RotationIndices(kSubDegree)) {
+    interface_->PrepareRotationKey(index, level);
+  }
+  const Batch m = RandomBatch(lanes, d, 0.15);
+  const Batch mp = RandomBatch(lanes, d, 0.15);
+  auto encrypt = [&](const Batch &src, std::vector<Ciphertext<word>> &out) {
+    out.resize(d);
+    for (int j = 0; j < d; j++) {
+      std::vector<Complex> message(degree / 2);
+      for (int i = 0; i < d; i++) {
+        for (int t = 0; t < lanes; t++) message[i * lanes + t] = src[t][i][j];
+      }
+      Plaintext<word> pt;
+      context_->encoder_.EncodeSinC(pt, level, scale, message, kSubDegree);
+      interface_->Encrypt(out[j], pt);
+    }
+  };
+  std::vector<Ciphertext<word>> lhs, rhs;
+  encrypt(m, lhs);
+  encrypt(mp, rhs);
+
+  std::vector<Ciphertext<word>> serial, batched;
+  ccmm.SetRelinSerial(true);
+  ccmm.Multiply(context_, serial, lhs, rhs, kSubDegree,
+                interface_->GetEvkMap());
+  ccmm.SetRelinSerial(false);
+  ccmm.Multiply(context_, batched, lhs, rhs, kSubDegree,
+                interface_->GetEvkMap());
+  ASSERT_EQ(serial.size(), batched.size());
+
+  size_t differ = 0, total = 0;
+  for (int j = 0; j < d; j++) {
+    ASSERT_EQ(serial[j].GetNP(), batched[j].GetNP());
+    ASSERT_DOUBLE_EQ(serial[j].GetScale(), batched[j].GetScale());
+    ASSERT_EQ(serial[j].GetNumSlots(), batched[j].GetNumSlots());
+    const DeviceVector<word> *got[2] = {&batched[j].bx_, &batched[j].ax_};
+    const DeviceVector<word> *want[2] = {&serial[j].bx_, &serial[j].ax_};
+    for (int p = 0; p < 2; p++) {
+      HostVector<word> a, b;
+      CopyDeviceToHost(a, *got[p]);
+      CopyDeviceToHost(b, *want[p]);
+      ASSERT_EQ(a.size(), b.size());
+      for (size_t i = 0; i < a.size(); i++) differ += (a[i] != b[i]);
+      total += a.size();
+    }
+  }
+  std::cout << "batched relinearization: " << differ << " of " << total
+            << " words differ from the serial loop" << std::endl;
+  ASSERT_EQ(differ, 0u);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     BatchCcmm, Testbed32, testing::ValuesIn(SmallRingParams()),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {

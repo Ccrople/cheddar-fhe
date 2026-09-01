@@ -1730,8 +1730,8 @@ __global__ void KeyMultBatch(int log_degree, word *dst, int dst_batch_stride,
                              int ext_words, const word *primes,
                              const make_signed_t<word> *inv_primes,
                              int num_q_primes, const DigitPtrList<word> modup,
-                             const word *const *key_table, int key_extra,
-                             const word *bx, int bx_batch_stride,
+                             const word *const *key_table, const word *bx,
+                             const word *add_a, int bx_batch_stride,
                              const word *p_prod) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= ext_words) return;
@@ -1741,15 +1741,18 @@ __global__ void KeyMultBatch(int log_degree, word *dst, int dst_batch_stride,
   const make_signed_t<word> inv_prime =
       basic::StreamingLoadConst(inv_primes + prime_index);
   const bool aux_part = (prime_index >= num_q_primes);
-  const int key_index = aux_part ? i + key_extra : i;
+  // Four pointers per (switch, digit): the key's b and a q limbs, then its b
+  // and a auxiliary limbs -- each key carries its own layout.
+  const int key_index = aux_part ? i - (num_q_primes << log_degree) : i;
+  const int key_half = aux_part ? 2 : 0;
 
   word res_b = 0;
   word res_a = 0;
-  const word *const *keys = key_table + z * modup.num_digits_ * 2;
+  const word *const *keys = key_table + z * modup.num_digits_ * 4;
   for (int d = 0; d < modup.num_digits_; d++) {
     const word m = basic::StreamingLoad(modup.ptrs_[d] + z * modup.batch_stride_ + i);
-    const word kb = basic::StreamingLoad(keys[2 * d] + key_index);
-    const word ka = basic::StreamingLoad(keys[2 * d + 1] + key_index);
+    const word kb = basic::StreamingLoad(keys[4 * d + key_half] + key_index);
+    const word ka = basic::StreamingLoad(keys[4 * d + key_half + 1] + key_index);
     res_b = basic::Add(res_b, basic::MultMontgomery(m, kb, prime, inv_prime),
                        prime);
     res_a = basic::Add(res_a, basic::MultMontgomery(m, ka, prime, inv_prime),
@@ -1757,9 +1760,16 @@ __global__ void KeyMultBatch(int log_degree, word *dst, int dst_batch_stride,
   }
   if (!aux_part) {
     const word pp = basic::StreamingLoadConst(p_prod + prime_index);
-    const word b = basic::StreamingLoad(bx + z * bx_batch_stride + i);
-    res_b = basic::Add(res_b, basic::MultMontgomery(pp, b, prime, inv_prime),
-                       prime);
+    if (bx != nullptr) {
+      const word b = basic::StreamingLoad(bx + z * bx_batch_stride + i);
+      res_b = basic::Add(res_b,
+                         basic::MultMontgomery(pp, b, prime, inv_prime), prime);
+    }
+    if (add_a != nullptr) {
+      const word a = basic::StreamingLoad(add_a + z * bx_batch_stride + i);
+      res_a = basic::Add(res_a,
+                         basic::MultMontgomery(pp, a, prime, inv_prime), prime);
+    }
   }
   word *out = dst + z * dst_batch_stride;
   out[i] = res_b;
@@ -1793,7 +1803,7 @@ template <typename word>
 void ElementWiseHandler<word>::KeyMultBatch(
     word *dst, int dst_batch_stride, const NPInfo &np,
     const std::vector<const word *> &modup, int modup_batch_stride,
-    const word *const *key_table, int key_extra, const word *bx,
+    const word *const *key_table, const word *bx, const word *add_a,
     int bx_batch_stride, const word *p_prod, int batch) const {
   const int num_digits = static_cast<int>(modup.size());
   AssertTrue(num_digits >= 1 && num_digits <= max_batch_digits_,
@@ -1811,7 +1821,7 @@ void ElementWiseHandler<word>::KeyMultBatch(
   kernel::KeyMultBatch<word><<<grid_dim, kernel_block_dim_>>>(
       param_.log_degree_, dst, dst_batch_stride, ext_words,
       param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np), np.GetNumQ(), list,
-      key_table, key_extra, bx, bx_batch_stride, p_prod);
+      key_table, bx, add_a, bx_batch_stride, p_prod);
 }
 
 template <typename word>

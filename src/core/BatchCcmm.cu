@@ -1,14 +1,65 @@
+#include <cstdlib>
+
 #include "common/Assert.h"
+#include "common/Basic.cuh"
 #include "common/CommonUtils.h"
 #include "core/BatchCcmm.h"
 #include "extension/Profile.h"
 
 namespace cheddar {
 
+namespace kernel {
+
+// The relinearization's operands for d columns in two contiguous buffers:
+//   switched[z]          = D3[z]           (d23[z].ax, the sk^2 part)
+//   addend[z]            = (D0[z], D1[z] + D2[z])
+//                        = (d01[z].bx, d01[z].ax + d23[z].bx)
+// src_ptrs[4z .. 4z+3] = d01.bx, d01.ax, d23.bx, d23.ax; blockIdx.y picks the
+// output polynomial (0: switched, 1: addend b, 2: addend a).
+template <typename word>
+__global__ void RelinGather(int log_degree, word *switched, word *addend,
+                            int poly_words, const word *const *src_ptrs,
+                            const word *primes) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= poly_words) return;
+  const int z = blockIdx.z;
+  const word *const *s = src_ptrs + 4 * z;
+  if (blockIdx.y == 0) {
+    switched[z * poly_words + i] = basic::StreamingLoad(s[3] + i);
+  } else if (blockIdx.y == 1) {
+    addend[z * 2 * poly_words + i] = basic::StreamingLoad(s[0] + i);
+  } else {
+    const word prime = basic::StreamingLoadConst(primes + (i >> log_degree));
+    addend[z * 2 * poly_words + poly_words + i] = basic::Add(
+        basic::StreamingLoad(s[1] + i), basic::StreamingLoad(s[2] + i), prime);
+  }
+}
+
+// dst_ptrs[2z + blockIdx.y][i] = src[z][poly blockIdx.y][i].
+template <typename word>
+__global__ void RelinScatter(word *const *dst_ptrs, int poly_words,
+                             const word *src) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= poly_words) return;
+  const int z = blockIdx.z;
+  dst_ptrs[2 * z + blockIdx.y][i] =
+      basic::StreamingLoad(src + z * 2 * poly_words + blockIdx.y * poly_words + i);
+}
+
+}  // namespace kernel
+
 template <typename word>
 BatchCcmmHandler<word>::BatchCcmmHandler(const Parameter<word> &param,
                                          const NTTHandler<word> &ntt_handler)
-    : param_{param}, cmt_{param, ntt_handler}, matrix_{param, ntt_handler} {}
+    : param_{param}, cmt_{param, ntt_handler}, matrix_{param, ntt_handler} {
+  const char *env = std::getenv("CHEDDAR_CCMM_RELIN_SERIAL");
+  relin_serial_ = (env != nullptr && env[0] == '1');
+}
+
+template <typename word>
+void BatchCcmmHandler<word>::SetRelinSerial(bool serial) {
+  relin_serial_ = serial;
+}
 
 template <typename word>
 std::vector<int> BatchCcmmHandler<word>::RotationIndices(
@@ -86,6 +137,69 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
   NvtxScope _r("ccmm: Relinearize + Rescale per column");
 
   res.resize(d);
+  const bool batched =
+      !relin_serial_ && !param_.conjugate_invariant_ && d >= 2;
+  if (batched) {
+    // Steps 5-7 for every column in one group: the key switch of the d
+    // sk^2 parts with the ONE multiplication key, (D0, D1 + D2) folded in as
+    // the switch's addend (Context::MultKeyBatch), the rescale over the 2d
+    // polynomials (ModSwitchHandler::RescaleBatch). Every word is the serial
+    // loop's: the same kernels, and modular sums in either order.
+    const int poly_words = num_total_primes * degree;
+    const NPInfo next_np = param_.LevelToNP(level - 1);
+    const int next_words = next_np.GetNumTotal() * degree;
+    constexpr int block = 256;
+    DeviceVector<word> switched(static_cast<size_t>(d) * poly_words);
+    DeviceVector<word> addend(static_cast<size_t>(d) * 2 * poly_words);
+    {
+      HostVector<uint64_t> ptrs(4 * d);
+      for (int j = 0; j < d; j++) {
+        ptrs[4 * j] = reinterpret_cast<uint64_t>(d01[j].bx_.data());
+        ptrs[4 * j + 1] = reinterpret_cast<uint64_t>(d01[j].ax_.data());
+        ptrs[4 * j + 2] = reinterpret_cast<uint64_t>(d23[j].bx_.data());
+        ptrs[4 * j + 3] = reinterpret_cast<uint64_t>(d23[j].ax_.data());
+      }
+      DeviceVector<uint64_t> ptrs_dev;
+      CopyHostToDevice(ptrs_dev, ptrs);
+      kernel::RelinGather<word><<<dim3(DivCeil(poly_words, block), 3, d),
+                                  block>>>(
+          param_.log_degree_, switched.data(), addend.data(), poly_words,
+          reinterpret_cast<const word *const *>(ptrs_dev.data()),
+          param_.GetPrimesPtr(np));
+    }
+    DeviceVector<word> combined_all(static_cast<size_t>(d) * 2 * poly_words);
+    {
+      std::vector<const EvaluationKey<word> *> keys(
+          d, &evk_map.GetMultiplicationKey());
+      context->MultKeyBatch(combined_all.data(), 2 * poly_words,
+                            switched.data(), poly_words, addend.data(),
+                            addend.data() + poly_words, 2 * poly_words, np,
+                            keys, d);
+    }
+    DeviceVector<word> rescaled(static_cast<size_t>(d) * 2 * next_words);
+    context->mod_switch_handlers_.at(level).RescaleBatch(
+        rescaled.data(), next_words, combined_all.data(), poly_words, 2 * d);
+    {
+      HostVector<uint64_t> ptrs(2 * d);
+      for (int j = 0; j < d; j++) {
+        Ct &r = res[j];
+        r.RemoveRx();
+        r.ModifyNP(next_np);
+        r.SetScale(product_scale / param_.GetRescalePrimeProd(level));
+        r.SetNumSlots(num_slots);
+        ptrs[2 * j] = reinterpret_cast<uint64_t>(r.bx_.data());
+        ptrs[2 * j + 1] = reinterpret_cast<uint64_t>(r.ax_.data());
+      }
+      DeviceVector<uint64_t> ptrs_dev;
+      CopyHostToDevice(ptrs_dev, ptrs);
+      kernel::RelinScatter<word><<<dim3(DivCeil(next_words, block), 2, d),
+                                   block>>>(
+          reinterpret_cast<word *const *>(ptrs_dev.data()), next_words,
+          rescaled.data());
+    }
+    return;
+  }
+
   Ct relin_input, relinearized, combined;
   for (int j = 0; j < d; j++) {
     // 5. Relinearize (0, D3). D3 is the a-part of the (D2, D3) pair, and it
