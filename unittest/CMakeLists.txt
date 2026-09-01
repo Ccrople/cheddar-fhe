@@ -252,6 +252,16 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_sinc_basis_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # The BATCHED layer on R+ (branch llama3_CI_new): one channel per
+  # ciphertext, the slots holding (token, instance) pairs, and every
+  # projection as [KANG] Algorithm 1 with a batch-invariant weight -- the
+  # int8 GEMM over whole ciphertexts, no ModDecomp/ModPack, no key. Against a
+  # host reference at a small width, then the real layer-0 weights at the
+  # model's width (LLAMA3_ALL_DIR).
+  add_executable(ci_batch_test CiBatchTest.cpp)
+  target_link_libraries(ci_batch_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)

@@ -156,6 +156,13 @@ class PcmmBlasHandler {
     NPInfo np;
     int chunk_b = 0;
     int chunk_a = 0;
+    // The RLWE form (`PrepareSource(..., const std::vector<Ct> &, rows)`)
+    // records the row count its chunks were cut for and the inputs' slot
+    // count, so that a product against a SMALLER row tile can reuse it: the
+    // chunk is a function of the rows only through the accumulator budget,
+    // and a smaller tile needs less of it, never more.
+    int rows = 0;
+    int num_slots = 0;
     std::vector<DeviceVector<int8_t>> b_data;  // [prime * chunks + chunk]
     std::vector<DeviceVector<int8_t>> a_data;
 
@@ -264,6 +271,30 @@ class PcmmBlasHandler {
    */
   void PrepareSource(SplitSource &res, const SplitMatrix &u,
                      const std::vector<MlweCiphertext<word>> &cts) const;
+
+  /**
+   * @brief The RLWE form of `PrepareSource`: whole ciphertexts split once,
+   * for a product taken against several row tiles of one weight.
+   *
+   * This is the [KANG] Algorithm 1 form of the projection (`CiBatchProjection`):
+   * the contracted channel sits on the CIPHERTEXT axis, so the source is the
+   * ciphertexts themselves -- rank 1, vector length the ring degree -- and a
+   * weight wider than one tile's worth of output rows is applied tile by tile
+   * against the same split. `rows` is the LARGEST tile the split will meet
+   * (0 = `u.rows`); the chunk is cut for it, and `Multiply(res, u, src)` then
+   * accepts any `u` with `u.rows <= rows` and the same columns, pieces and NP.
+   */
+  void PrepareSource(SplitSource &res, const SplitMatrix &u,
+                     const std::vector<Ct> &cts, int rows = 0) const;
+
+  /**
+   * @brief The RLWE product against a source split by the overload above.
+   * Same contract as `Multiply(res, u, cts)`: no rescaling, the result at
+   * `u.scale * cts[0].scale`. Word for word what that overload computes,
+   * which now runs through here.
+   */
+  void Multiply(std::vector<Ct> &res, const SplitMatrix &u,
+                const SplitSource &src) const;
 
   /**
    * @brief The MLWE product against a source that is already split.

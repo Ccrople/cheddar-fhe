@@ -456,32 +456,85 @@ void PcmmBlasHandler<word>::ProductComponent(
 }
 
 template <typename word>
-void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
-                                     const SplitMatrix &u,
-                                     const std::vector<Ct> &cts) const {
-  const int rows = u.rows, cols = u.cols;
-  AssertTrue(static_cast<int>(cts.size()) == cols,
-             "PcmmBlas::Multiply: cts size must equal u.cols");
-  AssertTrue(!cts.empty(), "PcmmBlas::Multiply: no inputs");
+void PcmmBlasHandler<word>::PrepareSource(SplitSource &res,
+                                          const SplitMatrix &u,
+                                          const std::vector<Ct> &cts,
+                                          int rows /*= 0*/) const {
+  const int cols = static_cast<int>(cts.size());
+  AssertTrue(cols > 0, "PcmmBlas::PrepareSource: no inputs");
+  AssertTrue(cols == u.cols,
+             "PcmmBlas::PrepareSource: cts size must equal u.cols");
+  if (rows <= 0) rows = u.rows;
+  AssertTrue(rows >= u.rows,
+             "PcmmBlas::PrepareSource: the split must be cut for the largest "
+             "tile it will meet");
 
   const NPInfo np = cts[0].GetNP();
   const int degree = param_.degree_;
-  AssertTrue(np.num_aux_ == 0, "PcmmBlas::Multiply: aux primes unsupported");
-  AssertTrue(np == u.np, "PcmmBlas::Multiply: NP mismatch between u and cts");
+  AssertTrue(np.num_aux_ == 0,
+             "PcmmBlas::PrepareSource: aux primes unsupported");
+  AssertTrue(np == u.np,
+             "PcmmBlas::PrepareSource: NP mismatch between u and cts");
   for (const auto &c : cts) {
-    AssertTrue(c.GetNP() == np, "PcmmBlas::Multiply: mixed NP");
-    AssertFalse(c.HasRx(), "PcmmBlas::Multiply: input has rx");
+    AssertTrue(c.GetNP() == np, "PcmmBlas::PrepareSource: mixed NP");
+    AssertFalse(c.HasRx(), "PcmmBlas::PrepareSource: input has rx");
   }
 
-  const double ct_scale = cts[0].GetScale();
-  const int num_slots = cts[0].GetNumSlots();
+  res.cols = cols;
+  res.pieces = u.pieces;
+  res.rank = 1;
+  res.degree = degree;
+  res.rows = rows;
+  res.num_slots = cts[0].GetNumSlots();
+  res.scale = cts[0].GetScale();
+  res.np = np;
+  // Both components are one ring polynomial per limb, so one chunk serves
+  // both -- the same cut the single-shot product made.
+  res.chunk_b = ChunkFor(cols, rows, u.pieces, degree);
+  res.chunk_a = res.chunk_b;
+
+  HostVector<word *> h_src_bx(cols), h_src_ax(cols);
+  for (int j = 0; j < cols; j++) {
+    h_src_bx[j] = const_cast<word *>(cts[j].bx_.data());
+    h_src_ax[j] = const_cast<word *>(cts[j].ax_.data());
+  }
+  DeviceVector<word *> d_src_bx(cols), d_src_ax(cols);
+  CopyHostToDevice(d_src_bx, h_src_bx);
+  CopyHostToDevice(d_src_ax, h_src_ax);
+
+  SplitComponent(res.b_data, d_src_bx.data(), cols, u.pieces, np, degree,
+                 res.chunk_b);
+  SplitComponent(res.a_data, d_src_ax.data(), cols, u.pieces, np, degree,
+                 res.chunk_a);
+}
+
+template <typename word>
+void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
+                                     const SplitMatrix &u,
+                                     const SplitSource &src) const {
+  const int rows = u.rows, cols = u.cols;
+  AssertTrue(rows > 0 && cols > 0, "PcmmBlas::Multiply: bad shape");
+  AssertTrue(src.rank == 1 && src.degree == param_.degree_,
+             "PcmmBlas::Multiply: the split source is not an RLWE one");
+  AssertTrue(cols == src.cols && u.pieces == src.pieces && u.np == src.np,
+             "PcmmBlas::Multiply: the split source was prepared for a "
+             "different matrix");
+  AssertTrue(rows <= src.rows,
+             "PcmmBlas::Multiply: the split source was cut for fewer rows "
+             "than this tile has");
+  AssertTrue(ChunkFor(cols, src.rows, u.pieces, src.degree) == src.chunk_b,
+             "PcmmBlas::Multiply: the split source was cut for a different "
+             "row count");
+
+  const NPInfo np = src.np;
+  const int degree = src.degree;
   res.clear();
   res.resize(rows);
   for (auto &r : res) {
     r.ModifyNP(np);
     r.RemoveRx();
-    r.SetNumSlots(num_slots);
-    r.SetScale(u.scale * ct_scale);
+    r.SetNumSlots(src.num_slots);
+    r.SetScale(u.scale * src.scale);
   }
 
   HostVector<word *> h_dst_bx(rows), h_dst_ax(rows);
@@ -493,23 +546,20 @@ void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
   CopyHostToDevice(d_dst_bx, h_dst_bx);
   CopyHostToDevice(d_dst_ax, h_dst_ax);
 
-  HostVector<word *> h_src_bx(cols), h_src_ax(cols);
-  for (int j = 0; j < cols; j++) {
-    h_src_bx[j] = const_cast<word *>(cts[j].bx_.data());
-    h_src_ax[j] = const_cast<word *>(cts[j].ax_.data());
-  }
-  DeviceVector<word *> d_src_bx(cols), d_src_ax(cols);
-  CopyHostToDevice(d_src_bx, h_src_bx);
-  CopyHostToDevice(d_src_ax, h_src_ax);
+  ProductComponent(d_dst_bx.data(), src.b_data, u, np, degree, src.chunk_b);
+  ProductComponent(d_dst_ax.data(), src.a_data, u, np, degree, src.chunk_a);
+}
 
-  // One product per component, so there is nothing to amortise the split
-  // across and it is discarded as soon as the component is done.
-  const int chunk = ChunkFor(cols, rows, u.pieces, degree);
-  std::vector<DeviceVector<int8_t>> split;
-  SplitComponent(split, d_src_bx.data(), cols, u.pieces, np, degree, chunk);
-  ProductComponent(d_dst_bx.data(), split, u, np, degree, chunk);
-  SplitComponent(split, d_src_ax.data(), cols, u.pieces, np, degree, chunk);
-  ProductComponent(d_dst_ax.data(), split, u, np, degree, chunk);
+template <typename word>
+void PcmmBlasHandler<word>::Multiply(std::vector<Ct> &res,
+                                     const SplitMatrix &u,
+                                     const std::vector<Ct> &cts) const {
+  // One product per source, so the split is discarded as soon as it is
+  // done; a caller with several row tiles against one source keeps it
+  // (`PrepareSource` + `Multiply(res, u, src)`), which is the same words.
+  SplitSource src;
+  PrepareSource(src, u, cts);
+  Multiply(res, u, src);
 }
 
 template <typename word>
