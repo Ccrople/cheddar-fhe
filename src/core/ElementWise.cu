@@ -1710,6 +1710,127 @@ void ElementWiseHandler<word>::MultImaginaryUnit(
   });
 }
 
+// ----- Batched key switching ----- //
+
+namespace kernel {
+
+template <typename word>
+struct DigitPtrList {
+  const word *ptrs_[8];
+  int num_digits_ = 0;
+  int batch_stride_ = 0;
+};
+
+// One switch per blockIdx.z: accum.b = sum_i modup_i * key_b_i + p_prod * bx,
+// accum.a = sum_i modup_i * key_a_i -- CPAccum's per-digit products and sums
+// and CAccum's p_prod term, in one pass. The modular sum does not care about
+// the order the terms arrive in, so the words are those of the two kernels.
+template <typename word>
+__global__ void KeyMultBatch(int log_degree, word *dst, int dst_batch_stride,
+                             int ext_words, const word *primes,
+                             const make_signed_t<word> *inv_primes,
+                             int num_q_primes, const DigitPtrList<word> modup,
+                             const word *const *key_table, int key_extra,
+                             const word *bx, int bx_batch_stride,
+                             const word *p_prod) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= ext_words) return;
+  const int z = blockIdx.z;
+  const int prime_index = (i >> log_degree);
+  const word prime = basic::StreamingLoadConst(primes + prime_index);
+  const make_signed_t<word> inv_prime =
+      basic::StreamingLoadConst(inv_primes + prime_index);
+  const bool aux_part = (prime_index >= num_q_primes);
+  const int key_index = aux_part ? i + key_extra : i;
+
+  word res_b = 0;
+  word res_a = 0;
+  const word *const *keys = key_table + z * modup.num_digits_ * 2;
+  for (int d = 0; d < modup.num_digits_; d++) {
+    const word m = basic::StreamingLoad(modup.ptrs_[d] + z * modup.batch_stride_ + i);
+    const word kb = basic::StreamingLoad(keys[2 * d] + key_index);
+    const word ka = basic::StreamingLoad(keys[2 * d + 1] + key_index);
+    res_b = basic::Add(res_b, basic::MultMontgomery(m, kb, prime, inv_prime),
+                       prime);
+    res_a = basic::Add(res_a, basic::MultMontgomery(m, ka, prime, inv_prime),
+                       prime);
+  }
+  if (!aux_part) {
+    const word pp = basic::StreamingLoadConst(p_prod + prime_index);
+    const word b = basic::StreamingLoad(bx + z * bx_batch_stride + i);
+    res_b = basic::Add(res_b, basic::MultMontgomery(pp, b, prime, inv_prime),
+                       prime);
+  }
+  word *out = dst + z * dst_batch_stride;
+  out[i] = res_b;
+  out[ext_words + i] = res_a;
+}
+
+// Permute's index map with the automorphism read per blockIdx.z.
+template <typename word>
+__global__ void PermuteBatch(int log_degree, word *dst, const word *src,
+                             int batch_stride, int poly_stride, int total_words,
+                             const uint32_t *galois_factors,
+                             const uint32_t *galois_offsets) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_words) return;
+  const int z = blockIdx.z;
+  const int degree = 1 << log_degree;
+  const int prime_index = (i >> log_degree);
+  const uint32_t x_idx = i & (degree - 1);
+  const uint32_t x_idx_rev = basic::BitReverse(x_idx, log_degree + 1);
+  const uint32_t gf = galois_factors[z];
+  const uint32_t go = galois_offsets[z];
+  const int src_idx = (prime_index << log_degree) +
+                      basic::BitReverse(x_idx_rev * gf + go, log_degree + 1);
+  const int base = z * batch_stride + blockIdx.y * poly_stride;
+  dst[base + i] = basic::StreamingLoad(src + base + src_idx);
+}
+
+}  // namespace kernel
+
+template <typename word>
+void ElementWiseHandler<word>::KeyMultBatch(
+    word *dst, int dst_batch_stride, const NPInfo &np,
+    const std::vector<const word *> &modup, int modup_batch_stride,
+    const word *const *key_table, int key_extra, const word *bx,
+    int bx_batch_stride, const word *p_prod, int batch) const {
+  const int num_digits = static_cast<int>(modup.size());
+  AssertTrue(num_digits >= 1 && num_digits <= max_batch_digits_,
+             "KeyMultBatch: invalid digit count");
+  AssertTrue(batch >= 1, "KeyMultBatch: invalid batch");
+  const int ext_words = np.GetNumTotal() * param_.degree_;
+  AssertTrue(dst_batch_stride >= 2 * ext_words,
+             "KeyMultBatch: the accumulators overlap");
+  kernel::DigitPtrList<word> list;
+  for (int d = 0; d < num_digits; d++) list.ptrs_[d] = modup.at(d);
+  list.num_digits_ = num_digits;
+  list.batch_stride_ = modup_batch_stride;
+
+  dim3 grid_dim(DivCeil(ext_words, kernel_block_dim_), 1, batch);
+  kernel::KeyMultBatch<word><<<grid_dim, kernel_block_dim_>>>(
+      param_.log_degree_, dst, dst_batch_stride, ext_words,
+      param_.GetPrimesPtr(np), param_.GetInvPrimesPtr(np), np.GetNumQ(), list,
+      key_table, key_extra, bx, bx_batch_stride, p_prod);
+}
+
+template <typename word>
+void ElementWiseHandler<word>::PermuteBatch(
+    word *dst, const word *src, int batch_stride, int poly_stride,
+    int num_poly, const NPInfo &np, const uint32_t *galois_factors,
+    const uint32_t *galois_offsets, int batch) const {
+  AssertTrue(np.num_aux_ == 0, "PermuteBatch: no auxiliary limbs");
+  AssertTrue(num_poly >= 1 && batch >= 1, "PermuteBatch: invalid shape");
+  AssertTrue(dst != src, "PermuteBatch does not support inplace operation");
+  const int total_words = np.GetNumTotal() * param_.degree_;
+  AssertTrue(poly_stride >= total_words && batch_stride >= num_poly * poly_stride,
+             "PermuteBatch: the polynomials overlap");
+  dim3 grid_dim(DivCeil(total_words, kernel_block_dim_), num_poly, batch);
+  kernel::PermuteBatch<word><<<grid_dim, kernel_block_dim_>>>(
+      param_.log_degree_, dst, src, batch_stride, poly_stride, total_words,
+      galois_factors, galois_offsets);
+}
+
 // explicit instantiation
 template class ElementWiseHandler<uint32_t>;
 template class ElementWiseHandler<uint64_t>;

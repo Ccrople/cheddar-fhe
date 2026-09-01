@@ -493,6 +493,23 @@ class Context {
       int batch) const;
 
   /**
+   * @brief `MultKey` for `batch` ciphertexts at one level, each with its own
+   * key, in about as many launches as ONE `MultKey` takes.
+   *
+   * Ciphertext `b` is read at `src + b * src_ct_stride` and written at
+   * `dst + b * dst_ct_stride`, both laid out as its b-part followed by its
+   * a-part, `np.GetNumTotal() * degree` words each, no rx part; `keys[b]` is
+   * its key. Every switch shares the level, the digit shape and the
+   * conversion tables, so the mod-up, the key multiply and the mod-down each
+   * run once over the group with `blockIdx.z` picking the ciphertext -- the
+   * same kernels `MultKey` runs, so the words are `MultKey`'s. Ordinary ring
+   * only (`ModSwitchHandler::ModUpBatch`).
+   */
+  void MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
+                    int src_ct_stride, const NPInfo &np,
+                    const std::vector<const Evk *> &keys, int batch) const;
+
+  /**
    * @brief Build the mod-switch machinery for key switches at `level` against
    * keys carrying `num_aux` auxiliary primes instead of `alpha_`.
    *

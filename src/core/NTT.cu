@@ -27,7 +27,9 @@ __global__ void INTTPhase1(make_signed_t<word> *dst, const word *primes,
                            const word *twiddle_factors,
                            const word *twiddle_factors_msb, int tw_y_extra,
                            int num_q_primes,
-                           const InputPtrList<make_signed_t<word>, 1> src) {
+                           const InputPtrList<make_signed_t<word>, 1> src,
+                           int src_batch_stride = 0,
+                           int dst_batch_stride = 0) {
   // Shared memory initialization
   extern __shared__ char shared_mem[];
   using signed_word = make_signed_t<word>;
@@ -52,12 +54,12 @@ __global__ void INTTPhase1(make_signed_t<word> *dst, const word *primes,
   word prime = basic::StreamingLoadConst(primes + y_idx);
   signed_word inv_prime = basic::StreamingLoadConst(inv_primes + y_idx);
   int tw_y_idx = y_idx;
-  const signed_word *src_limb = src.ptrs_[0] + (y_idx << log_degree);
+  const signed_word *src_limb = src.ptrs_[0] + blockIdx.z * src_batch_stride + (y_idx << log_degree);
   if (y_idx >= num_q_primes) {
     tw_y_idx += tw_y_extra;
     src_limb += src.extra_;
   }
-  signed_word *dst_limb = dst + (y_idx << log_degree);
+  signed_word *dst_limb = dst + blockIdx.z * dst_batch_stride + (y_idx << log_degree);
 
   const word *w = twiddle_factors + (tw_y_idx << log_degree);
   const word *w_msb = twiddle_factors_msb + (tw_y_idx * kMsbSize);
@@ -133,7 +135,8 @@ __global__ void INTTPhase2(
     const make_signed_t<word> *inv_primes, const word *twiddle_factors,
     int tw_y_extra, int num_q_primes,
     const InputPtrList<make_signed_t<word>, 1> src,
-    const InputPtrList<word, 1> src_const = InputPtrList<word, 1>()) {
+    const InputPtrList<word, 1> src_const = InputPtrList<word, 1>(),
+    int src_batch_stride = 0, int dst_batch_stride = 0) {
   // Shared memory initialization
   extern __shared__ char shared_mem[];
   using signed_word = make_signed_t<word>;
@@ -159,7 +162,7 @@ __global__ void INTTPhase2(
   signed_word inv_prime = basic::StreamingLoadConst(inv_primes + y_idx);
   int tw_y_idx = y_idx;
   int src_const_idx = y_idx;
-  const signed_word *src_limb = src.ptrs_[0] + (y_idx << log_degree);
+  const signed_word *src_limb = src.ptrs_[0] + blockIdx.z * src_batch_stride + (y_idx << log_degree);
   if (y_idx >= num_q_primes) {
     tw_y_idx += tw_y_extra;
     src_limb += src.extra_;
@@ -167,7 +170,7 @@ __global__ void INTTPhase2(
   }
   word src_const_value =
       basic::StreamingLoadConst(src_const.ptrs_[0] + src_const_idx);
-  signed_word *dst_limb = dst + (y_idx << log_degree);
+  signed_word *dst_limb = dst + blockIdx.z * dst_batch_stride + (y_idx << log_degree);
   const word *w = twiddle_factors + (tw_y_idx << log_degree);
 
   // Load first input
@@ -654,7 +657,8 @@ __global__ void NTTPhase2ForModDown(
     const make_signed_t<word> *inv_primes, const word *twiddle_factors,
     const word *twiddle_factors_msb, int src2_start, int src2_end,
     const make_signed_t<word> *src, const make_signed_t<word> *src2,
-    const word *inv_p_prod, const word *src2_padding = nullptr) {
+    const word *inv_p_prod, const word *src2_padding = nullptr,
+    int batch_stride = 0, int src2_batch_stride = 0) {
   // Shared memory initialization
   extern __shared__ char shared_mem[];
   using signed_word = make_signed_t<word>;
@@ -680,8 +684,8 @@ __global__ void NTTPhase2ForModDown(
   word prime = basic::StreamingLoadConst(primes + y_idx);
   signed_word inv_prime = basic::StreamingLoadConst(inv_primes + y_idx);
   int tw_y_idx = y_idx;
-  const signed_word *src_limb = src + (y_idx << log_degree);
-  signed_word *dst_limb = dst + (y_idx << log_degree);
+  const signed_word *src_limb = src + blockIdx.z * batch_stride + (y_idx << log_degree);
+  signed_word *dst_limb = dst + blockIdx.z * batch_stride + (y_idx << log_degree);
   const word *w = twiddle_factors + (tw_y_idx << log_degree);
   const word *w_msb = twiddle_factors_msb + (tw_y_idx * kMsbSize);
 
@@ -761,7 +765,7 @@ __global__ void NTTPhase2ForModDown(
   int src2_y_index = y_idx - src2_start;
   int offset = (src2_y_index << log_degree) +
                (blockIdx.x << (kNumStages + kLogWarpBatching));
-  const signed_word *src2_pos = src2 + offset;
+  const signed_word *src2_pos = src2 + blockIdx.z * src2_batch_stride + offset;
   signed_word inv_p_prod_val = basic::StreamingLoadConst(inv_p_prod + y_idx);
   signed_word *dst_pos =
       dst_limb + (blockIdx.x << (kNumStages + kLogWarpBatching));
@@ -1011,13 +1015,16 @@ template <typename word>
 void NTTHandler<word>::INTTAndMultConst(DvView<word> &dst, const NPInfo &np,
                                         const DvConstView<word> &src,
                                         const DvConstView<word> &src_const,
-                                        bool normalize /*= false*/) const {
+                                        bool normalize /*= false*/, int batch /*= 1*/,
+                                        int src_batch_stride /*= 0*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_q_primes = np.GetNumQ();
   int q_size = num_q_primes * param_.degree_;
   int num_total_primes = np.GetNumTotal();
-  AssertTrue(dst.TotalSize() == num_total_primes * param_.degree_,
+  AssertTrue(batch >= 1, "INTTAndMultConst: invalid batch");
+  const int dst_batch_stride = (batch == 1) ? 0 : num_total_primes * param_.degree_;
+  AssertTrue(dst.TotalSize() == batch * num_total_primes * param_.degree_,
              "INTTForModUp: Invalid dst size");
 
   const word *primes = param_.GetPrimesPtr(np);
@@ -1039,14 +1046,14 @@ void NTTHandler<word>::INTTAndMultConst(DvView<word> &dst, const NPInfo &np,
   int block_dim = GetBlockDim(NTTType::INTT, Phase::Phase1);
   int stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase1);
   dim3 grid_dim(param_.degree_ / (1 << stage_merging) / block_dim,
-                num_total_primes);
+                num_total_primes, batch);
   int shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
     kernel::INTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
         dst_ptr, primes, inv_primes, tw_ptr, tw_msb_ptr, main_left,
-        num_q_primes, src_ptr_list);
+        num_q_primes, src_ptr_list, src_batch_stride, dst_batch_stride);
   });
 
   src_ptr_list.ptrs_[0] = dst_ptr;
@@ -1060,7 +1067,7 @@ void NTTHandler<word>::INTTAndMultConst(DvView<word> &dst, const NPInfo &np,
   block_dim = GetBlockDim(NTTType::INTT, Phase::Phase2);
   stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase2);
   grid_dim =
-      dim3(param_.degree_ / (1 << stage_merging) / block_dim, num_total_primes);
+      dim3(param_.degree_ / (1 << stage_merging) / block_dim, num_total_primes, batch);
   shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
@@ -1069,19 +1076,19 @@ void NTTHandler<word>::INTTAndMultConst(DvView<word> &dst, const NPInfo &np,
       kernel::INTTPhase2<word, j, kernel::MultConstNormalize<word>>
           <<<grid_dim, block_dim, shared_mem_size>>>(
               dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes,
-              src_ptr_list, src_const_ptr_list);
+              src_ptr_list, src_const_ptr_list, dst_batch_stride, dst_batch_stride);
     } else {
       kernel::INTTPhase2<word, j, kernel::MultConst<word>>
           <<<grid_dim, block_dim, shared_mem_size>>>(
               dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes,
-              src_ptr_list, src_const_ptr_list);
+              src_ptr_list, src_const_ptr_list, dst_batch_stride, dst_batch_stride);
     }
   });
 
   // Phase 3: undo the fold, in whichever representative phase 2 left behind.
   if (param_.conjugate_invariant_) {
     CiUnfold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
-             num_total_primes, 0, 1, normalize);
+             num_total_primes, dst_batch_stride, batch, normalize);
   }
 }
 
@@ -1107,7 +1114,7 @@ void NTTHandler<word>::NTTForModUp(DvView<word> &dst, const NPInfo &np,
   AssertTrue(batch == 1 || (src.AuxSize() == dst.AuxSize() &&
                             src.QSize() == dst.QSize()),
              "NTTForModUp: a batched transform is in place over one buffer");
-  AssertTrue(batch == 1 || (skip_start == skip_end),
+  AssertTrue(batch == 1 || !param_.conjugate_invariant_ || skip_start == skip_end,
              "NTTForModUp: a batched transform cannot skip limbs");
 
   // Extra handling for skip primes
@@ -1189,13 +1196,15 @@ void NTTHandler<word>::NTTForModDown(
     const DvConstView<word> &src1, const DvConstView<word> &src2,
     const DvConstView<word> &inv_p_prod,
     const DvConstView<word> &src2_padding /*= DvConstView<word>(nullptr, 0)*/,
-    bool ci_prefolded /*= false*/) const {
+    bool ci_prefolded /*= false*/, int batch /*= 1*/, int batch_stride /*= 0*/,
+    int src2_batch_stride /*= 0*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_q_primes = np_src1.GetNumQ();
   int q_size = num_q_primes * param_.degree_;
   int num_total_primes = np_src1.GetNumTotal();
-  AssertTrue(dst.TotalSize() == num_total_primes * param_.degree_,
+  AssertTrue(batch >= 1, "NTTForModDown: invalid batch");
+  AssertTrue(dst.TotalSize() == (batch - 1) * batch_stride + num_total_primes * param_.degree_,
              "NTTForModUp: Invalid dst size");
 
   // Special restrictions for NTTForModDown
@@ -1233,7 +1242,7 @@ void NTTHandler<word>::NTTForModDown(
   // conversion that produced it folded on the way out.
   if (param_.conjugate_invariant_ && !ci_prefolded) {
     CiFold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
-           num_total_primes, 0, 0, 0, 1, src1_ptr, ntt_ptr_list.extra_);
+           num_total_primes, 0, 0, batch_stride, batch, src1_ptr, ntt_ptr_list.extra_);
     ntt_ptr_list.ptrs_[0] = dst_ptr;
     ntt_ptr_list.extra_ = 0;
   }
@@ -1242,7 +1251,7 @@ void NTTHandler<word>::NTTForModDown(
   int block_dim = GetBlockDim(NTTType::NTT, Phase::Phase1);
   int stage_merging = GetStageMerging(NTTType::NTT, Phase::Phase1);
   dim3 grid_dim(param_.degree_ / (1 << stage_merging) / block_dim,
-                num_total_primes);
+                num_total_primes, batch);
   int shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
@@ -1250,14 +1259,14 @@ void NTTHandler<word>::NTTForModDown(
     if constexpr (kFuseMontgomery) {
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, ntt_ptr_list);
+          batch_stride, ntt_ptr_list);
     } else {
       InputPtrList<word, 1> src_const_ptr_list;
       src_const_ptr_list.ptrs_[0] = montgomery_converter_.data() + ter_left;
       src_const_ptr_list.extra_ = main_left;
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, ntt_ptr_list, src_const_ptr_list);
+          batch_stride, ntt_ptr_list, src_const_ptr_list);
     }
   });
 
@@ -1265,7 +1274,7 @@ void NTTHandler<word>::NTTForModDown(
   block_dim = GetBlockDim(NTTType::NTT, Phase::Phase2);
   stage_merging = GetStageMerging(NTTType::NTT, Phase::Phase2);
   grid_dim =
-      dim3(param_.degree_ / (1 << stage_merging) / block_dim, num_total_primes);
+      dim3(param_.degree_ / (1 << stage_merging) / block_dim, num_total_primes, batch);
   shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
@@ -1273,7 +1282,7 @@ void NTTHandler<word>::NTTForModDown(
         <<<grid_dim, block_dim, shared_mem_size>>>(
             dst_ptr, primes, inv_primes, tw_ptr, tw_msb_ptr, src2_start,
             src2_end, dst_ptr, src2_ptr, inv_p_prod.data(),
-            src2_padding.data());
+            src2_padding.data(), batch_stride, src2_batch_stride);
   });
 }
 
@@ -1281,11 +1290,14 @@ void NTTHandler<word>::NTTForModDown(
 template <typename word>
 void NTTHandler<word>::INTTForModDown(
     DvView<word> &dst, const NPInfo &np_src, const NPInfo &np_non_intt,
-    const DvConstView<word> &src, const DvConstView<word> &src_const) const {
+    const DvConstView<word> &src, const DvConstView<word> &src_const,
+    int batch /*= 1*/, int src_batch_stride /*= 0*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_total_primes = np_src.GetNumTotal() - np_non_intt.GetNumTotal();
-  AssertTrue(dst.TotalSize() == num_total_primes * param_.degree_,
+  AssertTrue(batch >= 1, "INTTForModDown: invalid batch");
+  const int dst_batch_stride = (batch == 1) ? 0 : num_total_primes * param_.degree_;
+  AssertTrue(dst.TotalSize() == batch * num_total_primes * param_.degree_,
              "INTTForModDown: Invalid dst size");
 
   // Specific check for INTTForModDown
@@ -1350,14 +1362,14 @@ void NTTHandler<word>::INTTForModDown(
     int block_dim = GetBlockDim(NTTType::INTT, Phase::Phase1);
     int stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase1);
     dim3 grid_dim(param_.degree_ / (1 << stage_merging) / block_dim,
-                  num_total_primes);
+                  num_total_primes, batch);
     int shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
     constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
       if (log_degree != j) return;
       kernel::INTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, tw_msb_ptr, main_left,
-          num_q_primes, src_ptr_list);
+          num_q_primes, src_ptr_list, src_batch_stride, dst_batch_stride);
     });
 
     src_ptr_list.ptrs_[0] = dst_ptr;
@@ -1367,7 +1379,7 @@ void NTTHandler<word>::INTTForModDown(
     block_dim = GetBlockDim(NTTType::INTT, Phase::Phase2);
     stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase2);
     grid_dim = dim3(param_.degree_ / (1 << stage_merging) / block_dim,
-                    num_total_primes);
+                    num_total_primes, batch);
     shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
     constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
@@ -1375,7 +1387,7 @@ void NTTHandler<word>::INTTForModDown(
       kernel::INTTPhase2<word, j, kernel::MultConstNormalize<word>>
           <<<grid_dim, block_dim, shared_mem_size>>>(
               dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes,
-              src_ptr_list, src_const_ptr_list);
+              src_ptr_list, src_const_ptr_list, dst_batch_stride, dst_batch_stride);
     });
 
     // Phase 3: undo the fold, on the centred representative
@@ -1385,7 +1397,7 @@ void NTTHandler<word>::INTTForModDown(
     // inverse twiddle table above does.
     if (param_.conjugate_invariant_) {
       CiUnfold(dst_ptr, primes, inv_primes, num_tw_offset_primes, main_left,
-               num_q_primes, num_total_primes, 0, 1, /*normalized=*/true);
+               num_q_primes, num_total_primes, dst_batch_stride, batch, /*normalized=*/true);
     }
   } else {  // Case 2. We perform INTT on some of the ter primes and all aux
             // primes
@@ -1414,14 +1426,14 @@ void NTTHandler<word>::INTTForModDown(
     int block_dim = GetBlockDim(NTTType::INTT, Phase::Phase1);
     int stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase1);
     dim3 grid_dim(param_.degree_ / (1 << stage_merging) / block_dim,
-                  num_total_primes);
+                  num_total_primes, batch);
     int shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
     constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
       if (log_degree != j) return;
       kernel::INTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, tw_msb_ptr, tw_y_extra,
-          num_q_primes, src_ptr_list);
+          num_q_primes, src_ptr_list, src_batch_stride, dst_batch_stride);
     });
 
     src_ptr_list.ptrs_[0] = dst_ptr;
@@ -1431,7 +1443,7 @@ void NTTHandler<word>::INTTForModDown(
     block_dim = GetBlockDim(NTTType::INTT, Phase::Phase2);
     stage_merging = GetStageMerging(NTTType::INTT, Phase::Phase2);
     grid_dim = dim3(param_.degree_ / (1 << stage_merging) / block_dim,
-                    num_total_primes);
+                    num_total_primes, batch);
     shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
 
     constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
@@ -1439,14 +1451,14 @@ void NTTHandler<word>::INTTForModDown(
       kernel::INTTPhase2<word, j, kernel::MultConstNormalize<word>>
           <<<grid_dim, block_dim, shared_mem_size>>>(
               dst_ptr, primes, inv_primes, tw_ptr, tw_y_extra, num_q_primes,
-              src_ptr_list, src_const_ptr_list);
+              src_ptr_list, src_const_ptr_list, dst_batch_stride, dst_batch_stride);
     });
 
     // Phase 3, as in case 1 -- here the offset is ter_left, which is what this
     // branch hands the twiddle table.
     if (param_.conjugate_invariant_) {
       CiUnfold(dst_ptr, primes, inv_primes, ter_left, tw_y_extra, num_q_primes,
-               num_total_primes, 0, 1, /*normalized=*/true);
+               num_total_primes, dst_batch_stride, batch, /*normalized=*/true);
     }
   }
 }

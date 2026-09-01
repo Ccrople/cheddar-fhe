@@ -207,6 +207,68 @@ TEST_P(Testbed32, CmtIsAnInvolution) {
   ASSERT_LT(worst, 1e-3);
 }
 
+// The batched path (one buffer, the ciphertext index on blockIdx.z, ~40
+// launches) against the serial one (Context's per-ciphertext operations,
+// ~6.5k launches at d = 128) on the same inputs: every stage is modular
+// arithmetic through the same kernels or the same per-element operations, so
+// the two must agree WORD FOR WORD, not to a tolerance. Checked at the top
+// level and at level 1 -- the lifted ring's Cmt runs at level 1, where the
+// key switch has two digits and a terminal-prime offset.
+TEST_P(Testbed32, TheBatchedCmtIsTheSerialOneWordForWord) {
+  const int degree = param_->degree_;
+  const int d = degree / kSubDegree;
+  const int top = param_->max_level_;
+  const double scale = DetermineScale(top);
+
+  CmtHandler<word> cmt(*param_, context_->ntt_handler_);
+  for (int index : cmt.ScrambleAutoRotationIndices(kSubDegree)) {
+    interface_->PrepareRotationKey(index, top);
+  }
+
+  std::vector<Ciphertext<word>> at_top(d);
+  for (int j = 0; j < d; j++) {
+    std::vector<double> m(degree);
+    Random::SampleUniformReal(m.data(), degree, -0.5, 0.5);
+    Plaintext<word> pt;
+    context_->encoder_.EncodeCoeff(pt, top, scale, m);
+    interface_->Encrypt(at_top[j], pt);
+  }
+
+  for (int level : {top, 1}) {
+    if (level > top) continue;
+    std::vector<Ciphertext<word>> cts(d);
+    for (int j = 0; j < d; j++) context_->LevelDown(cts[j], at_top[j], level);
+
+    ASSERT_TRUE(CmtHandler<word>::BatchEnabled())
+        << "CHEDDAR_CMT_SERIAL=1 would compare the serial path with itself";
+    std::vector<Ciphertext<word>> serial, batched;
+    cmt.CmtSerial(context_, serial, cts, kSubDegree, interface_->GetEvkMap());
+    cmt.Cmt(context_, batched, cts, kSubDegree, interface_->GetEvkMap());
+    ASSERT_EQ(static_cast<int>(batched.size()), d);
+
+    size_t differing = 0, total = 0;
+    for (int j = 0; j < d; j++) {
+      ASSERT_EQ(batched[j].GetNP(), serial[j].GetNP());
+      ASSERT_EQ(batched[j].GetScale(), serial[j].GetScale());
+      ASSERT_EQ(batched[j].GetNumSlots(), serial[j].GetNumSlots());
+      ASSERT_FALSE(batched[j].HasRx());
+      const DeviceVector<word> *got[2] = {&batched[j].bx_, &batched[j].ax_};
+      const DeviceVector<word> *want[2] = {&serial[j].bx_, &serial[j].ax_};
+      for (int p = 0; p < 2; p++) {
+        HostVector<word> a, b;
+        CopyDeviceToHost(a, *got[p]);
+        CopyDeviceToHost(b, *want[p]);
+        ASSERT_EQ(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); i++) differing += (a[i] != b[i]);
+        total += a.size();
+      }
+    }
+    std::cout << "level " << level << ", d = " << d << ": " << differing
+              << " of " << total << " words differ" << std::endl;
+    EXPECT_EQ(differing, 0u) << "at level " << level;
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Cmt, Testbed32, testing::ValuesIn(SmallRingParams()),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "core/Container.h"
@@ -120,6 +122,30 @@ class CmtHandler {
   // host-side cost in ScrambleAuto worth naming.
   std::unordered_map<int, int> GaloisIndexTable() const;
 
+  // ----- The batched path ----- //
+  //
+  // One Cmt call is d ciphertexts through the same five stages with the same
+  // monomials and the same d automorphisms, and every stage is a map over
+  // the ciphertext index that touches each ciphertext once. Run
+  // ciphertext by ciphertext that is ~6.5k launches of ~10 us kernels per
+  // call at d = 128 (Doing 3.21: 78k launches a layer, 22 % busy); run over
+  // the d ciphertexts laid out back to back in one buffer it is ~40 launches
+  // with the ciphertext index on blockIdx.z. The words are the same: every
+  // stage is modular arithmetic through the same kernels (the key switch)
+  // or the same per-element operations (the monomials and the butterflies),
+  // and a modular sum does not care what order its terms arrive in.
+  //
+  // A plan holds what depends only on (level, sub_degree): the monomial bank
+  // (built once, not per call as the serial path's cache is), TWEAK's
+  // butterfly tables per pass, the automorphisms and the keys they ask for.
+  struct BatchPlan;
+  mutable std::map<std::pair<int, int>, std::shared_ptr<BatchPlan>> plans_;
+  const BatchPlan &GetPlan(int level, int sub_degree) const;
+
+  void CmtBatched(ConstContextPtr<word> context, std::vector<Ct> &res,
+                  const std::vector<Ct> &cts, int sub_degree,
+                  const EvkMap<word> &evk_map) const;
+
  public:
   CmtHandler(const Parameter<word> &param, const NTTHandler<word> &ntt_handler);
 
@@ -215,6 +241,19 @@ class CmtHandler {
   void Cmt(ConstContextPtr<word> context, std::vector<Ct> &res,
            const std::vector<Ct> &cts, int sub_degree,
            const EvkMap<word> &evk_map) const;
+
+  /**
+   * @brief Algorithm 3 ciphertext by ciphertext, through `Context`'s
+   * per-ciphertext operations: the reference the batched path is measured
+   * against word for word (`CmtTest`). `Cmt` takes this path on the
+   * conjugate-invariant ring, at d = 1, or under `CHEDDAR_CMT_SERIAL=1`.
+   */
+  void CmtSerial(ConstContextPtr<word> context, std::vector<Ct> &res,
+                 const std::vector<Ct> &cts, int sub_degree,
+                 const EvkMap<word> &evk_map) const;
+
+  /** @brief Whether `Cmt` batches: `CHEDDAR_CMT_SERIAL` unset or not 1. */
+  static bool BatchEnabled();
 };
 
 }  // namespace cheddar

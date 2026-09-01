@@ -932,6 +932,106 @@ void Context<word>::MultKeyNoModDown(Ct &accum, const Ct &a,
 }
 
 template <typename word>
+void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride, const word *src,
+                                 int src_ct_stride, const NPInfo &np,
+                                 const std::vector<const Evk *> &keys,
+                                 int batch) const {
+  NvtxScope _nv("ks: MultKeyBatch");
+  AssertTrue(batch >= 1 && static_cast<int>(keys.size()) == batch,
+             "MultKeyBatch: one key per ciphertext");
+  AssertTrue(np.num_aux_ == 0,
+             "MultKeyBatch is not supported for ciphertexts with p primes");
+  AssertTrue(!param_.conjugate_invariant_,
+             "MultKeyBatch: the conjugate-invariant ring is not batched");
+
+  const int degree = param_.degree_;
+  const int num_q = np.GetNumQ();
+  const int q_words = num_q * degree;
+  int level = param_.NPToLevel(np);
+  const int num_aux = keys.at(0)->GetNP().num_aux_;
+  AdjustLevelForMultKey(level, num_q, num_aux);
+  AssertTrue(level >= 0, "MultKeyBatch: the dense-to-sparse switch is not batched");
+  const int prime_offset = param_.GetMaxNumTer() - np.num_ter_;
+  const int padded_num_q = num_q + prime_offset;
+  const int beta = DivCeil(padded_num_q, num_aux);
+  const auto &mod_switcher = GetModSwitchHandler(level, num_aux);
+  const int ext_words = (num_q + num_aux) * degree;
+  AssertTrue(src_ct_stride >= 2 * q_words && dst_ct_stride >= 2 * q_words,
+             "MultKeyBatch: the ciphertexts overlap");
+
+  // 1. Mod-up of every a-part, one buffer per digit.
+  std::vector<DeviceVector<word>> digits;
+  std::vector<DvView<word>> digit_views;
+  std::vector<int> used;
+  digits.reserve(beta);
+  for (int i = 0; i < beta; i++) {
+    const int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
+    if (prime_index_end <= prime_offset) {
+      digits.emplace_back(0);
+      digit_views.emplace_back(nullptr, 0, 0);
+      continue;
+    }
+    digits.emplace_back(batch * ext_words);
+    digit_views.emplace_back(digits.back().data(), batch * ext_words,
+                             batch * ext_words - q_words);
+    used.push_back(i);
+  }
+  AssertTrue(!used.empty() &&
+                 static_cast<int>(used.size()) <=
+                     ElementWiseHandler<word>::max_batch_digits_,
+             "MultKeyBatch: digit count out of range");
+  mod_switcher.ModUpBatch(digit_views, src + q_words, src_ct_stride, batch);
+
+  // 2. The key multiply, every switch with its own key.
+  const NPInfo ext_np(np.num_main_, np.num_ter_, num_aux, degree);
+  HostVector<uint64_t> key_table(static_cast<size_t>(batch) * used.size() * 2);
+  int key_extra = -1;
+  for (int b = 0; b < batch; b++) {
+    const Evk &key = *keys.at(b);
+    AssertTrue(key.GetNP().num_aux_ == num_aux,
+               "MultKeyBatch: keys differ in auxiliary prime count");
+    AssertTrue(key.GetBeta() >= beta, "Beta mismatch");
+    for (size_t k = 0; k < used.size(); k++) {
+      const DvConstView<word> kb = key.BxConstView(used[k], prime_offset);
+      const DvConstView<word> ka = key.AxConstView(used[k], prime_offset);
+      const int extra = kb.QSize() - q_words;
+      AssertTrue(ka.QSize() - q_words == extra &&
+                     (key_extra == -1 || key_extra == extra),
+                 "MultKeyBatch: keys differ in limb layout");
+      key_extra = extra;
+      key_table[(b * used.size() + k) * 2] =
+          reinterpret_cast<uint64_t>(kb.data());
+      key_table[(b * used.size() + k) * 2 + 1] =
+          reinterpret_cast<uint64_t>(ka.data());
+    }
+  }
+  DeviceVector<uint64_t> key_table_dev;
+  CopyHostToDevice(key_table_dev, key_table);
+  std::vector<const word *> modup_ptrs;
+  for (int i : used) modup_ptrs.push_back(digits.at(i).data());
+  NPInfo p_prod_np = np;
+  const DvConstView<word> p_prod = GetPProd(p_prod_np, num_aux);
+
+  DeviceVector<word> accum(static_cast<size_t>(batch) * 2 * ext_words);
+  elem_handler_.KeyMultBatch(
+      accum.data(), 2 * ext_words, ext_np, modup_ptrs, ext_words,
+      reinterpret_cast<const word *const *>(key_table_dev.data()), key_extra,
+      src, src_ct_stride, p_prod.data(), batch);
+
+  // 3. Mod-down of both parts. With the parts contiguous on both sides the
+  //    2 * batch polynomials are one strided group.
+  if (dst_ct_stride == 2 * q_words) {
+    mod_switcher.ModDownBatch(dst, q_words, accum.data(), ext_words,
+                              2 * batch);
+  } else {
+    mod_switcher.ModDownBatch(dst, dst_ct_stride, accum.data(), 2 * ext_words,
+                              batch);
+    mod_switcher.ModDownBatch(dst + q_words, dst_ct_stride,
+                              accum.data() + ext_words, 2 * ext_words, batch);
+  }
+}
+
+template <typename word>
 void Context<word>::RelinearizeRescale(Ct &res, const Ct &a,
                                        const Evk &key) const {
   AssertTrue(a.HasRx(), "RelinearizeRescale requires aux");

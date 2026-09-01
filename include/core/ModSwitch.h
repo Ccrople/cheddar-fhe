@@ -84,6 +84,32 @@ class ModSwitchHandler {
   void ModUpFromCoeffBatch(DvView<word> &dst,
                            const DvConstView<word> &src_coeff,
                            int batch) const;
+  /**
+   * @brief ModUp for `batch` evaluation-domain polynomials at once.
+   *
+   * Polynomial `b` is read at `src + b * src_batch_stride` (its `num_q`
+   * limbs in Montgomery form, as `ModUp` reads a ciphertext component) and
+   * its digit `i` lands at `dst[i].data() + b * (num_q + num_aux) * degree`,
+   * exactly the words `ModUp` would have produced for it -- the same
+   * kernels run, `blockIdx.z` picks the polynomial. `dst[i]` is empty for a
+   * digit `ModUp` skips (one entirely below the terminal-prime offset).
+   *
+   * Ordinary ring only: the conjugate-invariant fold's skip handling is not
+   * batched.
+   */
+  void ModUpBatch(std::vector<DvView<word>> &dst, const word *src,
+                  int src_batch_stride, int batch) const;
+
+  /**
+   * @brief ModDown for `batch` extended-basis polynomials at once, the
+   * counterpart of `ModUpBatch`: polynomial `b` is read at
+   * `src + b * src_batch_stride` (`num_q + num_aux` limbs) and written to
+   * `dst + b * dst_batch_stride` (`num_q` limbs), word for word what
+   * `ModDown` gives. Ordinary ring only.
+   */
+  void ModDownBatch(word *dst, int dst_batch_stride, const word *src,
+                    int src_batch_stride, int batch) const;
+
   void ModDown(DvView<word> &dst, const DvConstView<word> &src) const;
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
   void ModDownAndRescale(DvView<word> &dst, const DvConstView<word> &src) const;

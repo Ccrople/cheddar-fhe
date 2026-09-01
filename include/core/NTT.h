@@ -97,7 +97,8 @@ class NTTHandler {
   void INTTAndMultConst(DvView<word> &dst, const NPInfo &np,
                         const DvConstView<word> &src,
                         const DvConstView<word> &src_const,
-                        bool normalize = false) const;
+                        bool normalize = false, int batch = 1,
+                        int src_batch_stride = 0) const;
 
   // special variants for ModUp and ModDown/Rescale/ModDownAndRescale
   //
@@ -115,10 +116,12 @@ class NTTHandler {
                      const DvConstView<word> &inv_p_prod,
                      const DvConstView<word> &src2_padding =
                          DvConstView<word>(nullptr, 0),
-                     bool ci_prefolded = false) const;
+                     bool ci_prefolded = false, int batch = 1,
+                     int batch_stride = 0, int src2_batch_stride = 0) const;
   void INTTForModDown(DvView<word> &dst, const NPInfo &np_src,
                       const NPInfo &np_non_intt, const DvConstView<word> &src,
-                      const DvConstView<word> &src_const) const;
+                      const DvConstView<word> &src_const, int batch = 1,
+                      int src_batch_stride = 0) const;
 
   // The conjugate-invariant per-prime constants, for the one caller that
   // carries the fold itself: the base conversion in ModSwitch. All Montgomery

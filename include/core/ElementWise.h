@@ -126,6 +126,44 @@ class ElementWiseHandler {
   void MultImaginaryUnit(std::vector<DvView<word>> &dst, const NPInfo &np,
                          const std::vector<DvConstView<word>> &src1,
                          const DvConstView<word> &src_i_unit) const;
+
+  // ----- Batched key switching (Cmt, and anything else that switches many
+  // ciphertexts with many keys at one level) ----- //
+
+  static constexpr int max_batch_digits_ = 8;
+
+  /**
+   * @brief The key multiply of `batch` key switches in one launch, each
+   * switch with its own key: what `PAccum` over the digits followed by
+   * `CAccum` of `p_prod * bx` computes per ciphertext, word for word.
+   *
+   * Switch `b` accumulates into `dst + b * dst_batch_stride`: its b-part on
+   * the first `ext_words = np.GetNumTotal() * degree` words and its a-part on
+   * the next. `modup[i] + b * modup_batch_stride` is its digit `i`
+   * (`ModSwitchHandler::ModUpBatch`'s layout), `key_table` holds, per switch
+   * and per digit, the key's b and a limb pointers (already offset by the
+   * terminal-prime padding, as `EvaluationKey::ConstViewVector(i, offset)`
+   * gives them) and `key_extra` the limb offset their auxiliary part carries.
+   * `bx + b * bx_batch_stride` is the switch's original b-part, added in
+   * times the per-prime `p_prod` on the q limbs.
+   */
+  void KeyMultBatch(word *dst, int dst_batch_stride, const NPInfo &np,
+                    const std::vector<const word *> &modup,
+                    int modup_batch_stride, const word *const *key_table,
+                    int key_extra, const word *bx, int bx_batch_stride,
+                    const word *p_prod, int batch) const;
+
+  /**
+   * @brief `Permute` of `batch` ciphertexts, each by its own automorphism, in
+   * one launch. Ciphertext `b` has `num_poly` polynomials of `np` limbs at
+   * `src + b * batch_stride + p * poly_stride`, the result lands at the same
+   * offsets of `dst`; `galois_factors[b]` / `galois_offsets[b]` are its map
+   * in `Parameter::GetGaloisOffset`'s terms. No auxiliary limbs.
+   */
+  void PermuteBatch(word *dst, const word *src, int batch_stride,
+                    int poly_stride, int num_poly, const NPInfo &np,
+                    const uint32_t *galois_factors,
+                    const uint32_t *galois_offsets, int batch) const;
 };
 
 }  // namespace cheddar

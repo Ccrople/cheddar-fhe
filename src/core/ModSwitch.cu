@@ -1045,6 +1045,151 @@ void ModSwitchHandler<word>::ModUpWorker(
   }
 }
 
+// The batched ModUp: ModUpWorker's evaluation-domain path with blockIdx.z
+// picking the polynomial. The INTT, the base conversion and the forward
+// transform all carry a batch dimension already; the pass-through copy of
+// the digit's own limbs is one strided memcpy for the whole group.
+template <typename word>
+void ModSwitchHandler<word>::ModUpBatch(std::vector<DvView<word>> &dst,
+                                        const word *src, int src_batch_stride,
+                                        int batch) const {
+  using signed_word = make_signed_t<word>;
+  AssertTrue(!param_.conjugate_invariant_,
+             "ModUpBatch: the conjugate-invariant ring is not batched");
+  AssertTrue(batch >= 1, "ModUpBatch: invalid batch");
+  AssertTrue(level_ >= 0, "ModUpBatch: the dense-to-sparse level is not batched");
+  NPInfo np = param_.LevelToNP(level_, 0);
+  const int num_q_primes = np.GetNumQ();
+  const int prime_offset = param_.GetMaxNumTer() - np.num_ter_;
+  const int degree = param_.degree_;
+  const int q_words = num_q_primes * degree;
+  const int ext_words = (num_q_primes + num_aux_) * degree;
+  AssertTrue(static_cast<int>(dst.size()) == beta_,
+             "ModUpBatch: dst size mismatch");
+  AssertTrue(src_batch_stride >= q_words || batch == 1,
+             "ModUpBatch: the polynomials overlap");
+
+  DeviceVector<word> src_intt(batch * q_words);
+  {
+    DvView<word> intt_view = src_intt.View(0, 0);
+    DvConstView<word> first(src, q_words, 0);
+    ntt_handler_.INTTAndMultConst(intt_view, np, first, mod_up1_.ConstView(0, 0),
+                                  true, batch, src_batch_stride);
+  }
+
+  const int padded_num_q_primes = num_q_primes + prime_offset;
+  np.num_aux_ = num_aux_;
+  const word *primes = param_.GetPrimesPtr(np);
+  const signed_word *inv_primes = param_.GetInvPrimesPtr(np);
+
+  for (int i = 0; i < beta_; i++) {
+    int prime_index_start = i * num_aux_;
+    int prime_index_end = Min((i + 1) * num_aux_, padded_num_q_primes);
+    if (prime_index_end <= prime_offset) {
+      AssertTrue(dst.at(i).TotalSize() == 0,
+                 "ModUpBatch: a skipped digit was given a buffer");
+      continue;
+    }
+    prime_index_start = Max(prime_index_start - prime_offset, 0);
+    prime_index_end = prime_index_end - prime_offset;
+    const int src_len = prime_index_end - prime_index_start;
+    const int dst_len = num_q_primes - src_len + num_aux_;
+    DvView<word> &dst_i = dst.at(i);
+    AssertTrue(dst_i.TotalSize() == batch * ext_words &&
+                   dst_i.AuxSize() == dst_i.TotalSize() - q_words,
+               "ModUpBatch: a digit buffer has the wrong shape (it is viewed "
+               "with aux = total - q so that the transform's limb offset is "
+               "zero)");
+
+    // The digit's own limbs pass through untouched, one strided copy for the
+    // whole group.
+    cudaMemcpy2DAsync(dst_i.data() + prime_index_start * degree,
+                      static_cast<size_t>(ext_words) * sizeof(word),
+                      src + prime_index_start * degree,
+                      static_cast<size_t>(src_batch_stride) * sizeof(word),
+                      static_cast<size_t>(src_len) * degree * sizeof(word),
+                      batch, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+
+    dim3 grid_dim(degree / kUnrollNumber / kNumThreadsX,
+                  DivCeil(dst_len, kLimbBatching * kNumThreadsY), batch);
+    dim3 block_dim(kNumThreadsX, kNumThreadsY);
+    int smem_size =
+        src_len * (kLimbBatching * kNumThreadsY) * sizeof(signed_word);
+    smem_size +=
+        kMaxNumAccum * (kUnrollNumber * kNumThreadsX) * sizeof(signed_word);
+    const signed_word *src_ptr = reinterpret_cast<const signed_word *>(
+        src_intt.data() + prime_index_start * degree);
+    kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+        dst_i.data(), primes, inv_primes, src_len, dst_len, prime_index_start,
+        prime_index_end, src_ptr, mod_up2_.at(i).data(), param_.log_degree_,
+        ext_words, q_words);
+    ntt_handler_.NTTForModUp(dst_i, np, prime_index_start, prime_index_end,
+                             dst_i, batch, /*ci_prefolded=*/false);
+  }
+}
+
+// The batched ModDown: ModDownWorker's ModDown case over `batch` polynomials.
+template <typename word>
+void ModSwitchHandler<word>::ModDownBatch(word *dst, int dst_batch_stride,
+                                          const word *src,
+                                          int src_batch_stride,
+                                          int batch) const {
+  using signed_word = make_signed_t<word>;
+  AssertTrue(!param_.conjugate_invariant_,
+             "ModDownBatch: the conjugate-invariant ring is not batched");
+  AssertTrue(kFuseModDownEpilogue,
+             "ModDownBatch: written against the fused epilogue");
+  AssertTrue(batch >= 1, "ModDownBatch: invalid batch");
+  AssertTrue(level_ >= 0, "ModDownBatch: the dense-to-sparse level is not batched");
+  const int degree = param_.degree_;
+  const NPInfo np_src = param_.LevelToNP(level_, num_aux_);
+  const NPInfo np_dst = param_.LevelToNP(level_, 0);
+  const NPInfo np_non_intt(np_dst.num_main_, np_dst.num_ter_, 0,
+                           np_src.degree_);
+  const int src_len = np_src.GetNumTotal() - np_non_intt.GetNumTotal();
+  const int dst_len = np_dst.GetNumTotal();
+  const int src_words = np_src.GetNumTotal() * degree;
+  const int dst_words = dst_len * degree;
+  AssertTrue(batch == 1 || (src_batch_stride >= src_words &&
+                            dst_batch_stride >= dst_words),
+             "ModDownBatch: the polynomials overlap");
+
+  DeviceVector<word> src_intt(batch * src_len * degree);
+  {
+    DvView<word> intt_view = src_intt.View(0, 0);
+    DvConstView<word> first(src, src_words, num_aux_ * degree);
+    ntt_handler_.INTTForModDown(intt_view, np_src, np_non_intt, first,
+                                mod_down1_.ConstView(num_aux_), batch,
+                                src_batch_stride);
+  }
+
+  const word *primes = param_.GetPrimesPtr(np_dst);
+  const signed_word *inv_primes = param_.GetInvPrimesPtr(np_dst);
+  dim3 grid_dim(degree / kUnrollNumber / kNumThreadsX,
+                DivCeil(dst_len, kLimbBatching * kNumThreadsY), batch);
+  dim3 block_dim(kNumThreadsX, kNumThreadsY);
+  int smem_size =
+      src_len * (kLimbBatching * kNumThreadsY) * sizeof(signed_word);
+  smem_size +=
+      kMaxNumAccum * (kUnrollNumber * kNumThreadsX) * sizeof(signed_word);
+  kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+      dst, primes, inv_primes, src_len, dst_len, 0, 0,
+      reinterpret_cast<const signed_word *>(src_intt.data()),
+      mod_down2_.data(), param_.log_degree_, dst_batch_stride,
+      src_len * degree);
+
+  // The epilogue: NTT of the converted limbs, then (src - dst) * P^-1 with
+  // the q limbs of the source, exactly as ModDownWorker's ModDown case.
+  DvView<word> dst_view(dst, (batch - 1) * dst_batch_stride + dst_words, 0);
+  DvConstView<word> src2(src, dst_words, 0);
+  ntt_handler_.NTTForModDown(dst_view, np_dst, np_non_intt,
+                             DvConstView<word>(dst_view), src2,
+                             inv_prime_prod_.ConstView(),
+                             DvConstView<word>(nullptr, 0),
+                             /*ci_prefolded=*/false, batch, dst_batch_stride,
+                             src_batch_stride);
+}
+
 template <typename word>
 void ModSwitchHandler<word>::ModDown(DvView<word> &dst,
                                      const DvConstView<word> &src) const {
