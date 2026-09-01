@@ -92,6 +92,8 @@ class PcmmBlasHandler {
 
   const Parameter<word> &param_;
   cublasHandle_t handle_ = nullptr;
+  //! The GEMMs' int32 group accumulator, kept between products.
+  mutable DeviceVector<int32_t> groups_;
 
   // 8 bits per int8 piece, as BALANCED digits in [-128, 127]: the digit `p`
   // of `r` is byte `p` of `r + 0x80..80` minus 128, so a 30-bit residue is

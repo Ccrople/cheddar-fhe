@@ -311,18 +311,31 @@ void CiBatchProjection<word>::Project(std::vector<Ct> &res, const Source &src,
   const int q_words = src.split.np.GetNumTotal() * degree;
   const NPInfo next_np = param.LevelToNP(level - 1);
   const int next_words = next_np.GetNumTotal() * degree;
-  DeviceVector<word> prod(static_cast<size_t>(rows) * 2 * q_words);
+  // The two tile buffers are kept between calls (grown, never shrunk): a
+  // projection at the model's width is 28-56 tiles, and a gigabyte
+  // allocated and freed per tile beside thousands of live ciphertexts is
+  // what fragmented the pool (Doing.md 7.4).
+  const size_t prod_words = static_cast<size_t>(rows) * 2 * q_words;
+  const size_t resc_words = static_cast<size_t>(rows) * 2 * next_words;
+  if (static_cast<size_t>(prod_.size()) < prod_words) {
+    prod_ = DeviceVector<word>();
+    prod_.resize(static_cast<int>(prod_words));
+  }
+  if (static_cast<size_t>(rescaled_.size()) < resc_words) {
+    rescaled_ = DeviceVector<word>();
+    rescaled_.resize(static_cast<int>(resc_words));
+  }
+  DeviceVector<word> &prod = prod_;
+  DeviceVector<word> &rescaled = rescaled_;
   {
     NvtxScope _g("batch: gemm");
     blas_->MultiplyInto(prod.data(), 2 * q_words, u, src.split);
   }
-  DeviceVector<word> rescaled(static_cast<size_t>(rows) * 2 * next_words);
   {
     NvtxScope _r("batch: rescale batch");
     context_->mod_switch_handlers_.at(level).RescaleBatch(
         rescaled.data(), next_words, prod.data(), q_words, 2 * rows);
   }
-  prod = DeviceVector<word>();
   {
     NvtxScope _s("batch: scatter");
     res.clear();

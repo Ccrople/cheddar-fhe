@@ -297,6 +297,8 @@ class CiBatchProjection {
   //! Scratch for the gathered encode: the residues of one tile, prime-major.
   mutable DeviceVector<word> residues_;
   mutable DeviceVector<int32_t> row_map_, col_map_;
+  //! A tile's GEMM output and its batched rescale, kept between calls.
+  mutable DeviceVector<word> prod_, rescaled_;
 };
 
 #endif  // USE_CUBLAS

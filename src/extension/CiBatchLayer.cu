@@ -97,6 +97,10 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
     t0 = Clock::now();
   }
 
+  // The split's buffers FIRST -- twenty of a gigabyte -- so they sit below
+  // everything the two passes allocate and free, rather than among it.
+  proj_->BeginSplit(src, model, hold - 1, layout_.num_slots);
+
   // Pass A: every channel booted, its square accumulated WITHOUT
   // relinearization (the tensor product's three components add), and the
   // channel itself either kept at the level the apply will meet it or
@@ -202,7 +206,6 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   // channel split into the projection source the moment it exists.
   stages_.norm += SinceSeconds(t0);
   t0 = Clock::now();
-  proj_->BeginSplit(src, model, hold - 1, layout_.num_slots);
   {
     NvtxScope _b("batch: norm pass B");
     for (int c = 0; c < model; c++) {

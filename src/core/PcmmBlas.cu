@@ -390,8 +390,17 @@ void PcmmBlasHandler<word>::ProductComponent(
   AssertTrue(static_cast<uint64_t>(16384) * cols <= kLiftBound,
              "PcmmBlas: too many columns for the signed int32 accumulator");
 
-  DeviceVector<int32_t> groups(
-      static_cast<int>(static_cast<size_t>(num_groups) * rows * chunk));
+  // The int32 accumulator is kept between calls (grown, never shrunk):
+  // at the batched layer's shape it is 2 GiB allocated and freed per tile,
+  // beside thousands of live ciphertexts, which fragmented the pool.
+  const size_t groups_words = static_cast<size_t>(num_groups) * rows * chunk;
+  AssertTrue(groups_words < (static_cast<size_t>(1) << 31),
+             "PcmmBlas: the accumulator does not fit an int index");
+  if (static_cast<size_t>(groups_.size()) < groups_words) {
+    groups_ = DeviceVector<int32_t>();
+    groups_.resize(static_cast<int>(groups_words));
+  }
+  DeviceVector<int32_t> &groups = groups_;
 
   const auto primes = param_.GetPrimeVector(np);
   const word *prime_ptr = param_.GetPrimesPtr(np);
