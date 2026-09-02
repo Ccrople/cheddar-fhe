@@ -229,12 +229,15 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
 
   // The per-token factor onto r, and the stream's factor OUT: the channel
   // the apply reads still carries `stream_scale`, and the norm is to land
-  // in the model's units -- y = (sink x) r = (s x) (sink r / s).
+  // in the model's units -- y = (sink x) r = (s x) (sink r / s). The
+  // polynomial evaluated 1/sqrt(alpha (ms + eps)), so sqrt(alpha) rides
+  // this same multiply (beta, as the batch-1 layer folds it).
   Ct rs;
   {
+    const double beta = std::sqrt(alpha);
     std::vector<double> f(T);
     for (int t = 0; t < T; t++) {
-      f[t] = (sink.empty() ? 1.0 : sink[t]) / stream_scale;
+      f[t] = beta * (sink.empty() ? 1.0 : sink[t]) / stream_scale;
     }
     Pt ps;
     layout_.PackPerToken(msg, f);
