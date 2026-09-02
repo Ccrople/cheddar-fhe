@@ -112,7 +112,8 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
                                   double window,
                                   const std::vector<double> &sink,
                                   double stream_scale,
-                                  const EvkMap<word> &evk, bool hold_ch) const {
+                                  const EvkMap<word> &evk, bool hold_ch,
+                                  int hold_level) const {
   NvtxScope _nv("batch: NormTurn");
   const int model = cfg_.model;
   const int T = cfg_.num_tokens;
@@ -126,7 +127,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   const auto &mult_key = evk.GetMultiplicationKey();
   const Parameter<word> &param = boot_->param_;
   const int top = boot_->GetBootParameter().GetEndLevel();
-  const int hold = cfg_.norm_apply_level;
+  const int hold = hold_level;
   AssertTrue(hold + 1 <= top,
              "CiBatchLayer::NormTurn: norm_apply_level is above the boot's "
              "landing");
@@ -302,7 +303,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   // 1. The norm, straight into the split the projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
-           evk, cfg_.hold_channels_ffn);
+           evk, cfg_.hold_channels_ffn, cfg_.norm_apply_level);
   const int ly = src_y.level;
   ParkedStream parked;
   Park(parked, stream);
@@ -453,7 +454,7 @@ void CiBatchLayer<word>::Attention(
   // 1. The pre-attention norm, into the split the three projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.attn_alpha, c.attn_norm_window, c.attn_sink,
-           c.stream_scale, evk, cfg_.hold_channels);
+           c.stream_scale, evk, cfg_.hold_channels, cfg_.norm_apply_level_attn);
   const int ly = src_y.level;
   ParkedStream parked;
   Park(parked, stream);

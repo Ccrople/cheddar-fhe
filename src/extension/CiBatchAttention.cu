@@ -318,7 +318,12 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
 
   mask_level_ = exp_out_;
   sq_level_ = (calib_.causal ? exp_out_ - 1 : exp_out_) - 1;
-  poly_in_ = sq_level_ - 1;
+  // Causal: the Euclidean norm's affine MULTIPLY rides the mask -- each
+  // mask value carries 1/sqrt(a), so the squared sum arrives already
+  // divided by the window's half-width and only the level-free constant
+  // remains. One level, and with it the whole walk fits a Boot landing at
+  // 16: ci16_35 as shipped, no thinner StC.
+  poly_in_ = calib_.causal ? sq_level_ : sq_level_ - 1;
   const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
   const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
   auto inv_coeffs = chebfit::Interpolate(
@@ -385,13 +390,16 @@ void CiBatchAttention<word>::BuildMasks(std::vector<Pt> &masks,
   masks.resize(T);
   std::vector<double> m(T);
   std::vector<Complex> msg;
+  // The affine's multiplicative half, folded (see PrepareSoftMax).
+  const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
+  const double fold = 1.0 / std::sqrt(aff_a);
   for (int l = 0; l < T; l++) {
     for (int t = 0; t < T; t++) {
       double v = 0.0;
       if (t >= l) {
-        v = calib_.row_norm.empty()
-                ? 1.0
-                : 1.0 / std::sqrt(calib_.row_norm[head][t]);
+        v = fold * (calib_.row_norm.empty()
+                        ? 1.0
+                        : 1.0 / std::sqrt(calib_.row_norm[head][t]));
       }
       m[t] = v;
     }
@@ -469,16 +477,25 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
   {
     const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
     const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
-    Constant<word> inv_a;
-    boot_->encoder_.EncodeConstant(inv_a, sq_level_, param.GetScale(sq_level_),
-                                   1.0 / aff_a);
-    Ct scaled;
-    boot_->Mult(scaled, sq, inv_a);
-    boot_->Rescale(sq, scaled);
-    Constant<word> shift;
-    boot_->encoder_.EncodeConstant(shift, poly_in_, sq.GetScale(),
-                                   -aff_b / aff_a);
-    boot_->Add(sq, sq, shift);
+    if (calib_.causal) {
+      // 1/a arrived through the masks (BuildMasks); only the level-free
+      // constant is left.
+      Constant<word> shift;
+      boot_->encoder_.EncodeConstant(shift, poly_in_, sq.GetScale(),
+                                     -aff_b / aff_a);
+      boot_->Add(sq, sq, shift);
+    } else {
+      Constant<word> inv_a;
+      boot_->encoder_.EncodeConstant(inv_a, sq_level_,
+                                     param.GetScale(sq_level_), 1.0 / aff_a);
+      Ct scaled;
+      boot_->Mult(scaled, sq, inv_a);
+      boot_->Rescale(sq, scaled);
+      Constant<word> shift;
+      boot_->encoder_.EncodeConstant(shift, poly_in_, sq.GetScale(),
+                                     -aff_b / aff_a);
+      boot_->Add(sq, sq, shift);
+    }
   }
   Ct r;
   polys_[1]->Evaluate(boot_, r, sq, mult_key);

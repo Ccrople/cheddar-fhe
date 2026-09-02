@@ -64,16 +64,19 @@ namespace cheddar {
  * blocks = query tokens: the layout's own form, straight into the O
  * projection after the return.
  *
- * ## Levels
+ * ## Levels, tight
  *
- *     projection output @ rope_level (6)  --RoPE(+mask)-->  5
- *       --LevelDown--> forward_level (4)  --SlotToSinC-->  3 = chain level
+ *     projection output @ rope_level (5)  --RoPE(+mask)-->  4
+ *       = forward_level  --SlotToSinC-->  3 = chain level
  *       --RingSwitch--> parts @3  --Lift-->  Algorithm 4 @3 -> 2
  *       --Descend, SwitchBack @2--> --SinCToSlot @ inverse_level (2)--> 1
  *
  * so a product's output lands in slots at level 1: the scores go to a
  * `Boot` (which takes any level), the attention output to the O projection
- * (1 -> 0) and the residual at 0.
+ * (1 -> 0) and the residual at 0. Nothing is LevelDowned past work: the
+ * attention norm holds at 7 (y at 6), the projections land at 5, RoPE at
+ * 4 = the forward level. The softmax fits the shipped `ci16_35` landing
+ * (16) because the Euclidean norm's affine multiply rides the causal mask.
  *
  * ## Keys, on three rings
  *
@@ -101,8 +104,9 @@ class CiBatchAttention {
     //! shipped chain (`ci16_35` / `ci12_35_boot` / `ringdegree13_35_boot`):
     //! the product ring's 4096 = 128 tokens x 32 lanes.
     int sub_degree = 32;
-    //! The projections' output level; RoPE lands one below.
-    int rope_level = 6;
+    //! The projections' output level; RoPE lands one below, ON the forward
+    //! level when the attention norm holds at 7 (y at 6, projections at 5).
+    int rope_level = 5;
     //! The slots -> SinC forward runs here and lands one below, where the
     //! chain runs.
     int forward_level = 4;
@@ -186,10 +190,11 @@ class CiBatchAttention {
     std::vector<std::vector<double>> row_shift, row_norm;
     double norm_lo = 0.9, norm_hi = 1.1;  //!< the invsqrt interval (ratio)
     int exp_degree = 0;   //!< 0 = derive from `m_eff`
-    //! 7 (three levels): on a ring whose Boot lands at 17 the walk has
-    //! exactly 13 levels above `forward_level` 4, and exp's four, the
-    //! mask, the square, the affine, three here and the closing two are
-    //! those. Degree 7 on [0.9, 1.1] is 2^-13.
+    //! 7 (three levels): with the affine's multiply folded into the causal
+    //! mask, the walk is 12 levels above `forward_level` 4 -- exp's four,
+    //! the mask, the square, three here and the closing two -- which is
+    //! exactly what a Boot landing at 16 (ci16_35 as shipped) has. Degree 7
+    //! on [0.9, 1.1] is 2^-13.
     int inv_degree = 7;
     bool causal = true;
   };

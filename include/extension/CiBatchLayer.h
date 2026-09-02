@@ -100,6 +100,11 @@ class CiBatchLayer {
     //! and it is the LOWEST that does: SiLU's four levels, the product and
     //! the down projection need six below the norm's output.
     int norm_apply_level = 8;
+    //! The ATTENTION norm's hold. 7 is tight: y at 6, the q/k/v
+    //! projections at 5 (= the attention's rope_level), RoPE at 4 = the
+    //! forward level -- no LevelDown wasted, and the normalised split and
+    //! the q/k/v tiles are one limb smaller than at the feed-forward's 8.
+    int norm_apply_level_attn = 7;
     //! Keep every booted channel (at `norm_apply_level`, 11 limbs = 23.6
     //! GiB at the model's width) between the sum of squares and the apply,
     //! or boot each channel twice and hold nothing. The first is 4096
@@ -208,7 +213,7 @@ class CiBatchLayer {
   void NormTurn(typename CiBatchProjection<word>::Source &src,
                 const std::vector<Ct> &stream, double alpha, double window,
                 const std::vector<double> &sink, double stream_scale,
-                const EvkMap<word> &evk, bool hold) const;
+                const EvkMap<word> &evk, bool hold, int hold_level) const;
 
   /**
    * @brief The whole feed-forward half: norm, gate/up, SiLU, down, residual.

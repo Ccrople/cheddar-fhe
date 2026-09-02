@@ -60,7 +60,7 @@ namespace {
 
 const char *Param() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_PARAM");
-  return (env && env[0]) ? env : "ci16_35_stc2.json";
+  return (env && env[0]) ? env : "ci16_35.json";
 }
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
@@ -1103,8 +1103,8 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   cfg.rank = 16;
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   cheddar::CiBatchAttention<word>::Config acfg;
-  // y at hold - 1, the projections one below.
-  acfg.rope_level = cfg.norm_apply_level - 2;
+  // y at the attention hold - 1, the projections one below.
+  acfg.rope_level = cfg.norm_apply_level_attn - 2;
   acfg.verbose = true;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg);
@@ -1301,7 +1301,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cfg.rank = 16;
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   cheddar::CiBatchAttention<word>::Config acfg;
-  acfg.rope_level = cfg.norm_apply_level - 2;
+  acfg.rope_level = cfg.norm_apply_level_attn - 2;
   acfg.verbose = cfg.verbose;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg);
@@ -1621,7 +1621,7 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
   auto t0 = Sync();
   typename cheddar::CiBatchProjection<word>::Source src;
   layer.NormTurn(src, stream, alpha, window, sink, stream_scale,
-                 boot.ui->GetEvkMap(), cfg.hold_channels);
+                 boot.ui->GetEvkMap(), cfg.hold_channels, cfg.norm_apply_level);
   auto t1 = Sync();
   std::cout << "  NormTurn on " << model << " channels: " << Ms(t0, t1) / 1000.0
             << " s" << std::endl;
