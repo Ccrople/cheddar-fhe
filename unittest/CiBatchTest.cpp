@@ -1848,8 +1848,10 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
   const double score_ride = [] {
+    // 0.25, not 0.35: the chain's carried (1.78) rides into the score
+    // boots -- see the attention-half test's derivation.
     const char *e = std::getenv("CHEDDAR_CI_BATCH_SCORE_RIDE");
-    return (e && e[0]) ? std::atof(e) : 0.35;
+    return (e && e[0]) ? std::atof(e) : 0.25;
   }();
 
   nlohmann::json calib_all;
