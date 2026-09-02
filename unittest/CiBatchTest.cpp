@@ -972,6 +972,7 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
       }
     }
   };
+  HostTensor q_orig = q;  // pre-RoPE, for the repeat loop's re-encryptions
   rope_host(q);
   rope_host(k);
   const std::vector<int> bs = {0, B / 3, B / 2, B - 1};
@@ -1001,6 +1002,44 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
             << ": 2^-" << std::fixed << Bits(e_lo.rms_rel) << ", >= " << T / 2
             << ": 2^-" << Bits(e_hi.rms_rel) << std::endl;
   EXPECT_LT(e.rms_rel, std::ldexp(1.0, -8));
+
+  // The layer calls Scores 32 times a layer against handler state (the
+  // Cmt plans, the converters' scratch, the ping-pong buffers) that the
+  // single call above never exercises twice, and reuses one K for the four
+  // heads of a kv group. CHEDDAR_CI_BATCH_SCORES_REPEAT=N replays the SAME
+  // product N more times (fresh Q encryption, the SAME K ciphertexts) and
+  // compares every replay: a call-count- or reuse-dependent corruption
+  // shows as a deviation that grows with the replay index.
+  const int reps = EnvInt("CHEDDAR_CI_BATCH_SCORES_REPEAT", 0);
+  for (int rep = 0; rep < reps; rep++) {
+    std::vector<Ciphertext<word>> q2, s2;
+    EncryptChannels(boot, layout, q_orig, cfg.rope_level, q2);
+    attn.Scores(s2, q2, k_cts, keys);
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    HostTensor g2{B, T, T, {}};
+    g2.v.assign(static_cast<size_t>(B) * T * T, 0.0);
+    DecryptChannels(boot, layout, s2, all_l, g2);
+    const Err er = Compare(g2, want, bs, all_l);
+    double mx = 0.0;
+    int mb = 0, mt = 0, mi = 0;
+    for (int b : bs) {
+      for (int t = 0; t < T; t++) {
+        for (int l = 0; l < T; l++) {
+          const double d = std::abs(g2.At(b, t, l) - want.At(b, t, l));
+          if (d > mx) {
+            mx = d;
+            mb = b; mt = t; mi = l;
+          }
+        }
+      }
+    }
+    std::cout << "  [rep " << std::setw(2) << rep << "] rms rel 2^-"
+              << std::fixed << std::setprecision(2) << Bits(er.rms_rel)
+              << ", worst |dev| " << std::scientific << mx << " at (b "
+              << std::fixed << mb << ", t " << mt << ", l " << mi << ")"
+              << std::endl;
+    EXPECT_LT(er.rms_rel, std::ldexp(1.0, -7)) << "replay " << rep;
+  }
 }
 
 // ---------------------------------------------------------------------------
