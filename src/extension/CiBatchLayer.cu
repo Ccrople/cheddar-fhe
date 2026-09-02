@@ -554,11 +554,17 @@ void CiBatchLayer<word>::Attention(
       }
       std::vector<Ct> q_h = std::move(q_heads[h % heads_per_tile]);
       stages_.qkv += SinceSeconds(t0);
+      if (h == 0 && cfg_.verbose) {
+        MemoryPool::Report("batch: head 0 before the scores");
+      }
 
       t0 = Clock::now();
       std::vector<Ct> scores;
       attn.Scores(scores, q_h, k_kv, akeys);
       stages_.scores += SinceSeconds(t0);
+      if (h == 0 && cfg_.verbose) {
+        MemoryPool::Report("batch: head 0 after the scores");
+      }
 
       // The scores' bootstraps, the chain's factor read off before them.
       t0 = Clock::now();
@@ -579,12 +585,18 @@ void CiBatchLayer<word>::Attention(
                  "CiBatchLayer::Attention: the score bootstrap did not "
                  "land at the top level");
       stages_.boot += SinceSeconds(t0);
+      if (h == 0 && cfg_.verbose) {
+        MemoryPool::Report("batch: head 0 after the score boots");
+      }
 
       t0 = Clock::now();
       std::vector<Ct> P;
       attn.SoftMax(P, booted, h, carried, evk);
       booted.clear();
       stages_.softmax += SinceSeconds(t0);
+      if (h == 0 && cfg_.verbose) {
+        MemoryPool::Report("batch: head 0 after the softmax");
+      }
 
       t0 = Clock::now();
       std::vector<Ct> out_h;
