@@ -1577,10 +1577,14 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   const int max_kv = EnvInt("CHEDDAR_CI_BATCH_MAX_KV", 8);
   cheddar::CiBatchLayer<word>::AttnDebug dbg;
   dbg.head = EnvInt("CHEDDAR_CI_BATCH_DBG_HEAD", 0);
+  // The debug path opens on a kv subset OR on an explicitly chosen head
+  // (a head in the last group needs all 8 groups run to be reached).
+  const bool debugging =
+      max_kv < 8 || std::getenv("CHEDDAR_CI_BATCH_DBG_HEAD") != nullptr;
   auto t3 = Sync();
   std::vector<Ciphertext<word>> res;
   layer.Attention(res, stream, w, cal, attn, akeys, boot.ui->GetEvkMap(),
-                  max_kv < 8 ? &dbg : nullptr);
+                  debugging ? &dbg : nullptr);
   auto t4 = Sync();
   const auto st = layer.GetStages();
   const auto counts = bctx->GetBootCounts();
@@ -1593,7 +1597,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
             << " s; " << FreeMiB() << " MiB free" << std::endl;
   ASSERT_EQ(static_cast<int>(res.size()), kH);
 
-  if (max_kv < 8) {
+  if (debugging) {
     // The bisection path: the captured head's stages against the host, at
     // the f = 1 instance.
     const int D = 128, head = dbg.head, T = kTokens;
