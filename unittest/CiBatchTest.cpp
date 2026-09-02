@@ -1026,11 +1026,13 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
   const int T = kTokens, head = 0;
   const double eps = 1e-5;
 
-  std::vector<float> x0, wq, wk, gain;
+  std::vector<float> x0, wq, wk, wv, wo, gain;
   ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
                       static_cast<size_t>(T) * kH, x0));
   ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
   ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
+  ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
   ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, gain));
 
   std::ifstream cf(rd + "/calib.json");
@@ -1149,6 +1151,32 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
     layer.AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  const int chain_level = attn.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  cheddar::CiBatchAttention<word>::Keys akeys;
+  akeys.boot = &boot.ui->GetEvkMap();
+  akeys.swtch = &swtch.ui->GetEvkMap();
+  akeys.lifted = &lifted.ui->GetEvkMap();
+  akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
+  akeys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
   {
     typename cheddar::CiBatchAttention<word>::SoftMaxCalibration sc;
     sc.m_eff = m_eff;
@@ -1223,6 +1251,125 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
               << e.rms_ref << ") in " << std::fixed << Ms(t0, t1) / 1000.0
               << " s (boot + walk)" << std::endl;
     EXPECT_LT(e.rms_rel, std::ldexp(1.0, -8)) << "carried " << carried;
+  }
+
+  // --- Values on the same head: the TRUE P against host P V, then the O
+  //     slice with the measured ratio -- the two stages the half test runs
+  //     that nothing had verified in isolation.
+  const int D2 = acfg.head_dim;
+  std::vector<double> v_host(static_cast<size_t>(T) * D2);
+  cheddar::ParallelFor(T, [&](int begin, int end) {
+    for (int l = begin; l < end; l++) {
+      for (int d = 0; d < D2; d++) {
+        double acc = 0.0;
+        for (int c = 0; c < kH; c++) {
+          acc += y[static_cast<size_t>(l) * kH + c] *
+                 wv[static_cast<size_t>(c) * kKv + kv_col + d];
+        }
+        v_host[static_cast<size_t>(l) * D2 + d] = acc;
+      }
+    }
+  });
+  std::vector<Ciphertext<word>> p_cts, v_cts;
+  {
+    HostTensor pt{B, T, T, {}};
+    pt.v.resize(static_cast<size_t>(B) * T * T);
+    HostTensor vt{B, T, D2, {}};
+    vt.v.resize(static_cast<size_t>(B) * T * D2);
+    for (int b = 0; b < B; b++) {
+      for (int t = 0; t < T; t++) {
+        for (int l = 0; l < T; l++) {
+          pt.At(b, t, l) = p_true[static_cast<size_t>(t) * T + l];
+        }
+        for (int d = 0; d < D2; d++) {
+          vt.At(b, t, d) = v_host[static_cast<size_t>(t) * D2 + d];
+        }
+      }
+    }
+    EncryptChannels(boot, layout, pt, acfg.forward_level, p_cts);
+    EncryptChannels(boot, layout, vt, acfg.forward_level + 1, v_cts);
+  }
+  auto tv0 = Sync();
+  std::vector<Ciphertext<word>> pv;
+  attn.Values(pv, p_cts, v_cts, akeys);
+  auto tv1 = Sync();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(static_cast<int>(pv.size()), D2);
+  {
+    std::vector<int> all_d(D2);
+    for (int d = 0; d < D2; d++) all_d[d] = d;
+    HostTensor got{B, T, D2, {}};
+    got.v.assign(static_cast<size_t>(B) * T * D2, 0.0);
+    DecryptChannels(boot, layout, pv, all_d, got);
+    HostTensor want{B, T, D2, {}};
+    want.v.assign(got.v.size(), 0.0);
+    for (int b : bs) {
+      for (int t = 0; t < T; t++) {
+        for (int d = 0; d < D2; d++) {
+          double acc = 0.0;
+          for (int l = 0; l <= t; l++) {
+            acc += p_true[static_cast<size_t>(t) * T + l] *
+                   v_host[static_cast<size_t>(l) * D2 + d];
+          }
+          want.At(b, t, d) = acc;
+        }
+      }
+    }
+    const Err ev = Compare(got, want, bs, all_d);
+    std::cout << "  values (P V): rms rel 2^-" << std::fixed
+              << std::setprecision(2) << Bits(ev.rms_rel) << " (max abs "
+              << std::scientific << ev.max_abs << ", ref rms " << ev.rms_ref
+              << ") in " << std::fixed << Ms(tv0, tv1) / 1000.0 << " s"
+              << std::endl;
+    EXPECT_LT(ev.rms_rel, std::ldexp(1.0, -8)) << "the values product";
+
+    // The O slice as the layer runs it: level and ratio read off the
+    // attention output, the weight told both.
+    const int o_level = boot.param->NPToLevel(pv[0].GetNP());
+    const double o_ratio =
+        pv[0].GetScale() / boot.param->GetScale(o_level);
+    std::cout << "  attention out at level " << o_level << ", ratio "
+              << o_ratio << std::endl;
+    cheddar::CiBatchProjection<word> &proj = layer.GetProjection();
+    std::vector<float> wo_slice(static_cast<size_t>(D2) * kH);
+    for (int d = 0; d < D2; d++) {
+      for (int c = 0; c < kH; c++) {
+        wo_slice[static_cast<size_t>(d) * kH + c] =
+            wo[(static_cast<size_t>(head) * D2 + d) * kH + c];
+      }
+    }
+    cheddar::DeviceVector<float> wo_dev;
+    ToDevice(wo_dev, wo_slice);
+    proj.Prepare("o.head0", wo_dev.data(), D2, kH, o_level, 1.0, o_ratio);
+    std::vector<Ciphertext<word>> o_cts;
+    proj.Project(o_cts, pv, "o.head0");
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    const int keep = 64;
+    std::vector<int> ks(keep);
+    for (int c = 0; c < keep; c++) ks[c] = c * (kH / keep);
+    HostTensor o_got{B, T, kH, {}};
+    o_got.v.assign(static_cast<size_t>(B) * T * kH, 0.0);
+    DecryptChannels(boot, layout, o_cts, ks, o_got);
+    HostTensor o_want{B, T, kH, {}};
+    o_want.v.assign(o_got.v.size(), 0.0);
+    for (int b : bs) {
+      for (int t = 0; t < T; t++) {
+        for (int c : ks) {
+          double acc = 0.0;
+          for (int d = 0; d < D2; d++) {
+            acc += want.At(b, t, d) *
+                   wo_slice[static_cast<size_t>(d) * kH + c];
+          }
+          o_want.At(b, t, c) = acc;
+        }
+      }
+    }
+    const Err eo = Compare(o_got, o_want, bs, ks);
+    std::cout << "  O slice (head 0): rms rel 2^-" << std::fixed
+              << Bits(eo.rms_rel) << " (max abs " << std::scientific
+              << eo.max_abs << ", ref rms " << eo.rms_ref << ")" << std::fixed
+              << std::endl;
+    EXPECT_LT(eo.rms_rel, std::ldexp(1.0, -8)) << "the O projection slice";
   }
 #endif
 }
