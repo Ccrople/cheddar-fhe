@@ -187,6 +187,18 @@ Err Compare(const HostTensor &got, const HostTensor &want,
 }
 double Bits(double rel) { return -std::log2(rel); }
 
+// The real-weight tests ride each instance at its own factor f in
+// [0.5, 1.5): a norm window fitted on the recorded prompt (f = 1) must
+// widen to the population -- the mean square scales by f^2 -- or the
+// out-of-window instances' inverse square root (a Chebyshev evaluated
+// past [-1, 1]) blows up by ~2^28, and at level 0 those slots wrap the
+// modulus and poison every instance, the checked f = 1 one included.
+void WidenForInstanceFactors(double &alpha, double &window,
+                             double f_lo = 0.5, double f_hi = 1.5) {
+  alpha /= f_lo * f_hi;  // 1/sqrt((lo f_lo^2)(hi f_hi^2)) restated
+  window *= (f_hi * f_hi) / (f_lo * f_lo);
+}
+
 bool ReadF32(const std::string &path, size_t count, std::vector<float> &out) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
@@ -598,6 +610,7 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
   cal.stream_scale = ride / resid_absmax;
+  WidenForInstanceFactors(cal.alpha, cal.norm_window);
   std::cout << "  calibration: alpha " << cal.alpha << " window "
             << cal.norm_window << " silu_range " << cal.silu_range
             << " resid_absmax " << resid_absmax << " -> stream_scale "
@@ -1076,6 +1089,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
   cal.stream_scale = ride / std::max(in_absmax, resid_absmax);
+  WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window);
   std::cout << "  calibration: attn_alpha " << cal.attn_alpha << " window "
             << cal.attn_norm_window << " span_raw " << cal.span_raw
             << " s_raw_max " << cal.s_raw_max << " m_eff " << cal.m_eff
@@ -1436,6 +1450,8 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     }
     const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
     cal.cq = cal.ck = std::sqrt(cqk);
+    WidenForInstanceFactors(cal.alpha, cal.norm_window);
+    WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window);
 
     bctx->ResetBootCounts();
     auto tl0 = Sync();
