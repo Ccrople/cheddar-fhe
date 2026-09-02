@@ -293,6 +293,7 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
                                      const Weights &w, const Calibration &c,
                                      const EvkMap<word> &evk) {
   NvtxScope _nv("batch: FeedForward");
+  if (cfg_.verbose) MemoryPool::Report("batch: FeedForward entry");
   const int model = cfg_.model, hidden = cfg_.hidden;
   const Parameter<word> &param = boot_->param_;
   const auto &mult_key = evk.GetMultiplicationKey();
