@@ -1659,10 +1659,29 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
         }
       }
       const Err e = Compare(g, want, bref, all_w);
+      // The blow detector across EVERY instance: the largest decrypted
+      // value anywhere, and which (instance, token, index) holds it --
+      // the f = 1 comparison alone missed garbage confined to other
+      // instances.
+      double mx_all = 0.0;
+      int mb = 0, mt = 0, mi = 0;
+      for (int b2 = 0; b2 < B; b2++) {
+        for (int t2 = 0; t2 < T; t2++) {
+          for (int i2 = 0; i2 < width; i2++) {
+            const double v = std::abs(g.At(b2, t2, i2));
+            if (v > mx_all) {
+              mx_all = v;
+              mb = b2; mt = t2; mi = i2;
+            }
+          }
+        }
+      }
       std::cout << "  [dbg] " << tag << ": rms rel 2^-" << std::fixed
                 << std::setprecision(2) << Bits(e.rms_rel) << " (max abs "
                 << std::scientific << e.max_abs << ", ref rms " << e.rms_ref
-                << ")" << std::fixed << std::endl;
+                << "); ALL-instance max |value| " << mx_all << " at (b "
+                << std::fixed << mb << ", t " << mt << ", i " << mi << ")"
+                << std::endl;
     };
     check("q (pre-RoPE)", dbg.q, qh, D, 1.0);
     check("k (pre-RoPE)", dbg.k, kh, D, 1.0);
