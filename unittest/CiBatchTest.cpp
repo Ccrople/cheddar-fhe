@@ -1760,6 +1760,31 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       }
     }
     check("scores", dbg.scores, sh, T, 1.0);
+    // The f-profile of one named slot: CHEDDAR_CI_BATCH_DBG_SLOT="t,l"
+    // prints the decoded score at (t, l) for a sweep of instances, against
+    // the f-independent host value -- the corruption's dependence on the
+    // instance factor (zero? linear? thresholded?) names its mechanism.
+    if (const char *sl = std::getenv("CHEDDAR_CI_BATCH_DBG_SLOT")) {
+      int st = 0, sll = 0;
+      if (std::sscanf(sl, "%d,%d", &st, &sll) == 2 && !dbg.scores.empty()) {
+        std::vector<int> one = {sll};
+        HostTensor g{B, T, T, {}};
+        g.v.assign(static_cast<size_t>(B) * T * T, 0.0);
+        DecryptChannels(boot, layout, dbg.scores, one, g);
+        std::cout << "  [dbg] slot (t " << st << ", l " << sll
+                  << "): host " << std::scientific
+                  << sh[static_cast<size_t>(st) * T + sll] << "; decoded by instance:"
+                  << std::endl;
+        for (int b2 = 0; b2 < B; b2 += 32) {
+          std::cout << "    b " << std::setw(3) << b2 << " (f "
+                    << std::fixed << std::setprecision(3)
+                    << (0.5 + static_cast<double>(b2) / B) << "): "
+                    << std::scientific << g.At(b2, st, sll) << std::endl;
+        }
+        std::cout << "    b 511 (f 1.498): " << std::scientific
+                  << g.At(511, st, sll) << std::fixed << std::endl;
+      }
+    }
     double carried = 1.0;
     if (!dbg.scores.empty()) {
       const int ls = boot.param->NPToLevel(dbg.scores[0].GetNP());
