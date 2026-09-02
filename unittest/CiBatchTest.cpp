@@ -1109,7 +1109,11 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   cheddar::CiBatchLayer<word>::Config cfg;
   cfg.num_tokens = kTokens;
   cfg.model = kH;
-  cfg.rows_per_tile = 512;
+  // Multiple of the head dim (128). At 512 the first group's K/V/Q tiles
+  // and the projection's persistent buffers stand ~5 GiB taller, and
+  // attn11 died ~2 GiB short in head 0's softmax (driver 80.8 of 81.9
+  // GiB): 256 is the margin, and the configuration cb_run.sh documents.
+  cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 256);
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
   cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
   cfg.verbose = true;
