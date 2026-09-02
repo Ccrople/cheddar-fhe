@@ -677,7 +677,11 @@ void CiBatchLayer<word>::Attention(
   proj_->Release("attn.k");
   proj_->Release("attn.v");
   src_y = typename CiBatchProjection<word>::Source();
-  if (cfg_.release_boot_tables) boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
+  // The tables STAY: in the layer the feed-forward's norm boots next and
+  // would re-prepare them at once -- chain1k died OOM at exactly that
+  // re-preparation, the same churn 7fae5ff removed inside the attention.
+  // The feed-forward's own post-norm release still frees them before the
+  // down tiles' peak.
 
   // 6. The residual.
   t0 = Clock::now();
