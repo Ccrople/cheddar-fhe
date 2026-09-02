@@ -1449,8 +1449,15 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       }
     }
     const double score_ride = [] {
+      // The chain hands the scores to their bootstrap CARRYING its scale
+      // ratio (1.78), so the boot's EvalMod sees ride x 1.78. At 0.35 the
+      // global score extremum rode at 0.623 of the +-0.6625 wrap boundary
+      // and instance 511's noise pushed head 31's (123, 102) slot over:
+      // decoded +302 for a true -268 = one full +570 wrap, the 2^+28
+      // garbage of 2026-09-02. 0.25 x 1.78 = 0.445 sits well inside (the
+      // FFN's stream boots run at 0.52 cleanly).
       const char *e = std::getenv("CHEDDAR_CI_BATCH_SCORE_RIDE");
-      return (e && e[0]) ? std::atof(e) : 0.35;
+      return (e && e[0]) ? std::atof(e) : 0.25;
     }();
     const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
     cal.cq = cal.ck = std::sqrt(cqk);
