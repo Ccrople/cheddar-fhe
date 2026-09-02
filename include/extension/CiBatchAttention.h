@@ -280,6 +280,36 @@ class CiBatchAttention {
   //! The forward (slots -> SinC) and the inverse converter.
   std::unique_ptr<CiSinCConverter<word>> fwd_;
   std::unique_ptr<CiSinCConverter<word>> inv_;
+
+ public:
+  /**
+   * @brief Residency of the two converters' compiled plaintexts (~7.5 GiB;
+   * `HoistHandler::Unstage`). The feed-forward half never touches them and
+   * the layer's seam is memory-bound: the layer unstages them for the FFN
+   * and stages them back for the next attention.
+   */
+  void UnstageConverters() const {
+    if (fwd_) {
+      if (fwd_->GetForward() != nullptr) fwd_->GetForward()->Unstage();
+      if (fwd_->GetInverse() != nullptr) fwd_->GetInverse()->Unstage();
+    }
+    if (inv_) {
+      if (inv_->GetForward() != nullptr) inv_->GetForward()->Unstage();
+      if (inv_->GetInverse() != nullptr) inv_->GetInverse()->Unstage();
+    }
+  }
+  void StageConverters() const {
+    if (fwd_) {
+      if (fwd_->GetForward() != nullptr) fwd_->GetForward()->Stage();
+      if (fwd_->GetInverse() != nullptr) fwd_->GetInverse()->Stage();
+    }
+    if (inv_) {
+      if (inv_->GetForward() != nullptr) inv_->GetForward()->Stage();
+      if (inv_->GetInverse() != nullptr) inv_->GetInverse()->Stage();
+    }
+  }
+
+ private:
   //! RoPE's per-token plaintexts at `rope_level`: [mask][pair], mask 0 =
   //! every token (Q), 1 / 2 = the key-token halves (K's two calls).
   std::vector<Pt> rope_cos_[3], rope_sin_[3];

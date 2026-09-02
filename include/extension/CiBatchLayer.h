@@ -269,8 +269,15 @@ class CiBatchLayer {
              const EvkMap<word> &evk) {
     std::vector<Ct> mid;
     Attention(mid, stream, aw, c, attn, akeys, evk);
+    // The seam is memory-bound (chain1m: 42.5 GiB live here, and the
+    // feed-forward wants its 20 GiB arena plus its churn on top): the
+    // input stream is dead -- `mid` replaced it -- and the converters are
+    // unused until the next layer's attention.
+    stream.clear();
+    attn.UnstageConverters();
     const Stages a = stages_;
     FeedForward(res, mid, fw, c, evk);
+    attn.StageConverters();
     stages_.boot += a.boot;
     stages_.norm += a.norm;
     stages_.qkv = a.qkv;
