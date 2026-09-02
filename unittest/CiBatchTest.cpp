@@ -1576,6 +1576,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   // the host at f = 1, and the full-output comparison skipped.
   const int max_kv = EnvInt("CHEDDAR_CI_BATCH_MAX_KV", 8);
   cheddar::CiBatchLayer<word>::AttnDebug dbg;
+  dbg.head = EnvInt("CHEDDAR_CI_BATCH_DBG_HEAD", 0);
   auto t3 = Sync();
   std::vector<Ciphertext<word>> res;
   layer.Attention(res, stream, w, cal, attn, akeys, boot.ui->GetEvkMap(),
@@ -1593,9 +1594,9 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   ASSERT_EQ(static_cast<int>(res.size()), kH);
 
   if (max_kv < 8) {
-    // The bisection path: head 0's captured stages against the host, at
+    // The bisection path: the captured head's stages against the host, at
     // the f = 1 instance.
-    const int D = 128, head = 0, T = kTokens;
+    const int D = 128, head = dbg.head, T = kTokens;
     std::vector<double> yn(static_cast<size_t>(T) * kH);
     for (int t = 0; t < T; t++) {
       double ms = 0.0;
@@ -1728,9 +1729,36 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       }
     }
     check("P V (head out)", dbg.out, pv2, D, 1.0);
+    // The blow-up detector, no reference needed: the residual's magnitude
+    // over a spread of channels. Sane is ~stream_scale x O(1); the failure
+    // under hunt is ~1e5.
+    {
+      const int probe = 64;
+      std::vector<int> ks(probe);
+      for (int c = 0; c < probe; c++) ks[c] = c * (kH / probe);
+      HostTensor g{B, T, kH, {}};
+      g.v.assign(static_cast<size_t>(B) * T * kH, 0.0);
+      DecryptChannels(boot, layout, res, ks, g);
+      double mx = 0.0, s2 = 0.0;
+      size_t n = 0;
+      for (int b : bref) {
+        for (int t = 0; t < T; t++) {
+          for (int c : ks) {
+            const double v = g.At(b, t, c);
+            mx = std::max(mx, std::abs(v));
+            s2 += v * v;
+            n++;
+          }
+        }
+      }
+      std::cout << "  [dbg] residual magnitude over " << probe
+                << " channels: rms " << std::scientific
+                << std::sqrt(s2 / static_cast<double>(n)) << ", max " << mx
+                << std::fixed << std::endl;
+    }
     std::cout << "  [dbg] bisection over " << max_kv
-              << " kv group(s); the full-output comparison is skipped"
-              << std::endl;
+              << " kv group(s), head " << head
+              << "; the full-output comparison is skipped" << std::endl;
     return;
   }
 
