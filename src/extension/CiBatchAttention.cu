@@ -326,9 +326,24 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   poly_in_ = calib_.causal ? sq_level_ : sq_level_ - 1;
   const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
   const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
-  auto inv_coeffs = chebfit::Interpolate(
-      [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
-      calib_.inv_degree);
+  // Causal: the mask carries 1/sqrt(a), so the NUMERATOR y is scaled by it
+  // too and P = (y r)^2 by 1/a. The polynomial must return sqrt(a) to
+  // cancel it: 1/sqrt(t + b/a) = sqrt(a)/sqrt(a t + b). Without the fold
+  // (non-causal) the plain 1/sqrt(a t + b) stands. The host mirror
+  // (softmax_mirror.py) puts the difference at 10x vs 2^-15.5 on the real
+  // layer-0 scores.
+  auto inv_coeffs =
+      calib_.causal
+          ? chebfit::Interpolate(
+                [aff_a, aff_b](double v) {
+                  return 1.0 / std::sqrt(v + aff_b / aff_a);
+                },
+                calib_.inv_degree)
+          : chebfit::Interpolate(
+                [aff_a, aff_b](double v) {
+                  return 1.0 / std::sqrt(aff_a * v + aff_b);
+                },
+                calib_.inv_degree);
   const int inv_used = EvalPoly<word>(inv_coeffs, poly_in_,
                                       param.GetScale(poly_in_),
                                       param.GetScale(poly_in_), true)

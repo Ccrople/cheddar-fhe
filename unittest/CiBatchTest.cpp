@@ -1004,6 +1004,230 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. The softmax alone, on the real head-0 scores, through the exact seam
+//     the layer uses: the scores encrypted at the chain's output level with
+//     the chain's non-canonical scale (carried), booted, then SoftMax --
+//     against the true causal softmax. The host mirror
+//     (reference: softmax_mirror.py) puts the algorithm at 2^-15.5 on these
+//     scores, so anything worse here is the crypto seam, not the fit.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  const char *rdir_env = std::getenv("LLAMA3_REF_DIR");
+  if (wdir_env == nullptr || rdir_env == nullptr) {
+    GTEST_SKIP() << "LLAMA3_ALL_DIR and LLAMA3_REF_DIR must both be set";
+  }
+  const std::string ld = std::string(wdir_env) + "/L00";
+  const std::string rd = rdir_env;
+  constexpr int kH = 4096, kKv = 1024, kHeads = 32;
+  const int T = kTokens, head = 0;
+  const double eps = 1e-5;
+
+  std::vector<float> x0, wq, wk, gain;
+  ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
+                      static_cast<size_t>(T) * kH, x0));
+  ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
+  ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, gain));
+
+  std::ifstream cf(rd + "/calib.json");
+  ASSERT_TRUE(cf.good()) << rd << "/calib.json";
+  nlohmann::json cj = nlohmann::json::parse(cf)["layers"][0];
+  const double s_min = cj["s_raw_min"], s_max = cj["s_raw_max"];
+  const double span_raw = s_max - s_min;
+  const double m_eff = cj["span"];
+  const double score_ride = 0.35;
+  const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
+  std::vector<double> sink(T, 1.0);
+  if (cj.contains("attn_sink")) {
+    const auto v = cj["attn_sink"].get<std::vector<double>>();
+    for (size_t i = 0; i < v.size() && i < sink.size(); i++) sink[i] = v[i];
+  }
+
+  cheddar::CiBatchAttention<word>::Config acfg;
+  acfg.verbose = true;
+
+  // Host: the real head-0 raw scores -- norm, Q/K, RoPE, the contraction.
+  const int D = acfg.head_dim;
+  std::vector<double> y(static_cast<size_t>(T) * kH);
+  for (int t = 0; t < T; t++) {
+    double ms = 0.0;
+    for (int c = 0; c < kH; c++) {
+      const double v = sink[t] * x0[static_cast<size_t>(t) * kH + c];
+      ms += v * v;
+    }
+    const double r = 1.0 / std::sqrt(ms / kH + eps);
+    for (int c = 0; c < kH; c++) {
+      y[static_cast<size_t>(t) * kH + c] =
+          sink[t] * x0[static_cast<size_t>(t) * kH + c] * r * gain[c];
+    }
+  }
+  std::vector<double> q(static_cast<size_t>(T) * D), k(q.size());
+  const int kv_col = (head / 4) * D;
+  cheddar::ParallelFor(T, [&](int begin, int end) {
+    for (int t = begin; t < end; t++) {
+      for (int d = 0; d < D; d++) {
+        double aq = 0.0, ak = 0.0;
+        for (int c = 0; c < kH; c++) {
+          const double yc = y[static_cast<size_t>(t) * kH + c];
+          aq += yc * wq[static_cast<size_t>(c) * kH + head * D + d];
+          ak += yc * wk[static_cast<size_t>(c) * kKv + kv_col + d];
+        }
+        q[static_cast<size_t>(t) * D + d] = aq;
+        k[static_cast<size_t>(t) * D + d] = ak;
+      }
+    }
+  });
+  const int half = D / 2;
+  for (int t = 0; t < T; t++) {
+    for (int c = 0; c < half; c++) {
+      const double theta = std::pow(acfg.rope_base, -2.0 * c / D);
+      const double a = t * theta;
+      for (double *m : {q.data(), k.data()}) {
+        const double lo = m[static_cast<size_t>(t) * D + c];
+        const double hi = m[static_cast<size_t>(t) * D + c + half];
+        m[static_cast<size_t>(t) * D + c] =
+            lo * std::cos(a) - hi * std::sin(a);
+        m[static_cast<size_t>(t) * D + c + half] =
+            hi * std::cos(a) + lo * std::sin(a);
+      }
+    }
+  }
+  std::vector<double> s_raw(static_cast<size_t>(T) * T);
+  for (int t = 0; t < T; t++) {
+    for (int l = 0; l < T; l++) {
+      double acc = 0.0;
+      for (int d = 0; d < D; d++) {
+        acc += q[static_cast<size_t>(t) * D + d] *
+               k[static_cast<size_t>(l) * D + d];
+      }
+      s_raw[static_cast<size_t>(t) * T + l] = acc;
+    }
+  }
+
+  // The true causal softmax the walk is to reproduce.
+  std::vector<double> row_shift(T);
+  for (int t = 0; t < T; t++) {
+    row_shift[t] = cj["row_shift_raw"][head][t].get<double>();
+  }
+  std::vector<double> p_true(static_cast<size_t>(T) * T, 0.0);
+  for (int t = 0; t < T; t++) {
+    double sum = 0.0;
+    for (int l = 0; l <= t; l++) {
+      const double e = std::exp(
+          m_eff * (s_raw[static_cast<size_t>(t) * T + l] - row_shift[t]) /
+          span_raw);
+      p_true[static_cast<size_t>(t) * T + l] = e;
+      sum += e;
+    }
+    for (int l = 0; l <= t; l++) p_true[static_cast<size_t>(t) * T + l] /= sum;
+  }
+
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  cheddar::CiBatchLayer<word>::Config lcfg;
+  lcfg.num_tokens = T;
+  lcfg.model = 32;
+  lcfg.hidden = 64;
+  lcfg.rows_per_tile = 32;
+  cheddar::CiBatchLayer<word> layer(bctx, lcfg);
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, acfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  {
+    typename cheddar::CiBatchAttention<word>::SoftMaxCalibration sc;
+    sc.m_eff = m_eff;
+    sc.span = cqk * span_raw;
+    sc.shift = cqk * s_max;
+    sc.causal = true;
+    sc.inv_degree = 15;
+    sc.row_shift.assign(kHeads, std::vector<double>(T, 0.0));
+    sc.row_norm.assign(kHeads, std::vector<double>(T, 1.0));
+    for (int h = 0; h < kHeads; h++) {
+      for (int t = 0; t < T; t++) {
+        sc.row_shift[h][t] = cqk * cj["row_shift_raw"][h][t].get<double>();
+        sc.row_norm[h][t] = cj["row_norm"][h][t].get<double>();
+      }
+    }
+    attn.PrepareSoftMax(sc);
+  }
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = layout.num_instances;
+  std::vector<int> bs = {0, B - 1}, all_l(T);
+  for (int l = 0; l < T; l++) all_l[l] = l;
+
+  // The chain leaves the scores at a low level with a non-canonical scale
+  // (`carried`, 1.8 on the real chain); the layer boots them and hands
+  // `carried` to the softmax. Both ends of that seam:
+  for (const double carried : {1.0, 1.8}) {
+    HostTensor s{B, T, T, {}};
+    s.v.resize(static_cast<size_t>(B) * T * T);
+    for (int b = 0; b < B; b++) {
+      for (int t = 0; t < T; t++) {
+        for (int l = 0; l < T; l++) {
+          s.At(b, t, l) =
+              carried * cqk * s_raw[static_cast<size_t>(t) * T + l];
+        }
+      }
+    }
+    std::vector<Ciphertext<word>> cts;
+    EncryptChannels(boot, layout, s, 1, cts);
+    // The chain's state: raw carries m * carried at the canonical scale =
+    // m at scale carried * canonical.
+    for (auto &ct : cts) {
+      ct.SetScale(carried * boot.param->GetScale(1));
+    }
+    auto t0 = Sync();
+    std::vector<Ciphertext<word>> booted(T);
+    for (int l = 0; l < T; l++) {
+      bctx->Boot(booted[l], cts[l], boot.ui->GetEvkMap());
+    }
+    cts.clear();
+    std::vector<Ciphertext<word>> P;
+    attn.SoftMax(P, booted, head, carried, boot.ui->GetEvkMap());
+    auto t1 = Sync();
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    HostTensor got{B, T, T, {}};
+    got.v.assign(static_cast<size_t>(B) * T * T, 0.0);
+    DecryptChannels(boot, layout, P, all_l, got);
+    HostTensor want{B, T, T, {}};
+    want.v.assign(got.v.size(), 0.0);
+    for (int b : bs) {
+      for (int t = 0; t < T; t++) {
+        for (int l = 0; l < T; l++) {
+          want.At(b, t, l) = p_true[static_cast<size_t>(t) * T + l];
+        }
+      }
+    }
+    const Err e = Compare(got, want, bs, all_l);
+    std::cout << "  softmax (carried " << carried << "): rms rel 2^-"
+              << std::fixed << std::setprecision(2) << Bits(e.rms_rel)
+              << " (max abs " << std::scientific << e.max_abs << ", ref rms "
+              << e.rms_ref << ") in " << std::fixed << Ms(t0, t1) / 1000.0
+              << " s (boot + walk)" << std::endl;
+    EXPECT_LT(e.rms_rel, std::ldexp(1.0, -8)) << "carried " << carried;
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // 6. The attention half of layer 0 on the real weights, B instances at once:
 //    norm, Q/K/V, per head scores -> Boot -> softmax -> P V, O, residual --
 //    against the exporter's clear attention output. RMSNorm is scale
