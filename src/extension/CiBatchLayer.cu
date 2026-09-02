@@ -505,7 +505,17 @@ void CiBatchLayer<word>::Attention(
     sc.span = cqk * c.span_raw;
     sc.shift = cqk * c.s_raw_max;
     sc.causal = true;
-    sc.inv_degree = 15;
+    // The Euclidean norm's window must absorb the exp-amplified chain
+    // noise: the scores decode at ~2^-7.5, the exp's slope at the top is
+    // m_eff/4 ~ 11, and a row with one dominant key then swings sq/est by
+    // ~+-12% -- the noise-injected mirror puts head 31 at [0.894, 1.121],
+    // past the default [0.9, 1.1], and its invsqrt blew the whole layer
+    // (2^+28, hbis bisection 2026-09-02). Degree 7 keeps the walk's three
+    // levels (Log2Ceil(8) = 3, r at 6, P at forward_level 4) and reads
+    // 1/sqrt on [0.75, 1.35] at ~2^-15.
+    sc.norm_lo = 0.75;
+    sc.norm_hi = 1.35;
+    sc.inv_degree = 7;
     AssertTrue(static_cast<int>(c.row_shift_raw.size()) == heads,
                "CiBatchLayer::Attention: row_shift_raw is [heads][tokens]");
     sc.row_shift.assign(heads, std::vector<double>(T, 0.0));
