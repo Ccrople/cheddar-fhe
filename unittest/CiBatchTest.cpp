@@ -1571,9 +1571,15 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
 
   bctx->ResetBootCounts();
+  // With CHEDDAR_CI_BATCH_MAX_KV < 8 the run is a bisection: only those kv
+  // groups, head 0's intermediates captured, each stage compared against
+  // the host at f = 1, and the full-output comparison skipped.
+  const int max_kv = EnvInt("CHEDDAR_CI_BATCH_MAX_KV", 8);
+  cheddar::CiBatchLayer<word>::AttnDebug dbg;
   auto t3 = Sync();
   std::vector<Ciphertext<word>> res;
-  layer.Attention(res, stream, w, cal, attn, akeys, boot.ui->GetEvkMap());
+  layer.Attention(res, stream, w, cal, attn, akeys, boot.ui->GetEvkMap(),
+                  max_kv < 8 ? &dbg : nullptr);
   auto t4 = Sync();
   const auto st = layer.GetStages();
   const auto counts = bctx->GetBootCounts();
@@ -1585,6 +1591,148 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
             << st.softmax << " values " << st.values << " o " << st.o
             << " s; " << FreeMiB() << " MiB free" << std::endl;
   ASSERT_EQ(static_cast<int>(res.size()), kH);
+
+  if (max_kv < 8) {
+    // The bisection path: head 0's captured stages against the host, at
+    // the f = 1 instance.
+    const int D = 128, head = 0, T = kTokens;
+    std::vector<double> yn(static_cast<size_t>(T) * kH);
+    for (int t = 0; t < T; t++) {
+      double ms = 0.0;
+      for (int c = 0; c < kH; c++) {
+        const double v =
+            cal.attn_sink[t] * x0[static_cast<size_t>(t) * kH + c];
+        ms += v * v;
+      }
+      const double r = 1.0 / std::sqrt(ms / kH + 1e-5);
+      for (int c = 0; c < kH; c++) {
+        yn[static_cast<size_t>(t) * kH + c] =
+            cal.attn_sink[t] * x0[static_cast<size_t>(t) * kH + c] * r;
+      }
+    }
+    std::vector<double> qh(static_cast<size_t>(T) * D),
+        kh(static_cast<size_t>(T) * D), vh(static_cast<size_t>(T) * D);
+    const int kv_col = (head / 4) * D;
+    cheddar::ParallelFor(T, [&](int begin, int end) {
+      for (int t = begin; t < end; t++) {
+        for (int d = 0; d < D; d++) {
+          double aq = 0.0, ak = 0.0, av2 = 0.0;
+          for (int c = 0; c < kH; c++) {
+            const double yg = yn[static_cast<size_t>(t) * kH + c] *
+                              static_cast<double>(gain[c]);
+            aq += yg * wq[static_cast<size_t>(c) * kH + head * D + d];
+            ak += yg * wk[static_cast<size_t>(c) * kKv + kv_col + d];
+            av2 += yg * wv[static_cast<size_t>(c) * kKv + kv_col + d];
+          }
+          qh[static_cast<size_t>(t) * D + d] = cal.cq * aq;
+          kh[static_cast<size_t>(t) * D + d] = cal.ck * ak;
+          vh[static_cast<size_t>(t) * D + d] = av2;
+        }
+      }
+    });
+    std::vector<int> bref = {B / 2};
+    auto check = [&](const char *tag, const std::vector<Ciphertext<word>> &cts,
+                     const std::vector<double> &host, int width,
+                     double divide) {
+      if (cts.empty()) {
+        std::cout << "  [dbg] " << tag << ": not captured" << std::endl;
+        return;
+      }
+      std::vector<int> all_w(width);
+      for (int i = 0; i < width; i++) all_w[i] = i;
+      HostTensor g{B, T, width, {}};
+      g.v.assign(static_cast<size_t>(B) * T * width, 0.0);
+      DecryptChannels(boot, layout, cts, all_w, g);
+      HostTensor want{B, T, width, {}};
+      want.v.assign(g.v.size(), 0.0);
+      for (int b : bref) {
+        for (int t = 0; t < T; t++) {
+          for (int i2 = 0; i2 < width; i2++) {
+            want.At(b, t, i2) =
+                host[static_cast<size_t>(t) * width + i2] / divide;
+          }
+        }
+      }
+      const Err e = Compare(g, want, bref, all_w);
+      std::cout << "  [dbg] " << tag << ": rms rel 2^-" << std::fixed
+                << std::setprecision(2) << Bits(e.rms_rel) << " (max abs "
+                << std::scientific << e.max_abs << ", ref rms " << e.rms_ref
+                << ")" << std::fixed << std::endl;
+    };
+    check("q (pre-RoPE)", dbg.q, qh, D, 1.0);
+    check("k (pre-RoPE)", dbg.k, kh, D, 1.0);
+    check("v", dbg.v, vh, D, 1.0);
+    // RoPE for the scores.
+    const int half2 = D / 2;
+    for (int t = 0; t < T; t++) {
+      for (int c = 0; c < half2; c++) {
+        const double theta = std::pow(500000.0, -2.0 * c / D);
+        const double a = t * theta;
+        for (double *m : {qh.data(), kh.data()}) {
+          const double lo = m[static_cast<size_t>(t) * D + c];
+          const double hi = m[static_cast<size_t>(t) * D + c + half2];
+          m[static_cast<size_t>(t) * D + c] =
+              lo * std::cos(a) - hi * std::sin(a);
+          m[static_cast<size_t>(t) * D + c + half2] =
+              hi * std::cos(a) + lo * std::sin(a);
+        }
+      }
+    }
+    std::vector<double> sh(static_cast<size_t>(T) * T);
+    for (int t = 0; t < T; t++) {
+      for (int l = 0; l < T; l++) {
+        double acc = 0.0;
+        for (int d = 0; d < D; d++) {
+          acc += qh[static_cast<size_t>(t) * D + d] *
+                 kh[static_cast<size_t>(l) * D + d];
+        }
+        sh[static_cast<size_t>(t) * T + l] = acc;
+      }
+    }
+    check("scores", dbg.scores, sh, T, 1.0);
+    double carried = 1.0;
+    if (!dbg.scores.empty()) {
+      const int ls = boot.param->NPToLevel(dbg.scores[0].GetNP());
+      carried = dbg.scores[0].GetScale() / boot.param->GetScale(ls);
+      std::cout << "  [dbg] carried " << carried << std::endl;
+    }
+    // Booted: the boot leaves carried in the message.
+    {
+      std::vector<double> shc(sh.size());
+      for (size_t i = 0; i < sh.size(); i++) shc[i] = sh[i] * carried;
+      check("booted scores", dbg.booted, shc, T, 1.0);
+    }
+    // P: the true causal softmax (row shift and norm are the fit's).
+    std::vector<double> pt2(static_cast<size_t>(T) * T, 0.0);
+    for (int t = 0; t < T; t++) {
+      const double rs = cal.row_shift_raw[head][t];
+      double sum = 0.0;
+      for (int l = 0; l <= t; l++) {
+        const double sr = sh[static_cast<size_t>(t) * T + l] / (cal.cq * cal.ck);
+        const double e2 = std::exp(cal.m_eff * (sr - rs) / cal.span_raw);
+        pt2[static_cast<size_t>(t) * T + l] = e2;
+        sum += e2;
+      }
+      for (int l = 0; l <= t; l++) pt2[static_cast<size_t>(t) * T + l] /= sum;
+    }
+    check("P", dbg.P, pt2, T, 1.0);
+    std::vector<double> pv2(static_cast<size_t>(T) * D, 0.0);
+    for (int t = 0; t < T; t++) {
+      for (int d = 0; d < D; d++) {
+        double acc = 0.0;
+        for (int l = 0; l <= t; l++) {
+          acc += pt2[static_cast<size_t>(t) * T + l] *
+                 vh[static_cast<size_t>(l) * D + d];
+        }
+        pv2[static_cast<size_t>(t) * D + d] = acc;
+      }
+    }
+    check("P V (head out)", dbg.out, pv2, D, 1.0);
+    std::cout << "  [dbg] bisection over " << max_kv
+              << " kv group(s); the full-output comparison is skipped"
+              << std::endl;
+    return;
+  }
 
   std::vector<int> bs = {0, B / 4, B / 2, B - 1};
   std::vector<int> all_c(kH);

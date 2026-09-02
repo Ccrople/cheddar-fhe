@@ -246,12 +246,20 @@ class CiBatchLayer {
    *        carrying `stream_scale`
    * @param attn the attention products, whose layout this layer's is
    * @param akeys the attention's keys on its three rings
+   * @param dbg when given, copies of one head's intermediates land here
+   *        so a test can compare the REAL path's stages against a host
+   *        mirror; `CHEDDAR_CI_BATCH_MAX_KV` limits the kv groups run for
+   *        the same purpose (the residual then holds only those heads)
    */
+  struct AttnDebug {
+    int head = 0;
+    std::vector<Ct> q, k, v, scores, booted, P, out;
+  };
   void Attention(std::vector<Ct> &res, std::vector<Ct> &stream,
                  const AttnWeights &w, const Calibration &c,
                  CiBatchAttention<word> &attn,
                  const typename CiBatchAttention<word>::Keys &akeys,
-                 const EvkMap<word> &evk);
+                 const EvkMap<word> &evk, AttnDebug *dbg = nullptr);
 
   /** @brief One whole layer: the attention half, then the feed-forward. */
   void Layer(std::vector<Ct> &res, std::vector<Ct> &stream,

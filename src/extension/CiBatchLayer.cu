@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -425,8 +426,17 @@ void CiBatchLayer<word>::Attention(
     std::vector<Ct> &res, std::vector<Ct> &stream, const AttnWeights &w,
     const Calibration &c, CiBatchAttention<word> &attn,
     const typename CiBatchAttention<word>::Keys &akeys,
-    const EvkMap<word> &evk) {
+    const EvkMap<word> &evk, AttnDebug *dbg) {
   NvtxScope _nv("batch: Attention");
+  // A LevelDown to a ciphertext's own level is a copy: the capture for dbg.
+  const auto snap = [this](std::vector<Ct> &dst, const std::vector<Ct> &src) {
+    dst.clear();
+    for (const auto &one : src) {
+      Ct copy;
+      boot_->LevelDown(copy, one, boot_->param_.NPToLevel(one.GetNP()));
+      dst.push_back(std::move(copy));
+    }
+  };
   const int model = cfg_.model;
   const Parameter<word> &param = boot_->param_;
   const CiBatchLayout &alayout = attn.GetLayout();
@@ -529,7 +539,11 @@ void CiBatchLayer<word>::Attention(
     }
     tile.clear();
   };
-  for (int kv = 0; kv < kv_heads; kv++) {
+  int max_kv = kv_heads;
+  if (const char *e = std::getenv("CHEDDAR_CI_BATCH_MAX_KV")) {
+    if (e[0] != '\0') max_kv = std::min(kv_heads, std::max(1, std::atoi(e)));
+  }
+  for (int kv = 0; kv < max_kv; kv++) {
     NvtxScope _g("batch: kv group");
     if (kv % heads_per_tile == 0) {
       t0 = Clock::now();
@@ -557,6 +571,11 @@ void CiBatchLayer<word>::Attention(
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 before the scores");
       }
+      if (dbg != nullptr && h == dbg->head) {
+        snap(dbg->q, q_h);
+        snap(dbg->k, k_kv);
+        snap(dbg->v, v_kv);
+      }
 
       t0 = Clock::now();
       std::vector<Ct> scores;
@@ -565,6 +584,7 @@ void CiBatchLayer<word>::Attention(
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 after the scores");
       }
+      if (dbg != nullptr && h == dbg->head) snap(dbg->scores, scores);
 
       // The scores' bootstraps, the chain's factor read off before them.
       t0 = Clock::now();
@@ -588,6 +608,7 @@ void CiBatchLayer<word>::Attention(
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 after the score boots");
       }
+      if (dbg != nullptr && h == dbg->head) snap(dbg->booted, booted);
 
       t0 = Clock::now();
       std::vector<Ct> P;
@@ -597,11 +618,13 @@ void CiBatchLayer<word>::Attention(
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 after the softmax");
       }
+      if (dbg != nullptr && h == dbg->head) snap(dbg->P, P);
 
       t0 = Clock::now();
       std::vector<Ct> out_h;
       attn.Values(out_h, P, v_kv, akeys);
       P.clear();
+      if (dbg != nullptr && h == dbg->head) snap(dbg->out, out_h);
       for (int cc = 0; cc < D; cc++) {
         attn_out[static_cast<size_t>(hi) * D + cc] = std::move(out_h[cc]);
       }
