@@ -113,7 +113,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
                                   const std::vector<double> &sink,
                                   double stream_scale,
                                   const EvkMap<word> &evk, bool hold_ch,
-                                  int hold_level) const {
+                                  int hold_level, bool release_tables) const {
   NvtxScope _nv("batch: NormTurn");
   const int model = cfg_.model;
   const int T = cfg_.num_tokens;
@@ -168,7 +168,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   }
   // The last bootstrap of this norm, when the channels are held: the
   // tables can go now.
-  if (hold_ch && cfg_.release_boot_tables) {
+  if (hold_ch && release_tables && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
   stages_.boot += SinceSeconds(t0);
@@ -269,7 +269,7 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       proj_->AddColumn(src, c, y_c);
     }
   }
-  if (!hold_ch && cfg_.release_boot_tables) {
+  if (!hold_ch && release_tables && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
   if (hold_ch) {
@@ -306,7 +306,8 @@ void CiBatchLayer<word>::FeedForward(std::vector<Ct> &res,
   // 1. The norm, straight into the split the projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.alpha, c.norm_window, c.ffn_sink, c.stream_scale,
-           evk, cfg_.hold_channels_ffn, cfg_.norm_apply_level);
+           evk, cfg_.hold_channels_ffn, cfg_.norm_apply_level,
+           /*release_tables=*/true);
   const int ly = src_y.level;
   ParkedStream parked;
   Park(parked, stream);
@@ -457,7 +458,8 @@ void CiBatchLayer<word>::Attention(
   // 1. The pre-attention norm, into the split the three projections read.
   typename CiBatchProjection<word>::Source src_y;
   NormTurn(src_y, stream, c.attn_alpha, c.attn_norm_window, c.attn_sink,
-           c.stream_scale, evk, cfg_.hold_channels, cfg_.norm_apply_level_attn);
+           c.stream_scale, evk, cfg_.hold_channels, cfg_.norm_apply_level_attn,
+           /*release_tables=*/false);
   const int ly = src_y.level;
   ParkedStream parked;
   Park(parked, stream);

@@ -209,11 +209,18 @@ class CiBatchLayer {
    * @param sink the per-token rescale, or empty
    * @param hold keep the booted channels between the two passes
    *        (`Config::hold_channels` / `hold_channels_ffn`)
+   * @param release_tables drop the boot tables after the last bootstrap.
+   *        Only where nothing boots until the phase's live set has shrunk
+   *        (the feed-forward: SiLU and down bootstrap nothing). The
+   *        attention boots at its FIRST head, with the split and a tile of
+   *        heads live: releasing here just re-prepares 18.6 GiB into a
+   *        fragmented pool, which is the OOM of 2026-09-02.
    */
   void NormTurn(typename CiBatchProjection<word>::Source &src,
                 const std::vector<Ct> &stream, double alpha, double window,
                 const std::vector<double> &sink, double stream_scale,
-                const EvkMap<word> &evk, bool hold, int hold_level) const;
+                const EvkMap<word> &evk, bool hold, int hold_level,
+                bool release_tables) const;
 
   /**
    * @brief The whole feed-forward half: norm, gate/up, SiLU, down, residual.

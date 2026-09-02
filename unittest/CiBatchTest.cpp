@@ -1637,7 +1637,8 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
   auto t0 = Sync();
   typename cheddar::CiBatchProjection<word>::Source src;
   layer.NormTurn(src, stream, alpha, window, sink, stream_scale,
-                 boot.ui->GetEvkMap(), cfg.hold_channels, cfg.norm_apply_level);
+                 boot.ui->GetEvkMap(), cfg.hold_channels, cfg.norm_apply_level,
+                 /*release_tables=*/true);
   auto t1 = Sync();
   std::cout << "  NormTurn on " << model << " channels: " << Ms(t0, t1) / 1000.0
             << " s" << std::endl;
