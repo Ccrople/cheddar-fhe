@@ -159,51 +159,30 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
              "CiBatchAttention::BootScoresFused: fused_scores and "
              "Keys::tower");
   if (cfg_.affine_in_prefix) {
-    // The softmax's affine multiply folded into the prefix (the landing-15
-    // lever): re-encode the prefix plaintexts with the extra factor
-    // `a1 = 2 / (span * carried)` the first time the chain's carried
-    // factor is observed. Same structure, same rotations -- only the
-    // values change, so the keys stand.
     AssertTrue(softmax_ready_ && calib_.causal,
                "CiBatchAttention::BootScoresFused: affine_in_prefix needs "
                "the causal softmax calibration (PrepareSoftMax first)");
     AssertTrue(carried > 0.0,
                "CiBatchAttention::BootScoresFused: affine_in_prefix needs "
                "the chain's carried factor");
-    if (std::abs(prefix_affine_carried_ - carried) >
-        1e-9 * std::abs(carried)) {
-      AssertTrue(prefix_affine_carried_ == 0.0,
-                 "CiBatchAttention::BootScoresFused: the chain's carried "
-                 "factor moved between calls -- the scale walk is expected "
-                 "deterministic");
-      const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
-      const double target = boot_->param_.GetScale(prefix_level - 1);
-      const double pt_scale =
-          target * boot_->param_.GetRescalePrimeProd(prefix_level) /
-          tower_->GetStCInputScale();
-      const double a1 = 2.0 / (calib_.span * carried);
-      basis_->PreparePrefix(tower_, prefix_level,
-                            /*constant=*/a1 / tower_->GetMessageRatio(),
-                            pt_scale);
-      prefix_affine_carried_ = carried;
-      if (cfg_.verbose) {
-        std::cout << "  [batch] fused scores: the affine folded into the "
-                  << "prefix (a1 " << a1 << ", carried " << carried << ")"
-                  << std::endl;
-      }
-    }
+    AssertTrue(prefix_affine_carried_ == 0.0 ||
+                   std::abs(prefix_affine_carried_ - carried) <=
+                       1e-9 * std::abs(carried),
+               "CiBatchAttention::BootScoresFused: the chain's carried "
+               "factor moved between calls -- the scale walk is expected "
+               "deterministic");
   }
   const int T = static_cast<int>(sinc.size());
   booted.clear();
   booted.resize(T);
   const int g_max = Max(group, 1);
+  const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
   for (int l0 = 0; l0 < T; l0 += g_max) {
     const int g = Min(T - l0, g_max);
     std::vector<const Ct *> xs(g);
     for (int j = 0; j < g; j++) xs[j] = &sinc[l0 + j];
     std::vector<Ct> halves;
     tower_->HalfBootTowerBatch(halves, xs, *keys.tower, *basis_);
-    const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
     for (int j = 0; j < g; j++) {
       sinc[l0 + j] = Ct();
       // A tower whose EvalMod ends above the prefix's entry: the exact
@@ -212,6 +191,42 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
         Ct down;
         tower_->LevelDown(down, halves[j], prefix_level);
         halves[j] = std::move(down);
+      }
+      // The prefix's plaintexts are (re-)encoded at the first ciphertext
+      // from the MEASURED input scale: the ctor's encode assumed the
+      // tower's nominal StCInputScale, but EvalMod's tree declares its own
+      // recursion result, ~0.3% off it on some ladders (the grafting drift
+      // SiLu.cu documents), and a landing that is not EXACTLY the layer's
+      // canonical scale fails the softmax's first Add. Folded in here too,
+      // under affine_in_prefix: the softmax's multiply
+      // `a1 = 2 / (span * carried)` (the landing-15 lever). Same
+      // structure, same rotations -- only the values change, so the keys
+      // stand.
+      const double in_scale = halves[j].GetScale();
+      if (std::abs(prefix_in_scale_ - in_scale) > 1e-9 * in_scale) {
+        AssertTrue(prefix_in_scale_ == 0.0,
+                   "CiBatchAttention::BootScoresFused: the tower boot's "
+                   "output scale moved between calls");
+        const double target = boot_->param_.GetScale(prefix_level - 1);
+        const double pt_scale =
+            target * tower_->param_.GetRescalePrimeProd(prefix_level) /
+            in_scale;
+        const double a1 =
+            cfg_.affine_in_prefix ? 2.0 / (calib_.span * carried) : 1.0;
+        basis_->PreparePrefix(tower_, prefix_level,
+                              /*constant=*/a1 / tower_->GetMessageRatio(),
+                              pt_scale);
+        prefix_in_scale_ = in_scale;
+        prefix_affine_carried_ = cfg_.affine_in_prefix ? carried : 0.0;
+        if (cfg_.verbose) {
+          std::cout << "  [batch] fused scores: the prefix re-encoded from "
+                    << "the measured scale 2^" << std::log2(in_scale)
+                    << " -> landing 2^" << std::log2(target)
+                    << (cfg_.affine_in_prefix ? " with the affine folded"
+                                              : "")
+                    << " (a1 " << a1 << ", carried " << carried << ")"
+                    << std::endl;
+        }
       }
       basis_->Prefix(booted[l0 + j], halves[j], *keys.tower);
       halves[j] = Ct();

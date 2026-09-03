@@ -364,6 +364,11 @@ class CiBatchAttention {
   //! with (0 = the plain ctor encode, no affine folded). The chain's scale
   //! walk is deterministic, so after the first fold this never changes.
   mutable double prefix_affine_carried_ = 0.0;
+  //! The MEASURED tower-boot output scale the prefix plaintexts were
+  //! encoded from (0 = the ctor's nominal-StCInputScale encode, which can
+  //! be ~0.3% off the true EvalMod-tree scale and then misses the
+  //! canonical landing the softmax's first Add requires).
+  mutable double prefix_in_scale_ = 0.0;
   void BuildMasks(std::vector<Pt> &masks, int head) const;
   //! Zero ciphertexts on the lifted ring, the shape of `like`, `count` of
   //! them: the contract's dead lhs columns.
