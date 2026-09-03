@@ -665,15 +665,15 @@ void CiBatchLayer<word>::Attention(
       if (dbg != nullptr && h == dbg->head) snap(dbg->scores, scores);
 
       // The scores' bootstraps, the chain's factor read off before them.
+      // The SAME reading fused or not: the recorded-over-canonical ratio at
+      // the ciphertext's level. The fused route's level descent to 0
+      // preserves that offset, so at level 0 it equals scale / base -- what
+      // the A100's fused return reads there. (Dividing the level-2 scale by
+      // the BASE instead cost a 0.3% constant, the fused-vs-serial
+      // diagnostic's whole residual.)
       t0 = Clock::now();
       const int ls = param.NPToLevel(scores[0].GetNP());
-      // Fused (idea [4]): the scores arrive as the nested SinC element and
-      // the tower's HalfBoot reads their level-zero words, so the factor is
-      // against the base scale (as the A100 leg's fused return reads it);
-      // the converter route's is against the level's canonical scale.
-      const double carried =
-          attn.FusedScores() ? scores[0].GetScale() / param.base_scale_
-                             : scores[0].GetScale() / param.GetScale(ls);
+      const double carried = scores[0].GetScale() / param.GetScale(ls);
       if (!boot_->IsBootPrepared(layout_.num_slots)) {
         NvtxScope _p("batch: prepare boot tables");
         boot_->PrepareEvalSpecialFFT(layout_.num_slots);

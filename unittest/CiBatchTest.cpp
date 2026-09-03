@@ -1289,11 +1289,14 @@ TEST(CiBatch, TheFusedScoreBootMatchesTheSerialBoot) {
     }
   }
 
-  // The fused route: the SinC element, HalfBootTower + prefix.
+  // The fused route: the SinC element, HalfBootTower + prefix. The carried
+  // reading is the serial one -- recorded over canonical at the
+  // ciphertext's level (the descent to 0 preserves the offset).
   attn_f.SetFusedScores(true);
   std::vector<Ciphertext<word>> s_sinc;
   attn_f.Scores(s_sinc, q_b, k_cts, keys);
-  const double carried_f = s_sinc[0].GetScale() / boot.param->base_scale_;
+  const int lf = boot.param->NPToLevel(s_sinc[0].GetNP());
+  const double carried_f = s_sinc[0].GetScale() / boot.param->GetScale(lf);
   std::vector<Ciphertext<word>> booted_f;
   attn_f.BootScoresFused(booted_f, s_sinc, keys, 16);
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
