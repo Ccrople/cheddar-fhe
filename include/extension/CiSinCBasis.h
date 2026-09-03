@@ -119,6 +119,13 @@ class CiSinCBasis {
   std::vector<NamedForward> forwards_;
   Chain cts_;
   Chain prefix_;
+  // Leading thin single-terminal CtS levels (an even landing ladder's top,
+  // e.g. `land18c4e10`'s 25-bit terminal), consumed by a PURE RESCALE before
+  // the compiled phases -- EvalSpecialFFT's rule, device-measured there:
+  // folding a ~25-bit rescale into a transform phase injects large
+  // coefficient noise (the first land18 tower read 2.5 bits).
+  std::vector<int> cts_thin_levels_;
+  std::vector<Constant<word>> cts_thin_consts_;
 
   static std::pair<int, int> Split(int num_diag);
   static int NumLevels(const Chain &chain);
@@ -220,7 +227,9 @@ class CiSinCBasis {
   int GetForwardNumLevels(const std::string &name) const;
   const std::vector<int> &GetForwardDiagonals(const std::string &name) const;
   int GetCtSLevel() const { return cts_.level; }
-  int GetCtSNumLevels() const { return NumLevels(cts_); }
+  int GetCtSNumLevels() const {
+    return NumLevels(cts_) + static_cast<int>(cts_thin_levels_.size());
+  }
   const std::vector<int> &GetCtSDiagonals() const { return cts_.diagonals; }
   int GetPrefixLevel() const { return prefix_.level; }
   int GetPrefixNumLevels() const { return NumLevels(prefix_); }

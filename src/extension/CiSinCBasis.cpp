@@ -351,8 +351,29 @@ void CiSinCBasis<word>::PrepareCtS(ConstContextPtr<word> context, int level,
       DefaultGroup(phases.cts_lane, log_lane_, "cts_lane");
   const int num_phases =
       static_cast<int>(outer.size() + inner.size() + lane.size());
-  AssertTrue(level >= num_phases,
-             "CiSinCBasis: the CtS needs one level per phase");
+  // Leading thin single-terminal levels (an even landing's top), set aside
+  // for the pure-rescale prologue in EvaluateCtS; the compiled phases start
+  // at the topmost THICK level.
+  constexpr double kThinRescaleProd = 1073741824.0;  // 2^30
+  cts_thin_levels_.clear();
+  cts_thin_consts_.clear();
+  int thick_level = level;
+  while (param.GetRescalePrimeProd(thick_level) < kThinRescaleProd) {
+    cts_thin_levels_.push_back(thick_level);
+    Constant<word> thin_c;
+    encoder.EncodeConstant(thin_c, thick_level,
+                           param.GetRescalePrimeProd(thick_level), 1.0);
+    cts_thin_consts_.push_back(std::move(thin_c));
+    thick_level--;
+  }
+  if (!cts_thin_levels_.empty()) {
+    std::cout << "CiSinCBasis CtS: " << cts_thin_levels_.size()
+              << " thin single-terminal level(s) at the top, consumed by a "
+                 "pure rescale" << std::endl;
+  }
+  AssertTrue(thick_level >= num_phases,
+             "CiSinCBasis: the CtS needs one THICK level per phase (the thin "
+             "single-terminal levels take none)");
   const int n = num_slots_;
   const double const_div = std::pow(cts_const, 1.0 / num_phases);
   // The twist groups return k/2 times the corrected pair sums and the lane
@@ -396,11 +417,18 @@ void CiSinCBasis<word>::PrepareCtS(ConstContextPtr<word> context, int level,
   AssertTrue(top == log_lane_ - 1, "CiSinCBasis: inner twist stages miscounted");
   take(lane, false, false, /*rows_last=*/true, lane_div);
   AssertTrue(top == -1, "CiSinCBasis: lane stages miscounted");
-  std::cout << "CiSinCBasis CtS at level " << level << ":" << std::endl;
+  std::cout << "CiSinCBasis CtS at level " << level
+            << (cts_thin_levels_.empty()
+                    ? ""
+                    : " (phases from " + std::to_string(thick_level) + ")")
+            << ":" << std::endl;
   const std::vector<int> sizes{static_cast<int>(outer.size()),
                                static_cast<int>(inner.size()),
                                static_cast<int>(lane.size())};
-  Compile(context, matrices, sizes, level, cts_);
+  Compile(context, matrices, sizes, thick_level, cts_);
+  // The public entry level is where the caller hands its ciphertext (the
+  // thin prologue runs there); the compiled phases sit below it.
+  cts_.level = level;
 }
 
 template <typename word>
@@ -596,6 +624,21 @@ template <typename word>
 void CiSinCBasis<word>::EvaluateCtS(Ct &res, const Ct &input,
                                     const EvkMap<word> &evk_map) const {
   NvtxScope _nv("tower CtS");
+  // Consume the thin single-terminal levels with a pure rescale (a
+  // constant-1 multiply at the level's own rescale product, then a rescale),
+  // exactly as EvalSpecialFFT's CoeffToSlot does.
+  if (!cts_thin_levels_.empty()) {
+    const auto &context = cts_.context;
+    Ct pre;
+    context->MultUnsafe(pre, input, cts_thin_consts_[0], cts_thin_levels_[0]);
+    context->Rescale(pre, pre);
+    for (size_t k = 1; k < cts_thin_levels_.size(); k++) {
+      context->MultUnsafe(pre, pre, cts_thin_consts_[k], cts_thin_levels_[k]);
+      context->Rescale(pre, pre);
+    }
+    Run(cts_, res, pre, evk_map);
+    return;
+  }
   Run(cts_, res, input, evk_map);
 }
 

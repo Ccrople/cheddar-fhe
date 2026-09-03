@@ -73,7 +73,46 @@ else:
 
 spare30 = [i for i in lo30 if i >= peak and not (first29 <= i < first29 + 16)]
 spare_needed = total_main - (peak + 16)
-assert len(spare30) >= spare_needed, "not enough spare 30-bit primes"
+
+
+def mine_primes(count, taken, log_degree):
+    """Fresh ~30-bit primes 1 mod 4N, descending from 2^30, for a ladder
+    whose upper reaches outgrow the mother preset's spare mains. Levels above
+    the landing never touch the keyless crossing (only 0..L must match), so a
+    new prime up there is as good as an inherited one."""
+    mod = 4 << log_degree
+    found = []
+    p = ((1 << 30) // mod) * mod + 1
+    import random
+    def is_prime(n):
+        if n < 2: return False
+        for sp in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            if n % sp == 0: return n == sp
+        d, r = n - 1, 0
+        while d % 2 == 0: d //= 2; r += 1
+        for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            x = pow(a, d, n)
+            if x in (1, n - 1): continue
+            for _ in range(r - 1):
+                x = x * x % n
+                if x == n - 1: break
+            else:
+                return False
+        return True
+    while len(found) < count:
+        if p not in taken and is_prime(p): found.append(p)
+        p -= mod
+        assert p > (1 << 29), "ran out of 30-bit candidates"
+    return found
+
+
+mined = []
+if len(spare30) < spare_needed:
+    short = spare_needed - len(spare30)
+    taken = set(main) | set(term) | set(aux)
+    mined = mine_primes(short, taken, j["log_degree"])
+    print(f"  (mined {short} fresh 30-bit primes for the ladder's top: "
+          f"{mined})")
 # The EvalMod ladder must rescale by the SAME width at every level it runs
 # its polynomial on: EvalMod's scale recursion s <- s^2 / prod has the
 # rescale width as its fixed point, and a 60-bit level at the TOP with
@@ -83,7 +122,7 @@ assert len(spare30) >= spare_needed, "not enough spare 30-bit primes"
 # the ladder, where the K = 16 junction landings already ride 59/60-bit
 # levels, and the 16 29-bit primes sit above them under CoeffToSlot.
 extra = 2 * (NE - 8)
-spares = [main[i] for i in spare30[:spare_needed]]
+spares = [main[i] for i in spare30[:spare_needed]] + mined
 new_main = main[:peak] + spares[:extra] + main[first29:first29 + 16] + spares[extra:]
 assert len(new_main) == total_main
 new_term = term[:]
