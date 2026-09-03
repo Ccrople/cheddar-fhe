@@ -127,6 +127,20 @@ class HoistHandler {
                                   std::map<int, Ct> &accum, Ct &res,
                                   const EvkMap<word> &evk_map,
                                   int input_num_slots, double input_scale);
+
+  /// `GSComplexRotateFold` over EVERY (ciphertext, half) accumulator map of
+  /// a batched group at once: all the giant key switches as ONE gather +
+  /// `ModDownBatch` + `MultKeyBatchNoModDown` (the Doing 3.23 pattern the
+  /// complex path never had), then per map the PermuteAccum folds and the
+  /// final mod-down. Word for word the loop of `GSComplexRotateFold` calls
+  /// -- the same kernels, and the modular sums in either order. Chunked by
+  /// `CHEDDAR_HOIST_GS_CHUNK_MIB` (default 2048) of key-switch output.
+  static void GSComplexRotateFoldGroup(ConstContextPtr<word> context,
+                                       const HoistHandler &re_h,
+                                       std::vector<std::map<int, Ct> *> &accums,
+                                       std::vector<Ct *> &results,
+                                       const EvkMap<word> &evk_map,
+                                       int input_num_slots, double input_scale);
   void BSFusedKeyMult(ConstContextPtr<word> context, std::map<int, Ct> &res,
                       std::vector<Dv> &a_modup, const Ct &a_orig,
                       const EvkMap<word> &keys, std::vector<int> &rotations,

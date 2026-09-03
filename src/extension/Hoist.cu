@@ -1864,6 +1864,138 @@ void HoistHandler<word>::GSComplexRotateFold(ConstContextPtr<word> context,
 }
 
 template <typename word>
+void HoistHandler<word>::GSComplexRotateFoldGroup(
+    ConstContextPtr<word> context, const HoistHandler &re_h,
+    std::vector<std::map<int, Ct> *> &accums, std::vector<Ct *> &results,
+    const EvkMap<word> &evk_map, int input_num_slots, double input_scale) {
+  const int n = static_cast<int>(accums.size());
+  AssertTrue(n > 0 && static_cast<int>(results.size()) == n,
+             "Hoist: the rotate/fold group's sides disagree in size");
+  if (gs_serial_) {
+    for (int a = 0; a < n; a++) {
+      GSComplexRotateFold(context, re_h, *accums[a], *results[a], evk_map,
+                          input_num_slots, input_scale);
+    }
+    return;
+  }
+
+  const NPInfo ref_ct_np = accums[0]->at(0).GetNP();
+  const int num_q_primes = ref_ct_np.GetNumQ();
+  const int num_p_primes = ref_ct_np.num_aux_;
+  const int degree = context->param_.degree_;
+  auto &mod_switcher = context->mod_switch_handlers_.at(re_h.pt_level_);
+  const NPInfo q_np(ref_ct_np.num_main_, ref_ct_np.num_ter_, 0, degree);
+  const int ext_words = ref_ct_np.GetNumTotal() * degree;
+  const int q_words = num_q_primes * degree;
+  const int p_words = num_p_primes * degree;
+
+  std::vector<int> rot_indices;
+  for (const auto &[gs_idx, ct] : *accums[0]) {
+    if (gs_idx != 0) rot_indices.push_back(gs_idx);
+  }
+  const int num_gs = static_cast<int>(rot_indices.size());
+
+  // Chunk the group so the key-switch output stays bounded: one slice is
+  // 2 * ext_words words, and a (ciphertext, half) map contributes num_gs.
+  static const size_t cap_bytes = [] {
+    const char *env = std::getenv("CHEDDAR_HOIST_GS_CHUNK_MIB");
+    const long value = (env != nullptr) ? std::atol(env) : 0;
+    return static_cast<size_t>(value > 0 ? value : 2048) << 20;
+  }();
+  const size_t map_bytes = static_cast<size_t>(num_gs) * 2 * ext_words *
+                           sizeof(word);
+  const int maps_per_chunk =
+      num_gs == 0 ? n
+                  : Max(1, static_cast<int>(Min(
+                            static_cast<size_t>(n), cap_bytes / Max(map_bytes,
+                                                                    size_t{1}))));
+
+  for (int a0 = 0; a0 < n; a0 += maps_per_chunk) {
+    const int width = Min(n - a0, maps_per_chunk);
+    if (num_gs > 0) {
+      NvtxScope nvtx_scope("hoist giant ks batch");
+      const int m = width * num_gs;
+      std::vector<const Evk *> keys;
+      keys.reserve(m);
+      HostVector<uint64_t> ptrs(m);
+      int s = 0;
+      for (int a = a0; a < a0 + width; a++) {
+        for (const auto &[gs_idx, ct] : *accums[a]) {
+          if (gs_idx == 0) continue;
+          ptrs[s] = reinterpret_cast<uint64_t>(ct.ax_.data());
+          keys.push_back(&evk_map.GetRotationKey(gs_idx));
+          s++;
+        }
+      }
+      DeviceVector<uint64_t> ptrs_dev;
+      CopyHostToDevice(ptrs_dev, ptrs);
+      Dv gathered(static_cast<size_t>(m) * ext_words);
+      {
+        ProfileScope s2("giant ks: gather");
+        constexpr int block = 256;
+        hoist_kernel::GatherPolys<word>
+            <<<dim3(DivCeil(ext_words, block), 1, m), block>>>(
+                gathered.data(), ext_words,
+                reinterpret_cast<const word *const *>(ptrs_dev.data()));
+      }
+      Dv moddown(static_cast<size_t>(m) * q_words);
+      {
+        ProfileScope s2("giant ks: moddown");
+        mod_switcher.ModDownBatch(moddown.data(), q_words, gathered.data(),
+                                  ext_words, m);
+      }
+      gathered = Dv();
+      Dv switched(static_cast<size_t>(m) * 2 * ext_words);
+      {
+        ProfileScope s2("giant ks: modup+keymult");
+        context->MultKeyBatchNoModDown(switched.data(), 2 * ext_words,
+                                       moddown.data(), q_words, nullptr,
+                                       nullptr, 0, q_np, keys, m);
+      }
+      {
+        ProfileScope s2("giant ks: permute+add");
+        for (int a = a0; a < a0 + width; a++) {
+          Ct *final_accum = &accums[a]->at(0);
+          std::vector<std::vector<DvConstView<word>>> views;
+          for (int g = 0; g < num_gs; g++) {
+            const word *base =
+                switched.data() +
+                (static_cast<size_t>(a - a0) * num_gs + g) * 2 * ext_words;
+            views.push_back(
+                {DvConstView<word>(base, ext_words, p_words),
+                 DvConstView<word>(base + ext_words, ext_words, p_words)});
+          }
+          // in place: the accumulator itself is the extra, unrotated term
+          views.push_back(final_accum->ConstViewVector());
+          auto final_accum_view = final_accum->ViewVector();
+          context->elem_handler_.PermuteAccum(final_accum_view, ref_ct_np,
+                                              rot_indices, views);
+        }
+      }
+    }
+    for (int a = a0; a < a0 + width; a++) {
+      Ct *final_accum = &accums[a]->at(0);
+      ProfileScope permute_scope("hoist permute+final moddown");
+      std::vector<std::vector<DvConstView<word>>> ct_bx_view;
+      std::vector<int> rots;
+      for (const auto &[gs_idx, ct] : *accums[a]) {
+        if (gs_idx == 0) continue;
+        ct_bx_view.push_back({ct.BxConstView()});
+        rots.push_back(gs_idx);
+      }
+      if (!rots.empty()) {
+        std::vector<DvView<word>> accum_view_vector = {final_accum->BxView()};
+        ct_bx_view.push_back({final_accum->BxConstView()});
+        context->elem_handler_.PermuteAccum(accum_view_vector, ref_ct_np, rots,
+                                            ct_bx_view);
+      }
+      re_h.EvaluateFinalModDown(context, *results[a], *final_accum,
+                                input_num_slots, input_scale);
+    }
+  }
+}
+
+template <typename word>
 void HoistHandler<word>::EvaluateGiantStepComplexBatch(
     ConstContextPtr<word> context, std::vector<Ct *> &res_re,
     std::vector<Ct *> *res_im, const HoistHandler &re_h,
@@ -1904,14 +2036,21 @@ void HoistHandler<word>::EvaluateGiantStepComplexBatch(
                               im_h, bs_re, bs_im);
   }
 
+  // Every (ciphertext, half) map through ONE batched rotate/fold.
+  std::vector<std::map<int, Ct> *> maps;
+  std::vector<Ct *> outs;
+  maps.reserve(2 * n);
+  outs.reserve(2 * n);
   for (int i = 0; i < n; i++) {
-    GSComplexRotateFold(context, re_h, accum_re[i], *res_re[i], evk_map,
-                        input_num_slots, input_scale);
+    maps.push_back(&accum_re[i]);
+    outs.push_back(res_re[i]);
     if (res_im != nullptr) {
-      GSComplexRotateFold(context, re_h, accum_im[i], *(*res_im)[i], evk_map,
-                          input_num_slots, input_scale);
+      maps.push_back(&accum_im[i]);
+      outs.push_back((*res_im)[i]);
     }
   }
+  GSComplexRotateFoldGroup(context, re_h, maps, outs, evk_map,
+                           input_num_slots, input_scale);
 }
 
 template <typename word>
