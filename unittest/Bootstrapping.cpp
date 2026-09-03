@@ -1,3 +1,8 @@
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+
 #include "Testbed.h"
 
 // Full slot packing, which is MaxNumSlots() and not a constant: degree / 2 on
@@ -209,6 +214,90 @@ TEST_P(Testbed32, TheBatchedBootIsTheSerialOneWordForWord) {
   ASSERT_EQ(differ, 0u);
 }
 
+// A SMALL throughput bench for the batched full Boot, so the group size
+// question never needs a B = 512 layer run: N level-0 inputs, every group
+// size from CHEDDAR_BOOT_BENCH_GROUPS (default "1,8,32,64"), ms per boot
+// each -- and each group ALSO timed with the reduction forced serial
+// (SetEvalModSerial), which splits a group's gain into "EvalMod batched"
+// against "the still-serial front/back" (ModUp, Trace, CtS, StC). Skipped
+// unless CHEDDAR_BOOT_BENCH=1; set CHEDDAR_EVALMOD_BATCH >= the largest
+// group or the reduction chunks under it.
+TEST_P(Testbed32, TheBatchedBootThroughput) {
+  using word = uint32_t;
+  const char *bench = std::getenv("CHEDDAR_BOOT_BENCH");
+  if (bench == nullptr || bench[0] != '1') {
+    GTEST_SKIP() << "set CHEDDAR_BOOT_BENCH=1 (and filter to one preset)";
+  }
+  if (!param_->conjugate_invariant_) {
+    GTEST_SKIP() << "BootBatch shares the real subring's single reduction";
+  }
+  const int num_slots = param_->MaxNumSlots();
+  std::shared_ptr<BootContext<word>> boot_context =
+      std::dynamic_pointer_cast<BootContext<word>>(context_);
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  std::vector<int> groups;
+  {
+    std::string spec = [] {
+      const char *e = std::getenv("CHEDDAR_BOOT_BENCH_GROUPS");
+      return std::string((e && e[0]) ? e : "1,8,32,64");
+    }();
+    for (size_t p = 0; p < spec.size();) {
+      size_t q = spec.find(',', p);
+      if (q == std::string::npos) q = spec.size();
+      groups.push_back(std::atoi(spec.substr(p, q - p).c_str()));
+      p = q + 1;
+    }
+  }
+  int n = 0;
+  for (int g : groups) n = std::max(n, g);
+
+  std::vector<Ciphertext<word>> inputs(n);
+  std::vector<const Ciphertext<word> *> ptrs(n);
+  for (int b = 0; b < n; b++) {
+    std::vector<Complex> msg;
+    GenerateRandomMessage(msg, num_slots, -1.0, 1.0, /*complex=*/false);
+    EncodeAndEncrypt(inputs[b], msg, 0);
+    ptrs[b] = &inputs[b];
+  }
+
+  auto run = [&](int g, bool serial_evalmod) {
+    BootContext<word>::SetEvalModSerial(serial_evalmod);
+    cudaDeviceSynchronize();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int start = 0; start < n; start += g) {
+      const int width = std::min(g, n - start);
+      if (width == 1) {
+        Ciphertext<word> out;
+        boot_context->Boot(out, inputs[start], interface_->GetEvkMap());
+      } else {
+        std::vector<const Ciphertext<word> *> in(ptrs.begin() + start,
+                                                 ptrs.begin() + start + width);
+        std::vector<Ciphertext<word>> out;
+        boot_context->BootBatch(out, in, interface_->GetEvkMap());
+      }
+    }
+    cudaDeviceSynchronize();
+    const auto t1 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count() / n;
+  };
+
+  run(std::min(8, n), false);  // warm-up: pool, plans, key paths
+  std::cout << "BootBench: " << n << " boots a config, ms per boot"
+            << std::endl;
+  for (int g : groups) {
+    const double batched = run(g, false);
+    const double serial_em = (g == 1) ? batched : run(g, true);
+    std::cout << "  group " << g << ": " << batched << " ms/boot"
+              << " (serial EvalMod: " << serial_em << ")" << std::endl;
+  }
+  BootContext<word>::SetEvalModSerial(false);
+}
+
 // [SYLPH] section 3.1.3 states the bootstrap requirement as one number and a
 // rule, and neither is the SNR this suite has always printed:
 //
@@ -296,7 +385,10 @@ INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_35.json",
                     "bootparam_40.json", "sylphflow16_35.json",
-                    "sylphflow16_40.json", "ci16_35.json", "ci16_40.json"),
+                    "sylphflow16_40.json", "ci16_35.json", "ci16_40.json",
+                    // The B = 512 batched layer's preset, for the boot
+                    // benches; always run filtered to one preset.
+                    "ci16_35_stc2.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
