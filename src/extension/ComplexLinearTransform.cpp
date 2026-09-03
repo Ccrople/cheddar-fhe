@@ -131,12 +131,14 @@ void ComplexLinearTransform<word>::EvaluateFromRealBatch(
   std::vector<std::map<int, Ct>> bs(n);
   std::vector<const std::map<int, Ct> *> bs_ptrs(n);
   std::vector<Ct *> re_ptrs(n), im_ptrs(n);
+  std::vector<std::map<int, Ct> *> bs_out(n);
   for (int i = 0; i < n; i++) {
-    re_.EvaluateBabyStep(context, bs[i], *inputs[i], evk_map, false);
+    bs_out[i] = &bs[i];
     bs_ptrs[i] = &bs[i];
     re_ptrs[i] = &res_re[i];
     im_ptrs[i] = &res_im[i];
   }
+  re_.EvaluateBabyStepBatch(context, bs_out, inputs, evk_map);
   LinearTransform<word>::EvaluateGiantStepComplexBatch(
       context, re_ptrs, &im_ptrs, re_, im_, bs_ptrs, /*bs_im=*/nullptr,
       evk_map);
@@ -152,9 +154,15 @@ void ComplexLinearTransform<word>::EvaluatePairBatch(
   std::vector<std::map<int, Ct>> bs_re(n), bs_im(n);
   std::vector<const std::map<int, Ct> *> bs_re_ptrs(n), bs_im_ptrs(n);
   std::vector<Ct *> re_ptrs(n), im_ptrs(n);
+  // One baby-step group of both halves: 2n ciphertexts at one level share
+  // the transform's keys, so the group is one ModUpBatch + one fused kernel.
+  std::vector<std::map<int, Ct> *> bs_out(2 * n);
+  std::vector<const Ct *> bs_in(2 * n);
   for (int i = 0; i < n; i++) {
-    re_.EvaluateBabyStep(context, bs_re[i], re[i], evk_map, false);
-    re_.EvaluateBabyStep(context, bs_im[i], im[i], evk_map, false);
+    bs_out[i] = &bs_re[i];
+    bs_out[n + i] = &bs_im[i];
+    bs_in[i] = &re[i];
+    bs_in[n + i] = &im[i];
     bs_re_ptrs[i] = &bs_re[i];
     bs_im_ptrs[i] = &bs_im[i];
     // The baby steps are materialised, so the inputs are dead and the
@@ -162,6 +170,7 @@ void ComplexLinearTransform<word>::EvaluatePairBatch(
     re_ptrs[i] = &re[i];
     im_ptrs[i] = &im[i];
   }
+  re_.EvaluateBabyStepBatch(context, bs_out, bs_in, evk_map);
   LinearTransform<word>::EvaluateGiantStepComplexBatch(
       context, re_ptrs, &im_ptrs, re_, im_, bs_re_ptrs, &bs_im_ptrs, evk_map);
 }
@@ -178,13 +187,18 @@ void ComplexLinearTransform<word>::EvaluateToRealBatch(
   std::vector<std::map<int, Ct>> bs_re(n), bs_im(n);
   std::vector<const std::map<int, Ct> *> bs_re_ptrs(n), bs_im_ptrs(n);
   std::vector<Ct *> res_ptrs(n);
+  std::vector<std::map<int, Ct> *> bs_out(2 * n);
+  std::vector<const Ct *> bs_in(2 * n);
   for (int i = 0; i < n; i++) {
-    re_.EvaluateBabyStep(context, bs_re[i], *in_re[i], evk_map, false);
-    re_.EvaluateBabyStep(context, bs_im[i], *in_im[i], evk_map, false);
+    bs_out[i] = &bs_re[i];
+    bs_out[n + i] = &bs_im[i];
+    bs_in[i] = in_re[i];
+    bs_in[n + i] = in_im[i];
     bs_re_ptrs[i] = &bs_re[i];
     bs_im_ptrs[i] = &bs_im[i];
     res_ptrs[i] = &res[i];
   }
+  re_.EvaluateBabyStepBatch(context, bs_out, bs_in, evk_map);
   LinearTransform<word>::EvaluateGiantStepComplexBatch(
       context, res_ptrs, /*res_im=*/nullptr, re_, im_, bs_re_ptrs,
       &bs_im_ptrs, evk_map);

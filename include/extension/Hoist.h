@@ -50,6 +50,9 @@ class HoistHandler {
   // The giant-step key switches one rotation at a time (the old loop;
   // `CHEDDAR_HOIST_GS_SERIAL=1`) instead of as one batched group.
   static bool gs_serial_;
+  // The baby steps one ciphertext at a time (`CHEDDAR_HOIST_BS_SERIAL=1`)
+  // instead of as one `ModUpBatch` + `BSFusedKernelBatch` group.
+  static bool bs_serial_;
 
  public:
   /**
@@ -58,6 +61,8 @@ class HoistHandler {
    * are word-for-word equal (`boot_test`).
    */
   static void SetGiantStepSerial(bool serial);
+  /** @brief The same switch for the batched baby step. */
+  static void SetBabyStepSerial(bool serial);
 
  private:
 
@@ -145,6 +150,19 @@ class HoistHandler {
                       std::vector<Dv> &a_modup, const Ct &a_orig,
                       const EvkMap<word> &keys, std::vector<int> &rotations,
                       const Dv &input_bx_pseudo_modup) const;
+  /// `BSFusedKeyMult` over a GROUP of ciphertexts in one kernel: the key and
+  /// galois tables are SHARED (one transform, one key set) and the ciphertext
+  /// index rides the FAST grid dimension so same-position blocks of different
+  /// ciphertexts hit the same key lines in L2. `a_modup[c * num_digits + j]`
+  /// holds ciphertext c's digit j at `modup_stride` words; per-ciphertext
+  /// arithmetic and its order are exactly the serial kernel's.
+  void BSFusedKeyMultBatch(ConstContextPtr<word> context,
+                           const std::vector<std::map<int, Ct> *> &res,
+                           const std::vector<const word *> &a_modup,
+                           const std::vector<const Ct *> &a_origs,
+                           const EvkMap<word> &keys,
+                           std::vector<int> &rotations,
+                           const std::vector<const word *> &pseudo_modup) const;
 
   // evaluation-related methods
   void EvaluateSingleAccum(ConstContextPtr<word> context, Ct &res,
@@ -228,6 +246,18 @@ class HoistHandler {
   void EvaluateBabyStep(ConstContextPtr<word> context, std::map<int, Ct> &bs,
                         const Ct &input, const EvkMap<word> &evk_map,
                         bool min_ks = false) const;
+  /**
+   * @brief `EvaluateBabyStep` over a GROUP of ciphertexts at one level: every
+   * a-part gathered into one strided buffer, ONE `ModUpBatch` (the NTTs carry
+   * the group on `blockIdx.z`), then ONE `BSFusedKernelBatch` with the key
+   * tables shared across the group. Word for word the loop of serial calls
+   * (`boot_test *WordForWord*`); `CHEDDAR_HOIST_BS_SERIAL=1` is the loop.
+   * No min_ks form; `bs[i]` answers `inputs[i]`.
+   */
+  void EvaluateBabyStepBatch(ConstContextPtr<word> context,
+                             const std::vector<std::map<int, Ct> *> &bs,
+                             const std::vector<const Ct *> &inputs,
+                             const EvkMap<word> &evk_map) const;
   void EvaluateGiantStep(ConstContextPtr<word> context, Ct &res,
                          const std::map<int, Ct> &bs,
                          const EvkMap<word> &evk_map,

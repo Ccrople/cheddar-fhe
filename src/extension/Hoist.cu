@@ -92,6 +92,16 @@ void HoistHandler<word>::SetGiantStepSerial(bool serial) {
   gs_serial_ = serial;
 }
 
+template <typename word>
+bool HoistHandler<word>::bs_serial_ =
+    (std::getenv("CHEDDAR_HOIST_BS_SERIAL") != nullptr &&
+     std::getenv("CHEDDAR_HOIST_BS_SERIAL")[0] == '1');
+
+template <typename word>
+void HoistHandler<word>::SetBabyStepSerial(bool serial) {
+  bs_serial_ = serial;
+}
+
 namespace kernel {
 
 // Fused kernel for KeyMult, MAC, and Aut in the baby step.
@@ -167,6 +177,83 @@ __global__ void BSFusedKernel(
     }
     dst_bx[k][dst_index + (prime_index << log_degree)] = res_bx_value;
     dst_ax[k][dst_index + (prime_index << log_degree)] = res_ax_value;
+  }
+}
+
+// `BSFusedKernel` over a GROUP of ciphertexts that share one transform: the
+// key and galois tables are the SAME for every ciphertext, so the group
+// carries one copy and the ciphertext index rides the FAST grid dimension --
+// same-position blocks of different ciphertexts hit the same key lines in
+// L2, and the key stream from DRAM is paid once per ~group instead of once
+// per ciphertext. For that reason the key loads here are plain
+// (L2-retaining), NOT StreamingLoad; the per-ciphertext mod-up and pseudo
+// mod-up loads stay streaming (each line is read exactly once). The
+// arithmetic per ciphertext, and its order, are exactly the serial kernel's.
+template <typename word, int num_accum_padded>
+__global__ void BSFusedKernelBatch(
+    word **dst_bx, word **dst_ax, const word **mod_up, const word **key_bx,
+    const word **key_ax, const word *const *pseudo_modup, int num_accum,
+    int num_rotations, int num_cts, const word *primes,
+    const make_signed_t<word> *inv_primes, int num_q_primes, word *key_extra,
+    word *galois_factors, word *galois_offsets, int log_degree) {
+  const int ct = blockIdx.x % num_cts;
+  const int xblk = blockIdx.x / num_cts;
+  int i = xblk * blockDim.x + threadIdx.x;
+  int prime_index = (i >> log_degree);
+  int x_idx = i & ((1 << log_degree) - 1);
+  const word prime = primes[prime_index];
+  const make_signed_t<word> montgomery = inv_primes[prime_index];
+
+  const word **mod_up_ct = mod_up + ct * num_accum;
+  word **dst_bx_ct = dst_bx + ct * num_rotations;
+  word **dst_ax_ct = dst_ax + ct * num_rotations;
+
+  // Same register story as BSFusedKernel: unroll on the padded count.
+  word mod_up_a[num_accum_padded];
+#pragma unroll
+  for (int j = 0; j < num_accum_padded; j++) {
+    mod_up_a[j] =
+        (j < num_accum) ? basic::StreamingLoad(mod_up_ct[j] + i) : 0;
+  }
+
+  word input_bx_pseudo_modup_value = 0;
+  if (prime_index < num_q_primes) {
+    input_bx_pseudo_modup_value =
+        basic::StreamingLoad(pseudo_modup[ct] + i);
+  }
+  for (int k = 0; k < num_rotations; k++) {
+    word galois_factor = galois_factors[k];
+    word galois_offset = galois_offsets[k];
+    auto dst_index = basic::BitReverse(x_idx, log_degree + 1);
+    dst_index = dst_index * galois_factor + galois_offset;
+    dst_index = basic::BitReverse(dst_index, log_degree + 1);
+
+    word res_bx_value = 0;
+    word res_ax_value = 0;
+#pragma unroll
+    for (int j = 0; j < num_accum_padded; j++) {
+      if (j >= num_accum) break;
+      int key_index = i;
+      if (prime_index >= num_q_primes) {
+        key_index += key_extra[k];
+      }
+      word mod_up_value = mod_up_a[j];
+      word key_ax_value = key_ax[j + k * num_accum][key_index];
+      word key_bx_value = key_bx[j + k * num_accum][key_index];
+      word mult =
+          basic::MultMontgomery(mod_up_value, key_bx_value, prime, montgomery);
+      res_bx_value = basic::Add(res_bx_value, mult, prime);
+
+      mult =
+          basic::MultMontgomery(mod_up_value, key_ax_value, prime, montgomery);
+      res_ax_value = basic::Add(res_ax_value, mult, prime);
+    }
+    if (prime_index < num_q_primes) {
+      res_bx_value =
+          basic::Add(res_bx_value, input_bx_pseudo_modup_value, prime);
+    }
+    dst_bx_ct[k][dst_index + (prime_index << log_degree)] = res_bx_value;
+    dst_ax_ct[k][dst_index + (prime_index << log_degree)] = res_ax_value;
   }
 }
 
@@ -708,6 +795,133 @@ void HoistHandler<word>::BSFusedKeyMult(
 }
 
 template <typename word>
+void HoistHandler<word>::BSFusedKeyMultBatch(
+    ConstContextPtr<word> context, const std::vector<std::map<int, Ct> *> &res,
+    const std::vector<const word *> &a_modup,
+    const std::vector<const Ct *> &a_origs, const EvkMap<word> &keys,
+    std::vector<int> &rotations,
+    const std::vector<const word *> &pseudo_modup) const {
+  const int num_cts = static_cast<int>(res.size());
+  const Ct &a_ref = *a_origs.at(0);
+  NPInfo a_orig_np = a_ref.GetNP();
+  int num_main = a_orig_np.num_main_;
+  int num_ter = a_orig_np.num_ter_;
+  int num_aux = keys.GetRotationKey(rotations[0]).GetNP().num_aux_;
+  int num_q = num_main + num_ter;
+  int prime_offset = context->param_.GetMaxNumTer() - num_ter;
+
+  int padded_num_q = num_q + prime_offset;
+  int beta = DivCeil(padded_num_q, num_aux);
+
+  NPInfo np(num_main, num_ter, num_aux, context->param_.degree_);
+
+  int num_accum = 0;
+  for (int i = 0; i < beta; i++) {
+    int prime_index_end = Min((i + 1) * num_aux, padded_num_q);
+    if (prime_index_end <= prime_offset) continue;
+    num_accum++;
+  }
+  int num_accum_offset = beta - num_accum;
+  int num_q_primes = a_ref.GetNP().GetNumQ();
+  int num_rotations = static_cast<int>(rotations.size());
+  AssertTrue(static_cast<int>(a_modup.size()) == num_cts * num_accum &&
+                 static_cast<int>(pseudo_modup.size()) == num_cts &&
+                 static_cast<int>(a_origs.size()) == num_cts,
+             "BSFusedKeyMultBatch: table sizes disagree with the group");
+
+  for (int c = 0; c < num_cts; c++) {
+    for (auto &[_, accum] : *res[c]) {
+      accum.RemoveRx();
+      accum.ModifyNP(np);
+      accum.SetScale(a_origs[c]->GetScale());
+      accum.SetNumSlots(a_origs[c]->GetNumSlots());
+    }
+  }
+
+  // The pointer tables, packed and uploaded once: keys and galois data are
+  // SHARED by the group, the mod-up / destination / pseudo tables carry one
+  // slice per ciphertext.
+  TableUpload tab(static_cast<size_t>(8) *
+                  (num_cts * num_accum + 2 * num_accum * num_rotations +
+                   2 * num_cts * num_rotations + num_cts + 3 * num_rotations +
+                   8));
+  const word **modup_ptrs = tab.Add<const word *>(num_cts * num_accum);
+  const word **key_a_ptrs = tab.Add<const word *>(num_accum * num_rotations);
+  const word **key_b_ptrs = tab.Add<const word *>(num_accum * num_rotations);
+  word **dst_b_ptrs = tab.Add<word *>(num_cts * num_rotations);
+  word **dst_a_ptrs = tab.Add<word *>(num_cts * num_rotations);
+  const word **pseudo_ptrs = tab.Add<const word *>(num_cts);
+  word *key_extra = tab.Add<word>(num_rotations);
+  word *galois_factors_h = tab.Add<word>(num_rotations);
+  word *galois_offsets_h = tab.Add<word>(num_rotations);
+
+  for (int i = 0; i < num_rotations; i++) {
+    for (int j = 0; j < num_accum; j++) {
+      key_b_ptrs[i * num_accum + j] =
+          keys.GetRotationKey(rotations[i]).bx_[j + num_accum_offset].data() +
+          prime_offset * context->param_.degree_;
+      key_a_ptrs[i * num_accum + j] =
+          keys.GetRotationKey(rotations[i]).ax_[j + num_accum_offset].data() +
+          prime_offset * context->param_.degree_;
+    }
+    const Evk &key = keys.GetRotationKey(rotations[i]);
+    DvConstView<word> key_view = key.AxConstView(0, prime_offset);
+    key_extra[i] = key_view.QSize() - num_q_primes * context->param_.degree_;
+
+    int permute_amount = rotations[i];
+    AssertTrue(permute_amount != -1, "Conjugate case should not be handled.");
+    const int max_num_slots = context->param_.MaxNumSlots();
+    AssertTrue(permute_amount >= 0 && permute_amount < max_num_slots,
+               "Permute: Invalid permute amount");
+    galois_factors_h[i] =
+        context->param_.GetGaloisFactor(max_num_slots - permute_amount);
+    galois_offsets_h[i] = context->param_.GetGaloisOffset(galois_factors_h[i]);
+  }
+  for (int c = 0; c < num_cts; c++) {
+    for (int j = 0; j < num_accum; j++) {
+      modup_ptrs[c * num_accum + j] = a_modup[c * num_accum + j];
+    }
+    for (int i = 0; i < num_rotations; i++) {
+      dst_b_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).bx_.data();
+      dst_a_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).ax_.data();
+    }
+    pseudo_ptrs[c] = pseudo_modup[c];
+  }
+  int num_primes = np.GetNumTotal();
+
+  tab.Upload(table_scratch_);
+  const word **modup_d_ptrs = tab.Device(modup_ptrs);
+  const word **key_a_d_ptrs = tab.Device(key_a_ptrs);
+  const word **key_b_d_ptrs = tab.Device(key_b_ptrs);
+  word **dst_b_d_ptrs = tab.Device(dst_b_ptrs);
+  word **dst_a_d_ptrs = tab.Device(dst_a_ptrs);
+  const word *const *pseudo_d_ptrs = tab.Device(pseudo_ptrs);
+  word *key_extra_d = tab.Device(key_extra);
+  word *galois_factors = tab.Device(galois_factors_h);
+  word *galois_offsets = tab.Device(galois_offsets_h);
+
+  const word *primes = context->param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
+  dim3 block_dim(kernel_block_dim_);
+  dim3 grid_dim(static_cast<unsigned>(num_cts) * num_primes *
+                context->param_.degree_ / kernel_block_dim_);
+
+  AssertTrue(num_accum <= (1 << max_log_beta_) && num_accum >= 1,
+             "BSFusedKeyMultBatch: accumulator count out of range");
+  constexpr_for<0, max_log_beta_ + 1>([&](auto i) {
+    constexpr int num_accum_padded = 1 << i;
+    if (num_accum > num_accum_padded) return;
+    if (i > 0 && num_accum <= (1 << (i - 1))) return;
+    kernel::BSFusedKernelBatch<word, num_accum_padded>
+        <<<grid_dim, block_dim>>>(
+            dst_b_d_ptrs, dst_a_d_ptrs, modup_d_ptrs, key_b_d_ptrs,
+            key_a_d_ptrs, pseudo_d_ptrs, num_accum, num_rotations, num_cts,
+            primes, inv_primes, num_q_primes, key_extra_d, galois_factors,
+            galois_offsets, context->param_.log_degree_);
+  });
+}
+
+template <typename word>
 void HoistHandler<word>::GSFusedPAccum(ConstContextPtr<word> context,
                                        std::map<int, Ct> &results,
                                        const std::vector<int> &gs_indices,
@@ -1074,6 +1288,133 @@ void HoistHandler<word>::EvaluateBabyStep(ConstContextPtr<word> context,
       }
     }
   }
+}
+
+template <typename word>
+void HoistHandler<word>::EvaluateBabyStepBatch(
+    ConstContextPtr<word> context, const std::vector<std::map<int, Ct> *> &bs,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  const int n = static_cast<int>(inputs.size());
+  AssertTrue(static_cast<int>(bs.size()) == n && n > 0,
+             "EvaluateBabyStepBatch: outputs disagree with inputs");
+  NPInfo input_np = inputs[0]->GetNP();
+  const int num_q_primes = input_np.GetNumQ();
+  const int num_p_primes = context->param_.alpha_;
+  const int prime_offset = context->param_.GetMaxNumTer() - input_np.num_ter_;
+  const int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
+  const bool trivial = bs_indices_.size() == 1 && *bs_indices_.begin() == 0;
+  const bool can_fuse = kFuseBSKeyMult && beta <= (1 << max_log_beta_);
+  if (n == 1 || bs_serial_ || trivial || !can_fuse) {
+    for (int i = 0; i < n; i++) {
+      EvaluateBabyStep(context, *bs[i], *inputs[i], evk_map, false);
+    }
+    return;
+  }
+  ProfileScope profile_scope("hoist baby step batch");
+  const int degree = context->param_.degree_;
+  const int q_words = num_q_primes * degree;
+  const int ext_words = (num_q_primes + num_p_primes) * degree;
+  AssertTrue(num_q_primes == context->param_.LevelToNP(pt_level_).GetNumQ(),
+             "EvaluateBabyStepBatch: input level mismatch");
+  for (int i = 0; i < n; i++) {
+    const NPInfo np_i = inputs[i]->GetNP();
+    AssertTrue(np_i.num_main_ == input_np.num_main_ &&
+                   np_i.num_ter_ == input_np.num_ter_ && np_i.num_aux_ == 0 &&
+                   !inputs[i]->HasRx(),
+               "EvaluateBabyStepBatch: the group's inputs disagree (all must "
+               "be relinearized, mod-down and at one level)");
+    AssertTrue(bs[i]->empty(), "Hoist: bs should be empty");
+  }
+  auto &mod_switcher = context->mod_switch_handlers_.at(pt_level_);
+
+  // 1. Every a-part gathered into one strided buffer, then ONE ModUpBatch:
+  // the INTT, the base conversion and the forward NTT each carry the group
+  // on `blockIdx.z` instead of launching per ciphertext.
+  Dv gathered(static_cast<size_t>(n) * q_words);
+  {
+    HostVector<uint64_t> ptrs(n);
+    for (int i = 0; i < n; i++) {
+      ptrs[i] = reinterpret_cast<uint64_t>(inputs[i]->ax_.data());
+    }
+    DeviceVector<uint64_t> ptrs_dev;
+    CopyHostToDevice(ptrs_dev, ptrs);
+    dim3 block(kernel_block_dim_);
+    dim3 grid(DivCeil(q_words, kernel_block_dim_), 1, n);
+    hoist_kernel::GatherPolys<word><<<grid, block>>>(
+        gathered.data(), q_words,
+        reinterpret_cast<const word *const *>(ptrs_dev.data()));
+  }
+  std::vector<Dv> digits;
+  std::vector<DvView<word>> digit_views;
+  int num_accum = 0;
+  for (int i = 0; i < beta; i++) {
+    const int prime_index_end =
+        Min((i + 1) * num_p_primes, num_q_primes + prime_offset);
+    if (prime_index_end <= prime_offset) {
+      digits.emplace_back(0);
+      digit_views.emplace_back(nullptr, 0, 0);
+      continue;
+    }
+    digits.emplace_back(static_cast<size_t>(n) * ext_words);
+    digit_views.emplace_back(digits.back().data(), n * ext_words,
+                             n * ext_words - q_words);
+    num_accum++;
+  }
+  mod_switcher.ModUpBatch(digit_views, gathered.data(), q_words, n);
+  const int num_accum_offset = beta - num_accum;
+
+  // 2. The pseudo mod-up (and the identity baby step) per ciphertext -- a
+  // few elementwise launches each, not worth a kernel of their own.
+  NPInfo modup_np(input_np.num_main_, input_np.num_ter_, num_p_primes,
+                  degree);
+  DvConstView<word> p_prod_view(context->p_prod_.data() + prime_offset,
+                                num_q_primes);
+  std::vector<Dv> pseudo_tmp;
+  std::vector<const word *> pseudo_ptrs(n);
+  const bool has_bs0 = bs_indices_.find(0) != bs_indices_.end();
+  if (!has_bs0) pseudo_tmp.reserve(n);
+  for (int c = 0; c < n; c++) {
+    if (!has_bs0) {
+      pseudo_tmp.emplace_back(q_words);
+      Dv &pm = pseudo_tmp.back();
+      DvView<word> pm_view = pm.View();
+      mod_switcher.PseudoModUp(pm_view, inputs[c]->BxConstView(), p_prod_view);
+      pm.ZeroExtend(num_p_primes * degree);
+      pseudo_ptrs[c] = pm.data();
+    } else {
+      bs[c]->try_emplace(0, input_np);
+      Ct &b0 = bs[c]->at(0);
+      b0.SetScale(inputs[c]->GetScale());
+      b0.SetNumSlots(inputs[c]->GetNumSlots());
+      DvView<word> b0_bx_view = b0.BxView();
+      DvView<word> b0_ax_view = b0.AxView();
+      mod_switcher.PseudoModUp(b0_bx_view, inputs[c]->BxConstView(),
+                               p_prod_view);
+      mod_switcher.PseudoModUp(b0_ax_view, inputs[c]->AxConstView(),
+                               p_prod_view);
+      b0.bx_.ZeroExtend(num_p_primes * degree);
+      b0.ax_.ZeroExtend(num_p_primes * degree);
+      b0.ModifyNP(modup_np);
+      pseudo_ptrs[c] = b0.bx_.data();
+    }
+  }
+
+  // 3. One fused KeyMult+MAC+Aut kernel over the whole group.
+  std::vector<int> rotations;
+  for (const auto &bs_idx : bs_indices_) {
+    if (bs_idx != 0) rotations.push_back(bs_idx);
+  }
+  std::vector<const word *> modup_ptrs(static_cast<size_t>(n) * num_accum);
+  for (int c = 0; c < n; c++) {
+    for (int j = 0; j < num_accum; j++) {
+      modup_ptrs[static_cast<size_t>(c) * num_accum + j] =
+          digits[j + num_accum_offset].data() +
+          static_cast<size_t>(c) * ext_words;
+    }
+    for (int rot : rotations) bs[c]->try_emplace(rot, modup_np);
+  }
+  BSFusedKeyMultBatch(context, bs, modup_ptrs, inputs, evk_map, rotations,
+                      pseudo_ptrs);
 }
 
 // 3. Giant-step accumulation and rotations
