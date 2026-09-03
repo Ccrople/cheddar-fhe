@@ -1167,6 +1167,170 @@ TEST(CiBatch, TheBatchedConverterIsWordForWord) {
 }
 
 // ---------------------------------------------------------------------------
+// 5a''. The fused score boot (idea [4]) against the serial return + full
+//       Boot, slot by slot on random data: both routes produce "the booted
+//       scores as a Boot left them" (carried * m at the landing level), so
+//       after dividing each by its own carried they must agree to boot
+//       precision. A global constant off means a scale/ratio convention; a
+//       scattered error means the tower basis does not read the batch
+//       chain's output. Needs no weights.
+TEST(CiBatch, TheFusedScoreBootMatchesTheSerialBoot) {
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  std::unique_ptr<Ring> tower;
+  {
+    const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    const std::string saved = prev ? prev : "";
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
+    tower = std::make_unique<Ring>(TowerParam(), boot.ui->GetSecretCoeffs(),
+                                   /*slack=*/0);
+    if (prev) {
+      setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+    } else {
+      unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    }
+  }
+  auto tctx = std::dynamic_pointer_cast<BootContext<word>>(tower->context);
+  ASSERT_NE(tctx, nullptr);
+  tctx->PrepareEvalMod();
+
+  cheddar::CiBatchAttention<word>::Config cfg_s;
+  cheddar::CiBatchAttention<word> attn_s(bctx, swtch.context, small.context,
+                                         lifted.context, cfg_s);
+  cheddar::CiBatchAttention<word>::Config cfg_f = cfg_s;
+  cfg_f.fused_scores = true;
+  cfg_f.verbose = true;
+  cheddar::CiBatchAttention<word> attn_f(bctx, swtch.context, small.context,
+                                         lifted.context, cfg_f, tctx);
+
+  const int num_slots = attn_s.GetLayout().num_slots;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(num_slots);
+  const int chain_level = attn_s.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn_s.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn_s.AddSwitchRotations(req);
+    attn_f.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn_s.AddBootRotations(req);
+    bctx->AddRequiredRotations(req, num_slots, false);
+    boot.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn_f.AddTowerRotations(req);
+    tower->ui->PrepareRotationKey(req);
+  }
+
+  const CiBatchLayout &layout = attn_s.GetLayout();
+  const int B = layout.num_instances;
+  const int D = cfg_s.head_dim;
+  const int T = cfg_s.num_tokens;
+  std::mt19937_64 gen(0xF05E);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+  HostTensor q{B, T, D, {}}, k{B, T, D, {}};
+  q.v.resize(static_cast<size_t>(B) * T * D);
+  k.v.resize(q.v.size());
+  for (auto &v : q.v) v = dist(gen);
+  for (auto &v : k.v) v = dist(gen);
+  std::vector<Ciphertext<word>> q_cts, k_cts;
+  EncryptChannels(boot, layout, q, cfg_s.rope_level, q_cts);
+  EncryptChannels(boot, layout, k, cfg_s.rope_level, k_cts);
+
+  cheddar::CiBatchAttention<word>::Keys keys;
+  keys.boot = &boot.ui->GetEvkMap();
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.tower = &tower->ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(attn_s.GetChain().rank);
+  keys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn_s.GetChain().rank);
+
+  std::vector<Ciphertext<word>> q_a(D), q_b(D);
+  for (int c = 0; c < D; c++) {
+    boot.context->Copy(q_a[c], q_cts[c]);
+    boot.context->Copy(q_b[c], q_cts[c]);
+  }
+
+  // The serial route: converter return, then the full Boot.
+  std::vector<Ciphertext<word>> s_ref;
+  attn_s.Scores(s_ref, q_a, k_cts, keys);
+  const int ls = boot.param->NPToLevel(s_ref[0].GetNP());
+  const double carried_ref = s_ref[0].GetScale() / boot.param->GetScale(ls);
+  std::vector<Ciphertext<word>> booted_ref(T);
+  {
+    std::vector<const Ciphertext<word> *> in(T);
+    for (int l = 0; l < T; l++) in[l] = &s_ref[l];
+    std::vector<Ciphertext<word>> out;
+    bctx->BootBatch(out, in, boot.ui->GetEvkMap());
+    for (int l = 0; l < T; l++) booted_ref[l] = std::move(out[l]);
+  }
+
+  // The fused route: the SinC element, HalfBootTower + prefix.
+  std::vector<Ciphertext<word>> s_sinc;
+  attn_f.Scores(s_sinc, q_b, k_cts, keys);
+  const double carried_f = s_sinc[0].GetScale() / boot.param->base_scale_;
+  std::vector<Ciphertext<word>> booted_f;
+  attn_f.BootScoresFused(booted_f, s_sinc, keys, 16);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  std::cout << "  carried: serial " << carried_ref << ", fused " << carried_f
+            << " (ratio " << carried_f / carried_ref << ")" << std::endl;
+  std::cout << "  landings: serial "
+            << boot.param->NPToLevel(booted_ref[0].GetNP()) << " scale "
+            << booted_ref[0].GetScale() << ", fused "
+            << boot.param->NPToLevel(booted_f[0].GetNP()) << " scale "
+            << booted_f[0].GetScale() << std::endl;
+
+  // Slot-by-slot: each route's message over its own carried.
+  double num = 0.0, den = 0.0, ratio_sum = 0.0;
+  int ratio_n = 0;
+  for (int l = 0; l < T; l += 17) {  // a sample of key tokens
+    std::vector<Complex> mr, mf;
+    {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, booted_ref[l]);
+      boot.context->encoder_.Decode(mr, pt);
+      boot.ui->Decrypt(pt, booted_f[l]);
+      boot.context->encoder_.Decode(mf, pt);
+    }
+    for (size_t s = 0; s < mr.size(); s++) {
+      const double a = mr[s].real() / carried_ref;
+      const double b = mf[s].real() / carried_f;
+      num += (a - b) * (a - b);
+      den += a * a;
+      if (std::abs(a) > 1e-3 && ratio_n < 200000) {
+        ratio_sum += b / a;
+        ratio_n++;
+      }
+    }
+  }
+  const double rel = std::sqrt(num / std::max(den, 1e-300));
+  std::cout << "  fused vs serial booted scores: rms rel 2^-" << std::fixed
+            << std::setprecision(2) << Bits(rel) << ", mean ratio "
+            << std::setprecision(6) << (ratio_n ? ratio_sum / ratio_n : 0.0)
+            << " over " << ratio_n << " large slots" << std::endl;
+  EXPECT_LT(rel, std::ldexp(1.0, -8));
+}
+
+// ---------------------------------------------------------------------------
 // 5b. The softmax alone, on the real head-0 scores, through the exact seam
 //     the layer uses: the scores encrypted at the chain's output level with
 //     the chain's non-canonical scale (carried), booted, then SoftMax --
