@@ -524,6 +524,22 @@ class Context {
                     const std::vector<const Evk *> &keys, int batch) const;
 
   /**
+   * @brief `RelinearizeRescale` for `batch` ciphertexts at one level with ONE
+   * key, in about as many launches as one takes.
+   *
+   * Ciphertext `b` is read at `src + b * src_ct_stride`, laid out as its
+   * b-part, its a-part and its rx part (`np.GetNumQ() * degree` words each),
+   * and the result lands at `dst + b * dst_ct_stride` as its b-part followed
+   * by its a-part (the next level's words each). The key switch of the rx
+   * parts is `MultKeyBatchNoModDown` with (b, a) folded in as the addend, and
+   * the epilogue is `ModDownAndRescaleBatch` -- the words are
+   * `RelinearizeRescale`'s.
+   */
+  void RelinearizeRescaleBatch(word *dst, int dst_ct_stride, const word *src,
+                               int src_ct_stride, const NPInfo &np,
+                               const Evk &key, int batch) const;
+
+  /**
    * @brief The general form without the mod-down: the accumulators on the
    * extended basis, ciphertext `b` at `dst + b * dst_ct_stride` as its b-part
    * followed by its a-part, `(num_q + num_aux) * degree` words each -- what

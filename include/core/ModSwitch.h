@@ -123,6 +123,17 @@ class ModSwitchHandler {
   void Rescale(DvView<word> &dst, const DvConstView<word> &src) const;
   void ModDownAndRescale(DvView<word> &dst, const DvConstView<word> &src) const;
 
+  /**
+   * @brief ModDownAndRescale for `batch` extended-basis polynomials at once:
+   * polynomial `b` is read at `src + b * src_batch_stride` (this level's
+   * `num_q + num_aux` limbs) and written to `dst + b * dst_batch_stride` (the
+   * next level's q limbs), word for word what `ModDownAndRescale` gives --
+   * the counterpart of `ModDownBatch`/`RescaleBatch` for the fused epilogue
+   * a `RelinearizeRescale` ends with.
+   */
+  void ModDownAndRescaleBatch(word *dst, int dst_batch_stride, const word *src,
+                              int src_batch_stride, int batch) const;
+
  private:
   // ModUp constants
   Dv mod_up1_;

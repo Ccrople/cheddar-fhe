@@ -776,11 +776,20 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
   if (cfg_.fused) {
     AssertTrue(keys.tower != nullptr,
                "CiSinCAttention: the fused return needs Keys::tower");
-    for (int bi = 0; bi < layout.num_cts; bi++) {
-      Ct half;
-      tower_->HalfBootTower(half, acc[bi], *keys.tower, *basis_);
-      acc[bi] = Ct{};
-      basis_->Prefix(res[bi], half, *keys.tower);
+    {
+      // The returns as ONE group: the per-ciphertext tower CtS' then a
+      // single batched EvalMod over the eight images.
+      std::vector<const Ct *> xs(layout.num_cts);
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        xs[bi] = &acc[bi];
+      }
+      std::vector<Ct> halves;
+      tower_->HalfBootTowerBatch(halves, xs, *keys.tower, *basis_);
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        acc[bi] = Ct{};
+        basis_->Prefix(res[bi], halves[bi], *keys.tower);
+        halves[bi] = Ct{};
+      }
     }
     return;
   }

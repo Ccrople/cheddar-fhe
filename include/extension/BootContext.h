@@ -102,6 +102,19 @@ class BootContext : public Context<word>,
   void SplitAndEvaluateMod(Ct &lo, Ct &hi, const Ct &main_ct,
                            const EvkMap<word> &evk_map) const;
 
+  /**
+   * @brief The per-ciphertext front of `HalfBootModule` / `HalfBootTower`
+   * (level descent, scale-up, ModRaise, the basis's CtS), shared by the
+   * serial call and the batched group so the two cannot drift. Leaves
+   * `slots` at EvalMod's start scale and returns the input's slot count.
+   */
+  int HalfBootModuleFront(Ct &slots, const Ct &input,
+                          const EvkMap<word> &evk_map,
+                          const CiModuleBasis<word> &basis) const;
+  int HalfBootTowerFront(Ct &slots, const Ct &input,
+                         const EvkMap<word> &evk_map,
+                         const CiSinCBasis<word> &basis) const;
+
   ContextPtr<word> GetContext();
   ConstContextPtr<word> GetContext() const;
 
@@ -270,6 +283,9 @@ class BootContext : public Context<word>,
    */
   double GetStCInputScale() const;
 
+  /** @brief The scale EvalMod's input must declare (EvalMod::start_scale_). */
+  double GetEvalModStartScale() const;
+
   /**
    * @brief What `HalfBoot` leaves on the message, exactly.
    *
@@ -325,6 +341,23 @@ class BootContext : public Context<word>,
   double GetCtSConst() const;
   double GetStCConst(BootVariant variant = BootVariant::kNormal) const;
   void EvaluateMod(Ct &res, const Ct &input, const Evk &mult_key) const;
+
+  /**
+   * @brief `EvaluateMod` over a group of ciphertexts at one (level, scale),
+   * in place: the group is gathered into one strided buffer and the compiled
+   * polynomial tree runs ONCE over it -- every key switch through
+   * `MultKeyBatch` with the one multiplication key, every elementwise pass
+   * with the batch on `gridDim.z`. Word for word the per-ciphertext loop
+   * (`CHEDDAR_EVALMOD_SERIAL=1` restores the loop, the A/B baseline). This
+   * is the lever Doing.md 3.23 named: EvalMod's ~87k launches at ~80 us each
+   * were 7.4-8.7 s of the 23 s layer.
+   */
+  void EvaluateModBatch(std::vector<Ct *> &cts, const Evk &mult_key) const;
+
+  /** @brief Whether EvaluateModBatch batches (CHEDDAR_EVALMOD_SERIAL). */
+  static bool EvalModSerial();
+  /** @brief The A/B switch, for tests that compare the two paths. */
+  static void SetEvalModSerial(bool serial);
 
   // The encoding conversions, public because the Llama pipeline needs them and
   // not only Boot does. SlotToCoeff is compiled at GetStCStartLevel(), which is
@@ -505,6 +538,23 @@ class BootContext : public Context<word>,
    */
   void HalfBootTower(Ct &res, const Ct &input, const EvkMap<word> &evk_map,
                      const CiSinCBasis<word> &basis) const;
+
+  /**
+   * @brief `HalfBootModule` over a group of ciphertexts: the per-ciphertext
+   * front (scale-up, ModRaise, the module CtS) exactly as the serial call
+   * runs it, then ONE `EvaluateModBatch` over the group. Word for word the
+   * loop of `HalfBootModule` calls.
+   */
+  void HalfBootModuleBatch(std::vector<Ct> &res,
+                           const std::vector<const Ct *> &inputs,
+                           const EvkMap<word> &evk_map,
+                           const CiModuleBasis<word> &basis) const;
+
+  /** @brief `HalfBootTower` over a group, as `HalfBootModuleBatch`. */
+  void HalfBootTowerBatch(std::vector<Ct> &res,
+                          const std::vector<const Ct *> &inputs,
+                          const EvkMap<word> &evk_map,
+                          const CiSinCBasis<word> &basis) const;
 
   /**
    * @brief Two real-payload coefficient ciphertexts through ONE HalfBoot.

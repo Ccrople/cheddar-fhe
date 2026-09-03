@@ -275,6 +275,15 @@ class SylphSchedule {
    * @return the ratio by which the descent to level 0 moved the scale; 1.0
    * when the input was already there
    */
+  /**
+   * @brief `ToSlot` over a group of ciphertexts: the per-ciphertext descent
+   * and CtS, then ONE batched EvalMod over the group
+   * (`BootContext::HalfBootModuleBatch`). On the native basis it is the
+   * serial loop. Returns the common descent drift.
+   */
+  double ToSlotBatch(std::vector<Ct> &res, const std::vector<const Ct *> &xs,
+                     const EvkMap<word> &evk_map, bool min_ks = false) const;
+
   double ToSlot(Ct &res, const Ct &x, const EvkMap<word> &evk_map,
                 bool min_ks = false) const;
 
