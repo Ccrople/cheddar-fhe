@@ -257,11 +257,22 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
             << bp.num_cts_levels_ << ", EvalMod " << bp.GetNumEvalModLevels()
             << " levels ending at " << bp.GetEvalModEndLevel() << std::endl;
 
+  // The phases follow the THICK level count: a thin single-terminal top
+  // (an even landing, e.g. land18c4e10) is consumed by CiSinCBasis's pure
+  // rescale and carries no phase.
+  int thick = bp.num_cts_levels_;
+  {
+    int lvl = bp.GetCtSStartLevel();
+    while (param_->GetRescalePrimeProd(lvl) < 1073741824.0) {
+      thick--;
+      lvl--;
+    }
+  }
   typename CiSinCBasis<word>::Phases ph;
-  if (bp.num_cts_levels_ == 4) {
+  if (thick == 4) {
     ph.cts_inner = {4, 3};  // the inner twist as a pair chain
-  } else if (bp.num_cts_levels_ != 3) {
-    GTEST_SKIP() << "the tower CtS' spends three (or four) levels";
+  } else if (thick != 3) {
+    GTEST_SKIP() << "the tower CtS' spends three (or four) thick levels";
   }
   CiSinCBasis<word> basis(n, kSmallDegree, kSubDegree);
   boot->PrepareEvalMod();
