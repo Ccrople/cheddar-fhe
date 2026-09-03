@@ -603,12 +603,21 @@ void CiLlamaLayer<word>::PrepareNormAhead(bool ffn,
   const double beta = std::sqrt(alpha);
   const double b2 = beta * beta;
   NormAhead &ahead = norm_ahead_[ffn ? 1 : 0];
-  ahead.rms = std::make_unique<RmsNormHandler<word>>(
-      boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
-      op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
-      channel_stride_);
-  ahead.wts = NormWeights(gain, alpha / b2);
-  ahead.rms->Prepare(ahead.wts);
+  // Split so the two halves are separable in a profile: this whole call sits
+  // in the leg's window, and once the leg stopped being idle (Doing.md 3.25)
+  // what it costs is the leg's hole.
+  {
+    NvtxScope _c("prep: norm handler compile");
+    ahead.rms = std::make_unique<RmsNormHandler<word>>(
+        boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
+        op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
+        channel_stride_);
+  }
+  {
+    NvtxScope _w("prep: norm weights");
+    ahead.wts = NormWeights(gain, alpha / b2);
+    ahead.rms->Prepare(ahead.wts);
+  }
   ahead.gain = gain;
   ahead.alpha = alpha;
   ahead.window = window;
