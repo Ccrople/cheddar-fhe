@@ -254,6 +254,155 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
   }
 }
 
+template <typename word>
+void CiBatchAttention<word>::DescendKV(DescendedKV &dkv,
+                                       const std::vector<Ct> &k,
+                                       const std::vector<Ct> &v,
+                                       const Keys &keys) const {
+  NvtxScope _nv("batch attn: descend kv");
+  const int D = cfg_.head_dim;
+  const int rank = chain_.rank;
+  AssertTrue(static_cast<int>(k.size()) == D &&
+                 static_cast<int>(v.size()) == D,
+             "CiBatchAttention::DescendKV: one kv head's channels each");
+  dkv.lk.clear();
+  dkv.lv.clear();
+  dkv.lk.resize(2);
+  dkv.lv.resize(2);
+  for (int call = 0; call < 2; call++) {
+    // K: RoPE with the call's key tokens kept, down to its parts -- what
+    // Scores' call loop does, once instead of once per Q head.
+    std::vector<Ct> kc(D);
+    for (int c = 0; c < D; c++) boot_->Copy(kc[c], k[c]);
+    Rope(kc, call);
+    auto &lk = dkv.lk[call];
+    lk.resize(rank);
+    for (int c = 0; c < D; c++) {
+      std::vector<Ct> parts;
+      Descend(parts, kc[c], call, keys);
+      for (int g = 0; g < rank; g++) lk[g].push_back(std::move(parts[g]));
+    }
+    // V with the call's key tokens kept, shifted down for the odd call by
+    // the converter's premap -- what Values' call loop does.
+    auto &lv = dkv.lv[call];
+    lv.resize(rank);
+    for (int c = 0; c < D; c++) {
+      Ct masked, t;
+      boot_->Mult(t, v[c], call_mask_[call]);
+      boot_->Rescale(masked, t);
+      std::vector<Ct> parts;
+      Descend(parts, masked, call, keys);
+      for (int g = 0; g < rank; g++) lv[g].push_back(std::move(parts[g]));
+    }
+  }
+}
+
+template <typename word>
+void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
+                                    const DescendedKV &dkv,
+                                    const Keys &keys) const {
+  NvtxScope _nv("batch attn: Scores");
+  const int T = cfg_.num_tokens;
+  const int D = cfg_.head_dim;
+  const int rank = chain_.rank;
+  AssertTrue(static_cast<int>(q.size()) == D &&
+                 static_cast<int>(dkv.lk.size()) == 2,
+             "CiBatchAttention::Scores: one head's channels and a hoisted "
+             "kv descent");
+  AssertTrue(keys.swtch != nullptr && keys.lifted != nullptr &&
+                 keys.ring_switch != nullptr &&
+                 keys.inverse_ring_switch != nullptr,
+             "CiBatchAttention::Scores: keys");
+
+  Rope(q, -1);
+  std::vector<std::vector<Ct>> lq(rank);
+  for (int c = 0; c < D; c++) {
+    std::vector<Ct> parts;
+    Descend(parts, q[c], -1, keys);
+    for (int g = 0; g < rank; g++) lq[g].push_back(std::move(parts[g]));
+  }
+
+  res.clear();
+  res.resize(T);
+  for (int call = 0; call < 2; call++) {
+    NvtxScope _c("batch attn: scores call");
+    const auto &lk = dkv.lk[call];
+    std::vector<std::vector<Ct>> out(rank);
+    for (int g = 0; g < rank; g++) {
+      std::vector<Ct> prod;
+      ccmm_.Multiply(lifted_ctx_, prod, lq[g], lk[g], 2 * cfg_.sub_degree,
+                     *keys.lifted, /*rhs_row_wise=*/true);
+      out[g].resize(T / 2);
+      for (int l = 0; l < T / 2; l++) lift_.Descend(out[g][l], prod[l]);
+    }
+    for (int l = 0; l < T / 2; l++) {
+      std::vector<Ct> parts(rank);
+      for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][l]);
+      Return(res[call * (T / 2) + l], parts, keys);
+    }
+  }
+}
+
+template <typename word>
+void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
+                                    const DescendedKV &dkv,
+                                    const Keys &keys) const {
+  NvtxScope _nv("batch attn: Values");
+  const int T = cfg_.num_tokens;
+  const int D = cfg_.head_dim;
+  const int rank = chain_.rank;
+  const int half = T / 2;
+  AssertTrue(static_cast<int>(P.size()) == T &&
+                 static_cast<int>(dkv.lv.size()) == 2,
+             "CiBatchAttention::Values: P's key tokens and a hoisted kv "
+             "descent");
+  AssertTrue(boot_->param_.NPToLevel(P[0].GetNP()) == cfg_.forward_level,
+             "CiBatchAttention::Values: P must be at forward_level");
+
+  std::vector<std::vector<Ct>> lp(rank);
+  for (int l = 0; l < T; l++) {
+    std::vector<Ct> parts;
+    Descend(parts, P[l], -1, keys);
+    for (int g = 0; g < rank; g++) lp[g].push_back(std::move(parts[g]));
+  }
+
+  std::vector<std::vector<Ct>> out(rank);
+  for (int call = 0; call < 2; call++) {
+    NvtxScope _c("batch attn: values call");
+    const auto &lv = dkv.lv[call];
+    for (int g = 0; g < rank; g++) {
+      std::vector<Ct> lhs;
+      lhs.reserve(T);
+      for (int l = 0; l < half; l++) {
+        lhs.push_back(std::move(lp[g][call * half + l]));
+      }
+      std::vector<Ct> zeros;
+      ZeroLifted(zeros, lhs[0], T - half);
+      for (auto &z : zeros) lhs.push_back(std::move(z));
+      std::vector<Ct> prod;
+      ccmm_.Multiply(lifted_ctx_, prod, lhs, lv[g], 2 * cfg_.sub_degree,
+                     *keys.lifted, /*rhs_row_wise=*/false);
+      if (call == 0) {
+        out[g].resize(D);
+        for (int c = 0; c < D; c++) lift_.Descend(out[g][c], prod[c]);
+      } else {
+        for (int c = 0; c < D; c++) {
+          Ct part;
+          lift_.Descend(part, prod[c]);
+          small_ctx_->Add(out[g][c], out[g][c], part);
+        }
+      }
+    }
+  }
+  res.clear();
+  res.resize(D);
+  for (int c = 0; c < D; c++) {
+    std::vector<Ct> parts(rank);
+    for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][c]);
+    Return(res[c], parts, keys);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The softmax walk
 // ---------------------------------------------------------------------------

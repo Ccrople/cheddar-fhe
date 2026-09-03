@@ -613,6 +613,23 @@ void CiBatchLayer<word>::Attention(
     }
     const std::vector<Ct> &k_kv = k_heads[kv % heads_per_tile];
     const std::vector<Ct> &v_kv = v_heads[kv % heads_per_tile];
+    // The GQA hoist: the kv head's K and V RoPE'd/masked and descended ONCE
+    // here, read by the group's four Q heads -- the per-head path redid the
+    // same descents four times (half the layer's Descend calls). The parts
+    // are bit-identical to the per-head ones, so accuracy cannot move;
+    // CHEDDAR_CI_BATCH_HOIST_KV=0 is the per-head loop.
+    static const bool hoist_kv = [] {
+      const char *e = std::getenv("CHEDDAR_CI_BATCH_HOIST_KV");
+      return e == nullptr || e[0] != '0';
+    }();
+    typename CiBatchAttention<word>::DescendedKV dkv;
+    if (hoist_kv) {
+      t0 = Clock::now();
+      attn.DescendKV(dkv, k_kv, v_kv, akeys);
+      const double half_kv = SinceSeconds(t0) / 2.0;
+      stages_.scores += half_kv;
+      stages_.values += half_kv;
+    }
     for (int hi = 0; hi < group; hi++) {
       const int h = kv * group + hi;
       NvtxScope _h("batch: head");
@@ -636,7 +653,11 @@ void CiBatchLayer<word>::Attention(
 
       t0 = Clock::now();
       std::vector<Ct> scores;
-      attn.Scores(scores, q_h, k_kv, akeys);
+      if (hoist_kv) {
+        attn.Scores(scores, q_h, dkv, akeys);
+      } else {
+        attn.Scores(scores, q_h, k_kv, akeys);
+      }
       stages_.scores += SinceSeconds(t0);
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 after the scores");
@@ -694,7 +715,11 @@ void CiBatchLayer<word>::Attention(
 
       t0 = Clock::now();
       std::vector<Ct> out_h;
-      attn.Values(out_h, P, v_kv, akeys);
+      if (hoist_kv) {
+        attn.Values(out_h, P, dkv, akeys);
+      } else {
+        attn.Values(out_h, P, v_kv, akeys);
+      }
       P.clear();
       if (dbg != nullptr && h == dbg->head) snap(dbg->out, out_h);
       for (int cc = 0; cc < D; cc++) {

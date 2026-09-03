@@ -176,6 +176,27 @@ class CiBatchAttention {
   void Scores(std::vector<Ct> &res, std::vector<Ct> &q,
               const std::vector<Ct> &k, const Keys &keys) const;
 
+  /**
+   * @brief One kv head's K and V descended ONCE for both calls, shared by
+   * its GQA group's four Q heads. `Scores`/`Values` on the raw channels
+   * redo the kv head's RoPE-and-descent per Q head -- four times for the
+   * same words. `lk[call][g][c]` / `lv[call][g][c]` is group `g`'s column
+   * `c` on the lifted ring, exactly what the per-head path builds
+   * (deterministic kernels on the same inputs, so bit-identical).
+   */
+  struct DescendedKV {
+    std::vector<std::vector<std::vector<Ct>>> lk, lv;
+  };
+  /** @brief Fill `dkv` from one kv head's K and V, both calls. */
+  void DescendKV(DescendedKV &dkv, const std::vector<Ct> &k,
+                 const std::vector<Ct> &v, const Keys &keys) const;
+  /** @brief `Scores` reading the hoisted K parts. */
+  void Scores(std::vector<Ct> &res, std::vector<Ct> &q,
+              const DescendedKV &dkv, const Keys &keys) const;
+  /** @brief `Values` reading the hoisted V parts. */
+  void Values(std::vector<Ct> &res, std::vector<Ct> &P,
+              const DescendedKV &dkv, const Keys &keys) const;
+
   /** @brief What the softmax walk needs to know about the data, in CHAIN
    * units: the raw scores times the factor the Q and K weights carried
    * (`cq * ck`). */
