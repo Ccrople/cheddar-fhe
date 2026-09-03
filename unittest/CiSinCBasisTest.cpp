@@ -214,9 +214,16 @@ TEST_P(CiSinCBasisTest, CtSReadsTheTowerCoordinates) {
   const auto native = TowerNative(x, ko, ki, Tl);
 
   // The top level has no canonical scale; the rescale product is what a
-  // CoeffToSlot input carries there.
+  // CoeffToSlot input carries there. On a THIN-top ladder that product is
+  // ~2^25 and the hoisted transforms' key-switch noise (raw, scale-blind)
+  // would read as ~2^-7 -- a scale artifact, not the transform (a real
+  // boot's CtS input arrives ScaleUp'ed far above it; both thin-top towers
+  // measured the identical 3.8e-3 absolute noise here). Boost the entry
+  // scale so the test measures the arithmetic.
+  double entry_scale = DetermineScale(level);
+  if (entry_scale < 1073741824.0) entry_scale *= 1073741824.0;
   Plaintext<word> pt;
-  context_->encoder_.EncodeCoeff(pt, level, DetermineScale(level), native);
+  context_->encoder_.EncodeCoeff(pt, level, entry_scale, native);
   Ciphertext<word> ct;
   interface_->Encrypt(ct, pt);
 
@@ -280,7 +287,20 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
   basis.PrepareForward(context_, "p", forward_level);
   basis.PrepareCtS(context_, bp.GetCtSStartLevel(), n * boot->GetCtSConst(),
                    ph);
-  basis.PreparePrefix(context_, bp.GetEvalModEndLevel());
+  // Land the prefix at a FIXED favorable scale (2^50) rather than the
+  // default input-preserving one: the default falls out of the ladder's
+  // EvalMod scale recursion (2^51.9 on land18c4e10, 2^34.75 on
+  // land16c4e10), and at ~2^35 the key-switch noise (~2^24.5 raw,
+  // scale-blind) reads as ~2^-7 -- ladder luck, not arithmetic. The layer
+  // path lands canonical (~2^35) on EVERY pair, so its quality gate is
+  // the fused-vs-serial diagnostic, not this bar.
+  {
+    const double target = 1125899906842624.0;  // 2^50
+    const int pl = bp.GetEvalModEndLevel();
+    basis.PreparePrefix(context_, pl, 1.0,
+                        target * param_->GetRescalePrimeProd(pl) /
+                            boot->GetStCInputScale());
+  }
   EvkRequest req;
   basis.AddRequiredRotations(req);
   interface_->PrepareRotationKey(req);
