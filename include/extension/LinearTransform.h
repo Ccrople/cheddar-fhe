@@ -119,6 +119,13 @@ class LinearTransform {
   void EvaluateBabyStep(ConstContextPtr<word> context, std::map<int, Ct> &bs,
                         const Ct &input, const EvkMap<word> &evk_map,
                         bool min_ks = false) const;
+  /// `HoistHandler::EvaluateBabyStepBatch` over this transform's handler:
+  /// the group's baby steps as one ModUpBatch + one fused kernel with the
+  /// key tables shared. `bs[i]` answers `inputs[i]`; no min_ks form.
+  void EvaluateBabyStepBatch(ConstContextPtr<word> context,
+                             const std::vector<std::map<int, Ct> *> &bs,
+                             const std::vector<const Ct *> &inputs,
+                             const EvkMap<word> &evk_map) const;
   void EvaluateGiantStep(ConstContextPtr<word> context, Ct &res,
                          const std::map<int, Ct> &bs,
                          const EvkMap<word> &evk_map,

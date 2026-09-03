@@ -146,6 +146,13 @@ void LinearTransform<word>::EvaluateBabyStep(ConstContextPtr<word> context,
 }
 
 template <typename word>
+void LinearTransform<word>::EvaluateBabyStepBatch(
+    ConstContextPtr<word> context, const std::vector<std::map<int, Ct> *> &bs,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  hoist_.EvaluateBabyStepBatch(context, bs, inputs, evk_map);
+}
+
+template <typename word>
 void LinearTransform<word>::EvaluateGiantStep(ConstContextPtr<word> context,
                                               Ct &res,
                                               const std::map<int, Ct> &bs,
