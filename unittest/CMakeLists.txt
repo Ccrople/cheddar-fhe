@@ -492,6 +492,8 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
 # wrap-around.
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c3e10.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

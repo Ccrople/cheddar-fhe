@@ -63,6 +63,13 @@ const char *Param() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_PARAM");
   return (env && env[0]) ? env : "ci16_35.json";
 }
+// The fused scores' tower ring: K = 64 with the prefix landing where the
+// layer preset's own Boot does. ci16_35_stc2 lands at 17 (19 - 2 StC
+// levels), so its tower is `land18c3e10` (EvalMod ends at 18).
+const char *TowerParam() {
+  const char *env = std::getenv("CHEDDAR_CI_BATCH_TOWER_PARAM");
+  return (env && env[0]) ? env : "ci16_35_land18c3e10.json";
+}
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
   return (e && e[0]) ? std::atoi(e) : fallback;
@@ -1646,7 +1653,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
     const std::string saved = prev ? prev : "";
     setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
-    tower = std::make_unique<Ring>("ci16_35_land17c3e10.json",
+    tower = std::make_unique<Ring>(TowerParam(),
                                    boot.ui->GetSecretCoeffs(), /*slack=*/0);
     if (prev) {
       setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
@@ -2107,7 +2114,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
     const std::string saved = prev ? prev : "";
     setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
-    tower = std::make_unique<Ring>("ci16_35_land17c3e10.json",
+    tower = std::make_unique<Ring>(TowerParam(),
                                    boot.ui->GetSecretCoeffs(), /*slack=*/0);
     if (prev) {
       setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
