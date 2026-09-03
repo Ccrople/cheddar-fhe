@@ -776,11 +776,20 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
   if (cfg_.fused) {
     AssertTrue(keys.tower != nullptr,
                "CiSinCAttention: the fused return needs Keys::tower");
-    for (int bi = 0; bi < layout.num_cts; bi++) {
-      Ct half;
-      tower_->HalfBootTower(half, acc[bi], *keys.tower, *basis_);
-      acc[bi] = Ct{};
-      basis_->Prefix(res[bi], half, *keys.tower);
+    {
+      // The returns as ONE group: the per-ciphertext tower CtS' then a
+      // single batched EvalMod over the eight images.
+      std::vector<const Ct *> xs(layout.num_cts);
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        xs[bi] = &acc[bi];
+      }
+      std::vector<Ct> halves;
+      tower_->HalfBootTowerBatch(halves, xs, *keys.tower, *basis_);
+      for (int bi = 0; bi < layout.num_cts; bi++) {
+        acc[bi] = Ct{};
+        basis_->Prefix(res[bi], halves[bi], *keys.tower);
+        halves[bi] = Ct{};
+      }
     }
     return;
   }
@@ -899,6 +908,9 @@ int ExpDegree(double m_eff) {
 
 template <typename word>
 void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
+  // Annotated because it is per LAYER, not per run: without a range of its
+  // own its cost showed up as an unattributed hole at the head of the leg.
+  NvtxScope _nv("attn: PrepareSoftMax");
   const auto &layout = ccmm_.GetLayout();
   calib_ = calib;
   const int top = GetTopLevel();
@@ -1006,9 +1018,15 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
           }
         }
       }
-      boot_->encoder_.Encode(causal_a0_[bi], exp_in_, u_scale, a0_msg);
-      boot_->encoder_.Encode(causal_mask_[bi], exp_out_,
-                             boot_->param_.GetScale(exp_out_), mask_msg);
+      // ON THE DEVICE. These two are the layer's only per-layer slot
+      // encodings of a full message, and the host path costs ~110 ms each --
+      // 1.7 s a layer over the eight, with the card doing NOTHING for the
+      // whole of it (Doing.md 3.25: the leg's stage was 48 % busy and every
+      // hole was here). `GpuEncoder::Encode` has `Encoder::Encode`'s
+      // contract and on R+ the two agree to the unit.
+      boot_->gpu_encoder_.Encode(causal_a0_[bi], exp_in_, u_scale, a0_msg);
+      boot_->gpu_encoder_.Encode(causal_mask_[bi], exp_out_,
+                                 boot_->param_.GetScale(exp_out_), mask_msg);
     }
   }
   softmax_ready_ = true;

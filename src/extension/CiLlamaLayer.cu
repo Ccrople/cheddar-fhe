@@ -469,9 +469,17 @@ void CiLlamaLayer<word>::NormTurn(std::vector<Ct> &res,
   // `beta = sqrt(alpha)` is exactly the constant that puts it there, and it
   // folds into the crossing's own multiply -- no level, no operation, no key.
   const double beta = std::sqrt(alpha);
-  std::vector<Ct> slots(num_model_cts_);
+  std::vector<Ct> slots;
+  {
+    // The crossings as ONE group: the per-ciphertext CtS then a single
+    // batched EvalMod (Doing.md 3.23's lever).
+    std::vector<const Ct *> xs(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      xs[k] = &stream[k];
+    }
+    sched_.ToSlotBatch(slots, xs, evk, cfg_.min_ks);
+  }
   for (int k = 0; k < num_model_cts_; k++) {
-    sched_.ToSlot(slots[k], stream[k], evk, cfg_.min_ks);
     // What is divided out here is the CROSSING ALONE. A residual carries the
     // O projection's own factor at both ends -- the stream was encrypted with
     // it and the O output already has it -- so a fit measured on this
@@ -595,12 +603,21 @@ void CiLlamaLayer<word>::PrepareNormAhead(bool ffn,
   const double beta = std::sqrt(alpha);
   const double b2 = beta * beta;
   NormAhead &ahead = norm_ahead_[ffn ? 1 : 0];
-  ahead.rms = std::make_unique<RmsNormHandler<word>>(
-      boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
-      op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
-      channel_stride_);
-  ahead.wts = NormWeights(gain, alpha / b2);
-  ahead.rms->Prepare(ahead.wts);
+  // Split so the two halves are separable in a profile: this whole call sits
+  // in the leg's window, and once the leg stopped being idle (Doing.md 3.25)
+  // what it costs is the leg's hole.
+  {
+    NvtxScope _c("prep: norm handler compile");
+    ahead.rms = std::make_unique<RmsNormHandler<word>>(
+        boot_, cfg_.num_tokens, cfg_.model_declared, alpha * ratio / b2,
+        op_level_, b2 * cfg_.eps / ratio, window, NormDegree(window),
+        channel_stride_);
+  }
+  {
+    NvtxScope _w("prep: norm weights");
+    ahead.wts = NormWeights(gain, alpha / b2);
+    ahead.rms->Prepare(ahead.wts);
+  }
   ahead.gain = gain;
   ahead.alpha = alpha;
   ahead.window = window;
@@ -763,10 +780,22 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   {
     SiLuHandler<word> silu(boot_, c.silu_range, op_level_,
                            SiLuDegree(c.silu_range));
+    // The 2 x 28 crossings as groups: the per-ciphertext CtS then batched
+    // EvalMods, instead of 56 serial launch-bound reductions.
+    std::vector<Ct> g_ups, u_ups;
+    {
+      std::vector<const Ct *> xs(num_hidden_cts_);
+      for (int i = 0; i < num_hidden_cts_; i++) xs[i] = &gate[i];
+      sched_.ToSlotBatch(g_ups, xs, evk, cfg_.min_ks);
+      gate.clear();
+      for (int i = 0; i < num_hidden_cts_; i++) xs[i] = &upv[i];
+      sched_.ToSlotBatch(u_ups, xs, evk, cfg_.min_ks);
+      upv.clear();
+    }
     for (int i = 0; i < num_hidden_cts_; i++) {
-      Ct g_up, u_up, sv, u_low;
-      sched_.ToSlot(g_up, gate[i], evk, cfg_.min_ks);
-      sched_.ToSlot(u_up, upv[i], evk, cfg_.min_ks);
+      Ct sv, u_low;
+      Ct &g_up = g_ups[i];
+      Ct &u_up = u_ups[i];
       // `crossing_`, NOT a fit taken on the residual: these carry no O factor.
       // And `kappa_` beside it, which is the same mistake one turn further out
       // -- see the class comment.
@@ -784,6 +813,8 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       silu.Apply(sv, g_up, evk);
       boot_->LevelDown(u_low, u_up, p.NPToLevel(sv.GetNP()));
       boot_->HMult(prod[i], sv, u_low, evk.GetMultiplicationKey());
+      g_ups[i] = Ct{};
+      u_ups[i] = Ct{};
     }
   }
   MemoryPool::Report("ffn: after SiLU and the gate multiply (28 products)");

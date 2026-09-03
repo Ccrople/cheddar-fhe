@@ -7,6 +7,7 @@
 #include "extension/CiSinCBasis.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -147,6 +148,13 @@ double BootContext<word>::GetStCInputScale() const {
              "GetStCInputScale: EvalMod not prepared, so the scale StC expects "
              "is not known yet");
   return eval_mod_->end_scale_;
+}
+
+template <typename word>
+double BootContext<word>::GetEvalModStartScale() const {
+  AssertTrue(eval_mod_ != nullptr,
+             "GetEvalModStartScale: EvalMod not prepared");
+  return eval_mod_->start_scale_;
 }
 
 template <typename word>
@@ -813,11 +821,9 @@ void BootContext<word>::HalfBoot(Ct &res, const Ct &input,
 }
 
 template <typename word>
-void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
-                                       const EvkMap<word> &evk_map,
-                                       const CiModuleBasis<word> &basis) const {
-  NvtxScope _nv("boot: HalfBootModule");
-  counts_.half++;
+int BootContext<word>::HalfBootModuleFront(
+    Ct &slots, const Ct &input, const EvkMap<word> &evk_map,
+    const CiModuleBasis<word> &basis) const {
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();
   // Not `GetBootEnabledNumSlots`: that reads the native tables, and a ring
@@ -830,35 +836,44 @@ void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
              "parameter's CtS levels, or EvalMod starts at the wrong level");
 
   Ct main_ct;
+  const Ct *src = &input;
+  Ct low;
   const int input_level = this->param_.NPToLevel(input.GetNP());
   if (input_level > 0) {
-    this->LevelDown(main_ct, input, 0);
-    HalfBootModule(res, main_ct, evk_map, basis);
-    return;
+    this->LevelDown(low, input, 0);
+    src = &low;
   }
 
   NPInfo min_np = this->param_.LevelToNP(-1);
-  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
-  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+  AssertTrue(min_np.IsSubsetOf(src->GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, *src, scaleup_const_, -1);
 
   ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel(),
                basis.GetSmallDegree());
   main_ct.SetNumSlots(max_num_slots);
 
-  Ct slots;
   basis.EvaluateCtS(GetContext(), slots, main_ct, evk_map);
+  return input_num_slots;
+}
 
+template <typename word>
+void BootContext<word>::HalfBootModule(Ct &res, const Ct &input,
+                                       const EvkMap<word> &evk_map,
+                                       const CiModuleBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootModule");
+  counts_.half++;
+  Ct slots;
+  const int input_num_slots =
+      HalfBootModuleFront(slots, input, evk_map, basis);
   EvaluateModAfterCtS(res, slots, /*full_slot=*/true, evk_map);
   res.SetNumSlots(input_num_slots);
   res.SetScale(eval_mod_->end_scale_);
 }
 
 template <typename word>
-void BootContext<word>::HalfBootTower(Ct &res, const Ct &input,
-                                      const EvkMap<word> &evk_map,
-                                      const CiSinCBasis<word> &basis) const {
-  NvtxScope _nv("boot: HalfBootTower");
-  counts_.half++;
+int BootContext<word>::HalfBootTowerFront(
+    Ct &slots, const Ct &input, const EvkMap<word> &evk_map,
+    const CiSinCBasis<word> &basis) const {
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();
   // Not `GetBootEnabledNumSlots`: that reads the native tables, and a ring
@@ -876,27 +891,180 @@ void BootContext<word>::HalfBootTower(Ct &res, const Ct &input,
              "EvalMod starts at the wrong level");
 
   Ct main_ct;
+  const Ct *src = &input;
+  Ct low;
   const int input_level = this->param_.NPToLevel(input.GetNP());
   if (input_level > 0) {
-    this->LevelDown(main_ct, input, 0);
-    HalfBootTower(res, main_ct, evk_map, basis);
-    return;
+    this->LevelDown(low, input, 0);
+    src = &low;
   }
 
   NPInfo min_np = this->param_.LevelToNP(-1);
-  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
-  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+  AssertTrue(min_np.IsSubsetOf(src->GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, *src, scaleup_const_, -1);
 
   ModUpToLevel(main_ct, main_ct, evk_map, boot_param_.GetMaxLevel(),
                basis.GetOuterSmallDegree(), basis.GetInnerRank());
   main_ct.SetNumSlots(max_num_slots);
 
-  Ct slots;
   basis.EvaluateCtS(slots, main_ct, evk_map);
+  return input_num_slots;
+}
 
+template <typename word>
+void BootContext<word>::HalfBootTower(Ct &res, const Ct &input,
+                                      const EvkMap<word> &evk_map,
+                                      const CiSinCBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootTower");
+  counts_.half++;
+  Ct slots;
+  const int input_num_slots = HalfBootTowerFront(slots, input, evk_map, basis);
   EvaluateModAfterCtS(res, slots, /*full_slot=*/true, evk_map);
   res.SetNumSlots(input_num_slots);
   res.SetScale(eval_mod_->end_scale_);
+}
+
+namespace {
+bool &EvalModSerialFlag() {
+  static bool serial = [] {
+    const char *env = std::getenv("CHEDDAR_EVALMOD_SERIAL");
+    return env != nullptr && env[0] == '1';
+  }();
+  return serial;
+}
+}  // namespace
+
+template <typename word>
+bool BootContext<word>::EvalModSerial() {
+  return EvalModSerialFlag();
+}
+
+template <typename word>
+void BootContext<word>::SetEvalModSerial(bool serial) {
+  EvalModSerialFlag() = serial;
+}
+
+template <typename word>
+void BootContext<word>::EvaluateModBatch(std::vector<Ct *> &cts,
+                                         const Evk &mult_key) const {
+  AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
+  const int batch = static_cast<int>(cts.size());
+  if (batch == 0) return;
+  if (batch == 1 || EvalModSerial()) {
+    for (Ct *ct : cts) {
+      EvaluateMod(*ct, *ct, mult_key);
+    }
+    return;
+  }
+  // The batch buffers hold every basis entry times the group, so the group
+  // is chunked: 8 ciphertexts keep the extra residency under ~2 GiB on the
+  // landing rings. `CHEDDAR_EVALMOD_BATCH` widens or narrows it.
+  static const int max_batch = [] {
+    const char *env = std::getenv("CHEDDAR_EVALMOD_BATCH");
+    const int value = (env != nullptr) ? std::atoi(env) : 0;
+    return value >= 1 ? value : 8;
+  }();
+  if (batch > max_batch) {
+    for (int start = 0; start < batch; start += max_batch) {
+      std::vector<Ct *> chunk(cts.begin() + start,
+                              cts.begin() + Min(batch, start + max_batch));
+      EvaluateModBatch(chunk, mult_key);
+    }
+    return;
+  }
+  NvtxScope _nv("boot: EvalModBatch");
+  // A launch-bound window in the serial shape; batched it is much shorter,
+  // but the prefetch can still use it.
+  IdleWindow::Notify("evalmod");
+
+  // Gather the group into one strided buffer. Every ciphertext must stand
+  // exactly where the serial EvaluateMod expects it.
+  const NPInfo np = cts[0]->GetNP();
+  CtBatch<word> state;
+  state.Allocate(np, batch, false);
+  state.scale_ = eval_mod_->start_scale_;
+  state.num_slots_ = cts[0]->GetNumSlots();
+  const size_t poly_bytes = state.PolyWords() * sizeof(word);
+  for (int b = 0; b < batch; b++) {
+    const Ct &ct = *cts[b];
+    AssertTrue(ct.GetNP() == np,
+               "EvaluateModBatch: the group must share one level");
+    AssertTrue(!ct.HasRx(), "EvaluateModBatch: relinearization required");
+    this->AssertSameScale(ct, eval_mod_->start_scale_);
+    cudaMemcpyAsync(state.CtData(b), ct.bx_.data(), poly_bytes,
+                    cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+    cudaMemcpyAsync(state.CtData(b) + state.PolyWords(), ct.ax_.data(),
+                    poly_bytes, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+  }
+
+  CtBatch<word> out;
+  eval_mod_->EvaluateBatch(GetContext(), out, state, mult_key);
+  this->AssertSameScale(out.scale_, eval_mod_->end_scale_);
+
+  // Scatter the results back into the callers' ciphertexts.
+  const size_t out_bytes = out.PolyWords() * sizeof(word);
+  for (int b = 0; b < batch; b++) {
+    Ct &ct = *cts[b];
+    const int num_slots = ct.GetNumSlots();
+    ct.RemoveRx();
+    ct.ModifyNP(out.np_);
+    ct.SetScale(eval_mod_->end_scale_);
+    ct.SetNumSlots(num_slots);
+    cudaMemcpyAsync(ct.bx_.data(), out.CtData(b), out_bytes,
+                    cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+    cudaMemcpyAsync(ct.ax_.data(), out.CtData(b) + out.PolyWords(), out_bytes,
+                    cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+  }
+}
+
+template <typename word>
+void BootContext<word>::HalfBootModuleBatch(
+    std::vector<Ct> &res, const std::vector<const Ct *> &inputs,
+    const EvkMap<word> &evk_map, const CiModuleBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootModuleBatch");
+  AssertTrue(this->param_.conjugate_invariant_,
+             "HalfBootModuleBatch: the module basis lives on R+, and the "
+             "batched EvalMod runs the real subring's single reduction");
+  const int n = static_cast<int>(inputs.size());
+  res.resize(n);
+  std::vector<int> num_slots(n);
+  std::vector<Ct *> ptrs(n);
+  for (int i = 0; i < n; i++) {
+    counts_.half++;
+    num_slots[i] = HalfBootModuleFront(res[i], *inputs[i], evk_map, basis);
+    res[i].SetScale(eval_mod_->start_scale_);
+    ptrs[i] = &res[i];
+  }
+  EvaluateModBatch(ptrs, evk_map.GetMultiplicationKey());
+  for (int i = 0; i < n; i++) {
+    res[i].SetNumSlots(num_slots[i]);
+    res[i].SetScale(eval_mod_->end_scale_);
+  }
+}
+
+template <typename word>
+void BootContext<word>::HalfBootTowerBatch(
+    std::vector<Ct> &res, const std::vector<const Ct *> &inputs,
+    const EvkMap<word> &evk_map, const CiSinCBasis<word> &basis) const {
+  NvtxScope _nv("boot: HalfBootTowerBatch");
+  AssertTrue(this->param_.conjugate_invariant_,
+             "HalfBootTowerBatch: the tower basis lives on R+, and the "
+             "batched EvalMod runs the real subring's single reduction");
+  const int n = static_cast<int>(inputs.size());
+  res.resize(n);
+  std::vector<int> num_slots(n);
+  std::vector<Ct *> ptrs(n);
+  for (int i = 0; i < n; i++) {
+    counts_.half++;
+    num_slots[i] = HalfBootTowerFront(res[i], *inputs[i], evk_map, basis);
+    res[i].SetScale(eval_mod_->start_scale_);
+    ptrs[i] = &res[i];
+  }
+  EvaluateModBatch(ptrs, evk_map.GetMultiplicationKey());
+  for (int i = 0; i < n; i++) {
+    res[i].SetNumSlots(num_slots[i]);
+    res[i].SetScale(eval_mod_->end_scale_);
+  }
 }
 
 template <typename word>

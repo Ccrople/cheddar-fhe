@@ -10,6 +10,10 @@ namespace cheddar {
 template <typename word, int num_poly>
 struct OutputPtrList {
   word *ptrs_[num_poly];
+  // Distance in words between consecutive ciphertexts of a batch; a batched
+  // kernel adds blockIdx.z * stride_ to every index. 0 (the default) leaves
+  // every serial launch exactly as it was.
+  size_t stride_ = 0;
 
   OutputPtrList() {
     for (int i = 0; i < num_poly; i++) {
@@ -38,6 +42,8 @@ template <typename word, int num_poly>
 struct InputPtrList {
   const word *ptrs_[num_poly];
   int extra_ = 0;
+  // Batch stride, as in OutputPtrList.
+  size_t stride_ = 0;
 
   InputPtrList() {
     for (int i = 0; i < num_poly; i++) {
@@ -102,6 +108,9 @@ struct CPAccumInputPtrList {
   int extra_ = 0;
   const word *common_ptr_;
   int common_extra_ = 0;
+  // Batch stride for ptrs_, as in OutputPtrList. The common source (a
+  // constant or plaintext) is shared across the batch and takes no stride.
+  size_t stride_ = 0;
 
   CPAccumInputPtrList() {
     for (int i = 0; i < num_poly; i++) {

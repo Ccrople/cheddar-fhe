@@ -75,6 +75,27 @@ void EvalMod<word>::Evaluate(ConstContextPtr<word> context, Ct &res,
 }
 
 template <typename word>
+void EvalMod<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                  CtBatch<word> &res, CtBatch<word> &input,
+                                  const Evk &mult_key) {
+  // Context::Add(res, input, initial_const_): the constant on every b part.
+  {
+    AssertTrue(input.np_ == initial_const_.GetNP(),
+               "EvalMod::EvaluateBatch: NP mismatch");
+    context->AssertSameScale(input.scale_, initial_const_.GetScale());
+    std::vector<DvView<word>> dst{input.ViewVector().at(0)};
+    std::vector<DvConstView<word>> src{input.ConstViewVector().at(0)};
+    context->elem_handler_.AddConstBatchCt(
+        dst, input.np_, src, initial_const_.ConstView(), input.batch_,
+        input.CtStride(), input.CtStride());
+  }
+  mod_functions_[0].EvaluateBatch(context, res, input, mult_key);
+  for (auto &da : double_angle_) {
+    da.EvaluateBatch(context, res, res, res, mult_key);
+  }
+}
+
+template <typename word>
 int EvalMod<word>::GetEvalModPolyDegree(int poly_index /*= 0*/) const {
   return mod_functions_.at(poly_index).GetPolyDegree();
 }

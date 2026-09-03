@@ -1320,6 +1320,83 @@ void ModSwitchHandler<word>::RescaleBatch(word *dst, int dst_batch_stride,
                              src_batch_stride);
 }
 
+// The batched ModDownAndRescale: ModDownWorker's ModDownAndRescale case over
+// `batch` polynomials -- what a batched RelinearizeRescale ends with.
+template <typename word>
+void ModSwitchHandler<word>::ModDownAndRescaleBatch(word *dst,
+                                                    int dst_batch_stride,
+                                                    const word *src,
+                                                    int src_batch_stride,
+                                                    int batch) const {
+  using signed_word = make_signed_t<word>;
+  const bool ci = param_.conjugate_invariant_;
+  AssertTrue(kFuseModDownEpilogue,
+             "ModDownAndRescaleBatch: written against the fused epilogue");
+  AssertTrue(batch >= 1 && level_ >= 1,
+             "ModDownAndRescaleBatch: invalid batch or level");
+  const int degree = param_.degree_;
+  const NPInfo np_src = param_.LevelToNP(level_, num_aux_);
+  const NPInfo np_dst = param_.LevelToNP(level_ - 1, 0);
+  const NPInfo np_non_intt(Min(np_src.num_main_, np_dst.num_main_),
+                           Min(np_src.num_ter_, np_dst.num_ter_), 0,
+                           np_src.degree_);
+  const int src_len = np_src.GetNumTotal() - np_non_intt.GetNumTotal();
+  const int dst_len = np_dst.GetNumTotal();
+  const int src_words = np_src.GetNumTotal() * degree;
+  const int dst_words = dst_len * degree;
+  AssertTrue(batch == 1 || (src_batch_stride >= src_words &&
+                            dst_batch_stride >= dst_words),
+             "ModDownAndRescaleBatch: the polynomials overlap");
+
+  DeviceVector<word> src_intt(batch * src_len * degree);
+  {
+    DvView<word> intt_view = src_intt.View(0, 0);
+    DvConstView<word> first(src, src_words, num_aux_ * degree);
+    ntt_handler_.INTTForModDown(intt_view, np_src, np_non_intt, first,
+                                mod_down_rescale1_.ConstView(num_aux_), batch,
+                                src_batch_stride);
+  }
+
+  const word *primes = param_.GetPrimesPtr(np_dst);
+  const signed_word *inv_primes = param_.GetInvPrimesPtr(np_dst);
+  dim3 grid_dim(degree / kUnrollNumber / kNumThreadsX,
+                DivCeil(dst_len, kLimbBatching * kNumThreadsY), batch);
+  dim3 block_dim(kNumThreadsX, kNumThreadsY);
+  int smem_size =
+      src_len * (kLimbBatching * kNumThreadsY) * sizeof(signed_word);
+  smem_size +=
+      kMaxNumAccum * (kUnrollNumber * kNumThreadsX) * sizeof(signed_word);
+  if (ci) {
+    auto cic = ntt_handler_.GetCiConstants();
+    kernel::ModSwitchMatrixMultCi<word><<<grid_dim, block_dim, smem_size>>>(
+        dst, primes, inv_primes, src_len, dst_len, 0, 0,
+        reinterpret_cast<const signed_word *>(src_intt.data()),
+        mod_down_rescale2_.data(), param_.log_degree_, cic.i_units,
+        cic.fwd_twist, param_.GetMaxNumTer() - np_dst.num_ter_, dst_len, 0,
+        dst_batch_stride, src_len * degree);
+  } else {
+    kernel::ModSwitchMatrixMult<word><<<grid_dim, block_dim, smem_size>>>(
+        dst, primes, inv_primes, src_len, dst_len, 0, 0,
+        reinterpret_cast<const signed_word *>(src_intt.data()),
+        mod_down_rescale2_.data(), param_.log_degree_, dst_batch_stride,
+        src_len * degree);
+  }
+
+  // The epilogue: NTT of the converted limbs, then the (src - dst) * P^-1
+  // correction against the q limbs of the source, exactly as ModDownWorker's
+  // ModDownAndRescale case.
+  const int pad_len = rescale_pad_end_ - rescale_pad_start_;
+  const int src2_offset = Max(0, np_src.num_ter_ - np_dst.num_ter_);
+  DvView<word> dst_view(dst, (batch - 1) * dst_batch_stride + dst_words, 0);
+  DvConstView<word> src2(src + src2_offset * degree, pad_len * degree, 0);
+  ntt_handler_.NTTForModDown(dst_view, np_dst, np_non_intt,
+                             DvConstView<word>(dst_view), src2,
+                             mod_down_rescale_inv_prime_prod_.ConstView(),
+                             mod_down_rescale_padding_.ConstView(),
+                             /*ci_prefolded=*/ci, batch, dst_batch_stride,
+                             src_batch_stride);
+}
+
 template <typename word>
 void ModSwitchHandler<word>::ModDown(DvView<word> &dst,
                                      const DvConstView<word> &src) const {

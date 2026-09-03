@@ -337,6 +337,43 @@ void SylphSchedule<word>::ToCoeff(Ct &res, const Ct &x,
 }
 
 template <typename word>
+double SylphSchedule<word>::ToSlotBatch(std::vector<Ct> &res,
+                                        const std::vector<const Ct *> &xs,
+                                        const EvkMap<word> &evk_map,
+                                        bool min_ks /*= false*/) const {
+  const int n = static_cast<int>(xs.size());
+  res.resize(n);
+  if (n == 0) return 1.0;
+  if (basis_ == nullptr) {
+    // The native basis has no batched EvalMod wired; the serial loop.
+    double drift = 1.0;
+    for (int i = 0; i < n; i++) {
+      drift = ToSlot(res[i], *xs[i], evk_map, min_ks);
+    }
+    return drift;
+  }
+  NvtxScope _nv("sched: ToSlotBatch");
+  // The descent, per ciphertext, so the drift stays visible here as in
+  // ToSlot; the crossing itself is one batched group.
+  double drift = 1.0;
+  std::vector<Ct> low(n);
+  std::vector<const Ct *> srcs(n);
+  for (int i = 0; i < n; i++) {
+    const int level = boot_->param_.NPToLevel(xs[i]->GetNP());
+    if (level > 0) {
+      const double before = xs[i]->GetScale();
+      boot_->LevelDown(low[i], *xs[i], 0);
+      drift = low[i].GetScale() / before;
+      srcs[i] = &low[i];
+    } else {
+      srcs[i] = xs[i];
+    }
+  }
+  boot_->HalfBootModuleBatch(res, srcs, evk_map, *basis_);
+  return drift;
+}
+
+template <typename word>
 double SylphSchedule<word>::ToSlot(Ct &res, const Ct &x,
                                    const EvkMap<word> &evk_map,
                                    bool min_ks /*= false*/) const {

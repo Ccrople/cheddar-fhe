@@ -48,7 +48,7 @@ __global__ void Sum(int log_degree,
   // int k = 0;
   (
       [&] {
-        int src_index = i;
+        size_t src_index = i + blockIdx.z * srcs.stride_;
         if (aux_part) {
           src_index += srcs.extra_;
         }
@@ -65,7 +65,7 @@ __global__ void Sum(int log_degree,
   // Store the result
 #pragma unroll
   for (int j = 0; j < num_poly; j++) {
-    dst.ptrs_[j][i] = result[j];
+    dst.ptrs_[j][i + blockIdx.z * dst.stride_] = result[j];
   }
 }
 
@@ -78,8 +78,8 @@ __global__ void Sub(int log_degree,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
-  int src1_index = i;
-  int src2_index = i;
+  size_t src1_index = i + blockIdx.z * src1.stride_;
+  size_t src2_index = i + blockIdx.z * src2.stride_;
   if (prime_index >= num_q_primes) {
     src1_index += src1.extra_;
     src2_index += src2.extra_;
@@ -89,7 +89,8 @@ __global__ void Sub(int log_degree,
   for (int j = 0; j < num_poly; j++) {
     const word src1_value = basic::StreamingLoad(src1.ptrs_[j] + src1_index);
     const word src2_value = basic::StreamingLoad(src2.ptrs_[j] + src2_index);
-    dst.ptrs_[j][i] = basic::Sub(src1_value, src2_value, prime);
+    dst.ptrs_[j][i + blockIdx.z * dst.stride_] =
+        basic::Sub(src1_value, src2_value, prime);
   }
 }
 
@@ -151,7 +152,7 @@ __global__ void AddConst(int log_degree,
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
   const word prime = basic::StreamingLoadConst(primes + prime_index);
-  int src_index = i;
+  size_t src_index = i + blockIdx.z * src.stride_;
   int const_src_index = prime_index;
   if (prime_index >= num_q_primes) {
     src_index += src.extra_;
@@ -163,7 +164,8 @@ __global__ void AddConst(int log_degree,
 #pragma unroll
   for (int j = 0; j < num_poly; j++) {
     const word src_value = basic::StreamingLoad(src.ptrs_[j] + src_index);
-    dst.ptrs_[j][i] = basic::Add(src_value, const_src_value, prime);
+    dst.ptrs_[j][i + blockIdx.z * dst.stride_] =
+        basic::Add(src_value, const_src_value, prime);
   }
 }
 
@@ -246,7 +248,7 @@ __global__ void CPAccum(int log_degree,
   // for any function
   (
       [&] {
-        int src_index = i;
+        size_t src_index = i + blockIdx.z * srcs.stride_;
         int common_index;
         // CAccum vs. PAccum
         if constexpr (const_accum) {
@@ -281,7 +283,7 @@ __global__ void CPAccum(int log_degree,
 // Store the result
 #pragma unroll
   for (int j = 0; j < num_poly; j++) {
-    dst.ptrs_[j][i] = result[j];
+    dst.ptrs_[j][i + blockIdx.z * dst.stride_] = result[j];
   }
 }
 
@@ -311,7 +313,7 @@ __global__ void CPAccumAdd(int log_degree, OutputPtrList<word, num_poly> dst,
   bool aux_part = (prime_index >= num_q_primes);
 
   // Only this part is different from the upper version
-  int src0_index = i;
+  size_t src0_index = i + blockIdx.z * src0.stride_;
   if (aux_part) {
     src0_index += src0.extra_;
   }
@@ -324,7 +326,7 @@ __global__ void CPAccumAdd(int log_degree, OutputPtrList<word, num_poly> dst,
   // for any function
   (
       [&] {
-        int src_index = i;
+        size_t src_index = i + blockIdx.z * srcs.stride_;
         int common_index;
         // CAccum vs. PAccum
         if constexpr (const_accum) {
@@ -359,7 +361,7 @@ __global__ void CPAccumAdd(int log_degree, OutputPtrList<word, num_poly> dst,
 // Store the result
 #pragma unroll
   for (int j = 0; j < num_poly; j++) {
-    dst.ptrs_[j][i] = result[j];
+    dst.ptrs_[j][i + blockIdx.z * dst.stride_] = result[j];
   }
 }
 
@@ -513,8 +515,8 @@ __global__ void Tensor(int log_degree,
   const word prime = basic::StreamingLoadConst(primes + prime_index);
   const signed_word inv_prime =
       basic::StreamingLoadConst(inv_primes + prime_index);
-  int src1_index = i;
-  int src2_index = i;
+  size_t src1_index = i + blockIdx.z * src1.stride_;
+  size_t src2_index = i + blockIdx.z * src2.stride_;
   if (prime_index >= num_q_primes) {
     src1_index += src1.extra_;
     src2_index += src2.extra_;
@@ -540,9 +542,10 @@ __global__ void Tensor(int log_degree,
   new_ax = basic::Sub(new_ax, a1_times_a2, prime);
 
   // bx, ax, rx
-  dst.ptrs_[0][i] = b1_times_b2;
-  dst.ptrs_[1][i] = new_ax;
-  dst.ptrs_[2][i] = a1_times_a2;
+  const size_t dst_index = i + blockIdx.z * dst.stride_;
+  dst.ptrs_[0][dst_index] = b1_times_b2;
+  dst.ptrs_[1][dst_index] = new_ax;
+  dst.ptrs_[2][dst_index] = a1_times_a2;
 }
 
 // dst = src_1 - src_2;
@@ -558,7 +561,7 @@ __global__ void TensorSquare(int log_degree,
   const word prime = basic::StreamingLoadConst(primes + prime_index);
   const signed_word inv_prime =
       basic::StreamingLoadConst(inv_primes + prime_index);
-  int src1_index = i;
+  size_t src1_index = i + blockIdx.z * src1.stride_;
   if (prime_index >= num_q_primes) {
     src1_index += src1.extra_;
   }
@@ -568,10 +571,13 @@ __global__ void TensorSquare(int log_degree,
   word a1 = basic::StreamingLoad(src1.ptrs_[1] + src1_index);
 
   // bx, ax, rx
-  dst.ptrs_[0][i] = basic::MultMontgomery<word>(b1, b1, prime, inv_prime);
+  const size_t dst_index = i + blockIdx.z * dst.stride_;
+  dst.ptrs_[0][dst_index] =
+      basic::MultMontgomery<word>(b1, b1, prime, inv_prime);
   word b1_times_a1 = basic::MultMontgomery<word>(b1, a1, prime, inv_prime);
-  dst.ptrs_[1][i] = basic::Add<word>(b1_times_a1, b1_times_a1, prime);
-  dst.ptrs_[2][i] = basic::MultMontgomery<word>(a1, a1, prime, inv_prime);
+  dst.ptrs_[1][dst_index] = basic::Add<word>(b1_times_a1, b1_times_a1, prime);
+  dst.ptrs_[2][dst_index] =
+      basic::MultMontgomery<word>(a1, a1, prime, inv_prime);
 }
 
 // Special kernels for bootstrapping
@@ -937,15 +943,147 @@ void ElementWiseHandler<word>::Tensor(
 
   if (src1.at(0).data() == src2.at(0).data() &&
       src1.at(1).data() == src2.at(1).data()) {
-    kernel::TensorSquare<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
+    kernel::TensorSquare<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list);
   } else {
     InputPtrList<word, 2> src2_ptr_list(src2);
     src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
-    kernel::Tensor<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_, 
+    kernel::Tensor<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
         dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list,
         src2_ptr_list);
   }
+}
+
+// ----- Batched-ciphertext elementwise ----- //
+
+template <typename word>
+void ElementWiseHandler<word>::AddBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<DvConstView<word>> &src1,
+    const std::vector<DvConstView<word>> &src2, int batch, size_t dst_stride,
+    size_t src1_stride, size_t src2_stride) const {
+  int num_poly = dst.size();
+  AssertTrue(num_poly == static_cast<int>(src1.size()) &&
+                 num_poly == static_cast<int>(src2.size()),
+             "AddBatchCt: Incompatible dst/src size");
+  AssertTrue(num_poly > 0 && num_poly <= max_num_poly_,
+             "AddBatchCt: Invalid number of polynomials");
+  AssertTrue(batch >= 1, "AddBatchCt: invalid batch");
+  AssertNPMatch(dst, np);
+
+  const word *primes = param_.GetPrimesPtr(np);
+  int num_q_primes = np.GetNumQ();
+  int q_size = num_q_primes * param_.degree_;
+  dim3 grid_dim(np.GetNumTotal() * param_.degree_ / kernel_block_dim_, 1,
+                batch);
+
+  constexpr_for<1, max_num_poly_ + 1>([&](auto j) {
+    if (num_poly != j) return;
+    OutputPtrList<word, j> dst_ptr_list(dst);
+    dst_ptr_list.stride_ = dst_stride;
+    InputPtrList<word, j> src1_ptr_list(src1);
+    src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
+    src1_ptr_list.stride_ = src1_stride;
+    InputPtrList<word, j> src2_ptr_list(src2);
+    src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
+    src2_ptr_list.stride_ = src2_stride;
+
+    kernel::Sum<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+        dst_ptr_list, primes, num_q_primes, src1_ptr_list, src2_ptr_list);
+  });
+}
+
+template <typename word>
+void ElementWiseHandler<word>::AddConstBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<DvConstView<word>> &src1,
+    const DvConstView<word> &src_const, int batch, size_t dst_stride,
+    size_t src1_stride) const {
+  int num_poly = dst.size();
+  AssertTrue(num_poly == static_cast<int>(src1.size()),
+             "AddConstBatchCt: Incompatible dst/src size");
+  AssertTrue(num_poly > 0 && num_poly <= max_num_poly_,
+             "AddConstBatchCt: Invalid number of polynomials");
+  AssertTrue(batch >= 1, "AddConstBatchCt: invalid batch");
+  AssertNPMatch(dst, np);
+
+  const word *primes = param_.GetPrimesPtr(np);
+  int num_q_primes = np.GetNumQ();
+  int q_size = num_q_primes * param_.degree_;
+  dim3 grid_dim(np.GetNumTotal() * param_.degree_ / kernel_block_dim_, 1,
+                batch);
+
+  constexpr_for<1, max_num_poly_ + 1>([&](auto j) {
+    if (num_poly != j) return;
+    OutputPtrList<word, j> dst_ptr_list(dst);
+    dst_ptr_list.stride_ = dst_stride;
+    InputPtrList<word, j> src1_ptr_list(src1);
+    src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
+    src1_ptr_list.stride_ = src1_stride;
+    InputPtrList<word, 1> src_const_ptr_list(src_const);
+    src_const_ptr_list.extra_ = src_const.QSize() - num_q_primes;
+
+    kernel::AddConst<word, j><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+        dst_ptr_list, primes, num_q_primes, src1_ptr_list, src_const_ptr_list);
+  });
+}
+
+template <typename word>
+void ElementWiseHandler<word>::MultConstBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<DvConstView<word>> &src1,
+    const DvConstView<word> &src_const, int batch, size_t dst_stride,
+    size_t src1_stride) const {
+  CPAccumWorkerBatch<true>(dst, np, {src1}, {src_const}, batch, dst_stride,
+                           {src1_stride});
+}
+
+template <typename word>
+void ElementWiseHandler<word>::TensorBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<DvConstView<word>> &src1,
+    const std::vector<DvConstView<word>> &src2, int batch, size_t dst_stride,
+    size_t src1_stride, size_t src2_stride) const {
+  AssertTrue(dst.size() == 3 && src1.size() == 2 && src2.size() == 2,
+             "TensorBatchCt: Invalid number of polynomials");
+  AssertTrue(batch >= 1, "TensorBatchCt: invalid batch");
+  AssertNPMatch(dst, np);
+
+  const word *primes = param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_primes = param_.GetInvPrimesPtr(np);
+  int num_q_primes = np.GetNumQ();
+  int q_size = num_q_primes * param_.degree_;
+  dim3 grid_dim(np.GetNumTotal() * param_.degree_ / kernel_block_dim_, 1,
+                batch);
+
+  OutputPtrList<word, 3> dst_ptr_list(dst);
+  dst_ptr_list.stride_ = dst_stride;
+  InputPtrList<word, 2> src1_ptr_list(src1);
+  src1_ptr_list.extra_ = src1.at(0).QSize() - q_size;
+  src1_ptr_list.stride_ = src1_stride;
+
+  if (src1.at(0).data() == src2.at(0).data() &&
+      src1.at(1).data() == src2.at(1).data() && src1_stride == src2_stride) {
+    kernel::TensorSquare<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+        dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list);
+  } else {
+    InputPtrList<word, 2> src2_ptr_list(src2);
+    src2_ptr_list.extra_ = src2.at(0).QSize() - q_size;
+    src2_ptr_list.stride_ = src2_stride;
+    kernel::Tensor<word><<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+        dst_ptr_list, primes, inv_primes, num_q_primes, src1_ptr_list,
+        src2_ptr_list);
+  }
+}
+
+template <typename word>
+void ElementWiseHandler<word>::CAccumBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+    const std::vector<DvConstView<word>> &const_srcs, int batch,
+    size_t dst_stride, const std::vector<size_t> &src_strides) const {
+  CPAccumWorkerBatch<true>(dst, np, ct_srcs, const_srcs, batch, dst_stride,
+                           src_strides);
 }
 
 template <typename word>
@@ -1641,6 +1779,233 @@ void ElementWiseHandler<word>::CPAccumWorker(
           break;
         default:
           Fail("CPAccum: Invalid number of accumulations");
+          break;
+      }
+    }
+  });
+}
+
+// The batched CPAccumWorker: the serial worker's launches with gridDim.z =
+// batch, ciphertext b of every source at its view plus b * its stride. The
+// chunking above max_num_accum_, the source order and the kernels are the
+// serial worker's, so the words are too.
+template <typename word>
+template <bool const_accum>
+void ElementWiseHandler<word>::CPAccumWorkerBatch(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+    const std::vector<DvConstView<word>> &common_srcs, int batch,
+    size_t dst_stride, const std::vector<size_t> &src_strides) const {
+  int num_poly = dst.size();
+  AssertTrue(num_poly > 0 && num_poly <= max_num_poly_,
+             "CPAccumBatch: Invalid number of polynomials");
+  AssertTrue(batch >= 1, "CPAccumBatch: invalid batch");
+  AssertTrue(ct_srcs.size() == src_strides.size(),
+             "CPAccumBatch: one stride per source");
+
+  int num_accum = common_srcs.size();
+  bool has_extra_ct = (ct_srcs.size() == (common_srcs.size() + 1));
+  AssertTrue(num_accum == static_cast<int>(ct_srcs.size()) || has_extra_ct,
+             "CPAccumBatch: Incompatible ct_srcs/common_srcs size");
+
+  if (num_accum > max_num_accum_) {
+    // The serial worker's split, with each per-poly temporary widened to the
+    // batch (stride = the polynomial's own size).
+    std::vector<DeviceVector<word>> temp;
+    std::vector<DvView<word>> temp_view;
+    std::vector<DvConstView<word>> temp_const_view;
+    for (int i = 0; i < num_poly; i++) {
+      int aux_size = dst.at(i).AuxSize();
+      temp.emplace_back(static_cast<size_t>(dst.at(i).TotalSize()) * batch);
+      temp_view.push_back(
+          DvView<word>(temp.at(i).data(), dst.at(i).TotalSize(), aux_size));
+      temp_const_view.push_back(DvConstView<word>(
+          temp.at(i).data(), dst.at(i).TotalSize(), aux_size));
+    }
+    const size_t temp_stride = dst.at(0).TotalSize();
+
+    std::vector<std::vector<DvConstView<word>>> ct_srcs_front(
+        ct_srcs.begin(), ct_srcs.begin() + max_num_accum_);
+    ct_srcs_front.push_back(temp_const_view);
+    std::vector<std::vector<DvConstView<word>>> ct_srcs_back(
+        ct_srcs.begin() + max_num_accum_, ct_srcs.end());
+    std::vector<DvConstView<word>> common_srcs_front(
+        common_srcs.begin(), common_srcs.begin() + max_num_accum_);
+    std::vector<DvConstView<word>> common_srcs_back(
+        common_srcs.begin() + max_num_accum_, common_srcs.end());
+    std::vector<size_t> strides_front(src_strides.begin(),
+                                      src_strides.begin() + max_num_accum_);
+    strides_front.push_back(temp_stride);
+    std::vector<size_t> strides_back(src_strides.begin() + max_num_accum_,
+                                     src_strides.end());
+
+    CPAccumWorkerBatch<const_accum>(temp_view, np, ct_srcs_back,
+                                    common_srcs_back, batch, temp_stride,
+                                    strides_back);
+    CPAccumWorkerBatch<const_accum>(dst, np, ct_srcs_front, common_srcs_front,
+                                    batch, dst_stride, strides_front);
+    return;
+  }
+
+  AssertTrue(num_accum > 0, "CPAccumBatch: Invalid number of accumulations");
+  for (const auto &ct_src : ct_srcs) {
+    AssertTrue(num_poly == static_cast<int>(ct_src.size()),
+               "CPAccumBatch: Incompatible dst/ct_src size");
+  }
+  AssertNPMatch(dst, np);
+
+  const word *primes = param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_primes = param_.GetInvPrimesPtr(np);
+  int num_q_primes = np.GetNumQ();
+  int q_size = num_q_primes * param_.degree_;
+  dim3 grid_dim(np.GetNumTotal() * param_.degree_ / kernel_block_dim_, 1,
+                batch);
+
+  constexpr_for<1, max_num_poly_ + 1>([&](auto j) {
+    if (num_poly != j) return;
+
+    OutputPtrList<word, j> dst_ptr_list(dst);
+    dst_ptr_list.stride_ = dst_stride;
+    std::vector<CPAccumInputPtrList<word, j>> src_ptr_list;
+    for (int i = 0; i < num_accum; i++) {
+      const auto &ct_src_i = ct_srcs.at(i);
+      const auto &common_src_i = common_srcs.at(i);
+      src_ptr_list.emplace_back(ct_src_i, common_src_i);
+      src_ptr_list.back().extra_ = ct_src_i.at(0).QSize() - q_size;
+      src_ptr_list.back().stride_ = src_strides.at(i);
+      src_ptr_list.back().common_extra_ = common_src_i.QSize();
+      if constexpr (const_accum) {  // CAccum
+        src_ptr_list.back().common_extra_ -= num_q_primes;
+      } else {  // PAccum
+        src_ptr_list.back().common_extra_ -= q_size;
+      }
+    }
+
+    if (has_extra_ct) {
+      InputPtrList<word, j> src0(ct_srcs.back());
+      src0.extra_ = ct_srcs.back().at(0).QSize() - q_size;
+      src0.stride_ = src_strides.back();
+      switch (num_accum) {
+        case 1:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                                                dst_ptr_list, primes,
+                                                inv_primes, num_q_primes, src0,
+                                                src_ptr_list[0]);
+          break;
+        case 2:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1]);
+          break;
+        case 3:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2]);
+          break;
+        case 4:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3]);
+          break;
+        case 5:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4]);
+          break;
+        case 6:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5]);
+          break;
+        case 7:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
+                  src_ptr_list[6]);
+          break;
+        case 8:
+          kernel::CPAccumAdd<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes, src0,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
+                  src_ptr_list[6], src_ptr_list[7]);
+          break;
+        default:
+          Fail("CPAccumBatch: Invalid number of accumulations");
+          break;
+      }
+    } else {
+      switch (num_accum) {
+        case 1:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                                                dst_ptr_list, primes,
+                                                inv_primes, num_q_primes,
+                                                src_ptr_list[0]);
+          break;
+        case 2:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1]);
+          break;
+        case 3:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2]);
+          break;
+        case 4:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3]);
+          break;
+        case 5:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4]);
+          break;
+        case 6:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5]);
+          break;
+        case 7:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
+                  src_ptr_list[6]);
+          break;
+        case 8:
+          kernel::CPAccum<word, j, const_accum>
+              <<<grid_dim, kernel_block_dim_>>>(param_.log_degree_,
+                  dst_ptr_list, primes, inv_primes, num_q_primes,
+                  src_ptr_list[0], src_ptr_list[1], src_ptr_list[2],
+                  src_ptr_list[3], src_ptr_list[4], src_ptr_list[5],
+                  src_ptr_list[6], src_ptr_list[7]);
+          break;
+        default:
+          Fail("CPAccumBatch: Invalid number of accumulations");
           break;
       }
     }

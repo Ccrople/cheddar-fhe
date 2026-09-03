@@ -31,6 +31,13 @@ class ElementWiseHandler {
                      const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
                      const std::vector<DvConstView<word>> &common_srcs) const;
 
+  template <bool const_accum>
+  void CPAccumWorkerBatch(
+      std::vector<DvView<word>> &dst, const NPInfo &np,
+      const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+      const std::vector<DvConstView<word>> &common_srcs, int batch,
+      size_t dst_stride, const std::vector<size_t> &src_strides) const;
+
   void PermuteAccumWorker(
       std::vector<DvView<word>> &dst, const NPInfo &np,
       const std::vector<int> &permute_amounts,
@@ -126,6 +133,48 @@ class ElementWiseHandler {
   void MultImaginaryUnit(std::vector<DvView<word>> &dst, const NPInfo &np,
                          const std::vector<DvConstView<word>> &src1,
                          const DvConstView<word> &src_i_unit) const;
+
+  // ----- Batched-ciphertext elementwise (a polynomial evaluation over a
+  // batch of ciphertexts at one level: EvalMod) ----- //
+  //
+  // Each call runs the serial method's kernel ONCE with gridDim.z = batch.
+  // The views describe ciphertext 0 of each batch, exactly as the serial call
+  // would receive them; ciphertext b's polynomial j sits at the view's
+  // pointer plus b * that buffer's stride (in words). With batch 1 and
+  // stride 0 every kernel is the serial one, word for word.
+
+  // dst = src1 + src2, over a batch.
+  void AddBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                  const std::vector<DvConstView<word>> &src1,
+                  const std::vector<DvConstView<word>> &src2, int batch,
+                  size_t dst_stride, size_t src1_stride,
+                  size_t src2_stride) const;
+  // dst = src1 + const, over a batch (the constant is shared).
+  void AddConstBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                       const std::vector<DvConstView<word>> &src1,
+                       const DvConstView<word> &src_const, int batch,
+                       size_t dst_stride, size_t src1_stride) const;
+  // dst = src1 * const, over a batch (the constant is shared).
+  void MultConstBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                        const std::vector<DvConstView<word>> &src1,
+                        const DvConstView<word> &src_const, int batch,
+                        size_t dst_stride, size_t src1_stride) const;
+  // The tensor product (b, a, r) of two batches; src1 == src2 (pointerwise,
+  // with equal strides) dispatches the square kernel as the serial call does.
+  void TensorBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                     const std::vector<DvConstView<word>> &src1,
+                     const std::vector<DvConstView<word>> &src2, int batch,
+                     size_t dst_stride, size_t src1_stride,
+                     size_t src2_stride) const;
+  // CAccum over a batch: per ciphertext b of the batch,
+  // dst_b = sum_k const_k * ct_srcs[k]_b (+ ct_srcs.back()_b when it has one
+  // more entry than const_srcs, exactly as the serial CAccum). Each source's
+  // batch stride is src_strides[k]; the constants are shared.
+  void CAccumBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                     const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+                     const std::vector<DvConstView<word>> &const_srcs,
+                     int batch, size_t dst_stride,
+                     const std::vector<size_t> &src_strides) const;
 
   // ----- Batched key switching (Cmt, and anything else that switches many
   // ciphertexts with many keys at one level) ----- //

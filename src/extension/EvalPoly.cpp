@@ -860,14 +860,511 @@ double EvalPoly<word>::PlainEvaluate(double input) const {
   return tree_root_->PlainEvaluate(basis);
 }
 
+// ------------------------ The batched evaluation ------------------------
+//
+// EvaluateBatch walks the SAME compiled tree once over a CtBatch: every
+// ciphertext of the batch follows the identical (level, scale) trajectory the
+// serial evaluation takes, so the tree's constants, levels and dispatch are
+// shared and only the payloads widen. Each helper below is one serial Context
+// operation's batch twin -- the same kernels with the batch on gridDim.z (or
+// `MultKeyBatch` for the key switches), so the words are the serial loop's.
+
+// ------------------------ CtBatch ------------------------
+
+template <typename word>
+void CtBatch<word>::Allocate(const NPInfo &np, int batch, bool has_rx) {
+  np_ = np;
+  batch_ = batch;
+  has_rx_ = has_rx;
+  data_ = DeviceVector<word>(static_cast<int>(batch * CtStride()));
+}
+
+template <typename word>
+std::vector<DvView<word>> CtBatch<word>::ViewVector(
+    int np_front_ignore /*= 0*/, bool ignore_rx /*= false*/) {
+  const int aux_size = np_.num_aux_ * np_.degree_;
+  const int front = np_front_ignore * np_.degree_;
+  const int size = static_cast<int>(PolyWords()) - front;
+  const int num_poly = (has_rx_ && !ignore_rx) ? 3 : 2;
+  std::vector<DvView<word>> views;
+  for (int j = 0; j < num_poly; j++) {
+    views.emplace_back(data_.data() + j * PolyWords() + front, size, aux_size);
+  }
+  return views;
+}
+
+template <typename word>
+std::vector<DvConstView<word>> CtBatch<word>::ConstViewVector(
+    int np_front_ignore /*= 0*/, bool ignore_rx /*= false*/) const {
+  const int aux_size = np_.num_aux_ * np_.degree_;
+  const int front = np_front_ignore * np_.degree_;
+  const int size = static_cast<int>(PolyWords()) - front;
+  const int num_poly = (has_rx_ && !ignore_rx) ? 3 : 2;
+  std::vector<DvConstView<word>> views;
+  for (int j = 0; j < num_poly; j++) {
+    views.emplace_back(data_.data() + j * PolyWords() + front, size, aux_size);
+  }
+  return views;
+}
+
+template class CtBatch<uint32_t>;
+template class CtBatch<uint64_t>;
+
+namespace {
+
+using namespace cheddar;
+
+// Context::MultUnsafe(res, a, b_const, level) over a batch.
+template <typename word>
+void MultUnsafeConstBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                          const CtBatch<word> &a, const Constant<word> &b,
+                          int level) {
+  const NPInfo res_np = context->param_.LevelToNP(level, 0);
+  AssertTrue(res_np.IsSubsetOf(a.np_),
+             "MultUnsafeConstBatch: incompatible levels");
+  res.Allocate(res_np, a.batch_, a.has_rx_);
+  res.num_slots_ = a.num_slots_;
+  res.scale_ = a.scale_ * b.GetScale();
+
+  const int a_front = a.np_.num_ter_ - res_np.num_ter_;
+  const int b_front = b.GetNP().num_ter_ - res_np.num_ter_;
+  auto dst = res.ViewVector();
+  context->elem_handler_.MultConstBatchCt(
+      dst, res_np, a.ConstViewVector(a_front), b.ConstView(b_front), a.batch_,
+      res.CtStride(), a.CtStride());
+}
+
+// Context::MultUnsafe(res, x, y, level) (Ct x Ct) over a batch. The result
+// is always a fresh buffer; the serial in-place case runs the same kernel on
+// the same words.
+template <typename word>
+void MultUnsafeCtBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                       const CtBatch<word> &a, const CtBatch<word> &b,
+                       int level) {
+  AssertFalse(a.has_rx_ || b.has_rx_,
+              "MultUnsafeCtBatch: relinearization required");
+  AssertTrue(a.np_.num_aux_ == 0 && b.np_.num_aux_ == 0,
+             "MultUnsafeCtBatch: no aux primes");
+  const NPInfo res_np = context->param_.LevelToNP(level, 0);
+  AssertTrue(res_np.IsSubsetOf(a.np_) && res_np.IsSubsetOf(b.np_),
+             "MultUnsafeCtBatch: incompatible levels");
+  res.Allocate(res_np, a.batch_, /*has_rx=*/true);
+  res.num_slots_ = Max(a.num_slots_, b.num_slots_);
+  res.scale_ = a.scale_ * b.scale_;
+
+  const int a_front = a.np_.num_ter_ - res_np.num_ter_;
+  const int b_front = b.np_.num_ter_ - res_np.num_ter_;
+  auto dst = res.ViewVector();
+  context->elem_handler_.TensorBatchCt(
+      dst, res_np, a.ConstViewVector(a_front, true),
+      b.ConstViewVector(b_front, true), a.batch_, res.CtStride(), a.CtStride(),
+      b.CtStride());
+}
+
+// Context::Add(res, res, b_const) over a batch, in place: the constant lands
+// on the b polynomial and everything else stays.
+template <typename word>
+void AddConstBatchInplace(ConstContextPtr<word> context, CtBatch<word> &res,
+                          const Constant<word> &b) {
+  AssertTrue(res.np_ == b.GetNP(), "AddConstBatchInplace: NP mismatch");
+  context->AssertSameScale(res.scale_, b.GetScale());
+  std::vector<DvView<word>> dst{res.ViewVector().at(0)};
+  std::vector<DvConstView<word>> src{res.ConstViewVector().at(0)};
+  context->elem_handler_.AddConstBatchCt(dst, res.np_, src, b.ConstView(),
+                                         res.batch_, res.CtStride(),
+                                         res.CtStride());
+}
+
+// Context::Rescale(res, a) over a batch (no rx): the two parts of every
+// ciphertext are contiguous, so the 2 * batch polynomials go as one strided
+// group through ModSwitchHandler::RescaleBatch.
+template <typename word>
+void RescaleBatchOp(ConstContextPtr<word> context, CtBatch<word> &res,
+                    const CtBatch<word> &a) {
+  AssertFalse(a.has_rx_, "RescaleBatchOp: written for relinearized batches");
+  AssertTrue(a.np_.num_aux_ == 0, "RescaleBatchOp: no aux primes");
+  const int level = context->param_.NPToLevel(a.np_);
+  AssertTrue(level > 0, "RescaleBatchOp: not enough q primes");
+  res.Allocate(context->param_.LevelToNP(level - 1), a.batch_, false);
+  res.num_slots_ = a.num_slots_;
+  res.scale_ = a.scale_ / context->param_.GetRescalePrimeProd(level);
+  context->mod_switch_handlers_.at(level).RescaleBatch(
+      res.data_.data(), static_cast<int>(res.PolyWords()), a.data_.data(),
+      static_cast<int>(a.PolyWords()), 2 * a.batch_);
+}
+
+// Context::RelinearizeRescale(res, a, key) over a batch.
+template <typename word>
+void RelinearizeRescaleBatchOp(ConstContextPtr<word> context,
+                               CtBatch<word> &res, const CtBatch<word> &a,
+                               const EvaluationKey<word> &key) {
+  AssertTrue(a.has_rx_, "RelinearizeRescaleBatchOp requires rx");
+  const int level = context->param_.NPToLevel(a.np_);
+  res.Allocate(context->param_.LevelToNP(level - 1), a.batch_, false);
+  res.num_slots_ = a.num_slots_;
+  res.scale_ = a.scale_ / context->param_.GetRescalePrimeProd(level);
+  context->RelinearizeRescaleBatch(
+      res.data_.data(), static_cast<int>(res.CtStride()), a.data_.data(),
+      static_cast<int>(a.CtStride()), a.np_, key, a.batch_);
+}
+
+// Context::AddLowerLevelsUntil over a batch: the level-down constant multiply
+// and the rescale, one batched launch each per level step.
+template <typename word>
+void AddLowerLevelsUntilBatch(ConstContextPtr<word> context,
+                              MLCtBatch<word> &ml, int min_level) {
+  if (ml.count(min_level) != 0) return;
+  const int max_level = ml.rbegin()->first;
+  const int old_min_level = ml.begin()->first;
+  AssertTrue(min_level <= max_level && min_level >= 0,
+             "AddLowerLevelsUntilBatch: Invalid level " +
+                 std::to_string(min_level));
+  for (int i = old_min_level - 1; i >= min_level; i--) {
+    const CtBatch<word> &up = ml.at(i + 1);
+    const Constant<word> &c =
+        MultiLevelCiphertext<word>::GetLevelDownConst(context->param_, i + 1);
+    CtBatch<word> tmp;
+    tmp.Allocate(up.np_, up.batch_, false);
+    tmp.num_slots_ = up.num_slots_;
+    tmp.scale_ = up.scale_ * c.GetScale();
+    auto dst = tmp.ViewVector();
+    context->elem_handler_.MultConstBatchCt(dst, up.np_, up.ConstViewVector(),
+                                            c.ConstView(), up.batch_,
+                                            tmp.CtStride(), up.CtStride());
+    CtBatch<word> down;
+    RescaleBatchOp(context, down, tmp);
+    ml.emplace(i, std::move(down));
+  }
+}
+
+}  // namespace
+
+// ------------------------ AXYPBZ (batched) ------------------------
+
+template <typename word>
+void AXYPBZ<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                 CtBatch<word> &res, const CtBatch<word> &x,
+                                 const CtBatch<word> &y, const CtBatch<word> &z,
+                                 const Evk &mult_key) const {
+  AssertTrue(has_z_, "Z should be provided for AXYPBZ with Z");
+  AssertTrue(!x.has_rx_ && !y.has_rx_ && !z.has_rx_,
+             "AXYPBZ: Relinearization required");
+  context->AssertSameScale(x.scale_, x_scale_);
+  context->AssertSameScale(y.scale_, y_scale_);
+  context->AssertSameScale(z.scale_, z_scale_);
+
+  CtBatch<word> tmp1;
+  if (has_a_) {  // a != 1
+    CtBatch<word> tmp0;
+    MultUnsafeConstBatch(context, tmp0, x, a_, final_level_ + 1);
+    MultUnsafeCtBatch(context, tmp1, tmp0, y, final_level_ + 1);
+  } else {  // a == 1
+    MultUnsafeCtBatch(context, tmp1, x, y, final_level_ + 1);
+  }
+
+  if (has_b_) {
+    const NPInfo np = tmp1.np_;
+    const int ter_diff = z.np_.num_ter_ - np.num_ter_;
+    AssertTrue(ter_diff >= 0, "AXYPBZ: Invalid levels");
+    auto dst = tmp1.ViewVector(0, true);
+    context->elem_handler_.CAccumBatchCt(
+        dst, np, {z.ConstViewVector(ter_diff, true),
+                  tmp1.ConstViewVector(0, true)},
+        {b_.ConstView()}, tmp1.batch_, tmp1.CtStride(),
+        {z.CtStride(), tmp1.CtStride()});
+    tmp1.num_slots_ = Max(tmp1.num_slots_, z.num_slots_);
+  }  // else, b == 0.0
+  RelinearizeRescaleBatchOp(context, res, tmp1, mult_key);
+
+  res.scale_ = final_scale_;
+}
+
+template <typename word>
+void AXYPBZ<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                 CtBatch<word> &res, const CtBatch<word> &x,
+                                 const CtBatch<word> &y,
+                                 const Evk &mult_key) const {
+  AssertTrue(!has_z_, "Z should not be provided for AXYPBZ without Z");
+  AssertTrue(!x.has_rx_ && !y.has_rx_, "AXYPBZ: Relinearization required");
+  context->AssertSameScale(x.scale_, x_scale_);
+  context->AssertSameScale(y.scale_, y_scale_);
+
+  CtBatch<word> tmp1;
+  if (has_a_) {  // a != 1
+    CtBatch<word> tmp0;
+    MultUnsafeConstBatch(context, tmp0, x, a_, final_level_ + 1);
+    MultUnsafeCtBatch(context, tmp1, tmp0, y, final_level_ + 1);
+  } else {  // a == 1
+    MultUnsafeCtBatch(context, tmp1, x, y, final_level_ + 1);
+  }
+
+  if (has_b_) {  // b != 0.0
+    AddConstBatchInplace(context, tmp1, b_);
+  }  // else, b == 0.0
+  RelinearizeRescaleBatchOp(context, res, tmp1, mult_key);
+
+  res.scale_ = final_scale_;
+}
+
 template class AXYPBZ<uint32_t>;
 template class AXYPBZ<uint64_t>;
+
+template <typename word>
+void BasisMap<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                   std::map<int, MLCtBatch<word>> &res,
+                                   const Evk &mult_key) const {
+  AssertTrue(!basis_eval_.empty(), "BasisMap: basis_eval_ is empty.");
+
+  for (const auto &[base_degree, eval] : basis_eval_) {
+    int left_degree = SplitBaseDegree(base_degree);
+    int right_degree = base_degree - left_degree;
+    // left_degree >= right_degree always holds
+    int sub_degree = left_degree - right_degree;
+    CtBatch<word> new_base;
+
+    int left_level = eval.x_level_;
+    int right_level = eval.y_level_;
+    AddLowerLevelsUntilBatch(context, res.at(left_degree), left_level);
+    AddLowerLevelsUntilBatch(context, res.at(right_degree), right_level);
+
+    const CtBatch<word> &left = res.at(left_degree).at(left_level);
+    const CtBatch<word> &right = res.at(right_degree).at(right_level);
+    if (chebyshev_ && sub_degree != 0) {
+      int sub_level = eval.z_level_;
+      AddLowerLevelsUntilBatch(context, res.at(sub_degree), sub_level);
+      const CtBatch<word> &sub = res.at(sub_degree).at(sub_level);
+      eval.EvaluateBatch(context, new_base, left, right, sub, mult_key);
+    } else {
+      eval.EvaluateBatch(context, new_base, left, right, mult_key);
+    }
+    const int new_level = context->param_.NPToLevel(new_base.np_);
+    MLCtBatch<word> ml;
+    ml.emplace(new_level, std::move(new_base));
+    res.try_emplace(base_degree, std::move(ml));
+  }
+}
 
 template class BasisMap<uint32_t>;
 template class BasisMap<uint64_t>;
 
+template <typename word>
+void EvalPolyNode<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                       CtBatch<word> &res,
+                                       std::map<int, MLCtBatch<word>> &basis,
+                                       const Evk &mult_key) const {
+  if (IsLeaf()) {
+    EvaluateLeafBatch(context, res, basis, mult_key, false);
+  } else {
+    EvaluateMiddleNodeBatch(context, res, basis, mult_key);
+  }
+}
+
+template <typename word>
+void EvalPolyNode<word>::EvaluateMiddleNodeBatch(
+    ConstContextPtr<word> context, CtBatch<word> &res,
+    std::map<int, MLCtBatch<word>> &basis, const Evk &mult_key) const {
+  CtBatch<word> tmp;
+  CtBatch<word> *accum = &res;
+  int working_level = target_level_;
+  if (do_rescale_) {
+    working_level += 1;
+    accum = &tmp;
+  }
+  AssertTrue(high_ != nullptr || is_high_constant_,
+             "This is not a middle node");
+  MLCtBatch<word> &ml_split = basis.at(split_degree_);
+  int ml_split_level = ml_split.rbegin()->first;
+  while (!context->IsMultUnsafeCompatible(ml_split_level, working_level)) {
+    ml_split_level -= 1;
+  }
+  AddLowerLevelsUntilBatch(context, ml_split, ml_split_level);
+  const CtBatch<word> &split = ml_split.at(ml_split_level);
+
+  if (high_ != nullptr) {
+    high_->EvaluateBatch(context, *accum, basis, mult_key);
+    CtBatch<word> product;
+    MultUnsafeCtBatch(context, product, *accum, split, working_level);
+    *accum = std::move(product);
+  } else if (is_high_constant_) {
+    MultUnsafeConstBatch(context, *accum, split, high_constant_,
+                         working_level);
+  } else {
+    Fail("Something went wrong during middle node evaluation");
+  }
+
+  if (low_ != nullptr) {
+    if (low_->IsLeaf()) {
+      // In-place mad addition into accum, as the serial path does.
+      low_->EvaluateLeafBatch(context, *accum, basis, mult_key, true);
+    } else {
+      CtBatch<word> tmp2;
+      low_->EvaluateBatch(context, tmp2, basis, mult_key);
+      // Context::Add(*accum, *accum, tmp2) over the batch.
+      context->AssertSameScale(accum->scale_, tmp2.scale_);
+      AssertTrue(accum->np_ == tmp2.np_, "EvaluateMiddleNodeBatch: NP mismatch");
+      const bool rx_add = accum->has_rx_ && tmp2.has_rx_;
+      accum->num_slots_ = Max(accum->num_slots_, tmp2.num_slots_);
+      if (rx_add) {
+        auto dst = accum->ViewVector();
+        context->elem_handler_.AddBatchCt(
+            dst, accum->np_, accum->ConstViewVector(), tmp2.ConstViewVector(),
+            accum->batch_, accum->CtStride(), accum->CtStride(),
+            tmp2.CtStride());
+      } else if (!accum->has_rx_ && tmp2.has_rx_) {
+        // The serial Add would hand tmp2's rx to the result.
+        CtBatch<word> sum;
+        sum.Allocate(accum->np_, accum->batch_, true);
+        sum.num_slots_ = accum->num_slots_;
+        sum.scale_ = accum->scale_;
+        auto dst = sum.ViewVector(0, true);
+        context->elem_handler_.AddBatchCt(
+            dst, accum->np_, accum->ConstViewVector(0, true),
+            tmp2.ConstViewVector(0, true), accum->batch_, sum.CtStride(),
+            accum->CtStride(), tmp2.CtStride());
+        cudaMemcpy2DAsync(
+            sum.CtData(0) + 2 * sum.PolyWords(), sum.CtStride() * sizeof(word),
+            tmp2.CtData(0) + 2 * tmp2.PolyWords(),
+            tmp2.CtStride() * sizeof(word), sum.PolyWords() * sizeof(word),
+            sum.batch_, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+        *accum = std::move(sum);
+      } else {
+        auto dst = accum->ViewVector(0, true);
+        context->elem_handler_.AddBatchCt(
+            dst, accum->np_, accum->ConstViewVector(0, true),
+            tmp2.ConstViewVector(0, true), accum->batch_, accum->CtStride(),
+            accum->CtStride(), tmp2.CtStride());
+      }
+    }
+  } else if (is_low_constant_ && (!is_low_zero_)) {
+    AddConstBatchInplace(context, *accum, low_constant_);
+  }
+  if (do_rescale_) {
+    if (accum->has_rx_) {
+      RelinearizeRescaleBatchOp(context, res, *accum, mult_key);
+    } else {
+      CtBatch<word> rescaled;
+      RescaleBatchOp(context, rescaled, *accum);
+      res = std::move(rescaled);
+    }
+  }
+}
+
+template <typename word>
+void EvalPolyNode<word>::EvaluateLeafBatch(ConstContextPtr<word> context,
+                                           CtBatch<word> &res,
+                                           std::map<int, MLCtBatch<word>> &basis,
+                                           const Evk &mult_key,
+                                           bool inplace) const {
+  AssertFalse(do_rescale_ && inplace,
+              "Rescale and inplace EvaluateLeaf is not compatible");
+  AssertTrue(IsLeaf() && !leaf_constants_.empty(),
+             "This is not a leaf node or leaf constants are not available.");
+
+  CtBatch<word> tmp;
+  CtBatch<word> *accum = &res;
+  int working_level = target_level_;
+  if (do_rescale_) {
+    accum = &tmp;
+    working_level += 1;
+  }
+
+  NPInfo np = context->param_.LevelToNP(working_level);
+  std::vector<std::vector<DvConstView<word>>> ct_srcs;
+  std::vector<DvConstView<word>> const_srcs;
+  std::vector<size_t> src_strides;
+
+  double scale = 0;
+  int num_slots = 0;
+  int batch = 0;
+  bool zero_const = false;
+  for (const auto &[base_degree, constant] : leaf_constants_) {
+    if (base_degree == 0) {
+      zero_const = true;
+      if (scale == 0) {
+        scale = constant.GetScale();
+      }
+      // do nothing
+    } else {
+      MLCtBatch<word> &ml_ct = basis.at(base_degree);
+      int ml_ct_level = ml_ct.rbegin()->first;
+      while (!context->IsMultUnsafeCompatible(ml_ct_level, working_level)) {
+        ml_ct_level -= 1;
+      }
+      AddLowerLevelsUntilBatch(context, ml_ct, ml_ct_level);
+      const CtBatch<word> &ct = ml_ct.at(ml_ct_level);
+      int ter_diff = ct.np_.num_ter_ - np.num_ter_;
+      AssertTrue(ter_diff >= 0, "Leaf evaluation level mismatch");
+      ct_srcs.push_back(ct.ConstViewVector(ter_diff, true));
+      src_strides.push_back(ct.CtStride());
+      const_srcs.push_back(constant.ConstView());
+      num_slots = Max(num_slots, ct.num_slots_);
+      batch = ct.batch_;
+      if (scale == 0) {
+        scale = ct.scale_ * constant.GetScale();
+      } else {
+        context->AssertSameScale(scale, ct.scale_ * constant.GetScale());
+      }
+    }
+  }
+
+  if (inplace) {
+    AssertTrue(accum->np_ == np, "Leaf evaluation level mismatch");
+    context->AssertSameScale(scale, accum->scale_);
+    accum->num_slots_ = Max(num_slots, accum->num_slots_);
+    ct_srcs.push_back(accum->ConstViewVector(0, true));
+    src_strides.push_back(accum->CtStride());
+  } else {
+    accum->Allocate(np, batch, false);
+    accum->scale_ = scale;
+    accum->num_slots_ = num_slots;
+  }
+  std::vector<DvView<word>> dst = accum->ViewVector(0, true);
+  context->elem_handler_.CAccumBatchCt(dst, np, ct_srcs, const_srcs,
+                                       accum->batch_, accum->CtStride(),
+                                       src_strides);
+  if (zero_const) {
+    AddConstBatchInplace(context, *accum, leaf_constants_.at(0));
+  }
+
+  if (do_rescale_) {
+    RescaleBatchOp(context, res, *accum);
+  }
+}
+
 template class EvalPolyNode<uint32_t>;
 template class EvalPolyNode<uint64_t>;
+
+template <typename word>
+void EvalPoly<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                   CtBatch<word> &res,
+                                   const CtBatch<word> &input,
+                                   const Evk &mult_key) const {
+  AssertTrue(tree_root_ != nullptr, "EvalPoly: not compiled.");
+  AssertTrue(context->param_.NPToLevel(input.np_) == input_level_,
+             "EvalPoly: input level does not match the compiled level.");
+  AssertTrue(input.np_.num_aux_ == 0,
+             "ModDown required before EvalPoly evaluation");
+  AssertFalse(input.has_rx_,
+              "Relinearization required before EvalPoly evaluation");
+  context->AssertSameScale(input.scale_, input_scale_);
+
+  std::map<int, MLCtBatch<word>> basis;
+  // To prevent problems in in-place operations and also to simplify the code
+  CtBatch<word> input_tmp;
+  input_tmp.Allocate(input.np_, input.batch_, false);
+  input_tmp.scale_ = input.scale_;
+  input_tmp.num_slots_ = input.num_slots_;
+  CopyDeviceToDevice(input_tmp.data_, input.data_);
+  MLCtBatch<word> ml;
+  ml.emplace(input_level_, std::move(input_tmp));
+  basis.try_emplace(1, std::move(ml));
+
+  basis_map_.EvaluateBatch(context, basis, mult_key);
+  tree_root_->EvaluateBatch(context, res, basis, mult_key);
+  // To avoid double calculation errors, manually set target scale
+  context->AssertSameScale(res.scale_, target_scale_);
+  res.scale_ = target_scale_;
+}
 
 template class EvalPoly<uint32_t>;
 template class EvalPoly<uint64_t>;

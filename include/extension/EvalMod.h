@@ -59,6 +59,15 @@ class EvalMod {
                 const Evk &mult_key);
 
   /**
+   * @brief `Evaluate` over a batch of ciphertexts at one (level, scale) --
+   * the initial constant, the mod polynomial and the double-angle turns each
+   * run once over the group, word for word the per-ciphertext loop. `input`
+   * is consumed.
+   */
+  void EvaluateBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                     CtBatch<word> &input, const Evk &mult_key);
+
+  /**
    * @brief Get the polynomial degree of the mod function.
    *
    * @param poly_index index of the polynomial (default: 0)

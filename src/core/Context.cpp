@@ -991,6 +991,53 @@ void Context<word>::MultKeyBatch(word *dst, int dst_ct_stride,
 }
 
 template <typename word>
+void Context<word>::RelinearizeRescaleBatch(word *dst, int dst_ct_stride,
+                                            const word *src, int src_ct_stride,
+                                            const NPInfo &np, const Evk &key,
+                                            int batch) const {
+  NvtxScope _nv("ks: RelinearizeRescaleBatch");
+  const int degree = param_.degree_;
+  const int num_q = np.GetNumQ();
+  const int q_words = num_q * degree;
+  int level = param_.NPToLevel(np);
+  AssertTrue(level >= 1, "RelinearizeRescaleBatch: not enough levels");
+  AdjustLevelForMultKey(level, num_q, key.GetNP().num_aux_);
+  AssertTrue(src_ct_stride >= 3 * q_words,
+             "RelinearizeRescaleBatch: the ciphertexts overlap");
+  const int num_aux = key.GetNP().num_aux_;
+  const int ext_words = (num_q + num_aux) * degree;
+  const NPInfo next_np = param_.LevelToNP(level - 1);
+  const int next_words = next_np.GetNumTotal() * degree;
+  AssertTrue(dst_ct_stride >= 2 * next_words,
+             "RelinearizeRescaleBatch: the results overlap");
+
+  // The key switch of every rx with the one key, (b, a) folded in as the
+  // addend on the extended basis (its P-multiple comes back exactly).
+  DeviceVector<word> accum(static_cast<size_t>(batch) * 2 * ext_words);
+  {
+    std::vector<const Evk *> keys(batch, &key);
+    MultKeyBatchNoModDown(accum.data(), 2 * ext_words, src + 2 * q_words,
+                          src_ct_stride, src, src + q_words, src_ct_stride, np,
+                          keys, batch);
+  }
+
+  // The fused epilogue over both parts: contiguous per ciphertext on both
+  // sides, so the 2 * batch polynomials are one strided group when the
+  // destination is packed; otherwise one call per part.
+  const auto &mod_switcher = GetModSwitchHandler(level, num_aux);
+  if (dst_ct_stride == 2 * next_words) {
+    mod_switcher.ModDownAndRescaleBatch(dst, next_words, accum.data(),
+                                        ext_words, 2 * batch);
+  } else {
+    mod_switcher.ModDownAndRescaleBatch(dst, dst_ct_stride, accum.data(),
+                                        2 * ext_words, batch);
+    mod_switcher.ModDownAndRescaleBatch(dst + next_words, dst_ct_stride,
+                                        accum.data() + ext_words,
+                                        2 * ext_words, batch);
+  }
+}
+
+template <typename word>
 void Context<word>::MultKeyBatchNoModDown(
     word *dst, int dst_ct_stride, const word *switched, int switched_stride,
     const word *add_b, const word *add_a, int add_stride, const NPInfo &np,

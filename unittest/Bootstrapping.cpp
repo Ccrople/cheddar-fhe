@@ -89,6 +89,69 @@ TEST_P(Testbed32, TheBatchedGiantStepsAreTheSerialOnesWordForWord) {
   ASSERT_EQ(differ, 0u);
 }
 
+// The batched EvalMod against the per-ciphertext loop: the same compiled
+// tree, every key switch through MultKeyBatch with the one key and every
+// elementwise pass with the batch on gridDim.z, so the words must agree
+// exactly (Doing.md 3.23's lever).
+TEST_P(Testbed32, TheBatchedEvalModIsTheSerialOneWordForWord) {
+  using word = uint32_t;
+  const int num_slots = param_->MaxNumSlots();
+  std::shared_ptr<BootContext<word>> boot_context =
+      std::dynamic_pointer_cast<BootContext<word>>(context_);
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  const int start_level =
+      boot_context->GetBootParameter().GetEvalModStartLevel();
+  const int group = 5;
+  std::vector<Ciphertext<word>> serial(group), batched(group);
+  for (int b = 0; b < group; b++) {
+    std::vector<Complex> msg;
+    GenerateRandomMessage(msg, num_slots, -1.0, 1.0,
+                          /*complex=*/!param_->conjugate_invariant_);
+    Ciphertext<word> ct;
+    EncodeAndEncrypt(ct, msg, start_level);
+    boot_context->Copy(serial[b], ct);
+    boot_context->Copy(batched[b], ct);
+  }
+
+  std::vector<Ciphertext<word> *> ptrs(group);
+  BootContext<word>::SetEvalModSerial(true);
+  for (int b = 0; b < group; b++) {
+    // The serial loop reads the declared scale EvalMod was compiled for.
+    serial[b].SetScale(boot_context->GetEvalModStartScale());
+    ptrs[b] = &serial[b];
+  }
+  boot_context->EvaluateModBatch(ptrs, interface_->GetEvkMap().GetMultiplicationKey());
+  BootContext<word>::SetEvalModSerial(false);
+  for (int b = 0; b < group; b++) {
+    batched[b].SetScale(boot_context->GetEvalModStartScale());
+    ptrs[b] = &batched[b];
+  }
+  boot_context->EvaluateModBatch(ptrs, interface_->GetEvkMap().GetMultiplicationKey());
+
+  size_t differ = 0, total = 0;
+  for (int b = 0; b < group; b++) {
+    const DeviceVector<word> *got[2] = {&batched[b].bx_, &batched[b].ax_};
+    const DeviceVector<word> *want[2] = {&serial[b].bx_, &serial[b].ax_};
+    for (int p = 0; p < 2; p++) {
+      HostVector<word> a, w;
+      CopyDeviceToHost(a, *got[p]);
+      CopyDeviceToHost(w, *want[p]);
+      ASSERT_EQ(a.size(), w.size());
+      for (size_t i = 0; i < a.size(); i++) differ += (a[i] != w[i]);
+      total += a.size();
+    }
+  }
+  std::cout << "EvalMod: " << differ << " of " << total
+            << " words differ between the batched and the serial evaluations"
+            << std::endl;
+  ASSERT_EQ(differ, 0u);
+}
+
 // [SYLPH] section 3.1.3 states the bootstrap requirement as one number and a
 // rule, and neither is the SNR this suite has always printed:
 //

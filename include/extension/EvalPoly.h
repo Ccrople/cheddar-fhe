@@ -21,6 +21,61 @@ enum class EvalPolyType {
 constexpr double kZeroCoeffThreshold = 1e-9;
 
 /**
+ * @brief A batch of ciphertexts at ONE (level, scale), in one strided device
+ * buffer: ciphertext b's polynomials (bx, ax and, when carried, rx,
+ * `np_.GetNumTotal() * degree` words each) lie back to back at
+ * `data_ + b * CtStride()`. The batched EvalMod keeps its whole state in
+ * these, so every key switch and every elementwise pass runs once over the
+ * group. EvalMod's ciphertexts carry no auxiliary primes, and neither do
+ * these.
+ *
+ * @tparam word uint32_t or uint64_t
+ */
+template <typename word>
+class CtBatch {
+ public:
+  DeviceVector<word> data_;
+  NPInfo np_;
+  double scale_ = 1.0;
+  int batch_ = 0;
+  int num_slots_ = 0;
+  bool has_rx_ = false;
+
+  CtBatch() = default;
+  CtBatch(CtBatch &&) = default;
+  CtBatch &operator=(CtBatch &&) = default;
+  CtBatch(const CtBatch &) = delete;
+  CtBatch &operator=(const CtBatch &) = delete;
+
+  size_t PolyWords() const {
+    return static_cast<size_t>(np_.GetNumTotal()) * np_.degree_;
+  }
+  size_t CtStride() const { return (has_rx_ ? 3 : 2) * PolyWords(); }
+
+  void Allocate(const NPInfo &np, int batch, bool has_rx);
+
+  word *CtData(int b) { return data_.data() + b * CtStride(); }
+  const word *CtData(int b) const { return data_.data() + b * CtStride(); }
+
+  /**
+   * @brief Views of ciphertext 0's polynomials, exactly as
+   * `Ciphertext::ViewVector` would give them; a batched kernel reaches
+   * ciphertext b through the batch stride.
+   */
+  std::vector<DvView<word>> ViewVector(int np_front_ignore = 0,
+                                       bool ignore_rx = false);
+  std::vector<DvConstView<word>> ConstViewVector(int np_front_ignore = 0,
+                                                 bool ignore_rx = false) const;
+};
+
+/**
+ * @brief The batched counterpart of MultiLevelCiphertext: one CtBatch per
+ * level, all at one scale.
+ */
+template <typename word>
+using MLCtBatch = std::map<int, CtBatch<word>>;
+
+/**
  * @brief A class for the evaluation of a * x * y + b * z where
  * a is a small integer, b is a real number, x, y, z are ciphertexts.
  *
@@ -62,6 +117,14 @@ class AXYPBZ {
                 const Ct &y, const Ct &z, const Evk &mult_key) const;
   void Evaluate(ConstContextPtr<word> context, Ct &res, const Ct &x,
                 const Ct &y, const Evk &mult_key) const;
+
+  // The same evaluations over a batch, word for word the per-ciphertext loop.
+  void EvaluateBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                     const CtBatch<word> &x, const CtBatch<word> &y,
+                     const CtBatch<word> &z, const Evk &mult_key) const;
+  void EvaluateBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                     const CtBatch<word> &x, const CtBatch<word> &y,
+                     const Evk &mult_key) const;
 };
 
 /**
@@ -102,6 +165,9 @@ class BasisMap {
 
   void Evaluate(ConstContextPtr<word> context, std::map<int, MLCt> &res,
                 const Evk &mult_key) const;
+  void EvaluateBatch(ConstContextPtr<word> context,
+                     std::map<int, MLCtBatch<word>> &res,
+                     const Evk &mult_key) const;
   void PlainEvaluate(std::map<int, double> &res) const;
 };
 
@@ -144,6 +210,13 @@ class EvalPolyNode {
   void EvaluateLeaf(ConstContextPtr<word> context, Ct &res,
                     std::map<int, MLCt> &basis, const Evk &mult_key,
                     bool inplace) const;
+  void EvaluateMiddleNodeBatch(ConstContextPtr<word> context,
+                               CtBatch<word> &res,
+                               std::map<int, MLCtBatch<word>> &basis,
+                               const Evk &mult_key) const;
+  void EvaluateLeafBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                         std::map<int, MLCtBatch<word>> &basis,
+                         const Evk &mult_key, bool inplace) const;
 
   int target_level_;
   bool do_rescale_ = true;
@@ -163,6 +236,9 @@ class EvalPolyNode {
 
   void Evaluate(ConstContextPtr<word> context, Ct &res,
                 std::map<int, MLCt> &basis, const Evk &mult_key) const;
+  void EvaluateBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                     std::map<int, MLCtBatch<word>> &basis,
+                     const Evk &mult_key) const;
   double PlainEvaluate(std::map<int, double> &res) const;
 };
 
@@ -220,6 +296,17 @@ class EvalPoly {
 
   void Evaluate(ConstContextPtr<word> context, Ct &res, const Ct &input,
                 const Evk &mult_key) const;
+
+  /**
+   * @brief `Evaluate` over a batch of ciphertexts at one (level, scale), in
+   * about as many launches as ONE evaluation takes: the compiled tree is
+   * walked once, every key switch is `MultKeyBatch`-shaped and every
+   * elementwise pass runs with the batch on `gridDim.z`. Word for word the
+   * per-ciphertext loop.
+   */
+  void EvaluateBatch(ConstContextPtr<word> context, CtBatch<word> &res,
+                     const CtBatch<word> &input, const Evk &mult_key) const;
+
   double PlainEvaluate(double input) const;
 };
 
