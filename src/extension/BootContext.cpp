@@ -663,28 +663,26 @@ void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
 }
 
 template <typename word>
-void BootContext<word>::Boot(Ct &res, const Ct &input,
-                             const EvkMap<word> &evk_map, bool min_ks) const {
-  NvtxScope _nv("boot: Boot");
-  counts_.full++;
-  int max_num_slots = this->param_.MaxNumSlots();
-  int input_num_slots = input.GetNumSlots();
-  int num_slots = GetBootEnabledNumSlots(input_num_slots);
-  bool full_slot = (num_slots == max_num_slots);
+int BootContext<word>::BootFront(Ct &slots, const Ct &input,
+                                 const EvkMap<word> &evk_map,
+                                 bool min_ks) const {
+  const int max_num_slots = this->param_.MaxNumSlots();
+  const int input_num_slots = input.GetNumSlots();
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
 
   Ct main_ct;
-  int input_level = this->param_.NPToLevel(input.GetNP());
-  if (input_level > 0) {
-    this->LevelDown(main_ct, input, 0);
-    Boot(res, main_ct, evk_map, min_ks);
-    return;
+  const Ct *src = &input;
+  Ct low;
+  if (this->param_.NPToLevel(input.GetNP()) > 0) {
+    this->LevelDown(low, input, 0);
+    src = &low;
   }
 
   // 0. Scale up
   NPInfo min_np = this->param_.LevelToNP(-1);
-  AssertTrue(min_np.IsSubsetOf(input.GetNP()), "Boot: Invalid input NP");
-  this->MultUnsafe(main_ct, input, scaleup_const_, -1);
+  AssertTrue(min_np.IsSubsetOf(src->GetNP()), "Boot: Invalid input NP");
+  this->MultUnsafe(main_ct, *src, scaleup_const_, -1);
 
   // 1. ModUp with optional DtS/StD key-switch + Trace.
   //
@@ -704,10 +702,31 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
   main_ct.SetNumSlots(num_slots);
 
   // 2. Perform CtS
-  CoeffToSlot(main_ct, num_slots, main_ct, evk_map, min_ks);
+  CoeffToSlot(slots, num_slots, main_ct, evk_map, min_ks);
+  return input_num_slots;
+}
+
+template <typename word>
+void BootContext<word>::Boot(Ct &res, const Ct &input,
+                             const EvkMap<word> &evk_map, bool min_ks) const {
+  NvtxScope _nv("boot: Boot");
+  counts_.full++;
+  const bool full_slot =
+      (GetBootEnabledNumSlots(input.GetNumSlots()) == this->param_.MaxNumSlots());
+
+  Ct main_ct;
+  const int input_num_slots = BootFront(main_ct, input, evk_map, min_ks);
 
   // 3. Take the coefficients through EvalMod.
   EvaluateModAfterCtS(res, main_ct, full_slot, evk_map);
+  BootBack(res, res, input_num_slots, evk_map, min_ks);
+}
+
+template <typename word>
+void BootContext<word>::BootBack(Ct &res, Ct &slots, int input_num_slots,
+                                 const EvkMap<word> &evk_map,
+                                 bool min_ks) const {
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
 
   // 4. Finally, perform StC.
   //
@@ -732,11 +751,11 @@ void BootContext<word>::Boot(Ct &res, const Ct &input,
   // costs no precision at all; declaring the wrong scale afterwards did.
   double leveldown_drift = 1.0;
   if (boot_param_.GetNumSlackLevels() > 0) {
-    const double before = res.GetScale();
-    this->LevelDown(res, res, boot_param_.GetStCStartLevel());
-    leveldown_drift = res.GetScale() / before;
+    const double before = slots.GetScale();
+    this->LevelDown(slots, slots, boot_param_.GetStCStartLevel());
+    leveldown_drift = slots.GetScale() / before;
   }
-  SlotToCoeff(res, num_slots, res, evk_map, min_ks);
+  SlotToCoeff(res, num_slots, slots, evk_map, min_ks);
 
   if (boot_variant_.at(num_slots) == BootVariant::kImaginaryRemoving) {
     // res += HConJ(res)
@@ -1039,6 +1058,35 @@ void BootContext<word>::HalfBootModuleBatch(
   for (int i = 0; i < n; i++) {
     res[i].SetNumSlots(num_slots[i]);
     res[i].SetScale(eval_mod_->end_scale_);
+  }
+}
+
+template <typename word>
+void BootContext<word>::BootBatch(std::vector<Ct> &res,
+                                  const std::vector<const Ct *> &inputs,
+                                  const EvkMap<word> &evk_map,
+                                  bool min_ks) const {
+  NvtxScope _nv("boot: BootBatch");
+  AssertTrue(this->param_.conjugate_invariant_,
+             "BootBatch: the batched EvalMod runs the real subring's single "
+             "reduction; the ordinary ring's axis split is not batched");
+  const int n = static_cast<int>(inputs.size());
+  res.resize(n);
+  std::vector<int> num_slots(n);
+  std::vector<Ct> slots(n);
+  std::vector<Ct *> ptrs(n);
+  for (int i = 0; i < n; i++) {
+    counts_.full++;
+    num_slots[i] = BootFront(slots[i], *inputs[i], evk_map, min_ks);
+    // What EvaluateModAfterCtS's conjugate-invariant branch does before its
+    // single reduction.
+    slots[i].SetScale(eval_mod_->start_scale_);
+    ptrs[i] = &slots[i];
+  }
+  EvaluateModBatch(ptrs, evk_map.GetMultiplicationKey());
+  for (int i = 0; i < n; i++) {
+    BootBack(res[i], slots[i], num_slots[i], evk_map, min_ks);
+    slots[i] = Ct();
   }
 }
 

@@ -120,6 +120,15 @@ class CiBatchLayer {
     //! next norm: nothing between two norms bootstraps, and the tables are
     //! the largest single object the Context holds.
     bool release_boot_tables = true;
+    //! Keep the residual stream ON THE CARD while a half runs, instead of
+    //! parking its 4.3 GiB in host memory between the norm and the
+    //! residual add. The default is the A100 configuration (parked); a
+    //! box with headroom (the B200's 179 GiB) skips the two copies.
+    bool park_stream = true;
+    //! Unstage the attention's converters around the feed-forward
+    //! (`CiBatchAttention::UnstageConverters` at the seam). The default is
+    //! the A100 configuration (unstaged); with headroom they stay put.
+    bool unstage_converters = true;
     //! SiLU's Chebyshev degree (four levels at 15; the range is folded
     //! into the gate weight, so the polynomial is fitted on [-1, 1]).
     int silu_degree = 15;
@@ -274,10 +283,10 @@ class CiBatchLayer {
     // input stream is dead -- `mid` replaced it -- and the converters are
     // unused until the next layer's attention.
     stream.clear();
-    attn.UnstageConverters();
+    if (cfg_.unstage_converters) attn.UnstageConverters();
     const Stages a = stages_;
     FeedForward(res, mid, fw, c, evk);
-    attn.StageConverters();
+    if (cfg_.unstage_converters) attn.StageConverters();
     stages_.boot += a.boot;
     stages_.norm += a.norm;
     stages_.qkv = a.qkv;

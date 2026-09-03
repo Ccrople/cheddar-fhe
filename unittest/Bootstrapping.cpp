@@ -152,6 +152,63 @@ TEST_P(Testbed32, TheBatchedEvalModIsTheSerialOneWordForWord) {
   ASSERT_EQ(differ, 0u);
 }
 
+// The FULL Boot over a group against the per-ciphertext loop: the fronts and
+// backs are the serial Boot's own (BootFront/BootBack are shared), and the
+// reduction in the middle is EvaluateModBatch, already word-for-word above --
+// so the composition must be too. This is the B = 512 batched layer's boot:
+// its channel loops pay 20,480 full Boots a layer, each serial EvalMod ~389
+// launches.
+TEST_P(Testbed32, TheBatchedBootIsTheSerialOneWordForWord) {
+  using word = uint32_t;
+  if (!param_->conjugate_invariant_) {
+    GTEST_SKIP() << "BootBatch shares the real subring's single reduction";
+  }
+  const int num_slots = param_->MaxNumSlots();
+  std::shared_ptr<BootContext<word>> boot_context =
+      std::dynamic_pointer_cast<BootContext<word>>(context_);
+  boot_context->PrepareEvalMod();
+  boot_context->PrepareEvalSpecialFFT(num_slots);
+  EvkRequest req;
+  boot_context->AddRequiredRotations(req, num_slots);
+  interface_->PrepareRotationKey(req);
+
+  const int group = 5;
+  std::vector<Ciphertext<word>> inputs(group), serial(group), batched;
+  std::vector<const Ciphertext<word> *> ptrs(group);
+  for (int b = 0; b < group; b++) {
+    std::vector<Complex> msg;
+    GenerateRandomMessage(msg, num_slots, -1.0, 1.0, /*complex=*/false);
+    EncodeAndEncrypt(inputs[b], msg, 0);
+    ptrs[b] = &inputs[b];
+  }
+
+  for (int b = 0; b < group; b++) {
+    boot_context->Boot(serial[b], inputs[b], interface_->GetEvkMap());
+  }
+  BootContext<word>::SetEvalModSerial(false);
+  boot_context->BootBatch(batched, ptrs, interface_->GetEvkMap());
+
+  size_t differ = 0, total = 0;
+  for (int b = 0; b < group; b++) {
+    const DeviceVector<word> *got[2] = {&batched[b].bx_, &batched[b].ax_};
+    const DeviceVector<word> *want[2] = {&serial[b].bx_, &serial[b].ax_};
+    for (int p = 0; p < 2; p++) {
+      HostVector<word> a, w;
+      CopyDeviceToHost(a, *got[p]);
+      CopyDeviceToHost(w, *want[p]);
+      ASSERT_EQ(a.size(), w.size());
+      for (size_t i = 0; i < a.size(); i++) differ += (a[i] != w[i]);
+      total += a.size();
+    }
+    ASSERT_EQ(batched[b].GetScale(), serial[b].GetScale());
+    ASSERT_EQ(batched[b].GetNumSlots(), serial[b].GetNumSlots());
+  }
+  std::cout << "Boot: " << differ << " of " << total
+            << " words differ between the batched group and the serial loop"
+            << std::endl;
+  ASSERT_EQ(differ, 0u);
+}
+
 // [SYLPH] section 3.1.3 states the bootstrap requirement as one number and a
 // rule, and neither is the SNR this suite has always printed:
 //

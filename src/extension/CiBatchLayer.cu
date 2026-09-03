@@ -54,6 +54,9 @@ CiBatchLayer<word>::CiBatchLayer(std::shared_ptr<BootContext<word>> boot,
 template <typename word>
 void CiBatchLayer<word>::Park(ParkedStream &parked,
                               std::vector<Ct> &stream) const {
+  // `park_stream = false` leaves the stream on the card; Unpark then finds
+  // `parked` empty and leaves it alone.
+  if (!cfg_.park_stream) return;
   NvtxScope _nv("batch: park the stream");
   const size_t n = stream.size();
   parked.bx.resize(n);
@@ -76,6 +79,7 @@ void CiBatchLayer<word>::Park(ParkedStream &parked,
 template <typename word>
 void CiBatchLayer<word>::Unpark(std::vector<Ct> &stream,
                                 ParkedStream &parked) const {
+  if (!cfg_.park_stream) return;
   NvtxScope _nv("batch: unpark the stream");
   const size_t n = parked.bx.size();
   stream.clear();
@@ -98,6 +102,21 @@ template <typename word>
 void CiBatchLayer<word>::AddRequiredRotations(EvkRequest &req) const {
   boot_->AddRequiredRotations(req, layout_.num_slots);
 }
+
+namespace {
+// How many full Boots stand together in one `BootBatch` group. 1 is the
+// serial loop, exactly the A100 configuration (the default, so a baseline
+// A/B needs no env); the Phase-2 lever raises it with
+// `CHEDDAR_EVALMOD_BATCH` sizing the reduction's chunks inside.
+int BootGroupSize() {
+  static const int group = [] {
+    const char *env = std::getenv("CHEDDAR_CI_BATCH_BOOT_GROUP");
+    const int value = (env != nullptr) ? std::atoi(env) : 0;
+    return value >= 1 ? value : 1;
+  }();
+  return group;
+}
+}  // namespace
 
 template <typename word>
 int CiBatchLayer<word>::NormDegree(double window) const {
@@ -154,17 +173,30 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   Ct acc;
   {
     NvtxScope _a("batch: norm pass A");
-    for (int c = 0; c < model; c++) {
-      Ct up;
-      boot_->Boot(up, stream[c], evk);
-      Ct sq;
-      boot_->Mult(sq, up, up);
-      if (c == 0) {
-        acc = std::move(sq);
+    const int group = BootGroupSize();
+    for (int c0 = 0; c0 < model; c0 += group) {
+      const int g = Min(model - c0, group);
+      std::vector<Ct> up_g;
+      if (g == 1) {
+        up_g.resize(1);
+        boot_->Boot(up_g[0], stream[c0], evk);
       } else {
-        boot_->Add(acc, acc, sq);
+        std::vector<const Ct *> in(g);
+        for (int j = 0; j < g; j++) in[j] = &stream[c0 + j];
+        boot_->BootBatch(up_g, in, evk);
       }
-      if (hold_ch) boot_->LevelDown(xs[c], up, hold);
+      for (int j = 0; j < g; j++) {
+        const int c = c0 + j;
+        Ct up = std::move(up_g[j]);
+        Ct sq;
+        boot_->Mult(sq, up, up);
+        if (c == 0) {
+          acc = std::move(sq);
+        } else {
+          boot_->Add(acc, acc, sq);
+        }
+        if (hold_ch) boot_->LevelDown(xs[c], up, hold);
+      }
     }
   }
   // The last bootstrap of this norm, when the channels are held: the
@@ -256,18 +288,32 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   t0 = Clock::now();
   {
     NvtxScope _b("batch: norm pass B");
-    for (int c = 0; c < model; c++) {
-      Ct x_c;
-      if (hold_ch) {
-        x_c = std::move(xs[c]);
-      } else {
-        Ct up;
-        boot_->Boot(up, stream[c], evk);
-        boot_->LevelDown(x_c, up, hold);
+    const int group = hold_ch ? 1 : BootGroupSize();
+    for (int c0 = 0; c0 < model; c0 += group) {
+      const int g = Min(model - c0, group);
+      std::vector<Ct> up_g;
+      if (!hold_ch && g > 1) {
+        std::vector<const Ct *> in(g);
+        for (int j = 0; j < g; j++) in[j] = &stream[c0 + j];
+        boot_->BootBatch(up_g, in, evk);
       }
-      Ct y_c;
-      boot_->HMult(y_c, x_c, rh, mult_key);
-      proj_->AddColumn(src, c, y_c);
+      for (int j = 0; j < g; j++) {
+        const int c = c0 + j;
+        Ct x_c;
+        if (hold_ch) {
+          x_c = std::move(xs[c]);
+        } else if (g > 1) {
+          boot_->LevelDown(x_c, up_g[j], hold);
+          up_g[j] = Ct();
+        } else {
+          Ct up;
+          boot_->Boot(up, stream[c], evk);
+          boot_->LevelDown(x_c, up, hold);
+        }
+        Ct y_c;
+        boot_->HMult(y_c, x_c, rh, mult_key);
+        proj_->AddColumn(src, c, y_c);
+      }
     }
   }
   if (!hold_ch && release_tables && cfg_.release_boot_tables) {
@@ -608,9 +654,24 @@ void CiBatchLayer<word>::Attention(
         t0 = Clock::now();
       }
       std::vector<Ct> booted(T);
-      for (int l = 0; l < T; l++) {
-        boot_->Boot(booted[l], scores[l], evk);
-        scores[l] = Ct();
+      {
+        const int group = BootGroupSize();
+        for (int l0 = 0; l0 < T; l0 += group) {
+          const int g = Min(T - l0, group);
+          if (g == 1) {
+            boot_->Boot(booted[l0], scores[l0], evk);
+            scores[l0] = Ct();
+            continue;
+          }
+          std::vector<const Ct *> in(g);
+          for (int j = 0; j < g; j++) in[j] = &scores[l0 + j];
+          std::vector<Ct> out_g;
+          boot_->BootBatch(out_g, in, evk);
+          for (int j = 0; j < g; j++) {
+            booted[l0 + j] = std::move(out_g[j]);
+            scores[l0 + j] = Ct();
+          }
+        }
       }
       AssertTrue(param.NPToLevel(booted[0].GetNP()) == top,
                  "CiBatchLayer::Attention: the score bootstrap did not "

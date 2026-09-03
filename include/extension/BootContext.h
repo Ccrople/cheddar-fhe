@@ -115,6 +115,25 @@ class BootContext : public Context<word>,
                          const EvkMap<word> &evk_map,
                          const CiSinCBasis<word> &basis) const;
 
+  /**
+   * @brief The per-ciphertext front of `Boot` (level descent, scale-up,
+   * ModUp, Trace, the native CoeffToSlot), shared by the serial call and
+   * `BootBatch` so the two cannot drift. Leaves `slots` where CtS left it
+   * -- the caller sets EvalMod's start scale -- and returns the input's
+   * slot count.
+   */
+  int BootFront(Ct &slots, const Ct &input, const EvkMap<word> &evk_map,
+                bool min_ks) const;
+
+  /**
+   * @brief The per-ciphertext back of `Boot` (the slack's LevelDown, the
+   * native SlotToCoeff, the variant epilogue, the declared scale), shared
+   * by the serial call and `BootBatch`. `slots` is EvalMod's output and is
+   * consumed.
+   */
+  void BootBack(Ct &res, Ct &slots, int input_num_slots,
+                const EvkMap<word> &evk_map, bool min_ks) const;
+
   ContextPtr<word> GetContext();
   ConstContextPtr<word> GetContext() const;
 
@@ -555,6 +574,21 @@ class BootContext : public Context<word>,
                           const std::vector<const Ct *> &inputs,
                           const EvkMap<word> &evk_map,
                           const CiSinCBasis<word> &basis) const;
+
+  /**
+   * @brief The FULL `Boot` over a group of ciphertexts: the per-ciphertext
+   * front (level descent, scale-up, ModUp, Trace, CtS) exactly as the
+   * serial call runs it, then ONE `EvaluateModBatch` over the group, then
+   * the per-ciphertext SlotToCoeff and epilogue. Word for word the loop of
+   * `Boot` calls (`CHEDDAR_EVALMOD_SERIAL=1` restores the loop inside the
+   * reduction). Conjugate-invariant rings only: the group shares the real
+   * subring's single reduction; the ordinary ring's axis split is not
+   * batched. This is what the B = 512 batched layer's channel loops hand
+   * over -- 20,480 full Boots a layer, each serial one paying EvalMod's
+   * ~389 launches alone.
+   */
+  void BootBatch(std::vector<Ct> &res, const std::vector<const Ct *> &inputs,
+                 const EvkMap<word> &evk_map, bool min_ks = false) const;
 
   /**
    * @brief Two real-payload coefficient ciphertexts through ONE HalfBoot.

@@ -1961,6 +1961,11 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 512);
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
   cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
+  // The B200 residency switches; every default is the A100 configuration.
+  cfg.hold_channels_ffn = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS_FFN", 1) != 0;
+  cfg.release_boot_tables = EnvInt("CHEDDAR_CI_BATCH_RELEASE_TABLES", 1) != 0;
+  cfg.park_stream = EnvInt("CHEDDAR_CI_BATCH_PARK", 1) != 0;
+  cfg.unstage_converters = EnvInt("CHEDDAR_CI_BATCH_UNSTAGE", 1) != 0;
   cfg.verbose = EnvInt("CHEDDAR_CI_BATCH_VERBOSE", 1) != 0;
   cfg.lanes = 32;  // the chain: 32 lanes a group, rank 16
   cfg.rank = 16;
