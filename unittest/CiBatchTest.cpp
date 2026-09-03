@@ -1200,14 +1200,14 @@ TEST(CiBatch, TheFusedScoreBootMatchesTheSerialBoot) {
   ASSERT_NE(tctx, nullptr);
   tctx->PrepareEvalMod();
 
+  // ONE attention object for both routes (two would double the converters'
+  // ~14 GiB); the fused return is flipped at runtime.
   cheddar::CiBatchAttention<word>::Config cfg_s;
+  cfg_s.fused_scores = true;
+  cfg_s.verbose = true;
   cheddar::CiBatchAttention<word> attn_s(bctx, swtch.context, small.context,
-                                         lifted.context, cfg_s);
-  cheddar::CiBatchAttention<word>::Config cfg_f = cfg_s;
-  cfg_f.fused_scores = true;
-  cfg_f.verbose = true;
-  cheddar::CiBatchAttention<word> attn_f(bctx, swtch.context, small.context,
-                                         lifted.context, cfg_f, tctx);
+                                         lifted.context, cfg_s, tctx);
+  cheddar::CiBatchAttention<word> &attn_f = attn_s;
 
   const int num_slots = attn_s.GetLayout().num_slots;
   bctx->PrepareEvalMod();
@@ -1269,21 +1269,28 @@ TEST(CiBatch, TheFusedScoreBootMatchesTheSerialBoot) {
     boot.context->Copy(q_b[c], q_cts[c]);
   }
 
-  // The serial route: converter return, then the full Boot.
+  // The serial route: converter return, then the full Boot (groups of 16;
+  // the whole T at once OOMs beside the tower tables).
+  attn_s.SetFusedScores(false);
   std::vector<Ciphertext<word>> s_ref;
   attn_s.Scores(s_ref, q_a, k_cts, keys);
   const int ls = boot.param->NPToLevel(s_ref[0].GetNP());
   const double carried_ref = s_ref[0].GetScale() / boot.param->GetScale(ls);
   std::vector<Ciphertext<word>> booted_ref(T);
-  {
-    std::vector<const Ciphertext<word> *> in(T);
-    for (int l = 0; l < T; l++) in[l] = &s_ref[l];
+  for (int l0 = 0; l0 < T; l0 += 16) {
+    const int g = std::min(T - l0, 16);
+    std::vector<const Ciphertext<word> *> in(g);
+    for (int j = 0; j < g; j++) in[j] = &s_ref[l0 + j];
     std::vector<Ciphertext<word>> out;
     bctx->BootBatch(out, in, boot.ui->GetEvkMap());
-    for (int l = 0; l < T; l++) booted_ref[l] = std::move(out[l]);
+    for (int j = 0; j < g; j++) {
+      booted_ref[l0 + j] = std::move(out[j]);
+      s_ref[l0 + j] = Ciphertext<word>();
+    }
   }
 
   // The fused route: the SinC element, HalfBootTower + prefix.
+  attn_f.SetFusedScores(true);
   std::vector<Ciphertext<word>> s_sinc;
   attn_f.Scores(s_sinc, q_b, k_cts, keys);
   const double carried_f = s_sinc[0].GetScale() / boot.param->base_scale_;

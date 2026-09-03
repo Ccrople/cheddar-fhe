@@ -174,6 +174,14 @@ class CiBatchAttention {
   //! Whether the scores' return rides their bootstrap (`Config::
   //! fused_scores` with a tower ring).
   bool FusedScores() const { return cfg_.fused_scores; }
+  //! Flip the fused return at runtime (the A/B of the fused-vs-serial
+  //! diagnostic). Turning it on requires the tower basis to have been built
+  //! at construction (`Config::fused_scores` true then).
+  void SetFusedScores(bool on) {
+    AssertTrue(!on || basis_ != nullptr,
+               "CiBatchAttention: the tower basis was not built");
+    cfg_.fused_scores = on;
+  }
   //! The level the fused score boot lands at (the tower's EvalMod end less
   //! the prefix); asserted equal to the layer boot's own landing in the
   //! constructor, so `SoftMax` reads either path the same.
