@@ -15,6 +15,7 @@
 #include "core/RingSwitch.h"
 #include "extension/BootContext.h"
 #include "extension/CiBatch.h"
+#include "extension/CiSinCBasis.h"
 #include "extension/EvalPoly.h"
 #include "extension/EvalSpecialFFT.h"
 
@@ -115,14 +116,25 @@ class CiBatchAttention {
     int inverse_level = 2;
     double rope_base = 500000.0;  //!< Llama-3's theta
     int converter_baby_steps = 256;
+    //! B512_ccmm_ideas idea [4], the way Doing.md 3.16 fused the leg: the
+    //! SCORES' return conversion is absorbed into their bootstrap. Scores
+    //! then hands back the SwitchBack outputs (the nested SinC element,
+    //! chain scale) and `BootScoresFused` runs `HalfBootTowerBatch` on the
+    //! TOWER ring plus the lane prefix, landing the booted scores at the
+    //! layer's top level with the carried factor in the message -- no
+    //! `SinCToSlot`, no full Boot, one level given back to the chain's
+    //! side. Needs the `tower` BootContext (K = 64, `ci16_35_land17c3e10`,
+    //! its SSE secret tower-sparse). Values' returns keep the converter.
+    bool fused_scores = false;
     bool verbose = false;
   };
 
-  /** @brief The keys one call needs, on three rings. */
+  /** @brief The keys one call needs, on three rings (four when fused). */
   struct Keys {
     const EvkMap<word> *boot = nullptr;    //!< the layer's ring (the shift)
     const EvkMap<word> *swtch = nullptr;   //!< the switching ring
     const EvkMap<word> *lifted = nullptr;  //!< the lifted ordinary ring
+    const EvkMap<word> *tower = nullptr;   //!< the tower ring (fused scores)
     const Evk *ring_switch = nullptr;
     const Evk *inverse_ring_switch = nullptr;
   };
@@ -138,7 +150,8 @@ class CiBatchAttention {
   CiBatchAttention(std::shared_ptr<const BootContext<word>> boot,
                    ConstContextPtr<word> switch_ctx,
                    ConstContextPtr<word> small_ctx,
-                   ConstContextPtr<word> lifted_ctx, const Config &cfg);
+                   ConstContextPtr<word> lifted_ctx, const Config &cfg,
+                   std::shared_ptr<const BootContext<word>> tower = nullptr);
 
   CiBatchAttention(const CiBatchAttention &) = delete;
   CiBatchAttention &operator=(const CiBatchAttention &) = delete;
@@ -157,6 +170,27 @@ class CiBatchAttention {
    * `CHEDDAR_CI_BATCH_CONV_SERIAL`.
    */
   static void SetConvSerial(bool serial);
+
+  //! Whether the scores' return rides their bootstrap (`Config::
+  //! fused_scores` with a tower ring).
+  bool FusedScores() const { return cfg_.fused_scores; }
+  //! The level the fused score boot lands at (the tower's EvalMod end less
+  //! the prefix); asserted equal to the layer boot's own landing in the
+  //! constructor, so `SoftMax` reads either path the same.
+  int GetFusedTopLevel() const {
+    return tower_->GetBootParameter().GetEvalModEndLevel() - 1;
+  }
+  //! The tower ring's rotations (the CtS' and the prefix); fused only.
+  void AddTowerRotations(EvkRequest &req) const;
+  /**
+   * @brief The fused score bootstrap: groups of `group` SinC-form score
+   * ciphertexts (what `Scores` hands back under `fused_scores`) through
+   * `HalfBootTowerBatch` and the lane prefix, landing in slots at
+   * `GetFusedTopLevel()` canonical with the chain's carried factor in the
+   * message, exactly as a `Boot` would have left them. `sinc` is consumed.
+   */
+  void BootScoresFused(std::vector<Ct> &booted, std::vector<Ct> &sinc,
+                       const Keys &keys, int group) const;
 
   //! Rotations on the switching ring: the two converters.
   void AddSwitchRotations(EvkRequest &req) const;
@@ -329,9 +363,11 @@ class CiBatchAttention {
   //! `Return` over a GROUP of columns: the ring switch-backs per column,
   //! then ONE ct-batched inverse conversion. `*res[i]` answers
   //! `parts_list[i]` (consumed). Word for word the loop of `Return` calls.
+  //! `to_slots` false stops after the switch-back (the fused scores' SinC
+  //! form; no inverse conversion).
   void ReturnBatch(const std::vector<Ct *> &res,
-                   std::vector<std::vector<Ct>> &parts_list,
-                   const Keys &keys) const;
+                   std::vector<std::vector<Ct>> &parts_list, const Keys &keys,
+                   bool to_slots = true) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   ConstContextPtr<word> switch_ctx_;
@@ -346,6 +382,9 @@ class CiBatchAttention {
   //! The forward (slots -> SinC) and the inverse converter.
   std::unique_ptr<CiSinCConverter<word>> fwd_;
   std::unique_ptr<CiSinCConverter<word>> inv_;
+  //! The fused scores' tower ring and its basis (CtS' + prefix).
+  std::shared_ptr<const BootContext<word>> tower_;
+  std::unique_ptr<CiSinCBasis<word>> basis_;
 
  public:
   /**

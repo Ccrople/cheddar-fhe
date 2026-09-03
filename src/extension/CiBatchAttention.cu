@@ -22,7 +22,8 @@ template <typename word>
 CiBatchAttention<word>::CiBatchAttention(
     std::shared_ptr<const BootContext<word>> boot,
     ConstContextPtr<word> switch_ctx, ConstContextPtr<word> small_ctx,
-    ConstContextPtr<word> lifted_ctx, const Config &cfg)
+    ConstContextPtr<word> lifted_ctx, const Config &cfg,
+    std::shared_ptr<const BootContext<word>> tower /*= nullptr*/)
     : boot_{std::move(boot)},
       switch_ctx_{std::move(switch_ctx)},
       small_ctx_{std::move(small_ctx)},
@@ -34,7 +35,8 @@ CiBatchAttention<word>::CiBatchAttention(
               chain_.rank},
       switcher_{switch_ctx_, small_ctx_},
       lift_{small_ctx_, lifted_ctx_},
-      ccmm_{lifted_ctx_->param_, lifted_ctx_->ntt_handler_} {
+      ccmm_{lifted_ctx_->param_, lifted_ctx_->ntt_handler_},
+      tower_{std::move(tower)} {
   AssertTrue(boot_->param_.degree_ == switch_ctx_->param_.degree_,
              "CiBatchAttention: the switching ring must have the layer's "
              "degree");
@@ -72,11 +74,96 @@ CiBatchAttention<word>::CiBatchAttention(
       switch_ctx_, cfg_.sub_degree, /*forward_level=*/-1, cfg_.inverse_level,
       &chain_, nullptr, cfg_.converter_baby_steps);
   BuildRope();
+
+  if (cfg_.fused_scores) {
+    // THE FUSED SCORE BOOT (idea [4], the 3.16 pattern): the scores stay in
+    // the nested SinC element after the switch-back, and the tower ring's
+    // HalfBoot -- whose CoeffToSlot is the tower CtS' -- lands their
+    // coordinates in slots; the lane prefix finishes the return. The prefix
+    // folds the inverse of the tower's message ratio (so the scores come
+    // back as a `Boot` would have left them, `carried * m`) and the
+    // plaintext scale that lands them CANONICAL at the layer's top level.
+    AssertTrue(tower_ != nullptr,
+               "CiBatchAttention: fused_scores needs the tower ring's "
+               "BootContext");
+    AssertTrue(tower_->GetStCInputScale() > 0.0 &&
+                   tower_->GetMessageRatio() != 0.0,
+               "CiBatchAttention: PrepareEvalMod must run on the tower ring "
+               "before construction");
+    const auto &tp = tower_->GetBootParameter();
+    const int prefix_out = tp.GetEvalModEndLevel() - 1;
+    AssertTrue(prefix_out == boot_->GetBootParameter().GetEndLevel(),
+               "CiBatchAttention: the fused score boot must land where the "
+               "layer's own Boot does (the softmax is compiled there)");
+    for (int L = 0; L <= prefix_out; L++) {
+      AssertTrue(
+          boot_->param_.GetPrimeVector(boot_->param_.LevelToNP(L)) ==
+              tower_->param_.GetPrimeVector(tower_->param_.LevelToNP(L)),
+          "CiBatchAttention: the tower ring must share the layer ring's "
+          "levels up to the prefix's landing (" + std::to_string(L) + ")");
+    }
+    basis_ = std::make_unique<CiSinCBasis<word>>(
+        switch_ctx_->param_.degree_, small_ctx_->param_.degree_,
+        cfg_.sub_degree);
+    basis_->PrepareCtS(tower_, tp.GetCtSStartLevel(),
+                       layout_.num_slots * tower_->GetCtSConst());
+    const int prefix_level = tp.GetEvalModEndLevel();
+    const double target = boot_->param_.GetScale(prefix_level - 1);
+    const double pt_scale = target *
+                            boot_->param_.GetRescalePrimeProd(prefix_level) /
+                            tower_->GetStCInputScale();
+    basis_->PreparePrefix(tower_, prefix_level,
+                          /*constant=*/1.0 / tower_->GetMessageRatio(),
+                          pt_scale);
+    if (cfg_.verbose) {
+      std::cout << "  [batch] fused scores: the tower CtS' at "
+                << tp.GetCtSStartLevel() << ", the prefix at " << prefix_level
+                << " landing " << prefix_out << " at scale 2^"
+                << std::log2(target) << ", ratio "
+                << tower_->GetMessageRatio() << std::endl;
+    }
+  }
+
   if (cfg_.verbose) {
     std::cout << "  [batch] attention: chain d " << chain_.dim << ", rank "
               << chain_.rank << ", lanes " << chain_.lanes << "; forward @"
               << cfg_.forward_level << ", chain @" << GetChainLevel()
               << ", inverse @" << cfg_.inverse_level << std::endl;
+  }
+}
+
+template <typename word>
+void CiBatchAttention<word>::AddTowerRotations(EvkRequest &req) const {
+  AssertTrue(cfg_.fused_scores,
+             "CiBatchAttention: no tower ring without fused_scores");
+  basis_->AddCtSRotations(req);
+  basis_->AddPrefixRotations(req);
+}
+
+template <typename word>
+void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
+                                             std::vector<Ct> &sinc,
+                                             const Keys &keys,
+                                             int group) const {
+  NvtxScope _nv("batch attn: fused score boot");
+  AssertTrue(cfg_.fused_scores && keys.tower != nullptr,
+             "CiBatchAttention::BootScoresFused: fused_scores and "
+             "Keys::tower");
+  const int T = static_cast<int>(sinc.size());
+  booted.clear();
+  booted.resize(T);
+  const int g_max = Max(group, 1);
+  for (int l0 = 0; l0 < T; l0 += g_max) {
+    const int g = Min(T - l0, g_max);
+    std::vector<const Ct *> xs(g);
+    for (int j = 0; j < g; j++) xs[j] = &sinc[l0 + j];
+    std::vector<Ct> halves;
+    tower_->HalfBootTowerBatch(halves, xs, *keys.tower, *basis_);
+    for (int j = 0; j < g; j++) {
+      sinc[l0 + j] = Ct();
+      basis_->Prefix(booted[l0 + j], halves[j], *keys.tower);
+      halves[j] = Ct();
+    }
   }
 }
 
@@ -279,16 +366,35 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
 template <typename word>
 void CiBatchAttention<word>::ReturnBatch(
     const std::vector<Ct *> &res, std::vector<std::vector<Ct>> &parts_list,
-    const Keys &keys) const {
+    const Keys &keys, bool to_slots /*= true*/) const {
   const int n = static_cast<int>(parts_list.size());
   AssertTrue(static_cast<int>(res.size()) == n,
              "CiBatchAttention::ReturnBatch: outputs disagree with inputs");
   if (conv_serial_ || n == 1) {
-    for (int i = 0; i < n; i++) Return(*res[i], parts_list[i], keys);
+    for (int i = 0; i < n; i++) {
+      if (to_slots) {
+        Return(*res[i], parts_list[i], keys);
+      } else {
+        t_return_.Begin();
+        switcher_.SwitchBack(*res[i], parts_list[i],
+                             *keys.inverse_ring_switch);
+        t_return_.End();
+      }
+      parts_list[i].clear();
+    }
     return;
   }
   NvtxScope _nv("batch attn: return");
   t_return_.Begin();
+  if (!to_slots) {
+    // The fused scores stop in the nested SinC element: switch back only.
+    std::vector<const std::vector<Ct> *> parts_ptrs(n);
+    for (int i = 0; i < n; i++) parts_ptrs[i] = &parts_list[i];
+    switcher_.SwitchBackBatch(res, parts_ptrs, *keys.inverse_ring_switch);
+    for (int i = 0; i < n; i++) parts_list[i].clear();
+    t_return_.End();
+    return;
+  }
   std::vector<Ct> big(n);
   {
     std::vector<Ct *> big_ptrs(n);
@@ -385,7 +491,9 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
         }
         outs[l] = &res[call * (T / 2) + l];
       }
-      ReturnBatch(outs, parts_list, keys);
+      // Fused scores stop at the switch-back (the SinC element goes to
+      // `BootScoresFused`); otherwise the full return to slots.
+      ReturnBatch(outs, parts_list, keys, /*to_slots=*/!cfg_.fused_scores);
     }
   }
 }
@@ -497,7 +605,9 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
         }
         outs[l] = &res[call * (T / 2) + l];
       }
-      ReturnBatch(outs, parts_list, keys);
+      // Fused scores stop at the switch-back (the SinC element goes to
+      // `BootScoresFused`); otherwise the full return to slots.
+      ReturnBatch(outs, parts_list, keys, /*to_slots=*/!cfg_.fused_scores);
     }
   }
 }

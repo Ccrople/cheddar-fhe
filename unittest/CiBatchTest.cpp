@@ -1635,6 +1635,29 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   ASSERT_NE(bctx, nullptr);
 
+  // Idea [4]: the scores' return fused into their bootstrap on the TOWER
+  // ring (K = 64), its SSE secret sampled tower-sparse around ITS Ring only
+  // (the fused return's wrap-around is bounded there; CiModelTest does the
+  // same for the A100 leg).
+  const bool fused_scores = EnvInt("CHEDDAR_CI_BATCH_FUSED_SCORES", 0) != 0;
+  std::unique_ptr<Ring> tower;
+  std::shared_ptr<BootContext<word>> tctx;
+  if (fused_scores) {
+    const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    const std::string saved = prev ? prev : "";
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
+    tower = std::make_unique<Ring>("ci16_35_land17c3e10.json",
+                                   boot.ui->GetSecretCoeffs(), /*slack=*/0);
+    if (prev) {
+      setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+    } else {
+      unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    }
+    tctx = std::dynamic_pointer_cast<BootContext<word>>(tower->context);
+    ASSERT_NE(tctx, nullptr);
+    tctx->PrepareEvalMod();
+  }
+
   auto t0 = Sync();
   cheddar::CiBatchLayer<word>::Config cfg;
   cfg.num_tokens = kTokens;
@@ -1653,9 +1676,10 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   cheddar::CiBatchAttention<word>::Config acfg;
   // y at the attention hold - 1, the projections one below.
   acfg.rope_level = cfg.norm_apply_level_attn - 2;
+  acfg.fused_scores = fused_scores;
   acfg.verbose = true;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
-                                       lifted.context, acfg);
+                                       lifted.context, acfg, tctx);
   bctx->PrepareEvalMod();
   bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
   {
@@ -1681,6 +1705,11 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     cheddar::EvkRequest req;
     attn.AddBootRotations(req);
     boot.ui->PrepareRotationKey(req);
+  }
+  if (fused_scores) {
+    cheddar::EvkRequest req;
+    attn.AddTowerRotations(req);
+    tower->ui->PrepareRotationKey(req);
   }
   auto t1 = Sync();
   std::cout << "  setup (boot tables, three converters, keys): " << std::fixed
@@ -1735,6 +1764,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   akeys.boot = &boot.ui->GetEvkMap();
   akeys.swtch = &swtch.ui->GetEvkMap();
   akeys.lifted = &lifted.ui->GetEvkMap();
+  akeys.tower = fused_scores ? &tower->ui->GetEvkMap() : nullptr;
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
   akeys.inverse_ring_switch =
       &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
@@ -2070,6 +2100,24 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
                   small.ui->GetSecretCoeffs()));
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   ASSERT_NE(bctx, nullptr);
+  const bool fused_scores = EnvInt("CHEDDAR_CI_BATCH_FUSED_SCORES", 0) != 0;
+  std::unique_ptr<Ring> tower;
+  std::shared_ptr<BootContext<word>> tctx;
+  if (fused_scores) {
+    const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    const std::string saved = prev ? prev : "";
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
+    tower = std::make_unique<Ring>("ci16_35_land17c3e10.json",
+                                   boot.ui->GetSecretCoeffs(), /*slack=*/0);
+    if (prev) {
+      setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+    } else {
+      unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    }
+    tctx = std::dynamic_pointer_cast<BootContext<word>>(tower->context);
+    ASSERT_NE(tctx, nullptr);
+    tctx->PrepareEvalMod();
+  }
   auto t0 = Sync();
   cheddar::CiBatchLayer<word>::Config cfg;
   cfg.num_tokens = kTokens;
@@ -2089,9 +2137,10 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.rope_level = cfg.norm_apply_level_attn - 2;
+  acfg.fused_scores = fused_scores;
   acfg.verbose = cfg.verbose;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
-                                       lifted.context, acfg);
+                                       lifted.context, acfg, tctx);
   bctx->PrepareEvalMod();
   bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
   {
@@ -2118,10 +2167,16 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     attn.AddBootRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  if (fused_scores) {
+    cheddar::EvkRequest req;
+    attn.AddTowerRotations(req);
+    tower->ui->PrepareRotationKey(req);
+  }
   cheddar::CiBatchAttention<word>::Keys akeys;
   akeys.boot = &boot.ui->GetEvkMap();
   akeys.swtch = &swtch.ui->GetEvkMap();
   akeys.lifted = &lifted.ui->GetEvkMap();
+  akeys.tower = fused_scores ? &tower->ui->GetEvkMap() : nullptr;
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
   akeys.inverse_ring_switch =
       &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);

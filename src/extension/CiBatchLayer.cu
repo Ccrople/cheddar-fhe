@@ -667,7 +667,13 @@ void CiBatchLayer<word>::Attention(
       // The scores' bootstraps, the chain's factor read off before them.
       t0 = Clock::now();
       const int ls = param.NPToLevel(scores[0].GetNP());
-      const double carried = scores[0].GetScale() / param.GetScale(ls);
+      // Fused (idea [4]): the scores arrive as the nested SinC element and
+      // the tower's HalfBoot reads their level-zero words, so the factor is
+      // against the base scale (as the A100 leg's fused return reads it);
+      // the converter route's is against the level's canonical scale.
+      const double carried =
+          attn.FusedScores() ? scores[0].GetScale() / param.base_scale_
+                             : scores[0].GetScale() / param.GetScale(ls);
       if (!boot_->IsBootPrepared(layout_.num_slots)) {
         NvtxScope _p("batch: prepare boot tables");
         boot_->PrepareEvalSpecialFFT(layout_.num_slots);
@@ -675,7 +681,9 @@ void CiBatchLayer<word>::Attention(
         t0 = Clock::now();
       }
       std::vector<Ct> booted(T);
-      {
+      if (attn.FusedScores()) {
+        attn.BootScoresFused(booted, scores, akeys, BootGroupSize());
+      } else {
         const int group = BootGroupSize();
         for (int l0 = 0; l0 < T; l0 += group) {
           const int g = Min(T - l0, group);
