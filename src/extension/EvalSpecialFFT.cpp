@@ -1839,6 +1839,24 @@ void CiSinCConverter<word>::SinCToSlot(ConstContextPtr<word> context, Ct &res,
 }
 
 template <typename word>
+void CiSinCConverter<word>::SlotToSinCBatch(
+    ConstContextPtr<word> context, const std::vector<Ct *> &res,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  AssertTrue(!forward_.empty(),
+             "CiSinCConverter: the forward direction was not built");
+  forward_.front().EvaluateBatch(context, res, inputs, evk_map);
+}
+
+template <typename word>
+void CiSinCConverter<word>::SinCToSlotBatch(
+    ConstContextPtr<word> context, const std::vector<Ct *> &res,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  AssertTrue(!inverse_.empty(),
+             "CiSinCConverter: the inverse direction was not built");
+  inverse_.front().EvaluateBatch(context, res, inputs, evk_map);
+}
+
+template <typename word>
 void CiSinCConverter<word>::Save(ArchiveWriter &ar) const {
   ar.Tag("cisincconv");
   ar.Pod<int32_t>(sub_degree_);

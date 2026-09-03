@@ -53,6 +53,9 @@ class HoistHandler {
   // The baby steps one ciphertext at a time (`CHEDDAR_HOIST_BS_SERIAL=1`)
   // instead of as one `ModUpBatch` + `BSFusedKernelBatch` group.
   static bool bs_serial_;
+  // `EvaluateBatch` one ciphertext at a time (`CHEDDAR_HOIST_EVAL_SERIAL=1`)
+  // instead of the whole-transform group.
+  static bool eval_serial_;
 
  public:
   /**
@@ -63,6 +66,8 @@ class HoistHandler {
   static void SetGiantStepSerial(bool serial);
   /** @brief The same switch for the batched baby step. */
   static void SetBabyStepSerial(bool serial);
+  /** @brief The same switch for the whole-transform `EvaluateBatch`. */
+  static void SetEvaluateSerial(bool serial);
 
  private:
 
@@ -162,7 +167,25 @@ class HoistHandler {
                            const std::vector<const Ct *> &a_origs,
                            const EvkMap<word> &keys,
                            std::vector<int> &rotations,
-                           const std::vector<const word *> &pseudo_modup) const;
+                           const std::vector<const word *> &pseudo_modup,
+                           const std::vector<word *> *dst_b_override = nullptr,
+                           const std::vector<word *> *dst_a_override =
+                               nullptr) const;
+
+  /**
+   * @brief `EvaluateBabyStepBatch` with every baby step written into ONE
+   * strided arena per baby index instead of per-ciphertext maps:
+   * `arenas[j]` (ordered as `bs_indices_`) holds ciphertext c's b-part at
+   * `c * 2 * total_words` and its a-part `total_words` later, at the
+   * extended (q + aux) basis. The kernels and their order are exactly
+   * `EvaluateBabyStepBatch`'s -- only the destination addresses differ --
+   * so the words are the map form's. Feeds the batched giant step's
+   * `PAccumBatchCt`, whose sources must be strided over the group.
+   */
+  void EvaluateBabyStepBatchArena(ConstContextPtr<word> context,
+                                  std::vector<Dv> &arenas,
+                                  const std::vector<const Ct *> &inputs,
+                                  const EvkMap<word> &evk_map) const;
 
   // evaluation-related methods
   void EvaluateSingleAccum(ConstContextPtr<word> context, Ct &res,
@@ -258,6 +281,28 @@ class HoistHandler {
                              const std::vector<std::map<int, Ct> *> &bs,
                              const std::vector<const Ct *> &inputs,
                              const EvkMap<word> &evk_map) const;
+  /**
+   * @brief The WHOLE transform over a GROUP of ciphertexts at one level and
+   * scale: the group's baby steps as one `EvaluateBabyStepBatchArena`, the
+   * plaintext accumulation as one `PAccumBatchCt` per giant step (the
+   * diagonal table streamed once for the group instead of once per
+   * ciphertext), and every giant key switch of every ciphertext through the
+   * one batched rotate/fold (`GSComplexRotateFoldGroup` -- generic over
+   * accumulator maps, nothing complex about it). Word for word the loop of
+   * `Evaluate` calls: the same kernels per ciphertext, and the modular sums
+   * accumulator by accumulator (order-exact mod p).
+   *
+   * Falls back to the serial loop when the group is 1, the transform is
+   * trivial (single baby or single accumulator), the digit count exceeds
+   * the fused kernel's cap, giant step 0 is absent, the inputs disagree in
+   * level/scale/slots, or `CHEDDAR_HOIST_EVAL_SERIAL=1`. The group is
+   * chunked so the baby arenas stay under `CHEDDAR_HOIST_EVAL_CHUNK_MIB`
+   * (default 24576). No min_ks form; `res[i]` answers `inputs[i]`.
+   */
+  void EvaluateBatch(ConstContextPtr<word> context,
+                     const std::vector<Ct *> &res,
+                     const std::vector<const Ct *> &inputs,
+                     const EvkMap<word> &evk_map) const;
   void EvaluateGiantStep(ConstContextPtr<word> context, Ct &res,
                          const std::map<int, Ct> &bs,
                          const EvkMap<word> &evk_map,

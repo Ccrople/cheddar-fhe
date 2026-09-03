@@ -47,6 +47,7 @@
 #include "extension/CiBatch.h"
 #include "extension/CiBatchAttention.h"
 #include "extension/CiBatchLayer.h"
+#include "extension/Hoist.h"
 
 using word = uint32_t;
 using cheddar::BootContext;
@@ -1040,6 +1041,111 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
               << std::endl;
     EXPECT_LT(er.rms_rel, std::ldexp(1.0, -7)) << "replay " << rep;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 5a'. The ct-batched descend/return (B512_ccmm_ideas idea [2]) against the
+//      serial converter loop, WORD FOR WORD: the same Scores call twice on
+//      the same inputs, once with `HoistHandler::EvaluateBatch` forced to
+//      its serial loop and once batched. Everything around the converters
+//      is deterministic per ciphertext, so any differing word is the
+//      batching's (the arena baby steps, the shared-table PAccum batch, the
+//      grouped rotate/fold).
+TEST(CiBatch, TheBatchedConverterIsWordForWord) {
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  cheddar::CiBatchAttention<word>::Config cfg;
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, cfg);
+  const int chain_level = attn.GetChainLevel();
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = layout.num_instances;
+  const int D = cfg.head_dim;
+  const int T = cfg.num_tokens;
+  std::mt19937_64 gen(0xB512);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+  HostTensor q{B, T, D, {}}, k{B, T, D, {}};
+  q.v.resize(static_cast<size_t>(B) * T * D);
+  k.v.resize(q.v.size());
+  for (auto &v : q.v) v = dist(gen);
+  for (auto &v : k.v) v = dist(gen);
+  std::vector<Ciphertext<word>> q_cts, k_cts;
+  EncryptChannels(boot, layout, q, cfg.rope_level, q_cts);
+  EncryptChannels(boot, layout, k, cfg.rope_level, k_cts);
+
+  cheddar::CiBatchAttention<word>::Keys keys;
+  keys.boot = &boot.ui->GetEvkMap();
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
+  keys.inverse_ring_switch =
+      &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+
+  // Scores consumes Q: one encryption, two device copies.
+  std::vector<Ciphertext<word>> q_a(D), q_b(D);
+  for (int c = 0; c < D; c++) {
+    boot.context->Copy(q_a[c], q_cts[c]);
+    boot.context->Copy(q_b[c], q_cts[c]);
+  }
+
+  std::vector<Ciphertext<word>> s_serial, s_batch;
+  auto t0 = Sync();
+  cheddar::HoistHandler<word>::SetEvaluateSerial(true);
+  attn.Scores(s_serial, q_a, k_cts, keys);
+  auto t1 = Sync();
+  cheddar::HoistHandler<word>::SetEvaluateSerial(false);
+  attn.Scores(s_batch, q_b, k_cts, keys);
+  auto t2 = Sync();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_EQ(s_serial.size(), s_batch.size());
+  std::cout << "  one head's scores, serial " << std::fixed
+            << std::setprecision(2) << Ms(t0, t1) / 1000.0 << " s -> batched "
+            << Ms(t1, t2) / 1000.0 << " s" << std::endl;
+
+  size_t diff = 0, total = 0;
+  for (size_t i = 0; i < s_serial.size(); i++) {
+    EXPECT_EQ(s_serial[i].GetScale(), s_batch[i].GetScale());
+    EXPECT_EQ(s_serial[i].GetNumSlots(), s_batch[i].GetNumSlots());
+    for (int part = 0; part < 2; part++) {
+      const auto &da = part ? s_serial[i].ax_ : s_serial[i].bx_;
+      const auto &db = part ? s_batch[i].ax_ : s_batch[i].bx_;
+      ASSERT_EQ(da.size(), db.size());
+      cheddar::HostVector<word> ha, hb;
+      cheddar::CopyDeviceToHost(ha, da);
+      cheddar::CopyDeviceToHost(hb, db);
+      total += ha.size();
+      for (size_t w = 0; w < ha.size(); w++) diff += (ha[w] != hb[w]);
+    }
+  }
+  std::cout << "  batched vs serial converters: " << diff << " of " << total
+            << " words differ" << std::endl;
+  EXPECT_EQ(diff, 0u);
 }
 
 // ---------------------------------------------------------------------------

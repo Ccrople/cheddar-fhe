@@ -99,6 +99,13 @@ class LinearTransform {
 
   void Evaluate(ConstContextPtr<word> context, Ct &res, const Ct &input,
                 const EvkMap<word> &evk_map, bool min_ks = false) const;
+  /// `HoistHandler::EvaluateBatch` over this transform's handler: the whole
+  /// transform over a group of ciphertexts at one level and scale, word for
+  /// word the loop of `Evaluate` calls. `res[i]` answers `inputs[i]`.
+  void EvaluateBatch(ConstContextPtr<word> context,
+                     const std::vector<Ct *> &res,
+                     const std::vector<const Ct *> &inputs,
+                     const EvkMap<word> &evk_map) const;
 
   /**
    * @brief The two halves of Evaluate, separately.

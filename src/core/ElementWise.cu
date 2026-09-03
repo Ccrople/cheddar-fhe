@@ -1087,6 +1087,16 @@ void ElementWiseHandler<word>::CAccumBatchCt(
 }
 
 template <typename word>
+void ElementWiseHandler<word>::PAccumBatchCt(
+    std::vector<DvView<word>> &dst, const NPInfo &np,
+    const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+    const std::vector<DvConstView<word>> &pt_srcs, int batch,
+    size_t dst_stride, const std::vector<size_t> &src_strides) const {
+  CPAccumWorkerBatch<false>(dst, np, ct_srcs, pt_srcs, batch, dst_stride,
+                            src_strides);
+}
+
+template <typename word>
 uint32_t ElementWiseHandler<word>::PermuteAmountToGaloisFactor(
     int permute_amount) const {
   if (permute_amount == -1) {

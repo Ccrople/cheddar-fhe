@@ -300,9 +300,24 @@ class CiBatchAttention {
   //! switch, the lift. `lifted[g]` is group `g`'s part. `ct` is consumed.
   void Descend(std::vector<Ct> &lifted, Ct &ct, int call,
                const Keys &keys) const;
+  //! `Descend` over a GROUP of channels: the LevelDowns (and the odd call's
+  //! shifts) per channel, then ONE ct-batched forward conversion
+  //! (`CiSinCConverter::SlotToSinCBatch` -- the B512_ccmm_ideas idea [2]:
+  //! the diagonal table streamed once for the group instead of once per
+  //! channel), then the ring switch and lift per channel. `lifted[c][g]` is
+  //! channel c's group-g part; `cts` are consumed. Word for word the loop
+  //! of `Descend` calls; `CHEDDAR_CI_BATCH_CONV_SERIAL=1` is that loop.
+  void DescendBatch(std::vector<std::vector<Ct>> &lifted,
+                    std::vector<Ct> &cts, int call, const Keys &keys) const;
   //! The way back for one column: the `rank` groups' parts (product ring)
   //! switched back into one big ciphertext, then SinC -> slots.
   void Return(Ct &res, const std::vector<Ct> &parts, const Keys &keys) const;
+  //! `Return` over a GROUP of columns: the ring switch-backs per column,
+  //! then ONE ct-batched inverse conversion. `*res[i]` answers
+  //! `parts_list[i]` (consumed). Word for word the loop of `Return` calls.
+  void ReturnBatch(const std::vector<Ct *> &res,
+                   std::vector<std::vector<Ct>> &parts_list,
+                   const Keys &keys) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
   ConstContextPtr<word> switch_ctx_;

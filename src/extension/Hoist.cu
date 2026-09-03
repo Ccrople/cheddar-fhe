@@ -102,6 +102,16 @@ void HoistHandler<word>::SetBabyStepSerial(bool serial) {
   bs_serial_ = serial;
 }
 
+template <typename word>
+bool HoistHandler<word>::eval_serial_ =
+    (std::getenv("CHEDDAR_HOIST_EVAL_SERIAL") != nullptr &&
+     std::getenv("CHEDDAR_HOIST_EVAL_SERIAL")[0] == '1');
+
+template <typename word>
+void HoistHandler<word>::SetEvaluateSerial(bool serial) {
+  eval_serial_ = serial;
+}
+
 namespace kernel {
 
 // Fused kernel for KeyMult, MAC, and Aut in the baby step.
@@ -800,8 +810,14 @@ void HoistHandler<word>::BSFusedKeyMultBatch(
     const std::vector<const word *> &a_modup,
     const std::vector<const Ct *> &a_origs, const EvkMap<word> &keys,
     std::vector<int> &rotations,
-    const std::vector<const word *> &pseudo_modup) const {
-  const int num_cts = static_cast<int>(res.size());
+    const std::vector<const word *> &pseudo_modup,
+    const std::vector<word *> *dst_b_override /*= nullptr*/,
+    const std::vector<word *> *dst_a_override /*= nullptr*/) const {
+  const int num_cts = static_cast<int>(a_origs.size());
+  const bool arena = dst_b_override != nullptr;
+  AssertTrue(arena == (dst_a_override != nullptr) &&
+                 (arena || static_cast<int>(res.size()) == num_cts),
+             "BSFusedKeyMultBatch: destination form mismatch");
   const Ct &a_ref = *a_origs.at(0);
   NPInfo a_orig_np = a_ref.GetNP();
   int num_main = a_orig_np.num_main_;
@@ -829,12 +845,14 @@ void HoistHandler<word>::BSFusedKeyMultBatch(
                  static_cast<int>(a_origs.size()) == num_cts,
              "BSFusedKeyMultBatch: table sizes disagree with the group");
 
-  for (int c = 0; c < num_cts; c++) {
-    for (auto &[_, accum] : *res[c]) {
-      accum.RemoveRx();
-      accum.ModifyNP(np);
-      accum.SetScale(a_origs[c]->GetScale());
-      accum.SetNumSlots(a_origs[c]->GetNumSlots());
+  if (!arena) {
+    for (int c = 0; c < num_cts; c++) {
+      for (auto &[_, accum] : *res[c]) {
+        accum.RemoveRx();
+        accum.ModifyNP(np);
+        accum.SetScale(a_origs[c]->GetScale());
+        accum.SetNumSlots(a_origs[c]->GetNumSlots());
+      }
     }
   }
 
@@ -882,8 +900,15 @@ void HoistHandler<word>::BSFusedKeyMultBatch(
       modup_ptrs[c * num_accum + j] = a_modup[c * num_accum + j];
     }
     for (int i = 0; i < num_rotations; i++) {
-      dst_b_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).bx_.data();
-      dst_a_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).ax_.data();
+      if (arena) {
+        dst_b_ptrs[c * num_rotations + i] =
+            (*dst_b_override)[c * num_rotations + i];
+        dst_a_ptrs[c * num_rotations + i] =
+            (*dst_a_override)[c * num_rotations + i];
+      } else {
+        dst_b_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).bx_.data();
+        dst_a_ptrs[c * num_rotations + i] = res[c]->at(rotations[i]).ax_.data();
+      }
     }
     pseudo_ptrs[c] = pseudo_modup[c];
   }
@@ -1415,6 +1440,295 @@ void HoistHandler<word>::EvaluateBabyStepBatch(
   }
   BSFusedKeyMultBatch(context, bs, modup_ptrs, inputs, evk_map, rotations,
                       pseudo_ptrs);
+}
+
+template <typename word>
+void HoistHandler<word>::EvaluateBabyStepBatchArena(
+    ConstContextPtr<word> context, std::vector<Dv> &arenas,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  // `EvaluateBabyStepBatch`'s body with the destinations redirected into one
+  // strided arena per baby index; every kernel and its order are the map
+  // form's. The caller (`EvaluateBatch`) has already checked the fallback
+  // conditions.
+  const int n = static_cast<int>(inputs.size());
+  NPInfo input_np = inputs[0]->GetNP();
+  const int num_q_primes = input_np.GetNumQ();
+  const int num_p_primes = context->param_.alpha_;
+  const int prime_offset = context->param_.GetMaxNumTer() - input_np.num_ter_;
+  const int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
+  ProfileScope profile_scope("hoist baby step batch");
+  const int degree = context->param_.degree_;
+  const int q_words = num_q_primes * degree;
+  const int ext_words = (num_q_primes + num_p_primes) * degree;
+  const size_t ct_words = static_cast<size_t>(2) * ext_words;
+  auto &mod_switcher = context->mod_switch_handlers_.at(pt_level_);
+
+  // 1. Every a-part gathered, ONE ModUpBatch (as the map form).
+  Dv gathered(static_cast<size_t>(n) * q_words);
+  {
+    HostVector<uint64_t> ptrs(n);
+    for (int i = 0; i < n; i++) {
+      ptrs[i] = reinterpret_cast<uint64_t>(inputs[i]->ax_.data());
+    }
+    DeviceVector<uint64_t> ptrs_dev;
+    CopyHostToDevice(ptrs_dev, ptrs);
+    dim3 block(kernel_block_dim_);
+    dim3 grid(DivCeil(q_words, kernel_block_dim_), 1, n);
+    hoist_kernel::GatherPolys<word><<<grid, block>>>(
+        gathered.data(), q_words,
+        reinterpret_cast<const word *const *>(ptrs_dev.data()));
+  }
+  std::vector<Dv> digits;
+  std::vector<DvView<word>> digit_views;
+  int num_accum = 0;
+  for (int i = 0; i < beta; i++) {
+    const int prime_index_end =
+        Min((i + 1) * num_p_primes, num_q_primes + prime_offset);
+    if (prime_index_end <= prime_offset) {
+      digits.emplace_back(0);
+      digit_views.emplace_back(nullptr, 0, 0);
+      continue;
+    }
+    digits.emplace_back(static_cast<size_t>(n) * ext_words);
+    digit_views.emplace_back(digits.back().data(), n * ext_words,
+                             n * ext_words - q_words);
+    num_accum++;
+  }
+  mod_switcher.ModUpBatch(digit_views, gathered.data(), q_words, n);
+  const int num_accum_offset = beta - num_accum;
+
+  // 2. The arenas, and the pseudo mod-up (the identity baby step's slice
+  // zero-padded above its q part, as the map form's ZeroExtend leaves it).
+  const int num_bs = static_cast<int>(bs_indices_.size());
+  arenas.clear();
+  arenas.reserve(num_bs);
+  for (int j = 0; j < num_bs; j++) {
+    arenas.emplace_back(static_cast<size_t>(n) * ct_words);
+  }
+  DvConstView<word> p_prod_view(context->p_prod_.data() + prime_offset,
+                                num_q_primes);
+  std::vector<Dv> pseudo_tmp;
+  std::vector<const word *> pseudo_ptrs(n);
+  const bool has_bs0 = bs_indices_.find(0) != bs_indices_.end();
+  if (has_bs0) {
+    AssertTrue(*bs_indices_.begin() == 0,
+               "EvaluateBabyStepBatchArena: baby 0 must come first");
+    Dv &b0 = arenas.front();
+    cudaMemsetAsync(b0.data(), 0, static_cast<size_t>(n) * ct_words *
+                                      sizeof(word), cudaStreamLegacy);
+    for (int c = 0; c < n; c++) {
+      word *bx = b0.data() + static_cast<size_t>(c) * ct_words;
+      word *ax = bx + ext_words;
+      DvView<word> bx_view(bx, q_words, 0);
+      DvView<word> ax_view(ax, q_words, 0);
+      mod_switcher.PseudoModUp(bx_view, inputs[c]->BxConstView(), p_prod_view);
+      mod_switcher.PseudoModUp(ax_view, inputs[c]->AxConstView(), p_prod_view);
+      pseudo_ptrs[c] = bx;
+    }
+  } else {
+    pseudo_tmp.reserve(n);
+    for (int c = 0; c < n; c++) {
+      pseudo_tmp.emplace_back(q_words);
+      Dv &pm = pseudo_tmp.back();
+      DvView<word> pm_view = pm.View();
+      mod_switcher.PseudoModUp(pm_view, inputs[c]->BxConstView(), p_prod_view);
+      pm.ZeroExtend(num_p_primes * degree);
+      pseudo_ptrs[c] = pm.data();
+    }
+  }
+
+  // 3. One fused KeyMult+MAC+Aut kernel, its destinations the arena slices.
+  std::vector<int> rotations;
+  std::vector<Dv *> rot_arena;
+  {
+    int j = 0;
+    for (const auto &bs_idx : bs_indices_) {
+      if (bs_idx != 0) {
+        rotations.push_back(bs_idx);
+        rot_arena.push_back(&arenas[j]);
+      }
+      j++;
+    }
+  }
+  const int num_rotations = static_cast<int>(rotations.size());
+  std::vector<const word *> modup_ptrs(static_cast<size_t>(n) * num_accum);
+  std::vector<word *> dst_b(static_cast<size_t>(n) * num_rotations);
+  std::vector<word *> dst_a(static_cast<size_t>(n) * num_rotations);
+  for (int c = 0; c < n; c++) {
+    for (int j = 0; j < num_accum; j++) {
+      modup_ptrs[static_cast<size_t>(c) * num_accum + j] =
+          digits[j + num_accum_offset].data() +
+          static_cast<size_t>(c) * ext_words;
+    }
+    for (int i = 0; i < num_rotations; i++) {
+      word *bx = rot_arena[i]->data() + static_cast<size_t>(c) * ct_words;
+      dst_b[static_cast<size_t>(c) * num_rotations + i] = bx;
+      dst_a[static_cast<size_t>(c) * num_rotations + i] = bx + ext_words;
+    }
+  }
+  BSFusedKeyMultBatch(context, {}, modup_ptrs, inputs, evk_map, rotations,
+                      pseudo_ptrs, &dst_b, &dst_a);
+}
+
+template <typename word>
+void HoistHandler<word>::EvaluateBatch(ConstContextPtr<word> context,
+                                       const std::vector<Ct *> &res,
+                                       const std::vector<const Ct *> &inputs,
+                                       const EvkMap<word> &evk_map) const {
+  const int n = static_cast<int>(inputs.size());
+  AssertTrue(static_cast<int>(res.size()) == n && n > 0,
+             "EvaluateBatch: outputs disagree with inputs");
+  const NPInfo input_np = inputs[0]->GetNP();
+  const int num_q_primes = input_np.GetNumQ();
+  const int num_p_primes = context->param_.alpha_;
+  const int prime_offset = context->param_.GetMaxNumTer() - input_np.num_ter_;
+  const int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
+  const int degree = context->param_.degree_;
+
+  bool group_ok =
+      n > 1 && !eval_serial_ && !bs_serial_ && kFuseBSKeyMult &&
+      num_q_primes == context->param_.LevelToNP(pt_level_).GetNumQ() &&
+      beta <= (1 << max_log_beta_) &&
+      !(bs_indices_.size() == 1 && *bs_indices_.begin() == 0) &&
+      !(gs_indices_.size() == 1 && gs_indices_.front() == 0) &&
+      !gs_indices_.empty() && gs_indices_.front() == 0 &&
+      hoist_pt_map_.find(0) != hoist_pt_map_.end();
+  for (int i = 0; group_ok && i < n; i++) {
+    const NPInfo np_i = inputs[i]->GetNP();
+    group_ok = np_i.num_main_ == input_np.num_main_ &&
+               np_i.num_ter_ == input_np.num_ter_ && np_i.num_aux_ == 0 &&
+               !inputs[i]->HasRx() &&
+               inputs[i]->GetScale() == inputs[0]->GetScale() &&
+               inputs[i]->GetNumSlots() == inputs[0]->GetNumSlots();
+  }
+  if (!group_ok) {
+    for (int i = 0; i < n; i++) {
+      Evaluate(context, *res[i], *inputs[i], evk_map, false);
+    }
+    return;
+  }
+  NvtxScope _nv("hoist evaluate batch");
+
+  const int ext_words = (num_q_primes + num_p_primes) * degree;
+  const size_t ct_words = static_cast<size_t>(2) * ext_words;
+  const NPInfo ext_np(input_np.num_main_, input_np.num_ter_, num_p_primes,
+                      degree);
+  const int input_num_slots = inputs[0]->GetNumSlots();
+  const double input_scale = inputs[0]->GetScale();
+
+  // The baby arenas are the transient: chunk the group under the cap.
+  static const size_t cap_bytes = [] {
+    const char *env = std::getenv("CHEDDAR_HOIST_EVAL_CHUNK_MIB");
+    const long value = (env != nullptr) ? std::atol(env) : 0;
+    return static_cast<size_t>(value > 0 ? value : 24576) << 20;
+  }();
+  const size_t per_ct_bytes = bs_indices_.size() * ct_words * sizeof(word);
+  const int chunk = Max(
+      1, static_cast<int>(Min(static_cast<size_t>(n),
+                              cap_bytes / Max(per_ct_bytes, size_t{1}))));
+
+  for (int c0 = 0; c0 < n; c0 += chunk) {
+    const int width = Min(n - c0, chunk);
+    if (width == 1) {
+      Evaluate(context, *res[c0], *inputs[c0], evk_map, false);
+      continue;
+    }
+    std::vector<const Ct *> chunk_inputs(inputs.begin() + c0,
+                                         inputs.begin() + c0 + width);
+
+    // 1. The group's baby steps, strided per baby index.
+    std::vector<Dv> baby_arenas;
+    EvaluateBabyStepBatchArena(context, baby_arenas, chunk_inputs, evk_map);
+
+    // The baby index -> arena position map for the per-gs source lists.
+    std::map<int, int> arena_of;
+    {
+      int j = 0;
+      for (const auto &bs_idx : bs_indices_) arena_of[bs_idx] = j++;
+    }
+
+    // 2. One batched plaintext accumulation per giant step: the diagonal
+    // table is shared by the group (`PAccumBatchCt` runs the serial
+    // launches with gridDim.z = width).
+    const int aux_words = num_p_primes * degree;
+    std::vector<Dv> accum_arenas;
+    std::vector<int> accum_gs;
+    std::vector<double> accum_scale;
+    std::vector<int> accum_slots;
+    {
+      NvtxScope _p("hoist paccum batch");
+      for (const auto &[gs_idx, pt_map] : hoist_pt_map_) {
+        std::vector<std::vector<DvConstView<word>>> ct_srcs;
+        std::vector<DvConstView<word>> pt_srcs;
+        std::vector<size_t> src_strides;
+        double scale = 0.0;
+        int num_slots = 0;
+        bool first = true;
+        for (const auto &[bs_idx, pt] : pt_map) {
+          const Dv &arena = baby_arenas.at(arena_of.at(bs_idx));
+          ct_srcs.push_back(
+              {DvConstView<word>(arena.data(), ext_words, aux_words),
+               DvConstView<word>(arena.data() + ext_words, ext_words,
+                                 aux_words)});
+          pt_srcs.push_back(pt.ConstView());
+          src_strides.push_back(ct_words);
+          if (first) {
+            scale = input_scale * pt.GetScale();
+            first = false;
+          } else {
+            context->AssertSameScale(scale, input_scale * pt.GetScale());
+          }
+          num_slots = Max(num_slots, pt.GetNumSlots(), input_num_slots);
+        }
+        accum_arenas.emplace_back(static_cast<size_t>(width) * ct_words);
+        Dv &dst_arena = accum_arenas.back();
+        std::vector<DvView<word>> dst_views = {
+            DvView<word>(dst_arena.data(), ext_words, aux_words),
+            DvView<word>(dst_arena.data() + ext_words, ext_words, aux_words)};
+        context->elem_handler_.PAccumBatchCt(dst_views, ext_np, ct_srcs,
+                                             pt_srcs, width, ct_words,
+                                             src_strides);
+        accum_gs.push_back(gs_idx);
+        accum_scale.push_back(scale);
+        accum_slots.push_back(num_slots);
+      }
+    }
+    baby_arenas.clear();
+
+    // 3. The accumulators into per-ciphertext maps for the batched
+    // rotate/fold (contiguous slices; plain device copies).
+    std::vector<std::map<int, Ct>> accum(width);
+    for (int c = 0; c < width; c++) {
+      for (size_t g = 0; g < accum_gs.size(); g++) {
+        auto [it, _] = accum[c].try_emplace(accum_gs[g], ext_np);
+        Ct &ct = it->second;
+        ct.SetScale(accum_scale[g]);
+        ct.SetNumSlots(accum_slots[g]);
+        const word *src =
+            accum_arenas[g].data() + static_cast<size_t>(c) * ct_words;
+        cudaMemcpyAsync(ct.bx_.data(), src,
+                        static_cast<size_t>(ext_words) * sizeof(word),
+                        cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+        cudaMemcpyAsync(ct.ax_.data(), src + ext_words,
+                        static_cast<size_t>(ext_words) * sizeof(word),
+                        cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+      }
+    }
+    accum_arenas.clear();
+
+    // 4. Every giant key switch of every ciphertext through the one batched
+    // rotate/fold, then the per-ciphertext folds and final mod-down.
+    std::vector<std::map<int, Ct> *> maps;
+    std::vector<Ct *> outs;
+    maps.reserve(width);
+    outs.reserve(width);
+    for (int c = 0; c < width; c++) {
+      maps.push_back(&accum[c]);
+      outs.push_back(res[c0 + c]);
+    }
+    GSComplexRotateFoldGroup(context, *this, maps, outs, evk_map,
+                             input_num_slots, input_scale);
+  }
 }
 
 // 3. Giant-step accumulation and rotations

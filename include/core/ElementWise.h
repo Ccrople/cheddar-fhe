@@ -175,6 +175,16 @@ class ElementWiseHandler {
                      const std::vector<DvConstView<word>> &const_srcs,
                      int batch, size_t dst_stride,
                      const std::vector<size_t> &src_strides) const;
+  // PAccum over a batch: per ciphertext b of the batch,
+  // dst_b = sum_k pt_k * ct_srcs[k]_b, the plaintexts SHARED across the
+  // batch. The serial worker's launches with gridDim.z = batch (the same
+  // chunking, source order and kernels), so the words are the serial
+  // PAccum's per ciphertext.
+  void PAccumBatchCt(std::vector<DvView<word>> &dst, const NPInfo &np,
+                     const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+                     const std::vector<DvConstView<word>> &pt_srcs, int batch,
+                     size_t dst_stride,
+                     const std::vector<size_t> &src_strides) const;
 
   // ----- Batched key switching (Cmt, and anything else that switches many
   // ciphertexts with many keys at one level) ----- //

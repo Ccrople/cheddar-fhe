@@ -486,6 +486,18 @@ class CiSinCConverter {
                   const EvkMap<word> &evk_map) const;
   void SinCToSlot(ConstContextPtr<word> context, Ct &res, const Ct &input,
                   const EvkMap<word> &evk_map) const;
+
+  /// The conversions over a GROUP of ciphertexts at one level and scale
+  /// through `LinearTransform::EvaluateBatch` -- word for word the loop of
+  /// the serial calls. `res[i]` answers `inputs[i]`.
+  void SlotToSinCBatch(ConstContextPtr<word> context,
+                       const std::vector<Ct *> &res,
+                       const std::vector<const Ct *> &inputs,
+                       const EvkMap<word> &evk_map) const;
+  void SinCToSlotBatch(ConstContextPtr<word> context,
+                       const std::vector<Ct *> &res,
+                       const std::vector<const Ct *> &inputs,
+                       const EvkMap<word> &evk_map) const;
 };
 
 }  // namespace cheddar

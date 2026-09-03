@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -198,6 +199,99 @@ void CiBatchAttention<word>::Return(Ct &res, const std::vector<Ct> &parts,
   t_return_.End();
 }
 
+namespace {
+bool BatchConvSerial() {
+  static const bool serial = [] {
+    const char *env = std::getenv("CHEDDAR_CI_BATCH_CONV_SERIAL");
+    return env != nullptr && env[0] == '1';
+  }();
+  return serial;
+}
+}  // namespace
+
+template <typename word>
+void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
+                                          std::vector<Ct> &cts, int call,
+                                          const Keys &keys) const {
+  const int n = static_cast<int>(cts.size());
+  lifted.clear();
+  lifted.resize(n);
+  if (BatchConvSerial() || n == 1) {
+    for (int c = 0; c < n; c++) Descend(lifted[c], cts[c], call, keys);
+    return;
+  }
+  NvtxScope _nv("batch attn: descend");
+  t_descend_.Begin();
+  // The per-channel prologue: LevelDown, and the odd call's key-token shift.
+  std::vector<Ct> down(n);
+  for (int c = 0; c < n; c++) {
+    boot_->LevelDown(down[c], cts[c], cfg_.forward_level);
+    cts[c] = Ct();
+    if (call == 1) {
+      AssertTrue(keys.boot != nullptr,
+                 "CiBatchAttention::DescendBatch: the shift needs Keys::boot");
+      const int r = GetShiftRotation();
+      Ct shifted;
+      boot_->HRot(shifted, down[c], keys.boot->GetRotationKey(r), r);
+      down[c] = std::move(shifted);
+    }
+  }
+  // ONE ct-batched forward conversion over the group.
+  std::vector<Ct> sinc(n);
+  {
+    std::vector<Ct *> outs(n);
+    std::vector<const Ct *> ins(n);
+    for (int c = 0; c < n; c++) {
+      outs[c] = &sinc[c];
+      ins[c] = &down[c];
+    }
+    fwd_->SlotToSinCBatch(switch_ctx_, outs, ins, *keys.swtch);
+  }
+  down.clear();
+  // The per-channel epilogue: the ring switch and the lifts.
+  for (int c = 0; c < n; c++) {
+    std::vector<Ct> parts;
+    switcher_.Switch(parts, sinc[c], *keys.ring_switch);
+    sinc[c] = Ct();
+    AssertTrue(static_cast<int>(parts.size()) == chain_.rank,
+               "CiBatchAttention::DescendBatch: the switch returned the "
+               "wrong number of parts");
+    lifted[c].resize(chain_.rank);
+    for (int g = 0; g < chain_.rank; g++) lift_.Lift(lifted[c][g], parts[g]);
+  }
+  t_descend_.End();
+}
+
+template <typename word>
+void CiBatchAttention<word>::ReturnBatch(
+    const std::vector<Ct *> &res, std::vector<std::vector<Ct>> &parts_list,
+    const Keys &keys) const {
+  const int n = static_cast<int>(parts_list.size());
+  AssertTrue(static_cast<int>(res.size()) == n,
+             "CiBatchAttention::ReturnBatch: outputs disagree with inputs");
+  if (BatchConvSerial() || n == 1) {
+    for (int i = 0; i < n; i++) Return(*res[i], parts_list[i], keys);
+    return;
+  }
+  NvtxScope _nv("batch attn: return");
+  t_return_.Begin();
+  std::vector<Ct> big(n);
+  for (int i = 0; i < n; i++) {
+    switcher_.SwitchBack(big[i], parts_list[i], *keys.inverse_ring_switch);
+    parts_list[i].clear();
+  }
+  {
+    std::vector<Ct *> outs(n);
+    std::vector<const Ct *> ins(n);
+    for (int i = 0; i < n; i++) {
+      outs[i] = res[i];
+      ins[i] = &big[i];
+    }
+    inv_->SinCToSlotBatch(switch_ctx_, outs, ins, *keys.swtch);
+  }
+  t_return_.End();
+}
+
 template <typename word>
 void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
                                     const std::vector<Ct> &k,
@@ -217,10 +311,13 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
   // ring. lq[g][c] is group g's column c of the lhs.
   Rope(q, -1);
   std::vector<std::vector<Ct>> lq(rank);
-  for (int c = 0; c < D; c++) {
-    std::vector<Ct> parts;
-    Descend(parts, q[c], -1, keys);
-    for (int g = 0; g < rank; g++) lq[g].push_back(std::move(parts[g]));
+  {
+    std::vector<std::vector<Ct>> lifted;
+    DescendBatch(lifted, q, -1, keys);
+    for (int g = 0; g < rank; g++) lq[g].resize(D);
+    for (int c = 0; c < D; c++) {
+      for (int g = 0; g < rank; g++) lq[g][c] = std::move(lifted[c][g]);
+    }
   }
 
   res.clear();
@@ -232,10 +329,13 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
     for (int c = 0; c < D; c++) boot_->Copy(kc[c], k[c]);
     Rope(kc, call);
     std::vector<std::vector<Ct>> lk(rank);
-    for (int c = 0; c < D; c++) {
-      std::vector<Ct> parts;
-      Descend(parts, kc[c], call, keys);
-      for (int g = 0; g < rank; g++) lk[g].push_back(std::move(parts[g]));
+    {
+      std::vector<std::vector<Ct>> lifted;
+      DescendBatch(lifted, kc, call, keys);
+      for (int g = 0; g < rank; g++) lk[g].resize(D);
+      for (int c = 0; c < D; c++) {
+        for (int g = 0; g < rank; g++) lk[g][c] = std::move(lifted[c][g]);
+      }
     }
     // Per group: the elided Algorithm 4, the live half of its columns
     // descended to the product ring.
@@ -254,10 +354,17 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
     }
     // Per key token: the groups' parts back into one big ciphertext and
     // into slots.
-    for (int l = 0; l < T / 2; l++) {
-      std::vector<Ct> parts(rank);
-      for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][l]);
-      Return(res[call * (T / 2) + l], parts, keys);
+    {
+      std::vector<std::vector<Ct>> parts_list(T / 2);
+      std::vector<Ct *> outs(T / 2);
+      for (int l = 0; l < T / 2; l++) {
+        parts_list[l].resize(rank);
+        for (int g = 0; g < rank; g++) {
+          parts_list[l][g] = std::move(out[g][l]);
+        }
+        outs[l] = &res[call * (T / 2) + l];
+      }
+      ReturnBatch(outs, parts_list, keys);
     }
   }
 }
@@ -285,22 +392,31 @@ void CiBatchAttention<word>::DescendKV(DescendedKV &dkv,
     Rope(kc, call);
     auto &lk = dkv.lk[call];
     lk.resize(rank);
-    for (int c = 0; c < D; c++) {
-      std::vector<Ct> parts;
-      Descend(parts, kc[c], call, keys);
-      for (int g = 0; g < rank; g++) lk[g].push_back(std::move(parts[g]));
+    {
+      std::vector<std::vector<Ct>> lifted;
+      DescendBatch(lifted, kc, call, keys);
+      for (int g = 0; g < rank; g++) lk[g].resize(D);
+      for (int c = 0; c < D; c++) {
+        for (int g = 0; g < rank; g++) lk[g][c] = std::move(lifted[c][g]);
+      }
     }
     // V with the call's key tokens kept, shifted down for the odd call by
     // the converter's premap -- what Values' call loop does.
     auto &lv = dkv.lv[call];
     lv.resize(rank);
-    for (int c = 0; c < D; c++) {
-      Ct masked, t;
-      boot_->Mult(t, v[c], call_mask_[call]);
-      boot_->Rescale(masked, t);
-      std::vector<Ct> parts;
-      Descend(parts, masked, call, keys);
-      for (int g = 0; g < rank; g++) lv[g].push_back(std::move(parts[g]));
+    {
+      std::vector<Ct> masked(D);
+      for (int c = 0; c < D; c++) {
+        Ct t;
+        boot_->Mult(t, v[c], call_mask_[call]);
+        boot_->Rescale(masked[c], t);
+      }
+      std::vector<std::vector<Ct>> lifted;
+      DescendBatch(lifted, masked, call, keys);
+      for (int g = 0; g < rank; g++) lv[g].resize(D);
+      for (int c = 0; c < D; c++) {
+        for (int g = 0; g < rank; g++) lv[g][c] = std::move(lifted[c][g]);
+      }
     }
   }
 }
@@ -324,10 +440,13 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
 
   Rope(q, -1);
   std::vector<std::vector<Ct>> lq(rank);
-  for (int c = 0; c < D; c++) {
-    std::vector<Ct> parts;
-    Descend(parts, q[c], -1, keys);
-    for (int g = 0; g < rank; g++) lq[g].push_back(std::move(parts[g]));
+  {
+    std::vector<std::vector<Ct>> lifted;
+    DescendBatch(lifted, q, -1, keys);
+    for (int g = 0; g < rank; g++) lq[g].resize(D);
+    for (int c = 0; c < D; c++) {
+      for (int g = 0; g < rank; g++) lq[g][c] = std::move(lifted[c][g]);
+    }
   }
 
   res.clear();
@@ -347,10 +466,17 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
       for (int l = 0; l < T / 2; l++) lift_.Descend(out[g][l], prod[l]);
       t_lift_descend_.End();
     }
-    for (int l = 0; l < T / 2; l++) {
-      std::vector<Ct> parts(rank);
-      for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][l]);
-      Return(res[call * (T / 2) + l], parts, keys);
+    {
+      std::vector<std::vector<Ct>> parts_list(T / 2);
+      std::vector<Ct *> outs(T / 2);
+      for (int l = 0; l < T / 2; l++) {
+        parts_list[l].resize(rank);
+        for (int g = 0; g < rank; g++) {
+          parts_list[l][g] = std::move(out[g][l]);
+        }
+        outs[l] = &res[call * (T / 2) + l];
+      }
+      ReturnBatch(outs, parts_list, keys);
     }
   }
 }
@@ -372,10 +498,13 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
              "CiBatchAttention::Values: P must be at forward_level");
 
   std::vector<std::vector<Ct>> lp(rank);
-  for (int l = 0; l < T; l++) {
-    std::vector<Ct> parts;
-    Descend(parts, P[l], -1, keys);
-    for (int g = 0; g < rank; g++) lp[g].push_back(std::move(parts[g]));
+  {
+    std::vector<std::vector<Ct>> lifted;
+    DescendBatch(lifted, P, -1, keys);
+    for (int g = 0; g < rank; g++) lp[g].resize(T);
+    for (int l = 0; l < T; l++) {
+      for (int g = 0; g < rank; g++) lp[g][l] = std::move(lifted[l][g]);
+    }
   }
 
   std::vector<std::vector<Ct>> out(rank);
@@ -412,10 +541,15 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
   }
   res.clear();
   res.resize(D);
-  for (int c = 0; c < D; c++) {
-    std::vector<Ct> parts(rank);
-    for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][c]);
-    Return(res[c], parts, keys);
+  {
+    std::vector<std::vector<Ct>> parts_list(D);
+    std::vector<Ct *> outs(D);
+    for (int c = 0; c < D; c++) {
+      parts_list[c].resize(rank);
+      for (int g = 0; g < rank; g++) parts_list[c][g] = std::move(out[g][c]);
+      outs[c] = &res[c];
+    }
+    ReturnBatch(outs, parts_list, keys);
   }
 }
 
@@ -740,10 +874,13 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
 
   // P's descent: lp[g][l] is group g's column l (key token).
   std::vector<std::vector<Ct>> lp(rank);
-  for (int l = 0; l < T; l++) {
-    std::vector<Ct> parts;
-    Descend(parts, P[l], -1, keys);
-    for (int g = 0; g < rank; g++) lp[g].push_back(std::move(parts[g]));
+  {
+    std::vector<std::vector<Ct>> lifted;
+    DescendBatch(lifted, P, -1, keys);
+    for (int g = 0; g < rank; g++) lp[g].resize(T);
+    for (int l = 0; l < T; l++) {
+      for (int g = 0; g < rank; g++) lp[g][l] = std::move(lifted[l][g]);
+    }
   }
 
   // out[g][c]: the product's column c on the product ring, summed over the
@@ -754,13 +891,19 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
     // V with the call's key tokens kept, shifted down for the odd call by
     // the converter's premap, down to its parts.
     std::vector<std::vector<Ct>> lv(rank);
-    for (int c = 0; c < D; c++) {
-      Ct masked, t;
-      boot_->Mult(t, v[c], call_mask_[call]);
-      boot_->Rescale(masked, t);
-      std::vector<Ct> parts;
-      Descend(parts, masked, call, keys);
-      for (int g = 0; g < rank; g++) lv[g].push_back(std::move(parts[g]));
+    {
+      std::vector<Ct> masked(D);
+      for (int c = 0; c < D; c++) {
+        Ct t;
+        boot_->Mult(t, v[c], call_mask_[call]);
+        boot_->Rescale(masked[c], t);
+      }
+      std::vector<std::vector<Ct>> lifted;
+      DescendBatch(lifted, masked, call, keys);
+      for (int g = 0; g < rank; g++) lv[g].resize(D);
+      for (int c = 0; c < D; c++) {
+        for (int g = 0; g < rank; g++) lv[g][c] = std::move(lifted[c][g]);
+      }
     }
     for (int g = 0; g < rank; g++) {
       // The contract's lhs: P's key tokens of this call as columns 0..63,
@@ -794,10 +937,15 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
   // Per channel: the groups' parts back into one big ciphertext, to slots.
   res.clear();
   res.resize(D);
-  for (int c = 0; c < D; c++) {
-    std::vector<Ct> parts(rank);
-    for (int g = 0; g < rank; g++) parts[g] = std::move(out[g][c]);
-    Return(res[c], parts, keys);
+  {
+    std::vector<std::vector<Ct>> parts_list(D);
+    std::vector<Ct *> outs(D);
+    for (int c = 0; c < D; c++) {
+      parts_list[c].resize(rank);
+      for (int g = 0; g < rank; g++) parts_list[c][g] = std::move(out[g][c]);
+      outs[c] = &res[c];
+    }
+    ReturnBatch(outs, parts_list, keys);
   }
 }
 
