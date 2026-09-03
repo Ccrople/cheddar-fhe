@@ -192,12 +192,11 @@ class CiBatchAttention {
                "CiBatchAttention: the tower basis was not built");
     cfg_.fused_scores = on;
   }
-  //! The level the fused score boot lands at (the tower's EvalMod end less
-  //! the prefix); asserted equal to the layer boot's own landing in the
-  //! constructor, so `SoftMax` reads either path the same.
-  int GetFusedTopLevel() const {
-    return tower_->GetBootParameter().GetEvalModEndLevel() - 1;
-  }
+  //! The level the fused score boot lands at: the LAYER boot's own landing
+  //! (the prefix runs one level above it; a tower whose EvalMod ends
+  //! higher is LevelDowned to the prefix's entry first), so `SoftMax`
+  //! reads either path the same.
+  int GetFusedTopLevel() const { return GetTopLevel(); }
   //! The tower ring's rotations (the CtS' and the prefix); fused only.
   void AddTowerRotations(EvkRequest &req) const;
   /**

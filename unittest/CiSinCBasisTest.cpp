@@ -289,8 +289,8 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
                    ph);
   // Land the prefix at a FIXED favorable scale (2^50) rather than the
   // default input-preserving one: the default falls out of the ladder's
-  // EvalMod scale recursion (2^51.9 on land18c4e10, 2^34.75 on
-  // land16c4e10), and at ~2^35 the key-switch noise (~2^24.5 raw,
+  // EvalMod scale recursion (2^51.9 on land18c4e10, 2^34.75 on the
+  // junction L16 probe), and at ~2^35 the key-switch noise (~2^24.5 raw,
   // scale-blind) reads as ~2^-7 -- ladder luck, not arithmetic. The layer
   // path lands canonical (~2^35) on EVERY pair, so its quality gate is
   // the fused-vs-serial diagnostic, not this bar.
@@ -400,8 +400,7 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CiSinCBasisTest,
-    testing::Values("ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json",
-                    "ci16_35_land16c4e10.json"),
+    testing::Values("ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json"),
     [](const testing::TestParamInfo<CiSinCBasisTest::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

@@ -94,10 +94,16 @@ CiBatchAttention<word>::CiBatchAttention(
                "CiBatchAttention: PrepareEvalMod must run on the tower ring "
                "before construction");
     const auto &tp = tower_->GetBootParameter();
-    const int prefix_out = tp.GetEvalModEndLevel() - 1;
-    AssertTrue(prefix_out == boot_->GetBootParameter().GetEndLevel(),
-               "CiBatchAttention: the fused score boot must land where the "
-               "layer's own Boot does (the softmax is compiled there)");
+    // The prefix lands where the LAYER's own Boot does (the softmax is
+    // compiled there). A tower whose EvalMod ends ABOVE that landing is
+    // fine: the HalfBootTower output is LevelDowned (exact) to the
+    // prefix's entry first -- so a landing-15 layer rides the SHIPPED
+    // land17c3e10 tower rather than a junction L16 ladder (whose EvalMod
+    // measured 2^-7 against land17's 2^-15.5, Doing 7.36).
+    const int prefix_out = boot_->GetBootParameter().GetEndLevel();
+    AssertTrue(prefix_out + 1 <= tp.GetEvalModEndLevel(),
+               "CiBatchAttention: the tower's EvalMod ends below the layer "
+               "boot's landing -- the prefix cannot reach it");
     for (int L = 0; L <= prefix_out; L++) {
       AssertTrue(
           boot_->param_.GetPrimeVector(boot_->param_.LevelToNP(L)) ==
@@ -110,7 +116,7 @@ CiBatchAttention<word>::CiBatchAttention(
         cfg_.sub_degree);
     basis_->PrepareCtS(tower_, tp.GetCtSStartLevel(),
                        layout_.num_slots * tower_->GetCtSConst());
-    const int prefix_level = tp.GetEvalModEndLevel();
+    const int prefix_level = prefix_out + 1;
     const double target = boot_->param_.GetScale(prefix_level - 1);
     const double pt_scale = target *
                             boot_->param_.GetRescalePrimeProd(prefix_level) /
@@ -170,8 +176,7 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
                  "CiBatchAttention::BootScoresFused: the chain's carried "
                  "factor moved between calls -- the scale walk is expected "
                  "deterministic");
-      const auto &tp = tower_->GetBootParameter();
-      const int prefix_level = tp.GetEvalModEndLevel();
+      const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
       const double target = boot_->param_.GetScale(prefix_level - 1);
       const double pt_scale =
           target * boot_->param_.GetRescalePrimeProd(prefix_level) /
@@ -198,8 +203,16 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
     for (int j = 0; j < g; j++) xs[j] = &sinc[l0 + j];
     std::vector<Ct> halves;
     tower_->HalfBootTowerBatch(halves, xs, *keys.tower, *basis_);
+    const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
     for (int j = 0; j < g; j++) {
       sinc[l0 + j] = Ct();
+      // A tower whose EvalMod ends above the prefix's entry: the exact
+      // LevelDown first (the declared-scale offset is preserved).
+      if (tower_->param_.NPToLevel(halves[j].GetNP()) > prefix_level) {
+        Ct down;
+        tower_->LevelDown(down, halves[j], prefix_level);
+        halves[j] = std::move(down);
+      }
       basis_->Prefix(booted[l0 + j], halves[j], *keys.tower);
       halves[j] = Ct();
     }
