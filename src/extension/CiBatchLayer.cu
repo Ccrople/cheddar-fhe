@@ -798,6 +798,11 @@ void CiBatchLayer<word>::Attention(
               << " s, softmax " << stages_.softmax << " s, values "
               << stages_.values << " s, o " << stages_.o << " s, total "
               << stages_.total << " s" << std::endl;
+    const auto ph = attn.GetPhaseSeconds();
+    std::cout << "  [batch] attn phases (device s, cumulative): descend "
+              << ph.descend << ", multiply " << ph.multiply
+              << ", lift.descend " << ph.lift_descend << ", return "
+              << ph.ret << std::endl;
   }
 }
 

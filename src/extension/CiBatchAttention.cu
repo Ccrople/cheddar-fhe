@@ -157,6 +157,7 @@ template <typename word>
 void CiBatchAttention<word>::Descend(std::vector<Ct> &lifted, Ct &ct,
                                      int call, const Keys &keys) const {
   NvtxScope _nv("batch attn: descend");
+  t_descend_.Begin();
   // On the LAYER's Context: the switching ring shares ci16_35's levels
   // 0..4 only, and a channel arrives above them.
   Ct down;
@@ -183,15 +184,18 @@ void CiBatchAttention<word>::Descend(std::vector<Ct> &lifted, Ct &ct,
   lifted.clear();
   lifted.resize(chain_.rank);
   for (int g = 0; g < chain_.rank; g++) lift_.Lift(lifted[g], parts[g]);
+  t_descend_.End();
 }
 
 template <typename word>
 void CiBatchAttention<word>::Return(Ct &res, const std::vector<Ct> &parts,
                                     const Keys &keys) const {
   NvtxScope _nv("batch attn: return");
+  t_return_.Begin();
   Ct big;
   switcher_.SwitchBack(big, parts, *keys.inverse_ring_switch);
   inv_->SinCToSlot(switch_ctx_, res, big, *keys.swtch);
+  t_return_.End();
 }
 
 template <typename word>
@@ -238,11 +242,15 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
     std::vector<std::vector<Ct>> out(rank);
     for (int g = 0; g < rank; g++) {
       std::vector<Ct> prod;
+      t_mult_.Begin();
       ccmm_.Multiply(lifted_ctx_, prod, lq[g], lk[g], 2 * cfg_.sub_degree,
                      *keys.lifted, /*rhs_row_wise=*/true);
+      t_mult_.End();
       lk[g].clear();
       out[g].resize(T / 2);
+      t_lift_descend_.Begin();
       for (int l = 0; l < T / 2; l++) lift_.Descend(out[g][l], prod[l]);
+      t_lift_descend_.End();
     }
     // Per key token: the groups' parts back into one big ciphertext and
     // into slots.
@@ -330,10 +338,14 @@ void CiBatchAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
     std::vector<std::vector<Ct>> out(rank);
     for (int g = 0; g < rank; g++) {
       std::vector<Ct> prod;
+      t_mult_.Begin();
       ccmm_.Multiply(lifted_ctx_, prod, lq[g], lk[g], 2 * cfg_.sub_degree,
                      *keys.lifted, /*rhs_row_wise=*/true);
+      t_mult_.End();
       out[g].resize(T / 2);
+      t_lift_descend_.Begin();
       for (int l = 0; l < T / 2; l++) lift_.Descend(out[g][l], prod[l]);
+      t_lift_descend_.End();
     }
     for (int l = 0; l < T / 2; l++) {
       std::vector<Ct> parts(rank);
@@ -380,8 +392,11 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
       ZeroLifted(zeros, lhs[0], T - half);
       for (auto &z : zeros) lhs.push_back(std::move(z));
       std::vector<Ct> prod;
+      t_mult_.Begin();
       ccmm_.Multiply(lifted_ctx_, prod, lhs, lv[g], 2 * cfg_.sub_degree,
                      *keys.lifted, /*rhs_row_wise=*/false);
+      t_mult_.End();
+      t_lift_descend_.Begin();
       if (call == 0) {
         out[g].resize(D);
         for (int c = 0; c < D; c++) lift_.Descend(out[g][c], prod[c]);
@@ -392,6 +407,7 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
           small_ctx_->Add(out[g][c], out[g][c], part);
         }
       }
+      t_lift_descend_.End();
     }
   }
   res.clear();
@@ -756,9 +772,12 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
       ZeroLifted(zeros, lhs[0], T - half);
       for (auto &z : zeros) lhs.push_back(std::move(z));
       std::vector<Ct> prod;
+      t_mult_.Begin();
       ccmm_.Multiply(lifted_ctx_, prod, lhs, lv[g], 2 * cfg_.sub_degree,
                      *keys.lifted, /*rhs_row_wise=*/false);
+      t_mult_.End();
       lv[g].clear();
+      t_lift_descend_.Begin();
       if (call == 0) {
         out[g].resize(D);
         for (int c = 0; c < D; c++) lift_.Descend(out[g][c], prod[c]);
@@ -769,6 +788,7 @@ void CiBatchAttention<word>::Values(std::vector<Ct> &res, std::vector<Ct> &P,
           small_ctx_->Add(out[g][c], out[g][c], part);
         }
       }
+      t_lift_descend_.End();
     }
   }
   // Per channel: the groups' parts back into one big ciphertext, to slots.

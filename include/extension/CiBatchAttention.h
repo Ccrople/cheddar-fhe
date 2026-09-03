@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "common/GpuTimer.h"
 #include "core/BatchCcmm.h"
 #include "core/CiLift.h"
 #include "core/CiSwitchedCcmm.h"
@@ -197,6 +198,21 @@ class CiBatchAttention {
   void Values(std::vector<Ct> &res, std::vector<Ct> &P,
               const DescendedKV &dkv, const Keys &keys) const;
 
+  /**
+   * @brief Device seconds of the four CC-MM phases since construction
+   * (`EventSpanTimer` brackets, resolved here): the slot -> lifted descent,
+   * Algorithm 4's product, the product's drop to the small ring, and the
+   * way back to slots. The B512_ccmm_ideas step-0 attribution without a
+   * profiler.
+   */
+  struct PhaseSeconds {
+    double descend, multiply, lift_descend, ret;
+  };
+  PhaseSeconds GetPhaseSeconds() const {
+    return {t_descend_.Seconds(), t_mult_.Seconds(),
+            t_lift_descend_.Seconds(), t_return_.Seconds()};
+  }
+
   /** @brief What the softmax walk needs to know about the data, in CHAIN
    * units: the raw scores times the factor the Q and K weights carried
    * (`cq * ck`). */
@@ -334,6 +350,8 @@ class CiBatchAttention {
   //! RoPE's per-token plaintexts at `rope_level`: [mask][pair], mask 0 =
   //! every token (Q), 1 / 2 = the key-token halves (K's two calls).
   std::vector<Pt> rope_cos_[3], rope_sin_[3];
+  //! The phase ledger (`GetPhaseSeconds`).
+  mutable EventSpanTimer t_descend_, t_mult_, t_lift_descend_, t_return_;
 };
 
 }  // namespace cheddar
