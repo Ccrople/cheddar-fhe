@@ -207,10 +207,16 @@ class CiBatchAttention {
    */
   struct PhaseSeconds {
     double descend, multiply, lift_descend, ret;
+    //! descend's split: the LevelDown/shift prologue, the batched forward
+    //! conversion, the ring switch, the lifts (batched path only; the
+    //! serial A/B leaves them zero).
+    double desc_pre, desc_conv, desc_switch, desc_lift;
   };
   PhaseSeconds GetPhaseSeconds() const {
-    return {t_descend_.Seconds(), t_mult_.Seconds(),
-            t_lift_descend_.Seconds(), t_return_.Seconds()};
+    return {t_descend_.Seconds(),     t_mult_.Seconds(),
+            t_lift_descend_.Seconds(), t_return_.Seconds(),
+            t_desc_pre_.Seconds(),    t_desc_conv_.Seconds(),
+            t_desc_switch_.Seconds(), t_desc_lift_.Seconds()};
   }
 
   /** @brief What the softmax walk needs to know about the data, in CHAIN
@@ -367,6 +373,8 @@ class CiBatchAttention {
   std::vector<Pt> rope_cos_[3], rope_sin_[3];
   //! The phase ledger (`GetPhaseSeconds`).
   mutable EventSpanTimer t_descend_, t_mult_, t_lift_descend_, t_return_;
+  mutable EventSpanTimer t_desc_pre_, t_desc_conv_, t_desc_switch_,
+      t_desc_lift_;
 };
 
 }  // namespace cheddar

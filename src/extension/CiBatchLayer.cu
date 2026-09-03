@@ -803,6 +803,9 @@ void CiBatchLayer<word>::Attention(
               << ph.descend << ", multiply " << ph.multiply
               << ", lift.descend " << ph.lift_descend << ", return "
               << ph.ret << std::endl;
+    std::cout << "  [batch] descend split: pre " << ph.desc_pre
+              << ", convert " << ph.desc_conv << ", switch "
+              << ph.desc_switch << ", lift " << ph.desc_lift << std::endl;
   }
 }
 

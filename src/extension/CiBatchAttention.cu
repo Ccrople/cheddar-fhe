@@ -223,6 +223,7 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
   NvtxScope _nv("batch attn: descend");
   t_descend_.Begin();
   // The per-channel prologue: LevelDown, and the odd call's key-token shift.
+  t_desc_pre_.Begin();
   std::vector<Ct> down(n);
   for (int c = 0; c < n; c++) {
     boot_->LevelDown(down[c], cts[c], cfg_.forward_level);
@@ -236,7 +237,9 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
       down[c] = std::move(shifted);
     }
   }
+  t_desc_pre_.End();
   // ONE ct-batched forward conversion over the group.
+  t_desc_conv_.Begin();
   std::vector<Ct> sinc(n);
   {
     std::vector<Ct *> outs(n);
@@ -248,16 +251,21 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
     fwd_->SlotToSinCBatch(switch_ctx_, outs, ins, *keys.swtch);
   }
   down.clear();
+  t_desc_conv_.End();
   // The per-channel epilogue: the ring switch and the lifts.
   for (int c = 0; c < n; c++) {
+    t_desc_switch_.Begin();
     std::vector<Ct> parts;
     switcher_.Switch(parts, sinc[c], *keys.ring_switch);
     sinc[c] = Ct();
+    t_desc_switch_.End();
     AssertTrue(static_cast<int>(parts.size()) == chain_.rank,
                "CiBatchAttention::DescendBatch: the switch returned the "
                "wrong number of parts");
+    t_desc_lift_.Begin();
     lifted[c].resize(chain_.rank);
     for (int g = 0; g < chain_.rank; g++) lift_.Lift(lifted[c][g], parts[g]);
+    t_desc_lift_.End();
   }
   t_descend_.End();
 }

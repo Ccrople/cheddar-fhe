@@ -1119,14 +1119,25 @@ TEST(CiBatch, TheBatchedConverterIsWordForWord) {
   cheddar::HoistHandler<word>::SetEvaluateSerial(true);
   attn.Scores(s_serial, q_a, k_cts, keys);
   auto t1 = Sync();
+  const auto ph0 = attn.GetPhaseSeconds();
   cheddar::HoistHandler<word>::SetEvaluateSerial(false);
   attn.Scores(s_batch, q_b, k_cts, keys);
   auto t2 = Sync();
+  const auto ph1 = attn.GetPhaseSeconds();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   ASSERT_EQ(s_serial.size(), s_batch.size());
   std::cout << "  one head's scores, serial " << std::fixed
             << std::setprecision(2) << Ms(t0, t1) / 1000.0 << " s -> batched "
             << Ms(t1, t2) / 1000.0 << " s" << std::endl;
+  std::cout << "  batched call's phases (device s): descend "
+            << ph1.descend - ph0.descend << " (pre "
+            << ph1.desc_pre - ph0.desc_pre << ", convert "
+            << ph1.desc_conv - ph0.desc_conv << ", switch "
+            << ph1.desc_switch - ph0.desc_switch << ", lift "
+            << ph1.desc_lift - ph0.desc_lift << "), multiply "
+            << ph1.multiply - ph0.multiply << ", lift.descend "
+            << ph1.lift_descend - ph0.lift_descend << ", return "
+            << ph1.ret - ph0.ret << std::endl;
 
   size_t diff = 0, total = 0;
   for (size_t i = 0; i < s_serial.size(); i++) {
