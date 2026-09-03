@@ -106,6 +106,21 @@ class RingSwitchHandler {
   void Switch(std::vector<Ct> &res, const Ct &ct, const Evk &swk) const;
 
   /**
+   * @brief `Switch` over a GROUP of ciphertexts at one level (conjugate-
+   * invariant ring only; other cases loop the serial call): the key
+   * switches as ONE `Context::MultKeyBatch` (one key repeated -- the
+   * mod-up, key multiply and mod-down each run once over the group), the
+   * INTTs per ciphertext, the component scan as ONE kernel over
+   * (ciphertext, limb, chain) -- the serial scan launches a SINGLE block
+   * of `limbs * (rank/2 + 1)` threads, so the group is also what finally
+   * fills the card -- and the small-ring NTTs per part. Per-ciphertext
+   * arithmetic is exactly the serial call's, so the words are too.
+   * `res[i]` answers `cts[i]`; `CHEDDAR_RING_SWITCH_SERIAL=1` is the loop.
+   */
+  void SwitchBatch(std::vector<std::vector<Ct>> &res,
+                   const std::vector<const Ct *> &cts, const Evk &swk) const;
+
+  /**
    * @brief The way back: recompose `rank` degree-N' ciphertexts into one at
    * degree N.
    *
@@ -123,6 +138,19 @@ class RingSwitchHandler {
    * UserInterface::PrepareInverseRingSwitchKey on the big Context
    */
   void SwitchBack(Ct &res, const std::vector<Ct> &parts, const Evk &swk) const;
+
+  /**
+   * @brief `SwitchBack` over a GROUP of part-sets at one level (conjugate-
+   * invariant ring only; other cases loop the serial call): the small-ring
+   * INTTs per part, the recomposition as ONE kernel over the group, the
+   * big-ring NTTs per ciphertext, and the key switches off the subring
+   * secret as ONE `Context::MultKeyBatch` with the one key repeated.
+   * `*res[i]` answers `*parts[i]`; word for word the loop of `SwitchBack`
+   * calls.
+   */
+  void SwitchBackBatch(const std::vector<Ct *> &res,
+                       const std::vector<const std::vector<Ct> *> &parts,
+                       const Evk &swk) const;
 };
 
 }  // namespace cheddar

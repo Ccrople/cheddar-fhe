@@ -199,15 +199,15 @@ void CiBatchAttention<word>::Return(Ct &res, const std::vector<Ct> &parts,
   t_return_.End();
 }
 
-namespace {
-bool BatchConvSerial() {
-  static const bool serial = [] {
-    const char *env = std::getenv("CHEDDAR_CI_BATCH_CONV_SERIAL");
-    return env != nullptr && env[0] == '1';
-  }();
-  return serial;
+template <typename word>
+bool CiBatchAttention<word>::conv_serial_ =
+    (std::getenv("CHEDDAR_CI_BATCH_CONV_SERIAL") != nullptr &&
+     std::getenv("CHEDDAR_CI_BATCH_CONV_SERIAL")[0] == '1');
+
+template <typename word>
+void CiBatchAttention<word>::SetConvSerial(bool serial) {
+  conv_serial_ = serial;
 }
-}  // namespace
 
 template <typename word>
 void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
@@ -216,7 +216,7 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
   const int n = static_cast<int>(cts.size());
   lifted.clear();
   lifted.resize(n);
-  if (BatchConvSerial() || n == 1) {
+  if (conv_serial_ || n == 1) {
     for (int c = 0; c < n; c++) Descend(lifted[c], cts[c], call, keys);
     return;
   }
@@ -252,21 +252,27 @@ void CiBatchAttention<word>::DescendBatch(std::vector<std::vector<Ct>> &lifted,
   }
   down.clear();
   t_desc_conv_.End();
-  // The per-channel epilogue: the ring switch and the lifts.
+  // The ring switches as one batched group, then the lifts per part.
+  t_desc_switch_.Begin();
+  std::vector<std::vector<Ct>> parts_all;
+  {
+    std::vector<const Ct *> sinc_ptrs(n);
+    for (int c = 0; c < n; c++) sinc_ptrs[c] = &sinc[c];
+    switcher_.SwitchBatch(parts_all, sinc_ptrs, *keys.ring_switch);
+  }
+  sinc.clear();
+  t_desc_switch_.End();
+  t_desc_lift_.Begin();
   for (int c = 0; c < n; c++) {
-    t_desc_switch_.Begin();
-    std::vector<Ct> parts;
-    switcher_.Switch(parts, sinc[c], *keys.ring_switch);
-    sinc[c] = Ct();
-    t_desc_switch_.End();
-    AssertTrue(static_cast<int>(parts.size()) == chain_.rank,
+    AssertTrue(static_cast<int>(parts_all[c].size()) == chain_.rank,
                "CiBatchAttention::DescendBatch: the switch returned the "
                "wrong number of parts");
-    t_desc_lift_.Begin();
     lifted[c].resize(chain_.rank);
-    for (int g = 0; g < chain_.rank; g++) lift_.Lift(lifted[c][g], parts[g]);
-    t_desc_lift_.End();
+    for (int g = 0; g < chain_.rank; g++) {
+      lift_.Lift(lifted[c][g], parts_all[c][g]);
+    }
   }
+  t_desc_lift_.End();
   t_descend_.End();
 }
 
@@ -277,17 +283,24 @@ void CiBatchAttention<word>::ReturnBatch(
   const int n = static_cast<int>(parts_list.size());
   AssertTrue(static_cast<int>(res.size()) == n,
              "CiBatchAttention::ReturnBatch: outputs disagree with inputs");
-  if (BatchConvSerial() || n == 1) {
+  if (conv_serial_ || n == 1) {
     for (int i = 0; i < n; i++) Return(*res[i], parts_list[i], keys);
     return;
   }
   NvtxScope _nv("batch attn: return");
   t_return_.Begin();
   std::vector<Ct> big(n);
-  for (int i = 0; i < n; i++) {
-    switcher_.SwitchBack(big[i], parts_list[i], *keys.inverse_ring_switch);
-    parts_list[i].clear();
+  {
+    std::vector<Ct *> big_ptrs(n);
+    std::vector<const std::vector<Ct> *> parts_ptrs(n);
+    for (int i = 0; i < n; i++) {
+      big_ptrs[i] = &big[i];
+      parts_ptrs[i] = &parts_list[i];
+    }
+    switcher_.SwitchBackBatch(big_ptrs, parts_ptrs,
+                              *keys.inverse_ring_switch);
   }
+  for (int i = 0; i < n; i++) parts_list[i].clear();
   {
     std::vector<Ct *> outs(n);
     std::vector<const Ct *> ins(n);

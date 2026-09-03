@@ -150,6 +150,14 @@ class CiBatchAttention {
   //! The level a product's output lands at, in slots.
   int GetOutputLevel() const { return cfg_.inverse_level - 1; }
 
+  /**
+   * @brief Run every descend/return group through the old per-channel loop
+   * (serial converter, serial ring switch) instead of the ct-batched path;
+   * the A/B of `CiBatch.TheBatchedConverterIsWordForWord`. Initialised from
+   * `CHEDDAR_CI_BATCH_CONV_SERIAL`.
+   */
+  static void SetConvSerial(bool serial);
+
   //! Rotations on the switching ring: the two converters.
   void AddSwitchRotations(EvkRequest &req) const;
   //! Rotations on the layer's ring: the key-token shift of the second
@@ -375,6 +383,7 @@ class CiBatchAttention {
   mutable EventSpanTimer t_descend_, t_mult_, t_lift_descend_, t_return_;
   mutable EventSpanTimer t_desc_pre_, t_desc_conv_, t_desc_switch_,
       t_desc_lift_;
+  static bool conv_serial_;
 };
 
 }  // namespace cheddar

@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
@@ -118,7 +120,104 @@ __global__ void CiRingSwitchRecompose(word *dst, const word *const *src_ptrs,
   dst[limb * degree + x] = value;
 }
 
+// One polynomial per blockIdx.z gathered into a strided buffer (the batch
+// key switch wants b then a back to back per ciphertext).
+template <typename word>
+__global__ void RingSwitchGatherPoly(word *dst, int words,
+                                     const word *const *src_ptrs) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int z = blockIdx.z;
+  if (i < words) {
+    dst[static_cast<size_t>(z) * words + i] =
+        basic::StreamingLoad(src_ptrs[z] + i);
+  }
+}
+
+// `CiRingSwitchScan` over a GROUP of ciphertexts: one thread per
+// (ciphertext, limb, chain), the per-(limb, chain) walk exactly the serial
+// kernel's. The serial launch is a single block of `limbs * (rank/2 + 1)`
+// threads; the group is what fills the card.
+template <typename word>
+__global__ void CiRingSwitchScanBatch(word *const *dst_ptrs,
+                                      const word *const *src_ptrs,
+                                      const word *primes, int rank,
+                                      int small_degree, int degree,
+                                      int num_limbs, int num_cts) {
+  const int num_chains = rank / 2 + 1;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= num_cts * num_limbs * num_chains) return;
+  const int ct = tid / (num_limbs * num_chains);
+  const int rem = tid - ct * (num_limbs * num_chains);
+  const int limb = rem / num_chains;
+  const int chain = rem - limb * num_chains;
+
+  const word *src_limb = src_ptrs[ct] + limb * degree;
+  word *const *dst_ct = dst_ptrs + static_cast<size_t>(ct) * rank;
+
+  if (chain == 0) {
+    word *dst = dst_ct[0] + limb * small_degree;
+    for (int t = 0; t < small_degree; t++) {
+      dst[t] = basic::StreamingLoad(src_limb + t * rank);
+    }
+    return;
+  }
+
+  const word prime = basic::StreamingLoadConst(primes + limb);
+  const int i = chain;
+  const int mi = rank - chain;
+  word *dst_i = dst_ct[i] + limb * small_degree;
+  word *dst_m = dst_ct[mi] + limb * small_degree;
+
+  word acc_i = 0;
+  word acc_m = 0;
+  for (int t = small_degree - 1; t >= 0; t--) {
+    const word vi = basic::StreamingLoad(src_limb + t * rank + i);
+    const word vm = basic::StreamingLoad(src_limb + t * rank + mi);
+    const word new_i = basic::Sub(vi, acc_m, prime);
+    const word new_m = basic::Sub(vm, acc_i, prime);
+    dst_i[t] = new_i;
+    dst_m[t] = new_m;
+    acc_i = new_i;
+    acc_m = new_m;
+  }
+}
+
+// `CiRingSwitchRecompose` over a GROUP: blockIdx.z picks the ciphertext.
+template <typename word>
+__global__ void CiRingSwitchRecomposeBatch(word *dst, size_t dst_ct_stride,
+                                           const word *const *src_ptrs,
+                                           const word *primes, int log_rank,
+                                           int small_degree, int degree) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int limb = blockIdx.y;
+  const int ct = blockIdx.z;
+
+  const int rank = 1 << log_rank;
+  const int i = x & (rank - 1);
+  const int t = x >> log_rank;
+  const word *const *src_ct = src_ptrs + static_cast<size_t>(ct) * rank;
+
+  word value = basic::StreamingLoad(src_ct[i] + limb * small_degree + t);
+  if (i != 0 && t + 1 < small_degree) {
+    const word prime = basic::StreamingLoadConst(primes + limb);
+    const word mirror =
+        basic::StreamingLoad(src_ct[rank - i] + limb * small_degree + t + 1);
+    value = basic::Add(value, mirror, prime);
+  }
+  dst[ct * dst_ct_stride + limb * degree + x] = value;
+}
+
 }  // namespace kernel
+
+namespace {
+bool RingSwitchSerial() {
+  static const bool serial = [] {
+    const char *env = std::getenv("CHEDDAR_RING_SWITCH_SERIAL");
+    return env != nullptr && env[0] == '1';
+  }();
+  return serial;
+}
+}  // namespace
 
 template <typename word>
 RingSwitchHandler<word>::RingSwitchHandler(ConstContextPtr<word> big,
@@ -261,6 +360,136 @@ void RingSwitchHandler<word>::Switch(std::vector<Ct> &res, const Ct &ct,
 }
 
 template <typename word>
+void RingSwitchHandler<word>::SwitchBatch(std::vector<std::vector<Ct>> &res,
+                                          const std::vector<const Ct *> &cts,
+                                          const Evk &swk) const {
+  const int n = static_cast<int>(cts.size());
+  res.clear();
+  res.resize(n);
+  if (RingSwitchSerial() || n == 1 || !big_->param_.conjugate_invariant_) {
+    for (int c = 0; c < n; c++) Switch(res[c], *cts[c], swk);
+    return;
+  }
+  const int degree = big_->param_.degree_;
+  const int small_degree = small_->param_.degree_;
+  const NPInfo np = cts[0]->GetNP();
+  AssertTrue(np.num_aux_ == 0, "RingSwitch: aux primes are not supported");
+  AssertTrue(np.degree_ == degree,
+             "RingSwitch: input does not belong to the big ring");
+  for (int c = 0; c < n; c++) {
+    AssertTrue(cts[c]->GetNP() == np && !cts[c]->HasRx(),
+               "RingSwitch::SwitchBatch: the group's inputs disagree");
+  }
+  const int level = big_->param_.NPToLevel(np);
+  AssertTrue(level >= 0, "RingSwitch: input is not at a valid level");
+  const int num_total_primes = np.GetNumTotal();
+  const size_t q_words = static_cast<size_t>(num_total_primes) * degree;
+  const size_t ct_words = 2 * q_words;
+
+  // 1. The group's key switches as ONE MultKeyBatch with the one key: the
+  // (b, a) parts gathered back to back per ciphertext.
+  DeviceVector<word> switched(static_cast<size_t>(n) * ct_words);
+  {
+    HostVector<const word *> h_ptrs(2 * n);
+    for (int c = 0; c < n; c++) {
+      h_ptrs[2 * c] = cts[c]->bx_.data();
+      h_ptrs[2 * c + 1] = cts[c]->ax_.data();
+    }
+    DeviceVector<const word *> d_ptrs(2 * n);
+    CopyHostToDevice(d_ptrs, h_ptrs);
+    DeviceVector<word> src_buf(static_cast<size_t>(n) * ct_words);
+    dim3 grid(DivCeil(static_cast<int>(q_words), kernel_block_dim_), 1,
+              2 * n);
+    kernel::RingSwitchGatherPoly<word><<<grid, kernel_block_dim_>>>(
+        src_buf.data(), static_cast<int>(q_words), d_ptrs.data());
+    std::vector<const Evk *> keys(n, &swk);
+    big_->MultKeyBatch(switched.data(), static_cast<int>(ct_words),
+                       src_buf.data(), static_cast<int>(ct_words), np, keys,
+                       n);
+  }
+
+  // 2. Leave the NTT domain, per ciphertext (the same INTT calls).
+  DeviceVector<word> a_coeffs(static_cast<size_t>(n) * q_words);
+  DeviceVector<word> b_coeffs(static_cast<size_t>(n) * q_words);
+  for (int c = 0; c < n; c++) {
+    DvView<word> a_view(a_coeffs.data() + c * q_words,
+                        static_cast<int>(q_words), 0);
+    DvView<word> b_view(b_coeffs.data() + c * q_words,
+                        static_cast<int>(q_words), 0);
+    DvConstView<word> bx_src(switched.data() + c * ct_words,
+                             static_cast<int>(q_words), 0);
+    DvConstView<word> ax_src(switched.data() + c * ct_words + q_words,
+                             static_cast<int>(q_words), 0);
+    big_->ntt_handler_.INTT(a_view, np, ax_src);
+    big_->ntt_handler_.INTT(b_view, np, bx_src);
+  }
+
+  const NPInfo small_np = small_->param_.LevelToNP(level);
+  const size_t sp_words = static_cast<size_t>(num_total_primes) * small_degree;
+  for (int c = 0; c < n; c++) {
+    res[c].resize(rank_);
+    for (auto &r : res[c]) {
+      r.RemoveRx();
+      r.ModifyNP(small_np);
+      r.SetNumSlots(small_->param_.MaxNumSlots());
+      r.SetScale(cts[c]->GetScale());
+    }
+  }
+
+  // 3. The component scan, ONE kernel over (ciphertext, limb, chain), into
+  // scratch (the NTT below needs distinct source and destination).
+  DeviceVector<word> gathered_a(static_cast<size_t>(n) * rank_ * sp_words);
+  DeviceVector<word> gathered_b(static_cast<size_t>(n) * rank_ * sp_words);
+  {
+    HostVector<word *> h_dst(2 * static_cast<size_t>(n) * rank_);
+    HostVector<const word *> h_src(2 * n);
+    for (int c = 0; c < n; c++) {
+      for (int i = 0; i < rank_; i++) {
+        h_dst[static_cast<size_t>(c) * rank_ + i] =
+            gathered_a.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words;
+        h_dst[static_cast<size_t>(n) * rank_ +
+              static_cast<size_t>(c) * rank_ + i] =
+            gathered_b.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words;
+      }
+      h_src[c] = a_coeffs.data() + c * q_words;
+      h_src[n + c] = b_coeffs.data() + c * q_words;
+    }
+    DeviceVector<word *> d_dst(2 * static_cast<size_t>(n) * rank_);
+    DeviceVector<const word *> d_src(2 * n);
+    CopyHostToDevice(d_dst, h_dst);
+    CopyHostToDevice(d_src, h_src);
+    const word *primes = big_->param_.GetPrimesPtr(np);
+    constexpr int scan_block_dim = 128;
+    const int num_chains = rank_ / 2 + 1;
+    const int scan_grid_dim =
+        DivCeil(n * num_total_primes * num_chains, scan_block_dim);
+    kernel::CiRingSwitchScanBatch<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_dst.data(), d_src.data(), primes, rank_, small_degree, degree,
+        num_total_primes, n);
+    kernel::CiRingSwitchScanBatch<word><<<scan_grid_dim, scan_block_dim>>>(
+        d_dst.data() + static_cast<size_t>(n) * rank_,
+        d_src.data() + n, primes, rank_, small_degree, degree,
+        num_total_primes, n);
+  }
+
+  // 4. Back into the NTT domain at the small degree, per part.
+  for (int c = 0; c < n; c++) {
+    for (int i = 0; i < rank_; i++) {
+      auto ax_view = res[c][i].AxView();
+      auto bx_view = res[c][i].BxView();
+      DvConstView<word> a_src(
+          gathered_a.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words,
+          static_cast<int>(sp_words), 0);
+      DvConstView<word> b_src(
+          gathered_b.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words,
+          static_cast<int>(sp_words), 0);
+      small_->ntt_handler_.NTT(ax_view, small_np, a_src, true);
+      small_->ntt_handler_.NTT(bx_view, small_np, b_src, true);
+    }
+  }
+}
+
+template <typename word>
 void RingSwitchHandler<word>::SwitchBack(Ct &res, const std::vector<Ct> &parts,
                                          const Evk &swk) const {
   const int degree = big_->param_.degree_;
@@ -341,6 +570,127 @@ void RingSwitchHandler<word>::SwitchBack(Ct &res, const std::vector<Ct> &parts,
 
   // 4. One key switch off the subring secret.
   big_->MultKey(res, recomposed, swk);
+}
+
+template <typename word>
+void RingSwitchHandler<word>::SwitchBackBatch(
+    const std::vector<Ct *> &res,
+    const std::vector<const std::vector<Ct> *> &parts, const Evk &swk) const {
+  const int n = static_cast<int>(parts.size());
+  AssertTrue(static_cast<int>(res.size()) == n,
+             "RingSwitch::SwitchBackBatch: outputs disagree with inputs");
+  if (RingSwitchSerial() || n == 1 || !big_->param_.conjugate_invariant_) {
+    for (int c = 0; c < n; c++) SwitchBack(*res[c], *parts[c], swk);
+    return;
+  }
+  const int degree = big_->param_.degree_;
+  const int small_degree = small_->param_.degree_;
+  const NPInfo small_np = parts[0]->at(0).GetNP();
+  AssertTrue(small_np.num_aux_ == 0,
+             "RingSwitch::SwitchBack: aux primes are not supported");
+  AssertTrue(small_np.degree_ == small_degree,
+             "RingSwitch::SwitchBack: inputs do not belong to the small ring");
+  for (int c = 0; c < n; c++) {
+    AssertTrue(static_cast<int>(parts[c]->size()) == rank_,
+               "RingSwitch::SwitchBack: expected exactly rank ciphertexts");
+    for (const auto &p : *parts[c]) {
+      AssertTrue(p.GetNP() == small_np && !p.HasRx(),
+                 "RingSwitch::SwitchBackBatch: the group's inputs disagree");
+    }
+  }
+  const int level = small_->param_.NPToLevel(small_np);
+  AssertTrue(level >= 0, "RingSwitch::SwitchBack: inputs are not at a valid "
+                         "level");
+  const int num_total_primes = small_np.GetNumTotal();
+  const size_t sp_words = static_cast<size_t>(num_total_primes) * small_degree;
+  const size_t q_words = static_cast<size_t>(num_total_primes) * degree;
+  const size_t ct_words = 2 * q_words;
+
+  // 1. Leave the NTT domain at the small degree, per part.
+  DeviceVector<word> a_coeffs(static_cast<size_t>(n) * rank_ * sp_words);
+  DeviceVector<word> b_coeffs(static_cast<size_t>(n) * rank_ * sp_words);
+  for (int c = 0; c < n; c++) {
+    for (int i = 0; i < rank_; i++) {
+      DvView<word> av(
+          a_coeffs.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words,
+          static_cast<int>(sp_words), 0);
+      DvView<word> bv(
+          b_coeffs.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words,
+          static_cast<int>(sp_words), 0);
+      small_->ntt_handler_.INTT(av, small_np, parts[c]->at(i).AxConstView());
+      small_->ntt_handler_.INTT(bv, small_np, parts[c]->at(i).BxConstView());
+    }
+  }
+
+  // 2. The recomposition, ONE kernel over the group per component, into a
+  // (b, a)-per-ciphertext buffer laid out for the batch key switch.
+  DeviceVector<word> recomposed(static_cast<size_t>(n) * ct_words);
+  {
+    HostVector<const word *> h_src(2 * static_cast<size_t>(n) * rank_);
+    for (int c = 0; c < n; c++) {
+      for (int i = 0; i < rank_; i++) {
+        h_src[static_cast<size_t>(c) * rank_ + i] =
+            a_coeffs.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words;
+        h_src[static_cast<size_t>(n) * rank_ +
+              static_cast<size_t>(c) * rank_ + i] =
+            b_coeffs.data() + (static_cast<size_t>(c) * rank_ + i) * sp_words;
+      }
+    }
+    DeviceVector<const word *> d_src(2 * static_cast<size_t>(n) * rank_);
+    CopyHostToDevice(d_src, h_src);
+    const word *primes = small_->param_.GetPrimesPtr(small_np);
+    const int log_rank = Log2Floor(rank_);
+    const dim3 grid_dim(degree / kernel_block_dim_, num_total_primes, n);
+    // b lands first in each slice, a after it.
+    kernel::CiRingSwitchRecomposeBatch<word><<<grid_dim, kernel_block_dim_>>>(
+        recomposed.data() + q_words, ct_words,
+        d_src.data(), primes, log_rank, small_degree, degree);
+    kernel::CiRingSwitchRecomposeBatch<word><<<grid_dim, kernel_block_dim_>>>(
+        recomposed.data(), ct_words,
+        d_src.data() + static_cast<size_t>(n) * rank_, primes, log_rank,
+        small_degree, degree);
+  }
+  a_coeffs = DeviceVector<word>();
+  b_coeffs = DeviceVector<word>();
+
+  // 3. Back into the NTT domain at the big degree, per ciphertext, in place
+  // through scratch (NTT needs distinct source and destination).
+  const NPInfo big_np = big_->param_.LevelToNP(level);
+  DeviceVector<word> ntted(static_cast<size_t>(n) * ct_words);
+  for (int c = 0; c < n; c++) {
+    DvView<word> b_view(ntted.data() + c * ct_words,
+                        static_cast<int>(q_words), 0);
+    DvView<word> a_view(ntted.data() + c * ct_words + q_words,
+                        static_cast<int>(q_words), 0);
+    DvConstView<word> b_src(recomposed.data() + c * ct_words,
+                            static_cast<int>(q_words), 0);
+    DvConstView<word> a_src(recomposed.data() + c * ct_words + q_words,
+                            static_cast<int>(q_words), 0);
+    big_->ntt_handler_.NTT(a_view, big_np, a_src, true);
+    big_->ntt_handler_.NTT(b_view, big_np, b_src, true);
+  }
+  recomposed = DeviceVector<word>();
+
+  // 4. The key switches off the subring secret as ONE MultKeyBatch.
+  DeviceVector<word> out(static_cast<size_t>(n) * ct_words);
+  {
+    std::vector<const Evk *> keys(n, &swk);
+    big_->MultKeyBatch(out.data(), static_cast<int>(ct_words), ntted.data(),
+                       static_cast<int>(ct_words), big_np, keys, n);
+  }
+  for (int c = 0; c < n; c++) {
+    Ct &r = *res[c];
+    r.RemoveRx();
+    r.ModifyNP(big_np);
+    r.SetNumSlots(big_->param_.MaxNumSlots());
+    r.SetScale(parts[c]->at(0).GetScale());
+    cudaMemcpyAsync(r.bx_.data(), out.data() + c * ct_words,
+                    q_words * sizeof(word), cudaMemcpyDeviceToDevice,
+                    cudaStreamLegacy);
+    cudaMemcpyAsync(r.ax_.data(), out.data() + c * ct_words + q_words,
+                    q_words * sizeof(word), cudaMemcpyDeviceToDevice,
+                    cudaStreamLegacy);
+  }
 }
 
 template class RingSwitchHandler<uint32_t>;

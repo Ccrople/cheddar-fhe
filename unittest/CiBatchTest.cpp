@@ -1116,11 +1116,11 @@ TEST(CiBatch, TheBatchedConverterIsWordForWord) {
 
   std::vector<Ciphertext<word>> s_serial, s_batch;
   auto t0 = Sync();
-  cheddar::HoistHandler<word>::SetEvaluateSerial(true);
+  cheddar::CiBatchAttention<word>::SetConvSerial(true);
   attn.Scores(s_serial, q_a, k_cts, keys);
   auto t1 = Sync();
   const auto ph0 = attn.GetPhaseSeconds();
-  cheddar::HoistHandler<word>::SetEvaluateSerial(false);
+  cheddar::CiBatchAttention<word>::SetConvSerial(false);
   attn.Scores(s_batch, q_b, k_cts, keys);
   auto t2 = Sync();
   const auto ph1 = attn.GetPhaseSeconds();
