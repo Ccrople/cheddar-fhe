@@ -121,6 +121,76 @@ void ComplexLinearTransform<word>::EvaluateToReal(
 }
 
 template <typename word>
+void ComplexLinearTransform<word>::EvaluateFromRealBatch(
+    ConstContextPtr<word> context, std::vector<Ct> &res_re,
+    std::vector<Ct> &res_im, const std::vector<const Ct *> &inputs,
+    const EvkMap<word> &evk_map) const {
+  const int n = static_cast<int>(inputs.size());
+  res_re.resize(n);
+  res_im.resize(n);
+  std::vector<std::map<int, Ct>> bs(n);
+  std::vector<const std::map<int, Ct> *> bs_ptrs(n);
+  std::vector<Ct *> re_ptrs(n), im_ptrs(n);
+  for (int i = 0; i < n; i++) {
+    re_.EvaluateBabyStep(context, bs[i], *inputs[i], evk_map, false);
+    bs_ptrs[i] = &bs[i];
+    re_ptrs[i] = &res_re[i];
+    im_ptrs[i] = &res_im[i];
+  }
+  LinearTransform<word>::EvaluateGiantStepComplexBatch(
+      context, re_ptrs, &im_ptrs, re_, im_, bs_ptrs, /*bs_im=*/nullptr,
+      evk_map);
+}
+
+template <typename word>
+void ComplexLinearTransform<word>::EvaluatePairBatch(
+    ConstContextPtr<word> context, std::vector<Ct> &re, std::vector<Ct> &im,
+    const EvkMap<word> &evk_map) const {
+  const int n = static_cast<int>(re.size());
+  AssertTrue(static_cast<int>(im.size()) == n,
+             "ComplexLinearTransform: the pair group's halves disagree");
+  std::vector<std::map<int, Ct>> bs_re(n), bs_im(n);
+  std::vector<const std::map<int, Ct> *> bs_re_ptrs(n), bs_im_ptrs(n);
+  std::vector<Ct *> re_ptrs(n), im_ptrs(n);
+  for (int i = 0; i < n; i++) {
+    re_.EvaluateBabyStep(context, bs_re[i], re[i], evk_map, false);
+    re_.EvaluateBabyStep(context, bs_im[i], im[i], evk_map, false);
+    bs_re_ptrs[i] = &bs_re[i];
+    bs_im_ptrs[i] = &bs_im[i];
+    // The baby steps are materialised, so the inputs are dead and the
+    // outputs alias them, as the serial EvaluatePair allows.
+    re_ptrs[i] = &re[i];
+    im_ptrs[i] = &im[i];
+  }
+  LinearTransform<word>::EvaluateGiantStepComplexBatch(
+      context, re_ptrs, &im_ptrs, re_, im_, bs_re_ptrs, &bs_im_ptrs, evk_map);
+}
+
+template <typename word>
+void ComplexLinearTransform<word>::EvaluateToRealBatch(
+    ConstContextPtr<word> context, std::vector<Ct> &res,
+    const std::vector<const Ct *> &in_re, const std::vector<const Ct *> &in_im,
+    const EvkMap<word> &evk_map) const {
+  const int n = static_cast<int>(in_re.size());
+  AssertTrue(static_cast<int>(in_im.size()) == n,
+             "ComplexLinearTransform: the to-real group's halves disagree");
+  res.resize(n);
+  std::vector<std::map<int, Ct>> bs_re(n), bs_im(n);
+  std::vector<const std::map<int, Ct> *> bs_re_ptrs(n), bs_im_ptrs(n);
+  std::vector<Ct *> res_ptrs(n);
+  for (int i = 0; i < n; i++) {
+    re_.EvaluateBabyStep(context, bs_re[i], *in_re[i], evk_map, false);
+    re_.EvaluateBabyStep(context, bs_im[i], *in_im[i], evk_map, false);
+    bs_re_ptrs[i] = &bs_re[i];
+    bs_im_ptrs[i] = &bs_im[i];
+    res_ptrs[i] = &res[i];
+  }
+  LinearTransform<word>::EvaluateGiantStepComplexBatch(
+      context, res_ptrs, /*res_im=*/nullptr, re_, im_, bs_re_ptrs,
+      &bs_im_ptrs, evk_map);
+}
+
+template <typename word>
 ComplexLinearTransform<word>::ComplexLinearTransform(LinearTransform<word> &&re,
                                                      LinearTransform<word> &&im)
     : re_(std::move(re)), im_(std::move(im)) {}

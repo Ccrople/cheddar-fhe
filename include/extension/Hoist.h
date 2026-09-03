@@ -5,6 +5,7 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "core/Context.h"
 #include "core/EvkMap.h"
@@ -99,6 +100,33 @@ class HoistHandler {
                                    const HoistHandler &im_h,
                                    const std::map<int, Ct> &bs_re,
                                    const std::map<int, Ct> *bs_im);
+
+  /**
+   * @brief `GSFusedComplexPAccum` over a GROUP of ciphertexts in one kernel:
+   * the baby-step and output tables carry one slice per ciphertext, the
+   * plaintext table is SHARED, and the ciphertext index rides the FAST grid
+   * dimension so same-position blocks of different ciphertexts hit the same
+   * plaintext lines in L2 -- the diagonal table is streamed from DRAM once
+   * per ~group instead of once per ciphertext (Doing.md 7.30: that stream
+   * was 20 of a 55 ms bootstrap). Per-ciphertext arithmetic and its order
+   * are exactly the serial kernel's, so the words agree exactly.
+   */
+  static void GSFusedComplexPAccumBatch(
+      ConstContextPtr<word> context,
+      std::vector<std::map<int, Ct>> &results_re,
+      std::vector<std::map<int, Ct>> *results_im, const HoistHandler &re_h,
+      const HoistHandler &im_h,
+      const std::vector<const std::map<int, Ct> *> &bs_re,
+      const std::vector<const std::map<int, Ct> *> *bs_im);
+
+  /// The rotate/fold half of `EvaluateGiantStepComplex` (giant key switches,
+  /// PermuteAccum, the final mod-down), shared by the serial call and the
+  /// batched group so the two cannot drift.
+  static void GSComplexRotateFold(ConstContextPtr<word> context,
+                                  const HoistHandler &re_h,
+                                  std::map<int, Ct> &accum, Ct &res,
+                                  const EvkMap<word> &evk_map,
+                                  int input_num_slots, double input_scale);
   void BSFusedKeyMult(ConstContextPtr<word> context, std::map<int, Ct> &res,
                       std::vector<Dv> &a_modup, const Ct &a_orig,
                       const EvkMap<word> &keys, std::vector<int> &rotations,
@@ -218,6 +246,22 @@ class HoistHandler {
                                        const std::map<int, Ct> &bs_re,
                                        const std::map<int, Ct> *bs_im,
                                        const EvkMap<word> &evk_map);
+
+  /**
+   * @brief `EvaluateGiantStepComplex` over a GROUP of ciphertexts: ONE
+   * `GSFusedComplexPAccumBatch` (the plaintext table streamed once for the
+   * group), then the per-ciphertext rotate/fold exactly as the serial call
+   * runs it. `res_re[i]`/`res_im[i]` answer `bs_re[i]`/`bs_im[i]`; `res_im`
+   * nullptr is the drop to real, `bs_im` nullptr the lift from it, as the
+   * serial call has them. Word for word the loop of serial calls.
+   */
+  static void EvaluateGiantStepComplexBatch(
+      ConstContextPtr<word> context, std::vector<Ct *> &res_re,
+      std::vector<Ct *> *res_im, const HoistHandler &re_h,
+      const HoistHandler &im_h,
+      const std::vector<const std::map<int, Ct> *> &bs_re,
+      const std::vector<const std::map<int, Ct> *> *bs_im,
+      const EvkMap<word> &evk_map);
 };
 
 }  // namespace cheddar

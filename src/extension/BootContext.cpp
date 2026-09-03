@@ -444,6 +444,24 @@ void BootContext<word>::SlotToCoeff(Ct &res, int num_slots, const Ct &input,
 }
 
 template <typename word>
+void BootContext<word>::CoeffToSlotBatch(
+    std::vector<Ct> &res, int num_slots,
+    const std::vector<const Ct *> &inputs,
+    const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("boot: CtS native batch");
+  eval_fft_.at(num_slots).EvaluateCtSBatch(GetContext(), res, inputs, evk_map);
+}
+
+template <typename word>
+void BootContext<word>::SlotToCoeffBatch(
+    std::vector<Ct> &res, int num_slots,
+    const std::vector<const Ct *> &inputs,
+    const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("boot: StC native batch");
+  eval_fft_.at(num_slots).EvaluateStCBatch(GetContext(), res, inputs, evk_map);
+}
+
+template <typename word>
 void BootContext<word>::PrepareSinC(int num_slots, int sub_degree,
                                     int stc_level, int cts_level,
                                     int num_phases) {
@@ -663,15 +681,13 @@ void BootContext<word>::HalfBootSplit(Ct &res_lo, Ct &res_hi, const Ct &merged,
 }
 
 template <typename word>
-int BootContext<word>::BootFront(Ct &slots, const Ct &input,
-                                 const EvkMap<word> &evk_map,
-                                 bool min_ks) const {
+int BootContext<word>::BootFrontPreCtS(Ct &main_ct, const Ct &input,
+                                       const EvkMap<word> &evk_map) const {
   const int max_num_slots = this->param_.MaxNumSlots();
   const int input_num_slots = input.GetNumSlots();
   const int num_slots = GetBootEnabledNumSlots(input_num_slots);
   AssertTrue(eval_mod_ != nullptr, "EvalMod not prepared");
 
-  Ct main_ct;
   const Ct *src = &input;
   Ct low;
   if (this->param_.NPToLevel(input.GetNP()) > 0) {
@@ -700,6 +716,16 @@ int BootContext<word>::BootFront(Ct &slots, const Ct &input,
   main_ct.SetNumSlots(max_num_slots);
   Trace(main_ct, num_slots, (max_num_slots / num_slots), main_ct, evk_map);
   main_ct.SetNumSlots(num_slots);
+  return input_num_slots;
+}
+
+template <typename word>
+int BootContext<word>::BootFront(Ct &slots, const Ct &input,
+                                 const EvkMap<word> &evk_map,
+                                 bool min_ks) const {
+  Ct main_ct;
+  const int input_num_slots = BootFrontPreCtS(main_ct, input, evk_map);
+  const int num_slots = GetBootEnabledNumSlots(input_num_slots);
 
   // 2. Perform CtS
   CoeffToSlot(slots, num_slots, main_ct, evk_map, min_ks);
@@ -1061,6 +1087,16 @@ void BootContext<word>::HalfBootModuleBatch(
   }
 }
 
+namespace {
+bool HoistCtSerial() {
+  static const bool serial = [] {
+    const char *env = std::getenv("CHEDDAR_HOIST_CT_SERIAL");
+    return env != nullptr && env[0] == '1';
+  }();
+  return serial;
+}
+}  // namespace
+
 template <typename word>
 void BootContext<word>::BootBatch(std::vector<Ct> &res,
                                   const std::vector<const Ct *> &inputs,
@@ -1075,18 +1111,70 @@ void BootContext<word>::BootBatch(std::vector<Ct> &res,
   std::vector<int> num_slots(n);
   std::vector<Ct> slots(n);
   std::vector<Ct *> ptrs(n);
+
+  // The batched conversions share one compiled table set, so the group must
+  // share one slot count; a mixed group falls back to the per-ciphertext
+  // conversions (CHEDDAR_HOIST_CT_SERIAL=1 forces that path, the A/B).
+  bool ct_batched = !HoistCtSerial() && !min_ks && n > 1;
+  for (int i = 1; ct_batched && i < n; i++) {
+    ct_batched = (inputs[i]->GetNumSlots() == inputs[0]->GetNumSlots());
+  }
+
+  if (ct_batched) {
+    std::vector<Ct> mains(n);
+    std::vector<const Ct *> main_ptrs(n);
+    for (int i = 0; i < n; i++) {
+      counts_.full++;
+      num_slots[i] = BootFrontPreCtS(mains[i], *inputs[i], evk_map);
+      main_ptrs[i] = &mains[i];
+    }
+    CoeffToSlotBatch(slots, GetBootEnabledNumSlots(num_slots[0]), main_ptrs,
+                     evk_map);
+    mains.clear();
+  } else {
+    for (int i = 0; i < n; i++) {
+      counts_.full++;
+      num_slots[i] = BootFront(slots[i], *inputs[i], evk_map, min_ks);
+    }
+  }
   for (int i = 0; i < n; i++) {
-    counts_.full++;
-    num_slots[i] = BootFront(slots[i], *inputs[i], evk_map, min_ks);
     // What EvaluateModAfterCtS's conjugate-invariant branch does before its
     // single reduction.
     slots[i].SetScale(eval_mod_->start_scale_);
     ptrs[i] = &slots[i];
   }
   EvaluateModBatch(ptrs, evk_map.GetMultiplicationKey());
-  for (int i = 0; i < n; i++) {
-    BootBack(res[i], slots[i], num_slots[i], evk_map, min_ks);
-    slots[i] = Ct();
+
+  if (ct_batched) {
+    // BootBack's steps, with the group's StC as ONE batched conversion: the
+    // slack's LevelDown per ciphertext, the conversion, the epilogue.
+    const int group_num_slots = GetBootEnabledNumSlots(num_slots[0]);
+    std::vector<double> leveldown_drift(n, 1.0);
+    if (boot_param_.GetNumSlackLevels() > 0) {
+      for (int i = 0; i < n; i++) {
+        const double before = slots[i].GetScale();
+        this->LevelDown(slots[i], slots[i], boot_param_.GetStCStartLevel());
+        leveldown_drift[i] = slots[i].GetScale() / before;
+      }
+    }
+    std::vector<const Ct *> slot_ptrs(n);
+    for (int i = 0; i < n; i++) slot_ptrs[i] = &slots[i];
+    SlotToCoeffBatch(res, group_num_slots, slot_ptrs, evk_map);
+    for (int i = 0; i < n; i++) {
+      if (boot_variant_.at(group_num_slots) ==
+          BootVariant::kImaginaryRemoving) {
+        this->HConjAdd(res[i], res[i], res[i], evk_map.GetConjugationKey());
+      }
+      res[i].SetNumSlots(num_slots[i]);
+      res[i].SetScale(this->param_.GetScale(boot_param_.GetEndLevel()) *
+                      leveldown_drift[i]);
+      slots[i] = Ct();
+    }
+  } else {
+    for (int i = 0; i < n; i++) {
+      BootBack(res[i], slots[i], num_slots[i], evk_map, min_ks);
+      slots[i] = Ct();
+    }
   }
 }
 

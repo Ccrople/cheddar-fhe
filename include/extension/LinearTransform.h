@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 #include "core/Context.h"
 #include "core/EvkMap.h"
@@ -135,6 +136,15 @@ class LinearTransform {
                                        const std::map<int, Ct> &bs_re,
                                        const std::map<int, Ct> *bs_im,
                                        const EvkMap<word> &evk_map);
+
+  /// `HoistHandler::EvaluateGiantStepComplexBatch` over the same handlers.
+  static void EvaluateGiantStepComplexBatch(
+      ConstContextPtr<word> context, std::vector<Ct *> &res_re,
+      std::vector<Ct *> *res_im, const LinearTransform &re_t,
+      const LinearTransform &im_t,
+      const std::vector<const std::map<int, Ct> *> &bs_re,
+      const std::vector<const std::map<int, Ct> *> *bs_im,
+      const EvkMap<word> &evk_map);
 
   /// The diagonal offsets the matrix was compiled from, for a caller pairing
   /// two transforms and needing to know they line up.

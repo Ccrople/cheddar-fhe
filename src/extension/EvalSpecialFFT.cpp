@@ -868,6 +868,80 @@ void EvalSpecialFFT<word>::EvaluateCtS(ConstContextPtr<word> context, Ct &res,
 }
 
 template <typename word>
+void EvalSpecialFFT<word>::EvaluateCtSBatch(
+    ConstContextPtr<word> context, std::vector<Ct> &res,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  AssertTrue(conjugate_invariant_,
+             "EvalSpecialFFT: the batched CtS is the conjugate-invariant "
+             "complex-phase chain; the ordinary path has no batch form");
+  const int n = static_cast<int>(inputs.size());
+  res.resize(n);
+
+  // The thin-level pre-rescales, per ciphertext, exactly as the serial call.
+  std::vector<Ct> pre(cts_thin_levels_.empty() ? 0 : n);
+  std::vector<const Ct *> in_ptrs = inputs;
+  if (!cts_thin_levels_.empty()) {
+    for (int c = 0; c < n; c++) {
+      context->MultUnsafe(pre[c], *inputs[c], cts_thin_consts_[0],
+                          cts_thin_levels_[0]);
+      context->Rescale(pre[c], pre[c]);
+      for (size_t k = 1; k < cts_thin_levels_.size(); k++) {
+        context->MultUnsafe(pre[c], pre[c], cts_thin_consts_[k],
+                            cts_thin_levels_[k]);
+        context->Rescale(pre[c], pre[c]);
+      }
+      in_ptrs[c] = &pre[c];
+    }
+  }
+
+  const int num_phases = static_cast<int>(cts_->ci_phases.size());
+  std::vector<Ct> re, im;
+  cts_->ci_phases.at(0).EvaluateFromRealBatch(context, re, im, in_ptrs,
+                                              evk_map);
+  pre.clear();
+  for (int i = 1; i < num_phases - 1; i++) {
+    cts_->ci_phases.at(i).EvaluatePairBatch(context, re, im, evk_map);
+  }
+  {
+    std::vector<const Ct *> re_ptrs(n), im_ptrs(n);
+    for (int c = 0; c < n; c++) {
+      re_ptrs[c] = &re[c];
+      im_ptrs[c] = &im[c];
+    }
+    cts_->ci_phases.at(num_phases - 1)
+        .EvaluateToRealBatch(context, res, re_ptrs, im_ptrs, evk_map);
+  }
+  for (int c = 0; c < n; c++) res[c].SetNumSlots(num_slots_);
+}
+
+template <typename word>
+void EvalSpecialFFT<word>::EvaluateStCBatch(
+    ConstContextPtr<word> context, std::vector<Ct> &res,
+    const std::vector<const Ct *> &inputs, const EvkMap<word> &evk_map) const {
+  AssertTrue(conjugate_invariant_,
+             "EvalSpecialFFT: the batched StC is the conjugate-invariant "
+             "complex-phase chain; the ordinary path has no batch form");
+  const int n = static_cast<int>(inputs.size());
+  res.resize(n);
+  const int num_phases = static_cast<int>(stc_ci_phases_.size());
+  std::vector<Ct> re, im;
+  stc_ci_phases_.at(0).EvaluateFromRealBatch(context, re, im, inputs, evk_map);
+  for (int i = 1; i < num_phases - 1; i++) {
+    stc_ci_phases_.at(i).EvaluatePairBatch(context, re, im, evk_map);
+  }
+  {
+    std::vector<const Ct *> re_ptrs(n), im_ptrs(n);
+    for (int c = 0; c < n; c++) {
+      re_ptrs[c] = &re[c];
+      im_ptrs[c] = &im[c];
+    }
+    stc_ci_phases_.at(num_phases - 1)
+        .EvaluateToRealBatch(context, res, re_ptrs, im_ptrs, evk_map);
+  }
+  for (int c = 0; c < n; c++) res[c].SetNumSlots(num_slots_);
+}
+
+template <typename word>
 void EvalSpecialFFT<word>::EvaluateStC(ConstContextPtr<word> context, Ct &res,
                                        const Ct &input,
                                        const EvkMap<word> &evk_map,

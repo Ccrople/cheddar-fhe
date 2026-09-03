@@ -125,6 +125,12 @@ class BootContext : public Context<word>,
   int BootFront(Ct &slots, const Ct &input, const EvkMap<word> &evk_map,
                 bool min_ks) const;
 
+  /// `BootFront` stopped before its CoeffToSlot: `main_ct` leaves ready for
+  /// the conversion. `BootBatch` runs the group's fronts through this and
+  /// ONE `CoeffToSlotBatch`.
+  int BootFrontPreCtS(Ct &main_ct, const Ct &input,
+                      const EvkMap<word> &evk_map) const;
+
   /**
    * @brief The per-ciphertext back of `Boot` (the slack's LevelDown, the
    * native SlotToCoeff, the variant epilogue, the declared scale), shared
@@ -399,6 +405,20 @@ class BootContext : public Context<word>,
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
   void SlotToCoeff(Ct &res, int num_slots, const Ct &input,
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
+
+  /**
+   * @brief The native conversions over a GROUP (conjugate-invariant only):
+   * each phase's giant step streams the shared diagonal table once for the
+   * whole group (`EvalSpecialFFT::Evaluate*Batch`). Word for word the loop
+   * of serial calls; `BootBatch` runs its group's CtS and StC through
+   * these unless `CHEDDAR_HOIST_CT_SERIAL=1`.
+   */
+  void CoeffToSlotBatch(std::vector<Ct> &res, int num_slots,
+                        const std::vector<const Ct *> &inputs,
+                        const EvkMap<word> &evk_map) const;
+  void SlotToCoeffBatch(std::vector<Ct> &res, int num_slots,
+                        const std::vector<const Ct *> &inputs,
+                        const EvkMap<word> &evk_map) const;
 
   /**
    * @brief The partial conversions of [SYLPH] section 3.2: slots <-> the

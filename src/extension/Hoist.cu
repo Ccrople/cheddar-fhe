@@ -311,6 +311,95 @@ __global__ void GSFusedComplexKernel(
     }
   }
 }
+
+// GSFusedComplexKernel over a GROUP of ciphertexts. The ciphertext index is
+// the FAST part of blockIdx.x, so consecutive blocks work the same (prime,
+// coefficient) window of DIFFERENT ciphertexts and their reads of the SHARED
+// plaintext table hit the same L2 lines: the table is streamed from DRAM
+// once per ~group, not once per ciphertext. For that reason the plaintext
+// loads here are plain (L2-retaining), NOT StreamingLoad -- the serial
+// kernel streams because it reads each line exactly once. The baby-step and
+// output tables carry one slice per ciphertext; the arithmetic per
+// ciphertext, and its order, are exactly the serial kernel's.
+template <typename word, int num_bs_padded, bool has_im_in, bool has_im_out>
+__global__ void GSFusedComplexKernelBatch(
+    word **dst, const word **bs_re, const word **bs_im, const word **mx_re,
+    const word **mx_im, int num_bs, int num_gs, int num_cts,
+    const word *primes, const make_signed_t<word> *inv_primes,
+    int log_degree) {
+  const int ct = blockIdx.x % num_cts;
+  const int xblk = blockIdx.x / num_cts;
+  int i = xblk * blockDim.x + threadIdx.x;
+  int prime_index = (i >> log_degree);
+
+  const word prime = primes[prime_index];
+  const make_signed_t<word> montgomery = inv_primes[prime_index];
+
+  constexpr int out_stride = has_im_out ? 4 : 2;
+  const word **bs_re_ct = bs_re + ct * 2 * num_bs;
+  const word **bs_im_ct = has_im_in ? bs_im + ct * 2 * num_bs : bs_im;
+  word **dst_ct = dst + ct * num_gs * out_stride;
+
+  word re_b[num_bs_padded];
+  word re_a[num_bs_padded];
+  word im_b[has_im_in ? num_bs_padded : 1];
+  word im_a[has_im_in ? num_bs_padded : 1];
+#pragma unroll
+  for (int j = 0; j < num_bs_padded; j++) {
+    re_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_re_ct[2 * j] + i) : 0;
+    re_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_re_ct[2 * j + 1] + i) : 0;
+    if constexpr (has_im_in) {
+      im_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_im_ct[2 * j] + i) : 0;
+      im_a[j] =
+          (j < num_bs) ? basic::StreamingLoad(bs_im_ct[2 * j + 1] + i) : 0;
+    }
+  }
+
+  for (int k = 0; k < num_gs; k++) {
+    word rr_b = 0, rr_a = 0;
+    word ri_b = 0, ri_a = 0;
+#pragma unroll
+    for (int j = 0; j < num_bs_padded; j++) {
+      if (j >= num_bs) break;
+      const word *re_pt = mx_re[j + k * num_bs];
+      if (re_pt != nullptr) {
+        word m = re_pt[i];
+        rr_b = basic::Add(rr_b, basic::MultMontgomery(re_b[j], m, prime,
+                                                      montgomery), prime);
+        rr_a = basic::Add(rr_a, basic::MultMontgomery(re_a[j], m, prime,
+                                                      montgomery), prime);
+        if constexpr (has_im_in && has_im_out) {
+          ri_b = basic::Add(ri_b, basic::MultMontgomery(im_b[j], m, prime,
+                                                        montgomery), prime);
+          ri_a = basic::Add(ri_a, basic::MultMontgomery(im_a[j], m, prime,
+                                                        montgomery), prime);
+        }
+      }
+      const word *im_pt = mx_im[j + k * num_bs];
+      if (im_pt != nullptr) {
+        word m = im_pt[i];
+        if constexpr (has_im_in) {
+          rr_b = basic::Sub(rr_b, basic::MultMontgomery(im_b[j], m, prime,
+                                                        montgomery), prime);
+          rr_a = basic::Sub(rr_a, basic::MultMontgomery(im_a[j], m, prime,
+                                                        montgomery), prime);
+        }
+        if constexpr (has_im_out) {
+          ri_b = basic::Add(ri_b, basic::MultMontgomery(re_b[j], m, prime,
+                                                        montgomery), prime);
+          ri_a = basic::Add(ri_a, basic::MultMontgomery(re_a[j], m, prime,
+                                                        montgomery), prime);
+        }
+      }
+    }
+    dst_ct[k * out_stride][i] = rr_b;
+    dst_ct[k * out_stride + 1][i] = rr_a;
+    if constexpr (has_im_out) {
+      dst_ct[k * out_stride + 2][i] = ri_b;
+      dst_ct[k * out_stride + 3][i] = ri_a;
+    }
+  }
+}
 }  // namespace kernel
 
 template <typename word>
@@ -1501,6 +1590,170 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
 }
 
 template <typename word>
+void HoistHandler<word>::GSFusedComplexPAccumBatch(
+    ConstContextPtr<word> context, std::vector<std::map<int, Ct>> &results_re,
+    std::vector<std::map<int, Ct>> *results_im, const HoistHandler &re_h,
+    const HoistHandler &im_h,
+    const std::vector<const std::map<int, Ct> *> &bs_re,
+    const std::vector<const std::map<int, Ct> *> *bs_im) {
+  const bool has_im_in = (bs_im != nullptr);
+  const bool has_im_out = (results_im != nullptr);
+  AssertTrue(has_im_in || has_im_out,
+             "Hoist: a complex accumulation with neither imaginary input nor "
+             "imaginary output is a real one; use GSFusedPAccum");
+  const int num_cts = static_cast<int>(bs_re.size());
+  AssertTrue(num_cts > 0, "Hoist: an empty complex accumulation group");
+  AssertTrue(static_cast<int>(results_re.size()) == num_cts &&
+                 (!has_im_out ||
+                  static_cast<int>(results_im->size()) == num_cts) &&
+                 (!has_im_in || static_cast<int>(bs_im->size()) == num_cts),
+             "Hoist: the complex accumulation group's sides disagree in size");
+
+  const auto &gs_indices = re_h.gs_indices_;
+  const auto &bs_indices = re_h.bs_indices_;
+  const int num_bs = static_cast<int>(bs_indices.size());
+  const int num_gs = static_cast<int>(gs_indices.size());
+  AssertTrue(num_bs <= 32, "Hoist: complex accumulation baby step too wide");
+  AssertTrue(im_h.gs_indices_ == gs_indices && im_h.bs_indices_ == bs_indices,
+             "Hoist: the complex halves disagree on BSGS structure");
+
+  // Scale and prime checks over the whole group, as the serial call makes
+  // them for its one ciphertext.
+  const Ct &first_ct = bs_re.front()->begin()->second;
+  const Pt &first_pt =
+      re_h.hoist_pt_map_.at(gs_indices.front()).begin()->second;
+  double scale = first_ct.GetScale() * first_pt.GetScale();
+  int num_slots = Max(first_ct.GetNumSlots(), first_pt.GetNumSlots());
+  NPInfo np = first_ct.GetNP();
+  for (int c = 0; c < num_cts; c++) {
+    for (const auto *bs : {bs_re[c], has_im_in ? (*bs_im)[c] : nullptr}) {
+      if (bs == nullptr) continue;
+      for (const auto &[bs_idx, ct] : *bs) {
+        AssertTrue(np == ct.GetNP(), "Hoist: baby-step NP mismatch");
+        context->AssertSameScale(scale, ct.GetScale() * first_pt.GetScale());
+        num_slots = Max(num_slots, ct.GetNumSlots());
+      }
+    }
+  }
+  for (const auto *h : {&re_h, &im_h}) {
+    for (const auto &[gs_idx, pt_map] : h->hoist_pt_map_) {
+      for (const auto &[bs_idx, pt] : pt_map) {
+        context->AssertSameScale(scale, first_ct.GetScale() * pt.GetScale());
+        num_slots = Max(num_slots, pt.GetNumSlots());
+      }
+    }
+  }
+
+  for (int c = 0; c < num_cts; c++) {
+    for (auto *results : {&results_re[c],
+                          has_im_out ? &(*results_im)[c] : nullptr}) {
+      if (results == nullptr) continue;
+      for (auto &[gs_idx, res] : *results) {
+        res.RemoveRx();
+        res.ModifyNP(np);
+        res.SetScale(scale);
+        res.SetNumSlots(num_slots);
+      }
+    }
+  }
+
+  // Pointer tables: baby steps and outputs carry one slice per ciphertext;
+  // the plaintext tables are shared by the whole group.
+  const int out_stride = has_im_out ? 4 : 2;
+  TableUpload tab(static_cast<size_t>(8) *
+                  (num_cts * 4 * num_bs + 2 * num_gs * num_bs +
+                   num_cts * num_gs * out_stride + 8));
+  const word **bs_re_ptrs = tab.Add<const word *>(num_cts * 2 * num_bs);
+  const word **bs_im_ptrs =
+      tab.Add<const word *>(has_im_in ? num_cts * 2 * num_bs : 1);
+  const word **mx_re_ptrs = tab.Add<const word *>(num_gs * num_bs);
+  const word **mx_im_ptrs = tab.Add<const word *>(num_gs * num_bs);
+  word **dst_ptrs = tab.Add<word *>(num_cts * num_gs * out_stride);
+  if (!has_im_in) bs_im_ptrs[0] = nullptr;
+
+  for (int c = 0; c < num_cts; c++) {
+    int idx = 0;
+    for (int bs_idx : bs_indices) {
+      bs_re_ptrs[c * 2 * num_bs + 2 * idx] = bs_re[c]->at(bs_idx).bx_.data();
+      bs_re_ptrs[c * 2 * num_bs + 2 * idx + 1] =
+          bs_re[c]->at(bs_idx).ax_.data();
+      if (has_im_in) {
+        bs_im_ptrs[c * 2 * num_bs + 2 * idx] =
+            (*bs_im)[c]->at(bs_idx).bx_.data();
+        bs_im_ptrs[c * 2 * num_bs + 2 * idx + 1] =
+            (*bs_im)[c]->at(bs_idx).ax_.data();
+      }
+      idx++;
+    }
+  }
+
+  int idx = 0;
+  for (int gs_idx : gs_indices) {
+    const auto &re_map = re_h.hoist_pt_map_.at(gs_idx);
+    const auto &im_map = im_h.hoist_pt_map_.at(gs_idx);
+    for (int bs_idx : bs_indices) {
+      auto re_it = re_map.find(bs_idx);
+      auto im_it = im_map.find(bs_idx);
+      AssertTrue((re_it == re_map.end()) == (im_it == im_map.end()),
+                 "Hoist: the complex halves disagree on a plaintext slot");
+      mx_re_ptrs[idx] =
+          (re_it == re_map.end()) ? nullptr : re_it->second.mx_.data();
+      mx_im_ptrs[idx] =
+          (im_it == im_map.end()) ? nullptr : im_it->second.mx_.data();
+      idx++;
+    }
+  }
+
+  for (int c = 0; c < num_cts; c++) {
+    idx = 0;
+    for (int gs_idx : gs_indices) {
+      word **dst = dst_ptrs + c * num_gs * out_stride;
+      dst[idx * out_stride] = results_re[c].at(gs_idx).bx_.data();
+      dst[idx * out_stride + 1] = results_re[c].at(gs_idx).ax_.data();
+      if (has_im_out) {
+        dst[idx * out_stride + 2] = (*results_im)[c].at(gs_idx).bx_.data();
+        dst[idx * out_stride + 3] = (*results_im)[c].at(gs_idx).ax_.data();
+      }
+      idx++;
+    }
+  }
+
+  tab.Upload(re_h.table_scratch_);
+  const word **bs_re_d = tab.Device(bs_re_ptrs);
+  const word **bs_im_d = tab.Device(bs_im_ptrs);
+  const word **mx_re_d = tab.Device(mx_re_ptrs);
+  const word **mx_im_d = tab.Device(mx_im_ptrs);
+  word **dst_d = tab.Device(dst_ptrs);
+
+  const word *primes = context->param_.GetPrimesPtr(np);
+  const make_signed_t<word> *inv_primes = context->param_.GetInvPrimesPtr(np);
+  dim3 block_dim(kernel_block_dim_);
+  dim3 grid_dim(static_cast<unsigned>(num_cts) * np.GetNumTotal() *
+                context->param_.degree_ / kernel_block_dim_);
+
+  auto launch = [&](auto in_flag, auto out_flag) {
+    constexpr bool kImIn = decltype(in_flag)::value;
+    constexpr bool kImOut = decltype(out_flag)::value;
+    constexpr_for<1, 6>([&](auto i) {
+      constexpr int num_bs_padded = 1 << i;
+      if (num_bs > num_bs_padded) return;
+      if (num_bs <= (1 << (i - 1))) return;
+      kernel::GSFusedComplexKernelBatch<word, num_bs_padded, kImIn, kImOut>
+          <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d, mx_im_d,
+                                    num_bs, num_gs, num_cts, primes,
+                                    inv_primes, context->param_.log_degree_);
+    });
+  };
+  if (has_im_in && has_im_out) {
+    launch(std::true_type{}, std::true_type{});
+  } else if (has_im_in) {
+    launch(std::true_type{}, std::false_type{});
+  } else {
+    launch(std::false_type{}, std::true_type{});
+  }
+}
+
+template <typename word>
 void HoistHandler<word>::EvaluateGiantStepComplex(
     ConstContextPtr<word> context, Ct &res_re, Ct *res_im,
     const HoistHandler &re_h, const HoistHandler &im_h,
@@ -1512,14 +1765,8 @@ void HoistHandler<word>::EvaluateGiantStepComplex(
   const Ct &ref_ct = bs_re.begin()->second;
 
   NPInfo ref_ct_np = ref_ct.GetNP();
-  int num_q_primes = ref_ct_np.GetNumQ();
-  int num_p_primes = ref_ct_np.num_aux_;
-  int prime_offset = context->param_.GetMaxNumTer() - ref_ct_np.num_ter_;
-  int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
   int input_num_slots = ref_ct.GetNumSlots();
   double input_scale = ref_ct.GetScale();
-  int degree = context->param_.degree_;
-  auto &mod_switcher = context->mod_switch_handlers_.at(re_h.pt_level_);
 
   AssertTrue(!re_h.gs_indices_.empty() && re_h.gs_indices_.front() == 0,
              "Hoist: the complex giant step assumes a 0 giant-step offset");
@@ -1539,9 +1786,33 @@ void HoistHandler<word>::EvaluateGiantStepComplex(
   }
 
   // Rotate and fold each half exactly as EvaluateGiantStepOptimized does its
-  // one: key-switch the ax of every non-zero giant step, batch-permute the bx
+  // one -- shared with the batched group in GSComplexRotateFold.
+  GSComplexRotateFold(context, re_h, accum_re, res_re, evk_map,
+                      input_num_slots, input_scale);
+  if (res_im != nullptr) {
+    GSComplexRotateFold(context, re_h, accum_im, *res_im, evk_map,
+                        input_num_slots, input_scale);
+  }
+}
+
+template <typename word>
+void HoistHandler<word>::GSComplexRotateFold(ConstContextPtr<word> context,
+                                             const HoistHandler &re_h,
+                                             std::map<int, Ct> &accum, Ct &res,
+                                             const EvkMap<word> &evk_map,
+                                             int input_num_slots,
+                                             double input_scale) {
+  // Key-switch the ax of every non-zero giant step, batch-permute the bx
   // side, mod-down. The giant-step index 0 accumulator always exists here,
   // because ComplexLinearTransform compiles both halves with a 0 offset.
+  const NPInfo ref_ct_np = accum.at(0).GetNP();
+  const int num_q_primes = ref_ct_np.GetNumQ();
+  const int num_p_primes = ref_ct_np.num_aux_;
+  const int prime_offset = context->param_.GetMaxNumTer() - ref_ct_np.num_ter_;
+  const int beta = DivCeil(num_q_primes + prime_offset, num_p_primes);
+  const int degree = context->param_.degree_;
+  auto &mod_switcher = context->mod_switch_handlers_.at(re_h.pt_level_);
+
   std::vector<Dv> tmp_modup;
   std::vector<DvView<word>> tmp_modup_view;
   for (int i = 0; i < beta; i++) {
@@ -1551,50 +1822,96 @@ void HoistHandler<word>::EvaluateGiantStepComplex(
   Dv tmp_moddown(num_q_primes * degree);
   Ct tmp;
 
-  auto rotate_half = [&](std::map<int, Ct> &accum, Ct &res) {
-    Ct *final_accum = &accum.at(0);
-    {
-      NvtxScope nvtx_scope("hoist giant ks");
-      for (auto &[gs_idx, ct] : accum) {
-        if (gs_idx == 0) continue;
-
-        DvView<word> tmp_moddown_view = tmp_moddown.View(0);
-        {
-          ProfileScope s2("giant ks: moddown");
-          mod_switcher.ModDown(tmp_moddown_view, ct.AxConstView());
-        }
-        {
-          ProfileScope s2("giant ks: modup");
-          mod_switcher.ModUp(tmp_modup_view, tmp_moddown_view);
-        }
-        const auto &key = evk_map.GetRotationKey(gs_idx);
-        ProfileScope s2("giant ks: keymult+permute+add");
-        context->MultKeyNoModDown(tmp, tmp_modup, ct, key);
-        context->Permute(tmp, tmp, gs_idx);
-        context->Add(*final_accum, *final_accum, tmp);
-      }
-    }
-
-    ProfileScope permute_scope("hoist permute+final moddown");
-    std::vector<std::vector<DvConstView<word>>> ct_bx_view;
-    std::vector<int> rot_indices;
-    for (const auto &[gs_idx, ct] : accum) {
+  Ct *final_accum = &accum.at(0);
+  {
+    NvtxScope nvtx_scope("hoist giant ks");
+    for (auto &[gs_idx, ct] : accum) {
       if (gs_idx == 0) continue;
-      ct_bx_view.push_back({ct.BxConstView()});
-      rot_indices.push_back(gs_idx);
-    }
-    if (!rot_indices.empty()) {
-      std::vector<DvView<word>> accum_view_vector = {final_accum->BxView()};
-      ct_bx_view.push_back({final_accum->BxConstView()});
-      context->elem_handler_.PermuteAccum(accum_view_vector, ref_ct_np,
-                                          rot_indices, ct_bx_view);
-    }
-    re_h.EvaluateFinalModDown(context, res, *final_accum, input_num_slots,
-                              input_scale);
-  };
 
-  rotate_half(accum_re, res_re);
-  if (res_im != nullptr) rotate_half(accum_im, *res_im);
+      DvView<word> tmp_moddown_view = tmp_moddown.View(0);
+      {
+        ProfileScope s2("giant ks: moddown");
+        mod_switcher.ModDown(tmp_moddown_view, ct.AxConstView());
+      }
+      {
+        ProfileScope s2("giant ks: modup");
+        mod_switcher.ModUp(tmp_modup_view, tmp_moddown_view);
+      }
+      const auto &key = evk_map.GetRotationKey(gs_idx);
+      ProfileScope s2("giant ks: keymult+permute+add");
+      context->MultKeyNoModDown(tmp, tmp_modup, ct, key);
+      context->Permute(tmp, tmp, gs_idx);
+      context->Add(*final_accum, *final_accum, tmp);
+    }
+  }
+
+  ProfileScope permute_scope("hoist permute+final moddown");
+  std::vector<std::vector<DvConstView<word>>> ct_bx_view;
+  std::vector<int> rot_indices;
+  for (const auto &[gs_idx, ct] : accum) {
+    if (gs_idx == 0) continue;
+    ct_bx_view.push_back({ct.BxConstView()});
+    rot_indices.push_back(gs_idx);
+  }
+  if (!rot_indices.empty()) {
+    std::vector<DvView<word>> accum_view_vector = {final_accum->BxView()};
+    ct_bx_view.push_back({final_accum->BxConstView()});
+    context->elem_handler_.PermuteAccum(accum_view_vector, ref_ct_np,
+                                        rot_indices, ct_bx_view);
+  }
+  re_h.EvaluateFinalModDown(context, res, *final_accum, input_num_slots,
+                            input_scale);
+}
+
+template <typename word>
+void HoistHandler<word>::EvaluateGiantStepComplexBatch(
+    ConstContextPtr<word> context, std::vector<Ct *> &res_re,
+    std::vector<Ct *> *res_im, const HoistHandler &re_h,
+    const HoistHandler &im_h,
+    const std::vector<const std::map<int, Ct> *> &bs_re,
+    const std::vector<const std::map<int, Ct> *> *bs_im,
+    const EvkMap<word> &evk_map) {
+  const int n = static_cast<int>(bs_re.size());
+  AssertTrue(n > 0, "Hoist: an empty complex giant-step group");
+  AssertTrue(static_cast<int>(res_re.size()) == n &&
+                 (res_im == nullptr || static_cast<int>(res_im->size()) == n) &&
+                 (bs_im == nullptr || static_cast<int>(bs_im->size()) == n),
+             "Hoist: the complex giant-step group's sides disagree in size");
+  AssertTrue(re_h.pt_level_ == im_h.pt_level_,
+             "Hoist: the complex halves disagree on level");
+  AssertTrue(!re_h.gs_indices_.empty() && re_h.gs_indices_.front() == 0,
+             "Hoist: the complex giant step assumes a 0 giant-step offset");
+
+  const Ct &ref_ct = bs_re.front()->begin()->second;
+  const NPInfo ref_ct_np = ref_ct.GetNP();
+  const int input_num_slots = ref_ct.GetNumSlots();
+  const double input_scale = ref_ct.GetScale();
+
+  // One accumulator map per ciphertext and output half.
+  std::vector<std::map<int, Ct>> accum_re(n), accum_im(res_im != nullptr ? n
+                                                                         : 0);
+  for (int i = 0; i < n; i++) {
+    for (const auto &gs_idx : re_h.gs_indices_) {
+      accum_re[i].try_emplace(gs_idx, ref_ct_np);
+      if (res_im != nullptr) accum_im[i].try_emplace(gs_idx, ref_ct_np);
+    }
+  }
+
+  {
+    ProfileScope profile_scope("hoist paccum complex batch");
+    GSFusedComplexPAccumBatch(context, accum_re,
+                              res_im != nullptr ? &accum_im : nullptr, re_h,
+                              im_h, bs_re, bs_im);
+  }
+
+  for (int i = 0; i < n; i++) {
+    GSComplexRotateFold(context, re_h, accum_re[i], *res_re[i], evk_map,
+                        input_num_slots, input_scale);
+    if (res_im != nullptr) {
+      GSComplexRotateFold(context, re_h, accum_im[i], *(*res_im)[i], evk_map,
+                          input_num_slots, input_scale);
+    }
+  }
 }
 
 template <typename word>

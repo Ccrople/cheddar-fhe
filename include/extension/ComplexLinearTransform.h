@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <vector>
 
 #include "core/Context.h"
 #include "core/EvkMap.h"
@@ -143,6 +144,26 @@ class ComplexLinearTransform {
   void EvaluateToReal(ConstContextPtr<word> context, Ct &res, const Ct &in_re,
                       const Ct &in_im, const EvkMap<word> &evk_map,
                       bool min_ks = false) const;
+
+  /**
+   * @brief The three evaluations over a GROUP of ciphertexts: the baby steps
+   * per ciphertext exactly as the serial calls run them, then ONE
+   * `EvaluateGiantStepComplexBatch` whose accumulation kernel streams the
+   * shared plaintext table once for the whole group (Doing.md 7.30). Word
+   * for word the loop of serial calls. No min_ks form.
+   */
+  void EvaluateFromRealBatch(ConstContextPtr<word> context,
+                             std::vector<Ct> &res_re, std::vector<Ct> &res_im,
+                             const std::vector<const Ct *> &inputs,
+                             const EvkMap<word> &evk_map) const;
+  /// In place over the group, as `EvaluatePair` may alias.
+  void EvaluatePairBatch(ConstContextPtr<word> context, std::vector<Ct> &re,
+                         std::vector<Ct> &im,
+                         const EvkMap<word> &evk_map) const;
+  void EvaluateToRealBatch(ConstContextPtr<word> context, std::vector<Ct> &res,
+                           const std::vector<const Ct *> &in_re,
+                           const std::vector<const Ct *> &in_im,
+                           const EvkMap<word> &evk_map) const;
 };
 
 }  // namespace cheddar

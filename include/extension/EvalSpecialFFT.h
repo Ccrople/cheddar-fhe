@@ -152,6 +152,20 @@ class EvalSpecialFFT {
                    const EvkMap<word> &evk_map, bool min_ks = false) const;
 
   /**
+   * @brief `EvaluateCtS` / `EvaluateStC` over a GROUP of ciphertexts
+   * (conjugate-invariant path only): each phase's giant step streams the
+   * shared diagonal table ONCE for the whole group
+   * (`ComplexLinearTransform::Evaluate*Batch`, Doing.md 7.30). Word for
+   * word the loop of serial calls; the group shares one slot count.
+   */
+  void EvaluateCtSBatch(ConstContextPtr<word> context, std::vector<Ct> &res,
+                        const std::vector<const Ct *> &inputs,
+                        const EvkMap<word> &evk_map) const;
+  void EvaluateStCBatch(ConstContextPtr<word> context, std::vector<Ct> &res,
+                        const std::vector<const Ct *> &inputs,
+                        const EvkMap<word> &evk_map) const;
+
+  /**
    * @brief SLOTS <-> SinC, the "partial bit-reversal operation which occurs
    * when moving to SinC encoding" of [SYLPH] section 3.2.
    *

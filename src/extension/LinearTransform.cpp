@@ -166,6 +166,19 @@ void LinearTransform<word>::EvaluateGiantStepComplex(
 }
 
 template <typename word>
+void LinearTransform<word>::EvaluateGiantStepComplexBatch(
+    ConstContextPtr<word> context, std::vector<Ct *> &res_re,
+    std::vector<Ct *> *res_im, const LinearTransform &re_t,
+    const LinearTransform &im_t,
+    const std::vector<const std::map<int, Ct> *> &bs_re,
+    const std::vector<const std::map<int, Ct> *> *bs_im,
+    const EvkMap<word> &evk_map) {
+  HoistHandler<word>::EvaluateGiantStepComplexBatch(
+      context, res_re, res_im, re_t.hoist_, im_t.hoist_, bs_re, bs_im,
+      evk_map);
+}
+
+template <typename word>
 void LinearTransform<word>::Save(ArchiveWriter &ar) const {
   ar.Tag("lintrans");
   ar.Pod<int32_t>(pt_level_);
