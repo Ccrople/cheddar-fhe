@@ -75,6 +75,9 @@ CiBatchAttention<word>::CiBatchAttention(
       &chain_, nullptr, cfg_.converter_baby_steps);
   BuildRope();
 
+  AssertTrue(!cfg_.affine_in_prefix || cfg_.fused_scores,
+             "CiBatchAttention: affine_in_prefix rides the fused score "
+             "boot's prefix -- it needs fused_scores");
   if (cfg_.fused_scores) {
     // THE FUSED SCORE BOOT (idea [4], the 3.16 pattern): the scores stay in
     // the nested SinC element after the switch-back, and the tower ring's
@@ -143,12 +146,48 @@ void CiBatchAttention<word>::AddTowerRotations(EvkRequest &req) const {
 template <typename word>
 void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
                                              std::vector<Ct> &sinc,
-                                             const Keys &keys,
-                                             int group) const {
+                                             const Keys &keys, int group,
+                                             double carried) const {
   NvtxScope _nv("batch attn: fused score boot");
   AssertTrue(cfg_.fused_scores && keys.tower != nullptr,
              "CiBatchAttention::BootScoresFused: fused_scores and "
              "Keys::tower");
+  if (cfg_.affine_in_prefix) {
+    // The softmax's affine multiply folded into the prefix (the landing-15
+    // lever): re-encode the prefix plaintexts with the extra factor
+    // `a1 = 2 / (span * carried)` the first time the chain's carried
+    // factor is observed. Same structure, same rotations -- only the
+    // values change, so the keys stand.
+    AssertTrue(softmax_ready_ && calib_.causal,
+               "CiBatchAttention::BootScoresFused: affine_in_prefix needs "
+               "the causal softmax calibration (PrepareSoftMax first)");
+    AssertTrue(carried > 0.0,
+               "CiBatchAttention::BootScoresFused: affine_in_prefix needs "
+               "the chain's carried factor");
+    if (std::abs(prefix_affine_carried_ - carried) >
+        1e-9 * std::abs(carried)) {
+      AssertTrue(prefix_affine_carried_ == 0.0,
+                 "CiBatchAttention::BootScoresFused: the chain's carried "
+                 "factor moved between calls -- the scale walk is expected "
+                 "deterministic");
+      const auto &tp = tower_->GetBootParameter();
+      const int prefix_level = tp.GetEvalModEndLevel();
+      const double target = boot_->param_.GetScale(prefix_level - 1);
+      const double pt_scale =
+          target * boot_->param_.GetRescalePrimeProd(prefix_level) /
+          tower_->GetStCInputScale();
+      const double a1 = 2.0 / (calib_.span * carried);
+      basis_->PreparePrefix(tower_, prefix_level,
+                            /*constant=*/a1 / tower_->GetMessageRatio(),
+                            pt_scale);
+      prefix_affine_carried_ = carried;
+      if (cfg_.verbose) {
+        std::cout << "  [batch] fused scores: the affine folded into the "
+                  << "prefix (a1 " << a1 << ", carried " << carried << ")"
+                  << std::endl;
+      }
+    }
+  }
   const int T = static_cast<int>(sinc.size());
   booted.clear();
   booted.resize(T);
@@ -728,7 +767,13 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   const Parameter<word> &param = boot_->param_;
   const int T = cfg_.num_tokens;
   const int top = GetTopLevel();
-  exp_in_ = top - 1;
+  // affine_in_prefix: the multiply rides the fused boot's prefix, so the
+  // walk starts at exp on the landing itself -- 11 levels above forward
+  // instead of 12 (the landing-15 lever).
+  AssertTrue(!cfg_.affine_in_prefix || calib_.causal,
+             "CiBatchAttention::PrepareSoftMax: affine_in_prefix needs the "
+             "causal calibration (the row shift is per token)");
+  exp_in_ = cfg_.affine_in_prefix ? top : top - 1;
   const int exp_degree =
       (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(calib_.m_eff);
   // k = 1 (Cho): y = exp(m_eff (u - 1) / 4), squared later by the norm.
@@ -876,15 +921,32 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
   if (calib_.causal) BuildMasks(masks, head);
 
   // Affine onto the fit domain (carried divides out here), exp, the mask.
+  // Under affine_in_prefix the multiply already rode the fused boot's
+  // prefix (BootScoresFused folded a1 with this carried -- asserted), so
+  // only the row shift is added and the walk starts one level higher.
   const double a1 = 2.0 / (calib_.span * carried);
   Constant<word> c1;
-  boot_->encoder_.EncodeConstant(c1, top, param.GetScale(top), a1);
+  if (cfg_.affine_in_prefix) {
+    AssertTrue(std::abs(prefix_affine_carried_ - carried) <=
+                   1e-9 * std::abs(carried),
+               "CiBatchAttention::SoftMax: the prefix was folded with a "
+               "different carried factor");
+  } else {
+    boot_->encoder_.EncodeConstant(c1, top, param.GetScale(top), a1);
+  }
   std::vector<Ct> y(T);
   Ct sq_acc;
   for (int l = 0; l < T; l++) {
-    Ct t1, u;
-    boot_->Mult(t1, scores[l], c1);
-    boot_->Rescale(u, t1);
+    Ct u;
+    if (cfg_.affine_in_prefix) {
+      // A LevelDown to the ciphertext's own level is a copy; the affine's
+      // multiply already rode the prefix.
+      boot_->LevelDown(u, scores[l], top);
+    } else {
+      Ct t1;
+      boot_->Mult(t1, scores[l], c1);
+      boot_->Rescale(u, t1);
+    }
     if (calib_.causal) {
       boot_->Add(u, u, a0_[head]);
     } else {

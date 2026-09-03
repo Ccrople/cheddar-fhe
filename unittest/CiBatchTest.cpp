@@ -64,11 +64,14 @@ const char *Param() {
   return (env && env[0]) ? env : "ci16_35.json";
 }
 // The fused scores' tower ring: K = 64 with the prefix landing where the
-// layer preset's own Boot does. ci16_35_stc2 lands at 17 (19 - 2 StC
-// levels), so its tower is `land18c4e10` (EvalMod ends at 18).
+// layer preset's own Boot does. The default pairs the default layer preset
+// `ci16_35` (landing 16, `bdeafd3`'s causal fold): the shipped
+// `land17c3e10` (EvalMod ends at 17). Pairs: ci16_35_stc2 (17) needs
+// `land18c4e10`; the landing-15 layer preset `ci16_35_land17c4e8s2`
+// needs `land16c4e10` plus `CHEDDAR_CI_BATCH_AFFINE_PREFIX=1`.
 const char *TowerParam() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_TOWER_PARAM");
-  return (env && env[0]) ? env : "ci16_35_land18c4e10.json";
+  return (env && env[0]) ? env : "ci16_35_land17c3e10.json";
 }
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
@@ -1858,6 +1861,8 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   // y at the attention hold - 1, the projections one below.
   acfg.rope_level = cfg.norm_apply_level_attn - 2;
   acfg.fused_scores = fused_scores;
+  acfg.affine_in_prefix =
+      fused_scores && EnvInt("CHEDDAR_CI_BATCH_AFFINE_PREFIX", 0) != 0;
   acfg.verbose = true;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg, tctx);
@@ -2319,6 +2324,8 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.rope_level = cfg.norm_apply_level_attn - 2;
   acfg.fused_scores = fused_scores;
+  acfg.affine_in_prefix =
+      fused_scores && EnvInt("CHEDDAR_CI_BATCH_AFFINE_PREFIX", 0) != 0;
   acfg.verbose = cfg.verbose;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg, tctx);

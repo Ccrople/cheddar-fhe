@@ -682,7 +682,8 @@ void CiBatchLayer<word>::Attention(
       }
       std::vector<Ct> booted(T);
       if (attn.FusedScores()) {
-        attn.BootScoresFused(booted, scores, akeys, BootGroupSize());
+        attn.BootScoresFused(booted, scores, akeys, BootGroupSize(),
+                             carried);
       } else {
         const int group = BootGroupSize();
         for (int l0 = 0; l0 < T; l0 += group) {

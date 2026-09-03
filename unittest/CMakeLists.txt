@@ -494,6 +494,10 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c4e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c4e10.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land16c4e10.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land16c4e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

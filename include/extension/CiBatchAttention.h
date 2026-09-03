@@ -126,6 +126,16 @@ class CiBatchAttention {
     //! side. Needs the `tower` BootContext (K = 64, `ci16_35_land17c3e10`,
     //! its SSE secret tower-sparse). Values' returns keep the converter.
     bool fused_scores = false;
+    //! The landing-15 lever (the level idea [4] freed): the softmax's
+    //! affine MULTIPLY `a1 = 2 / (span * carried)` is folded into the
+    //! fused boot's lane-prefix plaintexts (both factors are configuration
+    //! constants; the prefix is re-encoded lazily at the first
+    //! `BootScoresFused` once `carried` is observed), so the walk starts
+    //! at exp directly -- 11 levels above `forward_level` 4, which is what
+    //! a Boot landing at 15 has. Requires `fused_scores` and a causal
+    //! calibration; `SoftMax` then expects the affine already applied and
+    //! only adds the row shift.
+    bool affine_in_prefix = false;
     bool verbose = false;
   };
 
@@ -196,9 +206,17 @@ class CiBatchAttention {
    * `HalfBootTowerBatch` and the lane prefix, landing in slots at
    * `GetFusedTopLevel()` canonical with the chain's carried factor in the
    * message, exactly as a `Boot` would have left them. `sinc` is consumed.
+   *
+   * Under `Config::affine_in_prefix` the prefix also carries the softmax's
+   * affine multiply, so the landed message is `u - a0 = 2 S / span` and
+   * `SoftMax` starts at exp: pass the chain's `carried` (required then,
+   * ignored otherwise) and call `PrepareSoftMax` first (the fold needs
+   * `span`). The prefix is (re-)encoded at the first call and whenever
+   * `carried` changes.
    */
   void BootScoresFused(std::vector<Ct> &booted, std::vector<Ct> &sinc,
-                       const Keys &keys, int group) const;
+                       const Keys &keys, int group,
+                       double carried = 0.0) const;
 
   //! Rotations on the switching ring: the two converters.
   void AddSwitchRotations(EvkRequest &req) const;
@@ -343,6 +361,10 @@ class CiBatchAttention {
   //! The masks are built per head at its call (`BuildMasks`), 128
   //! plaintexts at a time.
   std::vector<Pt> a0_;
+  //! `affine_in_prefix`: the `carried` the prefix plaintexts were encoded
+  //! with (0 = the plain ctor encode, no affine folded). The chain's scale
+  //! walk is deterministic, so after the first fold this never changes.
+  mutable double prefix_affine_carried_ = 0.0;
   void BuildMasks(std::vector<Pt> &masks, int head) const;
   //! Zero ciphertexts on the lifted ring, the shape of `like`, `count` of
   //! them: the contract's dead lhs columns.
