@@ -151,16 +151,23 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   AssertTrue(hold + 1 <= top,
              "CiBatchLayer::NormTurn: norm_apply_level is above the boot's "
              "landing");
-  const bool chan = chan_boot_ != nullptr;
+  // The channel-ring path needs one level for the pre-boot squares; a
+  // level-0 stream (the attention's O lands at 0: the return path pins
+  // it) falls back to the old boot-first walk -- which the A/B prefers
+  // for the feed-forward's norm anyway (its baseline holds channels, so
+  // the ring saves no boots there).
+  const bool chan = chan_boot_ != nullptr &&
+                    param.NPToLevel(stream[0].GetNP()) >= 1;
+  if (chan_boot_ != nullptr && !chan && cfg_.verbose) {
+    std::cout << "  [batch] NormTurn: level-0 stream -- the channel ring "
+              << "sits out this norm" << std::endl;
+  }
   if (chan) {
     AssertTrue(chan_evk_ != nullptr,
                "CiBatchLayer::NormTurn: SetChannelBoot without its keys");
     AssertTrue(hold <= chan_boot_->GetBootParameter().GetEndLevel(),
                "CiBatchLayer::NormTurn: norm_apply_level is above the "
                "channel ring's landing");
-    AssertTrue(param.NPToLevel(stream[0].GetNP()) >= 1,
-               "CiBatchLayer::NormTurn: the pre-boot squares need the "
-               "stream at level >= 1");
   }
 
   // The boot's tables, if the previous norm dropped them.
