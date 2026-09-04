@@ -2653,6 +2653,184 @@ TEST(CiBatch, TheIncrementalSplitProjectsLikeTheWholeOne) {
 // 9. The norm alone, at a small width: NormTurn -> an identity projection
 //    onto the first channels -> the host's x / sqrt(mean(x^2) + eps).
 // ---------------------------------------------------------------------------
+// The decode dense-repacking microbenchmark (the two decode design notes,
+// 2026-09-04): 128 replica-C-layout channel ciphertexts are PACKED into one
+// dense ciphertext (mask + add), the ONE ciphertext bootstraps, and the
+// channels are UNPACKED back to replica form (mask + 7 rotate-add
+// broadcasts each) -- against the baseline of 128 individual bootstraps.
+// Also times the dense-VMM primitive triple (rotate + pt-mult + add) for
+// the design-2 projection estimate. Synthetic data; correctness checked to
+// boot-family precision on sample channels.
+TEST(CiBatch, DecodePackBootUnpackBench) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  const int K = kTokens;  // 128 channels = one dense ct
+  const int lvl_in = 1;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const int land = bctx->GetBootParameter().GetEndLevel();
+  // Broadcast strides over the token axis (slot = t * B + b).
+  std::vector<int> strides;
+  for (int s = B; s < B * kTokens; s <<= 1) strides.push_back(s);
+  for (int s : strides) {
+    boot.ui->PrepareRotationKey(s, land);
+    boot.ui->PrepareRotationKey(s, 3);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+  (void)mult_key;
+
+  // Data: x[c][b], replicated over tokens in the C-layout.
+  std::mt19937_64 gen(0x9e1);
+  std::uniform_real_distribution<double> ux(-0.3, 0.3);
+  std::vector<std::vector<double>> x(K, std::vector<double>(B));
+  for (auto &row : x)
+    for (auto &v : row) v = ux(gen);
+  HostTensor hx{B, kTokens, K, {}};
+  hx.v.resize(static_cast<size_t>(B) * kTokens * K);
+  for (int b = 0; b < B; b++)
+    for (int t = 0; t < kTokens; t++)
+      for (int c = 0; c < K; c++) hx.At(b, t, c) = x[c][b];
+  std::vector<Ciphertext<word>> cts;
+  EncryptChannels(boot, layout, hx, lvl_in, cts);
+
+  // Masks: token == c, one set at the input level, one at the landing.
+  auto make_mask = [&](int c, int level, Plaintext<word> &pt) {
+    std::vector<double> vals(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) vals[static_cast<size_t>(b) * kTokens + c] = 1.0;
+    std::vector<Complex> msg;
+    layout.Pack(msg, vals);
+    boot.context->gpu_encoder_.Encode(pt, level, boot.param->GetScale(level),
+                                      msg);
+  };
+  std::vector<Plaintext<word>> mask_in(K), mask_land(K);
+  for (int c = 0; c < K; c++) {
+    make_mask(c, lvl_in, mask_in[c]);
+    make_mask(c, land, mask_land[c]);
+  }
+
+  // --- Baseline: 128 individual (grouped) bootstraps.
+  auto t0 = Sync();
+  {
+    const int group = EnvInt("CHEDDAR_EVALMOD_BATCH", 32);
+    for (int c0 = 0; c0 < K; c0 += group) {
+      const int g = std::min(K - c0, group);
+      std::vector<const Ciphertext<word> *> in(g);
+      for (int j = 0; j < g; j++) in[j] = &cts[c0 + j];
+      std::vector<Ciphertext<word>> out_g;
+      bctx->BootBatch(out_g, in, boot.ui->GetEvkMap());
+    }
+  }
+  auto t1 = Sync();
+
+  // --- Candidate: pack -> one boot -> unpack.
+  Ciphertext<word> dense;
+  {
+    Ciphertext<word> acc;
+    for (int c = 0; c < K; c++) {
+      Ciphertext<word> m;
+      bctx->Mult(m, cts[c], mask_in[c]);
+      if (c == 0) {
+        acc = std::move(m);
+      } else {
+        bctx->Add(acc, acc, m);
+      }
+    }
+    bctx->Rescale(dense, acc);
+  }
+  auto t2 = Sync();
+  Ciphertext<word> dense_up;
+  bctx->Boot(dense_up, dense, boot.ui->GetEvkMap());
+  auto t3 = Sync();
+  std::vector<Ciphertext<word>> unpacked(K);
+  {
+    for (int c = 0; c < K; c++) {
+      Ciphertext<word> m, mm;
+      bctx->Mult(mm, dense_up, mask_land[c]);
+      bctx->Rescale(m, mm);
+      for (int s : strides) {
+        Ciphertext<word> r;
+        bctx->HRot(r, m, boot.ui->GetRotationKey(s), s);
+        bctx->Add(m, m, r);
+      }
+      unpacked[c] = std::move(m);
+    }
+  }
+  auto t4 = Sync();
+
+  // --- Dense-VMM primitive triple at a decode working level.
+  double triple_ms = 0.0;
+  {
+    Ciphertext<word> w, acc2;
+    bctx->LevelDown(w, dense_up, 3);
+    Plaintext<word> mask3;
+    make_mask(0, 3, mask3);
+    auto p0 = Sync();
+    const int reps = 128;
+    for (int i = 0; i < reps; i++) {
+      Ciphertext<word> rr, pm;
+      bctx->HRot(rr, w, boot.ui->GetRotationKey(B), B);
+      bctx->Mult(pm, rr, mask3);
+      if (i == 0) {
+        acc2 = std::move(pm);
+      } else {
+        bctx->Add(acc2, acc2, pm);
+      }
+    }
+    auto p1 = Sync();
+    triple_ms = Ms(p0, p1) / reps;
+  }
+
+  // Correctness on sample channels (boot-family precision).
+  double worst = 0.0;
+  for (int c : {0, 63, 127}) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, unpacked[c]);
+    std::vector<Complex> msg;
+    boot.context->encoder_.Decode(msg, pt);
+    std::vector<double> vals;
+    layout.Unpack(vals, msg);
+    for (int b = 0; b < B; b += 37) {
+      for (int t = 0; t < kTokens; t += 17) {
+        worst = std::max(
+            worst,
+            std::abs(vals[static_cast<size_t>(b) * kTokens + t] - x[c][b]));
+      }
+    }
+  }
+
+  const double base_ms = Ms(t0, t1);
+  const double pack_ms = Ms(t1, t2), boot_ms = Ms(t2, t3),
+               unpack_ms = Ms(t3, t4);
+  const double cand_ms = pack_ms + boot_ms + unpack_ms;
+  std::cout << "  [bench] baseline 128 grouped boots: " << base_ms << " ms ("
+            << base_ms / K << " ms/ct)" << std::endl;
+  std::cout << "  [bench] pack " << pack_ms << " + boot " << boot_ms
+            << " + unpack " << unpack_ms << " = " << cand_ms
+            << " ms  -> speedup x" << base_ms / cand_ms << std::endl;
+  std::cout << "  [bench] unpack alone: " << unpack_ms / K
+            << " ms/channel (7 HRot + mask)" << std::endl;
+  // Sum over the four projections of in*out/65536 = 3,322 triples per
+  // token-layer (B-independent); naive, no hoisting.
+  std::cout << "  [bench] dense-VMM triple (HRot+mask+add @L3): " << triple_ms
+            << " ms -> naive dense VMM ~" << triple_ms * 3322.0
+            << " ms per token-layer" << std::endl;
+  std::cout << "  [bench] worst abs error after pack/boot/unpack: " << worst
+            << std::endl;
+  EXPECT_LT(worst, 5e-3);
+#endif
+}
+
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
 // isolation: squares summed at level 1 BEFORE any bootstrap, relinearized
 // once, and the ONE sum bootstrapped on the deep ring -- against the same
