@@ -16,15 +16,16 @@
 //   (1) TheEvalModScaleRecursionMatchesTheHost -- the audit's model of
 //       EvalMod's recursion equals the library's (GetEvalModStartScale /
 //       GetStCInputScale), so the host deviation map stays honest.
-//   (2) TheBootLandsAtItsNominalScale -- HalfBoot's carried factor over the
-//       DERIVED crossing constant, and full Boot's carried factor over 1.0:
-//       any deviation is the measured-vs-nominal landing-scale miss (the
-//       0.28%). Reported in ppm; gated loosely by default, tightly under
-//       CHEDDAR_ROBUST_STRICT=1 (the v3 contract).
-//   (3) TrimmedPolynomialsLandAtEveryDegree -- EvalPoly through the
-//       used-degree probe + level-trimming logic (CiDecodeLayer's
-//       EvalAtDepth pattern) at every degree 1..15, against a host
-//       Chebyshev evaluation. The deg > 7 bug is watched permanently.
+//   (2) TheBootLandsAtItsNominalScale -- full Boot's carried factor over
+//       1.0 in ppm (the measured-vs-nominal landing-scale miss; 7.37's
+//       0.28% class), plus the HalfBoot -> SlotToCoeff cycle (HalfBoot's
+//       own carried constant is measured, not derived -- HalfBootTest's
+//       lesson) and the K-edge tail count.
+//   (3) TrimmedPolynomialsLandAtEveryDegree (run LAST; a library Fail()
+//       aborts the process) -- EvalPoly through the used-degree probe +
+//       level-trimming logic (CiDecodeLayer's EvalAtDepth pattern) at
+//       every degree 2..15, against a host Chebyshev evaluation. The
+//       deg > 7 bug is watched permanently.
 //   (4) TheCanonicalDescentIsExactAndTheBareDescentDrifts -- CanonicalTo's
 //       walk lands the canonical scale at every level; LevelDown keeps the
 //       message but leaves the declared scale off canonical by exactly the
@@ -185,30 +186,40 @@ TEST(ParamRobust, TheBootLandsAtItsNominalScale) {
   Ciphertext<word> ct;
   EncryptAt(r, ct, msg, 0);
 
+  // The half route, measured in the shape the pipeline actually runs
+  // (HalfBootTest's lesson): HalfBoot leaves the input's COEFFICIENTS
+  // bit-reversed in the slots -- not comparable to the message directly --
+  // so the honest check is the HalfBoot -> SlotToCoeff cycle, whose
+  // permutations cancel and whose composite constant is measured, not
+  // derived (BootContext.cpp says so at HalfBoot's SetScale).
   Ciphertext<word> half;
   b->HalfBoot(half, ct, r.ui->GetEvkMap());
   ASSERT_EQ(r.param->NPToLevel(half.GetNP()), bp.GetEvalModEndLevel());
-  const Fit h = FitResidual(msg, Decrypt(r, half));
-  const double half_miss = h.carried / b->GetMessageRatio() - 1.0;
-  std::cout << "[landing] HalfBoot carried " << h.carried
-            << " over derived ratio " << b->GetMessageRatio()
-            << ": miss " << half_miss * 1e6 << " ppm; residual "
-            << h.residual << " = 2^" << std::log2(h.residual) << std::endl;
-  EXPECT_LT(h.residual, 0.01) << "HalfBoot did not preserve the message";
-  EXPECT_LT(std::abs(half_miss), Strict() ? 2e-4 : 5e-3)
-      << "the measured landing scale misses the nominal (the 7.37 class)";
+  Ciphertext<word> cyc;
+  b->SlotToCoeff(cyc, num_slots, half, r.ui->GetEvkMap());
+  const Fit h = FitResidual(msg, Decrypt(r, cyc));
+  std::cout << "[landing] HalfBoot+StC cycle carried " << h.carried << " = 2^"
+            << std::log2(std::abs(h.carried)) << " (derived crossing ratio 2^"
+            << std::log2(b->GetMessageRatio())
+            << "); relative residual 2^"
+            << std::log2(h.residual / std::abs(h.carried)) << std::endl;
+  EXPECT_LT(h.residual / std::abs(h.carried), 1e-2)
+      << "the message did not survive the HalfBoot -> SlotToCoeff cycle";
 
   // The K-edge tail: slots whose ModRaise wrap-around fell past EvalMod's
   // range land far out, and one such slot is a rank-one error the layer's
   // projections spread (the K = 16 lesson, Doing.md 3.9/CLAUDE.md).
   {
-    const auto got = Decrypt(r, half);
+    const auto got = Decrypt(r, cyc);
     int far = 0;
     for (int i = 0; i < num_slots; i++) {
-      if (std::abs(got[i].real() - h.carried * msg[i].real()) > 1e-3) far++;
+      if (std::abs(got[i].real() - h.carried * msg[i].real()) >
+          1e-3 * std::abs(h.carried)) {
+        far++;
+      }
     }
-    std::cout << "[landing] slots past 1e-3 residual: " << far << " of "
-              << num_slots << std::endl;
+    std::cout << "[landing] slots past 1e-3 relative residual: " << far
+              << " of " << num_slots << std::endl;
     if (Strict()) {
       EXPECT_EQ(far, 0) << "K-edge tail: slots past EvalMod's range";
     }
@@ -232,66 +243,6 @@ TEST(ParamRobust, TheBootLandsAtItsNominalScale) {
   } else {
     std::cout << "[landing] full Boot skipped (lands at " << bp.GetEndLevel()
               << ")" << std::endl;
-  }
-}
-
-// (3) EvalPoly at every used degree 1..15 through the trimming logic --
-// CiDecodeLayer::EvalAtDepth's exact pattern: probe the used degree,
-// trim the landing to lv - Log2Ceil(used + 1), compile against the
-// canonical target scale there, evaluate. Doing.md 7.45 measured 2^400
-// garbage past used degree 7 on the decode path; this is the permanent
-// minimal watch. A pure Chebyshev T_d input pins the used degree to
-// exactly d (no silent 1e-9 trimming).
-TEST(ParamRobust, TrimmedPolynomialsLandAtEveryDegree) {
-  Ring r(RobustParam());
-  auto ctx = r.context;
-  const auto &mult_key = r.ui->GetEvkMap().GetMultiplicationKey();
-  const int num_slots = r.param->MaxNumSlots();
-
-  const int dec = r.param->default_encryption_level_;
-  const int lv = std::min(dec, 6);
-  const int max_fit_degree = (1 << std::max(lv, 0)) - 1;
-  ASSERT_GE(lv, 1) << "no levels to evaluate a polynomial";
-
-  const auto msg = RandomReal(num_slots, 0.95, 0x9017);
-
-  for (int d = 1; d <= std::min(15, max_fit_degree); d++) {
-    std::vector<double> coeffs(static_cast<size_t>(d) + 1, 0.0);
-    coeffs[d] = 0.5;  // 0.5 * T_d, well inside [-1, 1] on the domain
-
-    Ciphertext<word> in;
-    EncryptAt(r, in, msg, lv);
-    const double in_scale = in.GetScale();
-    const int used = cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale,
-                                             /*chebyshev=*/true)
-                         .GetPolyDegree();
-    ASSERT_EQ(used, d) << "the probe trimmed a pure T_" << d;
-    const int lr = lv - Log2Ceil(used + 1);
-    cheddar::EvalPoly<word> poly(coeffs, lv, in_scale,
-                                 r.param->GetScale(lr), /*chebyshev=*/true);
-    poly.Compile(ctx);
-    Ciphertext<word> out;
-    poly.Evaluate(ctx, out, in, mult_key);
-
-    const auto got = Decrypt(r, out);
-    double err = 0.0, absmax = 0.0;
-    for (int i = 0; i < num_slots; i++) {
-      const double x = msg[i].real();
-      const double want = 0.5 * std::cos(d * std::acos(std::min(
-                                    1.0, std::max(-1.0, x))));
-      err = std::max(err, std::abs(got[i].real() - want));
-      absmax = std::max(absmax, std::abs(want));
-    }
-    std::cout << "[poly] degree " << d << ": lands level "
-              << r.param->NPToLevel(out.GetNP()) << " (asked " << lr
-              << "), declared scale 2^" << std::log2(out.GetScale())
-              << ", max err " << err << " = 2^" << std::log2(err)
-              << std::endl;
-    EXPECT_EQ(r.param->NPToLevel(out.GetNP()), lr)
-        << "degree " << d << " did not land where the trim asked";
-    EXPECT_LT(err / std::max(absmax, 0.5), 1e-2)
-        << "degree " << d
-        << " did not evaluate (the used-degree > 7 class, Doing.md 7.45)";
   }
 }
 
@@ -391,4 +342,65 @@ TEST(ParamRobust, TheRideProbe) {
             << "mean; this is the rms view)" << std::endl;
   EXPECT_LT(rms_at[2], 1e-3)
       << "the residual at ride 0.2 is out of family for a working preset";
+}
+
+// (3, run LAST: a library Fail() aborts the process) EvalPoly at every
+// used degree 2..15 (EvalPoly rejects degree < 2) through the trimming logic --
+// CiDecodeLayer::EvalAtDepth's exact pattern: probe the used degree,
+// trim the landing to lv - Log2Ceil(used + 1), compile against the
+// canonical target scale there, evaluate. Doing.md 7.45 measured 2^400
+// garbage past used degree 7 on the decode path; this is the permanent
+// minimal watch. A pure Chebyshev T_d input pins the used degree to
+// exactly d (no silent 1e-9 trimming).
+TEST(ParamRobust, TrimmedPolynomialsLandAtEveryDegree) {
+  Ring r(RobustParam());
+  auto ctx = r.context;
+  const auto &mult_key = r.ui->GetEvkMap().GetMultiplicationKey();
+  const int num_slots = r.param->MaxNumSlots();
+
+  const int dec = r.param->default_encryption_level_;
+  const int lv = std::min(dec, 6);
+  const int max_fit_degree = (1 << std::max(lv, 0)) - 1;
+  ASSERT_GE(lv, 1) << "no levels to evaluate a polynomial";
+
+  const auto msg = RandomReal(num_slots, 0.95, 0x9017);
+
+  for (int d = 2; d <= std::min(15, max_fit_degree); d++) {
+    std::vector<double> coeffs(static_cast<size_t>(d) + 1, 0.0);
+    coeffs[d] = 0.5;  // 0.5 * T_d, well inside [-1, 1] on the domain
+
+    Ciphertext<word> in;
+    EncryptAt(r, in, msg, lv);
+    const double in_scale = in.GetScale();
+    const int used = cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale,
+                                             /*chebyshev=*/true)
+                         .GetPolyDegree();
+    ASSERT_EQ(used, d) << "the probe trimmed a pure T_" << d;
+    const int lr = lv - Log2Ceil(used + 1);
+    cheddar::EvalPoly<word> poly(coeffs, lv, in_scale,
+                                 r.param->GetScale(lr), /*chebyshev=*/true);
+    poly.Compile(ctx);
+    Ciphertext<word> out;
+    poly.Evaluate(ctx, out, in, mult_key);
+
+    const auto got = Decrypt(r, out);
+    double err = 0.0, absmax = 0.0;
+    for (int i = 0; i < num_slots; i++) {
+      const double x = msg[i].real();
+      const double want = 0.5 * std::cos(d * std::acos(std::min(
+                                    1.0, std::max(-1.0, x))));
+      err = std::max(err, std::abs(got[i].real() - want));
+      absmax = std::max(absmax, std::abs(want));
+    }
+    std::cout << "[poly] degree " << d << ": lands level "
+              << r.param->NPToLevel(out.GetNP()) << " (asked " << lr
+              << "), declared scale 2^" << std::log2(out.GetScale())
+              << ", max err " << err << " = 2^" << std::log2(err)
+              << std::endl;
+    EXPECT_EQ(r.param->NPToLevel(out.GetNP()), lr)
+        << "degree " << d << " did not land where the trim asked";
+    EXPECT_LT(err / std::max(absmax, 0.5), 1e-2)
+        << "degree " << d
+        << " did not evaluate (the used-degree > 7 class, Doing.md 7.45)";
+  }
 }
