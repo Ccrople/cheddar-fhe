@@ -4750,13 +4750,40 @@ TEST(CiBatch, TheDecodeChainRunsOnTheRealLayers) {
       ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, w.fn));
 
       LayerM &m = lm[j];
-      // The cache: every position's RoPE'd k and v.
+      // The cache: every position's RoPE'd k and v -- with the SINK
+      // rescale the prefill applies at every norm (reference_forward.py's
+      // rescale_sinks: rows 0..1 to the user rows' geometric-mean power
+      // BEFORE the norm; a public per-token calibration). Without it the
+      // sink rows' k/v differ ~1.5% through the norm's eps and the
+      // sink-heavy heads carry ~1e-2 into row 127.
+      constexpr int kSinkTokens = 2;
+      std::vector<double> sink_fac(T, 1.0);
+      {
+        std::vector<double> ms(T);
+        for (int t = 0; t < T; t++) {
+          double s = 0.0;
+          for (int c2 = 0; c2 < kH; c2++) {
+            const double v2 = x[static_cast<size_t>(t) * kH + c2];
+            s += v2 * v2;
+          }
+          ms[t] = s / kH;
+        }
+        double logsum = 0.0;
+        for (int t = kSinkTokens; t < T; t++) logsum += std::log(ms[t]);
+        const double target = std::exp(logsum / (T - kSinkTokens));
+        for (int t = 0; t < kSinkTokens; t++) {
+          sink_fac[t] = std::sqrt(target / ms[t]);
+        }
+      }
       m.k_host.resize(static_cast<size_t>(T) * kKv);
       m.v_host.resize(static_cast<size_t>(T) * kKv);
       cheddar::ParallelFor(T, [&](int begin, int end) {
         for (int t = begin; t < end; t++) {
-          std::vector<double> yt;
-          rmsnorm(&x[static_cast<size_t>(t) * kH], w.an.data(), yt);
+          std::vector<double> xt(kH), yt;
+          for (int c2 = 0; c2 < kH; c2++) {
+            xt[c2] = sink_fac[t] * x[static_cast<size_t>(t) * kH + c2];
+          }
+          rmsnorm(xt.data(), w.an.data(), yt);
           for (int col = 0; col < kKv; col++) {
             double ak = 0.0, av2 = 0.0;
             for (int c2 = 0; c2 < kH; c2++) {
