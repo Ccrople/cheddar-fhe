@@ -20,6 +20,10 @@ namespace cheddar {
 #ifdef USE_CUBLAS
 
 namespace {
+// The norm's unpack runs at 8 so y lands at 7 = the V projection's input
+// (the header's level ledger); everything below derives from it.
+constexpr int kNormUnpackLevel = 8;
+
 using Clock = std::chrono::steady_clock;
 double SinceSeconds(Clock::time_point t0) {
   cudaDeviceSynchronize();
@@ -116,23 +120,12 @@ int CiDecodeLayer<word>::ExpSquarings(const Calibration &c) const {
 }
 
 template <typename word>
-int CiDecodeLayer<word>::FanoutLevel(const Calibration &c) const {
-  const int land = boot_->GetBootParameter().GetEndLevel();
-  const int le = land - 1 - Log2Ceil(cfg_.exp_degree + 1);
-  // The V projection reads the norm's output (land - 7), so e never needs
-  // to stand higher than land - 8; the walk brings it down for free, a
-  // canonical rescale covers the rest.
-  return Min(le - ExpSquarings(c), land - 8);
-}
-
-template <typename word>
-std::vector<typename CiDecodeLayer<word>::Ct> CiDecodeLayer<word>::AtLevel(
-    const std::vector<Ct> &x, int level) const {
-  std::vector<Ct> res(x.size());
-  for (size_t i = 0; i < x.size(); i++) {
-    boot_->LevelDown(res[i], x[i], level);
+void CiDecodeLayer<word>::LowerTo(std::vector<Ct> &x, int level) const {
+  for (auto &ct : x) {
+    Ct t;
+    boot_->LevelDown(t, ct, level);
+    ct = std::move(t);
   }
-  return res;
 }
 
 template <typename word>
@@ -299,9 +292,11 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
   CanonicalTo(r_inv, lr);
   r_inv.SetScale(r_inv.GetScale() * stream_scale / std::sqrt(alpha));
 
-  // Apply: ONE multiply normalises a group's 128 channels; then the
-  // hoisted unpack back to broadcast channels.
-  auto &unpack = UnpackAt(lr - 1);
+  // Apply: ONE multiply normalises a group's 128 channels; the product
+  // then descends to 8 BEFORE the unpack -- y lands at 7, the lowest
+  // level that still feeds the V projection, because 4096 channels cost
+  // 2.1 GiB a limb and the projections copy them once more.
+  auto &unpack = UnpackAt(kNormUnpackLevel);
   y.clear();
   y.resize(model);
   for (int g = 0; g < groups; g++) {
@@ -309,8 +304,10 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
     boot_->LevelDown(dd, up[g], lr);
     up[g] = Ct();
     boot_->HMult(dn, dd, r_inv, mult_key);
+    Ct dn8;
+    boot_->LevelDown(dn8, dn, kNormUnpackLevel);
     std::vector<Ct> chans;
-    unpack.Evaluate(boot_, chans, dn, evk);
+    unpack.Evaluate(boot_, chans, dn8, evk);
     for (int r = 0; r < T; r++) {
       y[g * T + r] = std::move(chans[r]);
     }
@@ -378,9 +375,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   const int land = boot_->GetBootParameter().GetEndLevel();
   const int k_sq = ExpSquarings(c);
   const int le = land - 1 - Log2Ceil(cfg_.exp_degree + 1);
-  const int lf = FanoutLevel(c);
-  const int lz = lf - 3;
-  AssertTrue(lf >= 7,
+  const int lf = FanoutLevel();  // 7; the walk descends canonically to it
+  AssertTrue(le - k_sq >= lf,
              "CiDecodeLayer::Step: the level budget does not close (the O "
              "output must reach level 1)");
   stages_ = Stages();
@@ -404,7 +400,10 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   std::vector<Ct> q, knew, vnew;
   {
     NvtxScope _w("decode: qkv");
-    const int lv_proj = lf + 1;
+    const int lv_proj = lf;  // y's own level: V projects with NO copy
+    AssertTrue(param.NPToLevel(y[0].GetNP()) == lv_proj,
+               "CiDecodeLayer::Step: the norm must land y at the V "
+               "projection's level");
     auto ratio = [&](int level) {
       return y[0].GetScale() / param.GetScale(level);
     };
@@ -428,22 +427,18 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       proj_->Prepare("dec.v", vd.data(), model, kv_heads * D, lv_proj, 1.0,
                      ratio(lv_proj));
     }
-    {
-      auto yv = AtLevel(y, lv_proj);
-      proj_->Project(vnew, yv, "dec.v");
-    }
-    {
-      auto yk = AtLevel(y, 4);
-      proj_->Project(knew, yk, "dec.k");
-    }
-    {
-      auto yq = AtLevel(y, 3);
-      proj_->Project(q, yq, "dec.q");
-    }
-    y.clear();
-    proj_->Release("dec.q");
-    proj_->Release("dec.k");
+    // Largest first, y walked DOWN in place between them: at the model's
+    // width a second copy of y is 17 GiB, which is what OOM'd the first
+    // run of this step.
+    proj_->Project(vnew, y, "dec.v");
     proj_->Release("dec.v");
+    LowerTo(y, 4);
+    proj_->Project(knew, y, "dec.k");
+    proj_->Release("dec.k");
+    LowerTo(y, 3);
+    proj_->Project(q, y, "dec.q");
+    proj_->Release("dec.q");
+    y.clear();
   }
   stages_.qkv = SinceSeconds(t0);
   t0 = Clock::now();
@@ -462,7 +457,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       layout_.Pack(msg, mv);
       boot_->gpu_encoder_.Encode(kmask, 3, param.GetScale(3), msg);
     }
-    auto vmasks = MakeRowMasks(lf, 1.0);
+    auto vmasks = MakeRowMasks(lf - 1, 1.0);  // vnew's level; the pack
+                                              // lands at VCacheLevel
     for (int kv = 0; kv < kv_heads; kv++) {
       for (int d = 0; d < D; d++) {
         Ct m, r;
@@ -481,7 +477,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   // ---- Per head: scores, the max shift, ONE boot, the exp walk, Z and
   // its reciprocal, the fan-out, ScoreV, the reciprocal LAST, the unpack.
   auto &fanout = UnpackAt(lf);
-  auto &hunpack = UnpackAt(lf - 4);
+  auto &hunpack = UnpackAt(3);
   std::vector<Ct> o_in(model);
   for (int h = 0; h < heads; h++) {
     NvtxScope _h("decode: head");
@@ -543,7 +539,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       EvalAtDepth(r_inv, z, 1.0 / a, -b / a,
                   [a, b](double t) { return 1.0 / (a * t + b); },
                   cfg_.recip_degree, evk);
-      CanonicalTo(r_inv, lz);
+      CanonicalTo(r_inv, 4);
     }
     std::vector<Ct> e_t;
     fanout.Evaluate(boot_, e_t, e, evk);
@@ -551,8 +547,11 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     {
       Ct acc;
       for (int t = 0; t < T; t++) {
+        Ct et;
+        boot_->LevelDown(et, e_t[t], VCacheLevel());
+        e_t[t] = Ct();
         Ct m;
-        boot_->Mult(m, e_t[t], cache.vt[kv][t]);
+        boot_->Mult(m, et, cache.vt[kv][t]);
         if (t == 0) {
           acc = std::move(m);
         } else {
@@ -565,7 +564,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     Ct out_ct;
     {
       Ct dd;
-      boot_->LevelDown(dd, out_raw, lz);
+      boot_->LevelDown(dd, out_raw, 4);
       boot_->HMult(out_ct, dd, r_inv, mult_key);
     }
     std::vector<Ct> chans;
@@ -631,9 +630,9 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   }
   typename CiBatchProjection<word>::Source src2;
   {
-    auto y2c = AtLevel(y2, 2);
+    LowerTo(y2, 2);
+    proj_->Split(src2, y2, "dec.gate");
     y2.clear();
-    proj_->Split(src2, y2c, "dec.gate");
   }
   auto gmasks = MakeRowMasks(1, gam_g);
   auto umasks = MakeRowMasks(1, gam_u);

@@ -4536,7 +4536,7 @@ TEST(CiBatch, TheDecodeLayerRunsOnTheRealLayer) {
     boot.ui->PrepareRotationKey(req);
   }
   const int k_sq = layer.ExpSquarings(cal);
-  const int lf = layer.FanoutLevel(cal);
+  const int lf = layer.FanoutLevel();
   std::cout << "  [decode layer] walk k=" << k_sq << ", fanout level " << lf
             << ", stream carries " << cal.stream_scale << ", "
             << FreeMiB() << " MiB free after setup" << std::endl;
@@ -4598,7 +4598,7 @@ TEST(CiBatch, TheDecodeLayerRunsOnTheRealLayer) {
                         : 0.0;
           }
         }
-        encrypt_one(values, layer.VCacheLevel(cal), cache.vt[kv][tc]);
+        encrypt_one(values, layer.VCacheLevel(), cache.vt[kv][tc]);
       }
     }
   }
