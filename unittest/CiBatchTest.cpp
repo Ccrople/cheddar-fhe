@@ -49,6 +49,7 @@
 #include "extension/CiBatchLayer.h"
 #include "extension/ChebyshevFit.h"
 #include "extension/CiDecode.h"
+#include "extension/CiDecodeLayer.h"
 #include "extension/Hoist.h"
 
 using word = uint32_t;
@@ -4310,6 +4311,342 @@ TEST(CiBatch, TheDecodeAttentionRunsOnTheRealLayer) {
             << " ms/head); walk k=" << k_sq << ", e level " << lf
             << ", V level " << lv_v << std::endl;
   EXPECT_LT(worst_bits, -6.0);
+#endif
+}
+
+// The WHOLE decode step on the real layer-0 weights (Doing.md 7.40 roadmap
+// [6]'s main body): `CiDecodeLayer::Step` chains the five gated mechanisms
+// -- the decode NormTurn (7.42), the Kang q/k/v with the norm gain, the
+// per-head score gammas AND RoPE at the position folded into the weights,
+// the encrypted K/V appends (7.45), all 32 heads through the one-boot
+// softmax and the hoisted fan-out (7.43), O + residual, the second norm,
+// the gate/up -> SiLU -> down walk with the ride gammas in the pack masks
+// (7.44), and the second residual -- 1-step e2e against a float64 mirror
+// of the same step (norm -> RoPE'd projections -> true softmax(q k /
+// sqrt(d)) V over the 128-position cache -> O -> residual -> norm -> FFN
+// -> residual). The cache below `position` is the host prefill's (what a
+// prefill run leaves behind); the decode token's k/v enter ENCRYPTED
+// through the layer's own projections and appends. Instances are
+// replicated; both residual streams sit at level 1, so the step chains.
+TEST(CiBatch, TheDecodeLayerRunsOnTheRealLayer) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  if (wdir_env == nullptr) GTEST_SKIP() << "LLAMA3_ALL_DIR is not set";
+  const std::string ld = std::string(wdir_env) + "/L00";
+  constexpr int kH = 4096, kKv = 1024, kI = 14336, kHeads = 32, kKvHeads = 8;
+  const int D = kTokens, half = D / 2, T = kTokens, Tc = T - 1;
+  const double eps = 1e-5, rope_base = 500000.0;
+  const double sqd = std::sqrt(static_cast<double>(D));
+
+  std::vector<float> x0, wq, wk, wv, wo, wg, wu, wdn, an, fn;
+  ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
+                      static_cast<size_t>(T) * kH, x0));
+  ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
+  ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
+  ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
+  ASSERT_TRUE(ReadF32(ld + "/wgate.f32", static_cast<size_t>(kH) * kI, wg));
+  ASSERT_TRUE(ReadF32(ld + "/wup.f32", static_cast<size_t>(kH) * kI, wu));
+  ASSERT_TRUE(ReadF32(ld + "/wdown.f32", static_cast<size_t>(kI) * kH, wdn));
+  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an));
+  ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, fn));
+
+  // ---- The float64 mirror. Norms of every token (the cache reads them),
+  // the per-position RoPE'd K/V, the decode token's whole step.
+  auto rmsnorm = [&](const double *x, const float *gain,
+                     std::vector<double> &out) {
+    double ms = 0.0;
+    for (int c = 0; c < kH; c++) ms += x[c] * x[c];
+    const double r = 1.0 / std::sqrt(ms / kH + eps);
+    out.resize(kH);
+    for (int c = 0; c < kH; c++) out[c] = x[c] * r * gain[c];
+  };
+  auto rope = [&](double *m, int pos) {
+    for (int c = 0; c < half; c++) {
+      const double a = pos * std::pow(rope_base, -2.0 * c / D);
+      const double lo = m[c], hi = m[c + half];
+      m[c] = lo * std::cos(a) - hi * std::sin(a);
+      m[c + half] = hi * std::cos(a) + lo * std::sin(a);
+    }
+  };
+  std::vector<double> y(static_cast<size_t>(T) * kH);
+  for (int t = 0; t < T; t++) {
+    std::vector<double> xt(kH), yt;
+    for (int c = 0; c < kH; c++) xt[c] = x0[static_cast<size_t>(t) * kH + c];
+    rmsnorm(xt.data(), an.data(), yt);
+    std::copy(yt.begin(), yt.end(), y.begin() + static_cast<size_t>(t) * kH);
+  }
+  // k_host/v_host[t * kKv + kv * D + d], every position (Tc = the mirror
+  // of the encrypted appends).
+  std::vector<double> k_host(static_cast<size_t>(T) * kKv),
+      v_host(static_cast<size_t>(T) * kKv);
+  cheddar::ParallelFor(T, [&](int begin, int end) {
+    for (int t = begin; t < end; t++) {
+      for (int col = 0; col < kKv; col++) {
+        double ak = 0.0, av2 = 0.0;
+        for (int c = 0; c < kH; c++) {
+          const double yc = y[static_cast<size_t>(t) * kH + c];
+          ak += yc * wk[static_cast<size_t>(c) * kKv + col];
+          av2 += yc * wv[static_cast<size_t>(c) * kKv + col];
+        }
+        k_host[static_cast<size_t>(t) * kKv + col] = ak;
+        v_host[static_cast<size_t>(t) * kKv + col] = av2;
+      }
+      for (int kv = 0; kv < kKvHeads; kv++) {
+        rope(&k_host[static_cast<size_t>(t) * kKv + kv * D], t);
+      }
+    }
+  });
+  std::vector<double> q_host(kH);
+  cheddar::ParallelFor(kH, [&](int begin, int end) {
+    for (int o = begin; o < end; o++) {
+      double a = 0.0;
+      for (int c = 0; c < kH; c++) {
+        a += y[static_cast<size_t>(Tc) * kH + c] *
+             wq[static_cast<size_t>(c) * kH + o];
+      }
+      q_host[o] = a;
+    }
+  });
+  for (int h = 0; h < kHeads; h++) rope(&q_host[static_cast<size_t>(h) * D], Tc);
+  std::vector<double> s_lo(kHeads, 1e30), s_hi(kHeads, -1e30),
+      z_host(kHeads), av(kH);
+  for (int h = 0; h < kHeads; h++) {
+    const int kv = h / (kHeads / kKvHeads);
+    std::vector<double> s(T);
+    for (int l = 0; l < T; l++) {
+      double a = 0.0;
+      for (int d = 0; d < D; d++) {
+        a += q_host[static_cast<size_t>(h) * D + d] *
+             k_host[static_cast<size_t>(l) * kKv + kv * D + d];
+      }
+      s[l] = a;
+      s_lo[h] = std::min(s_lo[h], a);
+      s_hi[h] = std::max(s_hi[h], a);
+    }
+    double z = 0.0;
+    std::vector<double> p(T);
+    for (int l = 0; l < T; l++) {
+      p[l] = std::exp((s[l] - s_hi[h]) / sqd);
+      z += p[l];
+    }
+    z_host[h] = z;
+    for (int d = 0; d < D; d++) {
+      double a = 0.0;
+      for (int l = 0; l < T; l++) {
+        a += (p[l] / z) * v_host[static_cast<size_t>(l) * kKv + kv * D + d];
+      }
+      av[static_cast<size_t>(h) * D + d] = a;
+    }
+  }
+  std::vector<double> mid(kH), out_ref(kH);
+  {
+    std::vector<double> o_ref(kH);
+    cheddar::ParallelFor(kH, [&](int begin, int end) {
+      for (int c = begin; c < end; c++) {
+        double a = 0.0;
+        for (int i = 0; i < kH; i++) {
+          a += av[i] * wo[static_cast<size_t>(i) * kH + c];
+        }
+        o_ref[c] = a;
+      }
+    });
+    for (int c = 0; c < kH; c++) {
+      mid[c] = x0[static_cast<size_t>(Tc) * kH + c] + o_ref[c];
+    }
+  }
+  std::vector<double> y2, gg(kI), uu(kI), dd(kH);
+  rmsnorm(mid.data(), fn.data(), y2);
+  cheddar::ParallelFor(kI, [&](int begin, int end) {
+    for (int j = begin; j < end; j++) {
+      double ag = 0.0, au = 0.0;
+      for (int c = 0; c < kH; c++) {
+        ag += y2[c] * wg[static_cast<size_t>(c) * kI + j];
+        au += y2[c] * wu[static_cast<size_t>(c) * kI + j];
+      }
+      gg[j] = ag;
+      uu[j] = au;
+    }
+  });
+  std::vector<double> hh(kI);
+  for (int j = 0; j < kI; j++) {
+    hh[j] = gg[j] / (1.0 + std::exp(-gg[j])) * uu[j];
+  }
+  cheddar::ParallelFor(kH, [&](int begin, int end) {
+    for (int c = begin; c < end; c++) {
+      double a = 0.0;
+      for (int j = 0; j < kI; j++) {
+        a += hh[j] * wdn[static_cast<size_t>(j) * kH + c];
+      }
+      dd[c] = a;
+    }
+  });
+  for (int c = 0; c < kH; c++) out_ref[c] = mid[c] + dd[c];
+
+  // ---- Calibration from the mirror (replicated instances: single-point
+  // norm windows widened by the standard 1.3 ratio).
+  cheddar::CiDecodeLayer<word>::Calibration cal;
+  {
+    double msA = 0.0, msF = 0.0, absmax = 0.0, gmax = 0.0, umax = 0.0;
+    for (int c = 0; c < kH; c++) {
+      const double xa = x0[static_cast<size_t>(Tc) * kH + c];
+      msA += xa * xa;
+      msF += mid[c] * mid[c];
+      absmax = std::max({absmax, std::abs(xa), std::abs(mid[c]),
+                         std::abs(out_ref[c])});
+    }
+    for (int j = 0; j < kI; j++) {
+      gmax = std::max(gmax, std::abs(gg[j]));
+      umax = std::max(umax, std::abs(uu[j]));
+    }
+    cal.attn_alpha = 1.0 / (msA / kH + eps);
+    cal.attn_window = 1.3;
+    cal.ffn_alpha = 1.0 / (msF / kH + eps);
+    cal.ffn_window = 1.3;
+    cal.s_lo = s_lo;
+    cal.s_hi = s_hi;
+    cal.z_lo = z_host;
+    cal.z_hi = z_host;
+    cal.silu_gmax = gmax;
+    cal.up_umax = umax;
+    cal.stream_scale = 0.35 / absmax;
+  }
+
+  // ---- The ring, the layer, the keys.
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  cheddar::CiDecodeLayer<word>::Config cfg;
+  cfg.verbose = EnvInt("CHEDDAR_DECODE_VERBOSE", 0) != 0;
+  cheddar::CiDecodeLayer<word> layer(bctx, cfg);
+  const CiBatchLayout &layout = layer.GetLayout();
+  const int B = layout.num_instances;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const int k_sq = layer.ExpSquarings(cal);
+  const int lf = layer.FanoutLevel(cal);
+  std::cout << "  [decode layer] walk k=" << k_sq << ", fanout level " << lf
+            << ", stream carries " << cal.stream_scale << ", "
+            << FreeMiB() << " MiB free after setup" << std::endl;
+
+  cheddar::CiDecodeLayer<word>::HostWeights hw;
+  hw.q = wq.data();
+  hw.k = wk.data();
+  hw.v = wv.data();
+  hw.o = wo.data();
+  hw.gate = wg.data();
+  hw.up = wu.data();
+  hw.down = wdn.data();
+  hw.attn_norm.assign(an.begin(), an.end());
+  hw.ffn_norm.assign(fn.begin(), fn.end());
+
+  // ---- Encrypt: the stream (the decode token broadcast, in stream_scale
+  // units) and the prefill's K/V cache, replicated over the instances.
+  auto encrypt_one = [&](const std::vector<double> &values, int level,
+                         Ciphertext<word> &ct) {
+    std::vector<Complex> msg;
+    layout.Pack(msg, values);
+    Plaintext<word> pt;
+    boot.context->gpu_encoder_.Encode(pt, level,
+                                      boot.param->GetScale(level), msg);
+    boot.ui->Encrypt(ct, pt);
+  };
+  std::vector<Ciphertext<word>> stream(kH);
+  {
+    std::vector<double> values(static_cast<size_t>(B) * T);
+    for (int c = 0; c < kH; c++) {
+      const double v = cal.stream_scale * x0[static_cast<size_t>(Tc) * kH + c];
+      std::fill(values.begin(), values.end(), v);
+      encrypt_one(values, layer.StreamLevel(), stream[c]);
+    }
+  }
+  cheddar::CiDecodeLayer<word>::Cache cache;
+  cache.kc.resize(kKvHeads);
+  cache.vt.resize(kKvHeads);
+  {
+    std::vector<double> values(static_cast<size_t>(B) * T);
+    for (int kv = 0; kv < kKvHeads; kv++) {
+      cache.kc[kv].resize(D);
+      for (int d = 0; d < D; d++) {
+        for (int b = 0; b < B; b++) {
+          for (int t = 0; t < T; t++) {
+            values[static_cast<size_t>(b) * T + t] =
+                t < Tc ? k_host[static_cast<size_t>(t) * kKv + kv * D + d]
+                       : 0.0;
+          }
+        }
+        encrypt_one(values, layer.KCacheLevel(), cache.kc[kv][d]);
+      }
+      cache.vt[kv].resize(T);
+      for (int tc = 0; tc < T; tc++) {
+        for (int b = 0; b < B; b++) {
+          for (int d = 0; d < T; d++) {
+            values[static_cast<size_t>(b) * T + d] =
+                tc < Tc ? v_host[static_cast<size_t>(tc) * kKv + kv * D + d]
+                        : 0.0;
+          }
+        }
+        encrypt_one(values, layer.VCacheLevel(cal), cache.vt[kv][tc]);
+      }
+    }
+  }
+  auto t0 = Sync();
+
+  // ---- The step.
+  bctx->ResetBootCounts();
+  std::vector<Ciphertext<word>> next;
+  cheddar::CiDecodeLayer<word>::Debug dbg;
+  layer.Step(next, stream, cache, hw, cal, Tc, boot.ui->GetEvkMap(), &dbg);
+  auto t1 = Sync();
+  const auto counts = bctx->GetBootCounts();
+  const auto &st = layer.GetStages();
+  std::cout << "  [decode layer] step " << Ms(t0, t1) / 1000.0
+            << " s: norm1 " << st.norm1 << " qkv " << st.qkv << " append "
+            << st.append << " heads " << st.heads << " o " << st.o
+            << " norm2 " << st.norm2 << " gate/up " << st.gate_up << " mid "
+            << st.mid << " down " << st.down << " s; boots " << counts.full
+            << "; " << FreeMiB() << " MiB free" << std::endl;
+
+  // ---- The comparison, in model units.
+  auto compare = [&](const std::vector<Ciphertext<word>> &cts,
+                     const std::vector<double> &ref, int stride,
+                     const char *tag) {
+    double num = 0.0, den = 0.0, worst = 0.0;
+    for (int c = 0; c < kH; c += stride) {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, cts[c]);
+      std::vector<Complex> m2;
+      boot.context->encoder_.Decode(m2, pt);
+      std::vector<double> got;
+      layout.Unpack(got, m2);
+      for (const int slot : {3, static_cast<int>(B / 2) * T + 77}) {
+        const double g = got[slot] / cal.stream_scale;
+        num += (g - ref[c]) * (g - ref[c]);
+        den += ref[c] * ref[c];
+        worst = std::max(worst, std::abs(g - ref[c]));
+      }
+    }
+    const double bits = 0.5 * std::log2(num / den);
+    std::cout << "  [decode layer] " << tag << ": rms rel 2^" << bits
+              << ", worst abs " << worst << std::endl;
+    return bits;
+  };
+  compare(dbg.mid, mid, 7, "mid (attention half)");
+  const double bits = compare(next, out_ref, 1, "layer out vs float64");
+  EXPECT_EQ(boot.param->NPToLevel(next[0].GetNP()), layer.StreamLevel());
+  EXPECT_LT(bits, -4.0);
 #endif
 }
 
