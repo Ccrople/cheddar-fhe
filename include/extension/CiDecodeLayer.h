@@ -54,13 +54,17 @@ namespace cheddar {
  *
  *   norm: dense 0 -> boot land -> square land-1 -> affine land-2 ->
  *     invsqrt (deg 7, 3 levels) land-5 -> apply land-6 -> a LevelDown to
- *     8 before the unpack: y @ 7 (the lowest that feeds the V projection;
- *     [BAE]'s rule in memory -- 4096 channels cost 2.1 GiB a limb)
- *   scores: q @ 2 x K @ 2 -> 1 -> boot land -> exp affine land-1 ->
+ *     the unpack level: the attention's y @ 6 (the V append reads it),
+ *     the feed-forward's y2 @ 2 ([BAE]'s rule in memory -- 4096 channels
+ *     cost 2.1 GiB a limb, so each stands at the lowest level its
+ *     consumers allow)
+ *   the V APPEND: a per-token plaintext fold of W_v on y @ 6 (no Kang
+ *     projection, no split), landing vt[position] canonical @ 5
+ *   scores: q @ 1 x K @ 1 -> 0 -> boot land -> exp affine land-1 ->
  *     poly le = land-1-Log2Ceil(deg+1) -> k squarings -> canonical @ 7
  *   fan-out @ 7 -> e_t @ 6, LevelDown 5 = the V cache's level; ScoreV
  *     -> 4; Z's reciprocal (deg 3, 2 levels) @ 4; the product 3;
- *     unpack 2; O -> 1
+ *     unpack 2; O (per head, accumulated) -> 1
  *   The budget needs the walk to end at or above 7 (O's output must reach
  *   level 1), so it caps k at le-7 and lets the per-chunk range grow
  *   instead (deg 7 absorbs a range of ~4 at ~5e-5); an end above 7
@@ -111,7 +115,8 @@ class CiDecodeLayer {
     //! two levels (not three) are what lets the O output reach level 1.
     int recip_degree = 3;
     int silu_degree = 15;
-    int rows_per_tile = 2048;
+    //! 1024: the tile GEMM buffers (rows x 2 x limbs) stay under 3 GiB.
+    int rows_per_tile = 1024;
     bool verbose = false;
   };
 
@@ -178,7 +183,7 @@ class CiDecodeLayer {
   //! Where e stands for the fan-out: 7, always (the walk lands at or
   //! above it and descends canonically).
   int FanoutLevel() const { return 7; }
-  int KCacheLevel() const { return 2; }
+  int KCacheLevel() const { return 1; }
   //! ScoreV meets the cache at 5: e_t (6 after the fan-out) LevelDowns
   //! onto it, and the product still reaches the reciprocal at 4.
   int VCacheLevel() const { return 5; }
@@ -238,13 +243,18 @@ class CiDecodeLayer {
                    const std::function<double(double)> &fn, int degree,
                    const EvkMap<word> &evk) const;
   /**
-   * @brief pack -> boot -> squares -> invsqrt at depth -> apply -> unpack.
-   * `y` gets `model` broadcast channels at land - 7, in model units (the
-   * stream's factor and sqrt(alpha) ride the reciprocal's declared scale).
+   * @brief pack -> boot -> squares -> invsqrt at depth -> apply -> a
+   * LevelDown to `unpack_pt_level` -> unpack. `y` gets `model` broadcast
+   * channels at `unpack_pt_level - 1`, in model units (the stream's
+   * factor and sqrt(alpha) ride the reciprocal's declared scale). The
+   * level is the caller's because it is a MEMORY choice: 4096 channels
+   * cost 2.1 GiB a limb, so each half unpacks at the lowest level its
+   * consumers allow (7 for the attention's V append, 3 for the
+   * feed-forward's gate/up).
    */
   void NormTurn(std::vector<Ct> &y, const std::vector<Ct> &stream,
                 double alpha, double window, double stream_scale,
-                const EvkMap<word> &evk);
+                int unpack_pt_level, const EvkMap<word> &evk);
   //! The q/k weight fold: the norm gain on the rows, a per-head factor
   //! and RoPE at `position` on the columns. `head_scale` empty = 1.
   std::vector<float> FoldQK(const float *w, int out,

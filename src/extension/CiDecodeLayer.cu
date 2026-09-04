@@ -20,10 +20,6 @@ namespace cheddar {
 #ifdef USE_CUBLAS
 
 namespace {
-// The norm's unpack runs at 8 so y lands at 7 = the V projection's input
-// (the header's level ledger); everything below derives from it.
-constexpr int kNormUnpackLevel = 8;
-
 using Clock = std::chrono::steady_clock;
 double SinceSeconds(Clock::time_point t0) {
   cudaDeviceSynchronize();
@@ -97,11 +93,15 @@ template <typename word>
 void CiDecodeLayer<word>::AddRequiredRotations(EvkRequest &req) const {
   const int land = boot_->GetBootParameter().GetEndLevel();
   const int T = cfg_.num_tokens, B = layout_.num_instances;
+  // The unpacks' babies run at their pt levels (<= the fan-out's 7); a
+  // land-level key per baby is ~35 MiB of dead weight times 120. The
+  // ladder's strides do run at land - 1, so they are requested LAST and
+  // keep the deep key.
+  for (int b = 1; b < T; b++) {
+    req.AddRequest(b * B, FanoutLevel() + 1);
+  }
   for (int s = B; s < B * T; s <<= 1) {
     req.AddRequest(s, land);  // the token ladder
-  }
-  for (int b = 1; b < T; b++) {
-    req.AddRequest(b * B, land);  // the hoisted unpack's babies
   }
 }
 
@@ -294,6 +294,7 @@ template <typename word>
 void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
                                    const std::vector<Ct> &stream, double alpha,
                                    double window, double stream_scale,
+                                   int unpack_pt_level,
                                    const EvkMap<word> &evk) {
   NvtxScope _nv("decode: NormTurn");
   const Parameter<word> &param = boot_->param_;
@@ -346,10 +347,10 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
   r_inv.SetScale(r_inv.GetScale() * stream_scale / std::sqrt(alpha));
 
   // Apply: ONE multiply normalises a group's 128 channels; the product
-  // then descends to 8 BEFORE the unpack -- y lands at 7, the lowest
-  // level that still feeds the V projection, because 4096 channels cost
-  // 2.1 GiB a limb and the projections copy them once more.
-  auto &unpack = UnpackAt(kNormUnpackLevel);
+  // then descends to the caller's level BEFORE the unpack -- 4096
+  // channels cost 2.1 GiB a limb, so y stands as low as its consumers
+  // allow.
+  auto &unpack = UnpackAt(unpack_pt_level);
   y.clear();
   y.resize(model);
   for (int g = 0; g < groups; g++) {
@@ -358,7 +359,7 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
     up[g] = Ct();
     boot_->HMult(dn, dd, r_inv, mult_key);
     Ct dn8;
-    boot_->LevelDown(dn8, dn, kNormUnpackLevel);
+    boot_->LevelDown(dn8, dn, unpack_pt_level);
     std::vector<Ct> chans;
     unpack.Evaluate(boot_, chans, dn8, evk);
     for (int r = 0; r < T; r++) {
@@ -440,118 +441,150 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   // ---- The attention norm; the stream then parks in host memory until
   // its residual add (the card wants every byte for y and the splits).
   std::vector<Ct> y;
-  NormTurn(y, stream, c.attn_alpha, c.attn_window, c.stream_scale, evk);
+  NormTurn(y, stream, c.attn_alpha, c.attn_window, c.stream_scale, lf, evk);
   Parked parked;
   Park(parked, stream);
   stages_.norm1 = SinceSeconds(t0);
   t0 = Clock::now();
 
-  // ---- q/k/v: the norm gain, the per-head score gamma (q) and RoPE at
-  // the step's position folded into the weights on the host. gamma rides
-  // the PROJECTION WEIGHTS, never a post-product multiply (Doing.md 7.45:
-  // an unscaled partial score wraps the low-level message headroom).
+  // ---- q/k and the appends. The norm gain, the per-head score gamma (q)
+  // and RoPE at the step's position fold into the weights on the host.
+  // gamma rides the PROJECTION WEIGHTS, never a post-product multiply
+  // (Doing.md 7.45: an unscaled partial score wraps the low-level message
+  // headroom).
   std::vector<double> gam(heads);
   for (int h = 0; h < heads; h++) {
     gam[h] = cfg_.ride / Max(c.s_hi[h] - c.s_lo[h], 1e-9);
   }
-  std::vector<Ct> q, knew, vnew;
+  std::vector<Ct> q, knew;
+  auto ratio_of = [&](const Ct &x) {
+    return x.GetScale() / param.GetScale(param.NPToLevel(x.GetNP()));
+  };
   {
     NvtxScope _w("decode: qkv");
-    const int lv_proj = lf;  // y's own level: V projects with NO copy
-    AssertTrue(param.NPToLevel(y[0].GetNP()) == lv_proj,
+    AssertTrue(param.NPToLevel(y[0].GetNP()) == lf - 1,
                "CiDecodeLayer::Step: the norm must land y at the V "
-               "projection's level");
-    auto ratio = [&](int level) {
-      return y[0].GetScale() / param.GetScale(level);
-    };
+               "append's level");
+    // The V APPEND first, straight off y at 6: there is no V projection.
+    // vt[position] = sum_d mask_d (sum_c W_v[c][d] y_c)
+    //             = sum_c (sum_d W_v[c][d] mask_d) y_c,
+    // and the inner sum is a PER-TOKEN plaintext (row d carries the
+    // weight), so the append is `model` plaintext multiplies per kv head
+    // and ONE rescale -- no 17 GiB level-7 split of y, which is what
+    // OOM'd this step twice. The plaintext's scale is chosen so the pack
+    // lands CANONICAL at VCacheLevel; the per-step encodes (~kv * model)
+    // are the cost, and folding them away is an open lever.
     {
-      auto qf = FoldQK(w.q, heads * D, w.attn_norm, gam, position);
-      DeviceVector<float> qd;
-      ToDev(qd, qf.data(), qf.size());
-      proj_->Prepare("dec.q", qd.data(), model, heads * D, 3, 1.0, ratio(3));
+      NvtxScope _v("decode: v append");
+      const int ly = lf - 1;
+      const double pt_scale =
+          param.GetScale(ly) * param.GetScale(ly) / y[0].GetScale();
+      std::vector<double> vals(D);
+      std::vector<Complex> msg;
+      for (int kv = 0; kv < kv_heads; kv++) {
+        Ct acc;
+        for (int cc = 0; cc < model; cc++) {
+          for (int d = 0; d < D; d++) {
+            vals[d] = w.attn_norm[cc] *
+                      static_cast<double>(
+                          w.v[static_cast<size_t>(cc) * kv_heads * D +
+                              kv * D + d]);
+          }
+          layout_.PackPerToken(msg, vals);
+          Pt pt;
+          boot_->gpu_encoder_.Encode(pt, ly, pt_scale, msg);
+          Ct m;
+          boot_->Mult(m, y[cc], pt);
+          if (cc == 0) {
+            acc = std::move(m);
+          } else {
+            boot_->Add(acc, acc, m);
+          }
+        }
+        boot_->Rescale(cache.vt[kv][position], acc);
+      }
     }
+    Note("v appended");
+    stages_.append = SinceSeconds(t0);
+    t0 = Clock::now();
+
+    // k and q per HALF: the operand a sliced-row half of the folded
+    // tensor, the source that half's incremental split at y's own scale
+    // (`BeginSplit`), the halves' products ADDED -- a whole-width int8
+    // copy never coexists with y. The scale ratio is per LEVEL (LevelDown
+    // keeps the scale, the canonical one moves).
+    LowerTo(y, 3);
     {
       auto kf = FoldQK(w.k, kv_heads * D, w.attn_norm, {}, position);
-      DeviceVector<float> kd;
-      ToDev(kd, kf.data(), kf.size());
-      proj_->Prepare("dec.k", kd.data(), model, kv_heads * D, 4, 1.0,
-                     ratio(4));
-    }
-    Note("qkv prepared");
-    // Each projection from a split taken at y's current level, with y
-    // walked DOWN (or cleared) between the split and the product, so y
-    // and its int8 copy never both stand at the higher level -- the
-    // model's width is 2.1 GiB a limb and this moment OOM'd the first
-    // run of the step.
-    auto project_tiles = [&](std::vector<Ct> &res,
-                             const typename CiBatchProjection<word>::Source
-                                 &src,
-                             const std::string &name) {
-      res.clear();
-      for (int t2 = 0; t2 < proj_->NumTiles(name); t2++) {
-        std::vector<Ct> part;
-        proj_->Project(part, src, name, t2);
-        for (auto &ct : part) res.push_back(std::move(ct));
-      }
-      proj_->Release(name);
-    };
-    // V in channel HALVES: the projection is a sum over input channels,
-    // so each half projects from its own incremental split (the gated
-    // BeginSplit/AddColumn path) and the halves add -- a whole level-7
-    // split beside y is 17 GiB, half is the peak's ratchet.
-    {
+      const double kr = ratio_of(y[0]);
       const int block = model / 2;
       for (int b0 = 0; b0 < model; b0 += block) {
-        {
-          std::vector<double> gain_slice(w.attn_norm.begin() + b0,
-                                         w.attn_norm.begin() + b0 + block);
-          auto vf = FoldRows(w.v + static_cast<size_t>(b0) * kv_heads * D,
-                             block, kv_heads * D, gain_slice);
-          DeviceVector<float> vd;
-          ToDev(vd, vf.data(), vf.size());
-          proj_->Prepare("dec.v", vd.data(), block, kv_heads * D, lv_proj,
-                         1.0, ratio(lv_proj));
-        }
+        DeviceVector<float> kd;
+        ToDev(kd, kf.data() + static_cast<size_t>(b0) * kv_heads * D,
+              static_cast<size_t>(block) * kv_heads * D);
+        proj_->Prepare("dec.k", kd.data(), block, kv_heads * D, 3, 1.0, kr);
         typename CiBatchProjection<word>::Source src;
-        proj_->BeginSplit(src, block, lv_proj, layout_.num_slots,
-                          y[0].GetScale());
+        proj_->BeginSplit(src, block, 3, layout_.num_slots, y[0].GetScale());
         for (int i = 0; i < block; i++) {
           proj_->AddColumn(src, i, y[b0 + i]);
         }
         std::vector<Ct> part;
-        project_tiles(part, src, "dec.v");
+        for (int t2 = 0; t2 < proj_->NumTiles("dec.k"); t2++) {
+          std::vector<Ct> rows;
+          proj_->Project(rows, src, "dec.k", t2);
+          for (auto &ct : rows) part.push_back(std::move(ct));
+        }
         if (b0 == 0) {
-          vnew = std::move(part);
+          knew = std::move(part);
         } else {
-          for (size_t i = 0; i < vnew.size(); i++) {
-            boot_->Add(vnew[i], vnew[i], part[i]);
+          for (size_t i = 0; i < knew.size(); i++) {
+            boot_->Add(knew[i], knew[i], part[i]);
           }
         }
       }
-      LowerTo(y, 4);
+      proj_->Release("dec.k");
     }
-    Note("v projected");
+    Note("k projected");
+    LowerTo(y, 2);
     {
-      typename CiBatchProjection<word>::Source src;
-      proj_->Split(src, y, "dec.k");
-      LowerTo(y, 3);
-      project_tiles(knew, src, "dec.k");
+      auto qf = FoldQK(w.q, heads * D, w.attn_norm, gam, position);
+      const double qr = ratio_of(y[0]);
+      const int block = model / 2;
+      for (int b0 = 0; b0 < model; b0 += block) {
+        DeviceVector<float> qd;
+        ToDev(qd, qf.data() + static_cast<size_t>(b0) * heads * D,
+              static_cast<size_t>(block) * heads * D);
+        proj_->Prepare("dec.q", qd.data(), block, heads * D, 2, 1.0, qr);
+        typename CiBatchProjection<word>::Source src;
+        proj_->BeginSplit(src, block, 2, layout_.num_slots, y[0].GetScale());
+        for (int i = 0; i < block; i++) {
+          proj_->AddColumn(src, i, y[b0 + i]);
+        }
+        std::vector<Ct> part;
+        for (int t2 = 0; t2 < proj_->NumTiles("dec.q"); t2++) {
+          std::vector<Ct> rows;
+          proj_->Project(rows, src, "dec.q", t2);
+          for (auto &ct : rows) part.push_back(std::move(ct));
+        }
+        if (b0 == 0) {
+          q = std::move(part);
+        } else {
+          for (size_t i = 0; i < q.size(); i++) {
+            boot_->Add(q[i], q[i], part[i]);
+          }
+        }
+      }
+      proj_->Release("dec.q");
     }
-    {
-      typename CiBatchProjection<word>::Source src;
-      proj_->Split(src, y, "dec.q");
-      y.clear();
-      project_tiles(q, src, "dec.q");
-    }
-    Note("q/k projected");
+    y.clear();
+    Note("q projected");
   }
   stages_.qkv = SinceSeconds(t0);
   t0 = Clock::now();
 
-  // ---- The appends: K row `position` by a masked add per channel, the V
-  // token ciphertext by one pack (Doing.md 7.45's [4]).
+  // ---- The K append: one masked add per channel (Doing.md 7.45's [4]).
   {
-    NvtxScope _a("decode: appends");
+    NvtxScope _a("decode: k append");
     Pt kmask;
     {
       std::vector<double> mv(static_cast<size_t>(B) * T, 0.0);
@@ -560,10 +593,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       }
       std::vector<Complex> msg;
       layout_.Pack(msg, mv);
-      boot_->gpu_encoder_.Encode(kmask, 3, param.GetScale(3), msg);
+      boot_->gpu_encoder_.Encode(kmask, 2, param.GetScale(2), msg);
     }
-    auto vmasks = MakeRowMasks(lf - 1, 1.0);  // vnew's level; the pack
-                                              // lands at VCacheLevel
     for (int kv = 0; kv < kv_heads; kv++) {
       for (int d = 0; d < D; d++) {
         Ct m, r;
@@ -571,20 +602,20 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
         boot_->Rescale(r, m);
         boot_->Add(cache.kc[kv][d], cache.kc[kv][d], r);
       }
-      PackGroup(cache.vt[kv][position], vnew, kv * D, vmasks);
     }
     knew.clear();
-    vnew.clear();
   }
   Note("appends done");
-  stages_.append = SinceSeconds(t0);
+  stages_.append += SinceSeconds(t0);
   t0 = Clock::now();
 
   // ---- Per head: scores, the max shift, ONE boot, the exp walk, Z and
   // its reciprocal, the fan-out, ScoreV, the reciprocal LAST, the unpack.
   auto &fanout = UnpackAt(lf);
   auto &hunpack = UnpackAt(3);
-  std::vector<Ct> o_in(model);
+  std::vector<Ct> o_acc;
+  DeviceVector<float> o_dev;
+  ToDev(o_dev, w.o, static_cast<size_t>(model) * model);
   for (int h = 0; h < heads; h++) {
     NvtxScope _h("decode: head");
     if (h % 8 == 0) Note(("head " + std::to_string(h)).c_str());
@@ -676,48 +707,51 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     }
     std::vector<Ct> chans;
     hunpack.Evaluate(boot_, chans, out_ct, evk);
-    for (int d = 0; d < D; d++) {
-      o_in[h * D + d] = std::move(chans[d]);
+    // The head's slice of O, projected NOW and accumulated -- 128
+    // channels split per head instead of 4096 standing until one big O.
+    {
+      const double ratio = ratio_of(chans[0]);
+      const int lo_in = param.NPToLevel(chans[0].GetNP());
+      proj_->Prepare("dec.o",
+                     o_dev.data() + static_cast<size_t>(h) * D * model, D,
+                     model, lo_in, c.stream_scale, ratio);
+      std::vector<Ct> o_part;
+      proj_->Project(o_part, chans, "dec.o");
+      proj_->Release("dec.o");
+      if (h == 0) {
+        o_acc = std::move(o_part);
+      } else {
+        for (int i = 0; i < model; i++) {
+          boot_->Add(o_acc[i], o_acc[i], o_part[i]);
+        }
+      }
     }
   }
   q.clear();
   stages_.heads = SinceSeconds(t0);
   t0 = Clock::now();
 
-  // ---- O (the stream's factor back on) and the attention residual.
+  // ---- The attention residual (the stream's factor rode the O weights).
   std::vector<Ct> mid(model);
   {
-    NvtxScope _o("decode: O");
-    const int lo_in = param.NPToLevel(o_in[0].GetNP());
-    const double ratio = o_in[0].GetScale() / param.GetScale(lo_in);
-    DeviceVector<float> od;
-    ToDev(od, w.o, static_cast<size_t>(model) * model);
-    proj_->Prepare("dec.o", od.data(), model, model, lo_in, c.stream_scale,
-                   ratio);
-    std::vector<Ct> o_out;
-    proj_->Project(o_out, o_in, "dec.o");
-    proj_->Release("dec.o");
-    o_in.clear();
+    NvtxScope _o("decode: attention residual");
     Unpark(stream, parked);
     for (int i = 0; i < model; i++) {
-      CanonicalTo(o_out[i], StreamLevel());
-      boot_->Add(mid[i], stream[i], o_out[i]);
+      CanonicalTo(o_acc[i], StreamLevel());
+      boot_->Add(mid[i], stream[i], o_acc[i]);
     }
     stream.clear();
+    o_acc.clear();
   }
   Note("attention residual");
   stages_.o = SinceSeconds(t0);
   t0 = Clock::now();
-  if (dbg != nullptr) {
-    dbg->mid.resize(model);
-    for (int i = 0; i < model; i++) {
-      boot_->LevelDown(dbg->mid[i], mid[i], param.NPToLevel(mid[i].GetNP()));
-    }
-  }
 
-  // ---- The feed-forward norm.
+  // ---- The feed-forward norm; mid then parks until its residual add.
   std::vector<Ct> y2;
-  NormTurn(y2, mid, c.ffn_alpha, c.ffn_window, c.stream_scale, evk);
+  NormTurn(y2, mid, c.ffn_alpha, c.ffn_window, c.stream_scale, 3, evk);
+  Parked parked_mid;
+  Park(parked_mid, mid);
   stages_.norm2 = SinceSeconds(t0);
   t0 = Clock::now();
 
@@ -739,7 +773,6 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   }
   typename CiBatchProjection<word>::Source src2;
   {
-    LowerTo(y2, 2);
     proj_->Split(src2, y2, "dec.gate");
     y2.clear();
   }
@@ -826,11 +859,18 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   proj_->Release("dec.up");
 
   // ---- The feed-forward residual: the next stream, level 1, chainable.
+  Unpark(mid, parked_mid);
   next.clear();
   next.resize(model);
   for (int i = 0; i < model; i++) {
     CanonicalTo(d_acc[i], StreamLevel());
     boot_->Add(next[i], mid[i], d_acc[i]);
+  }
+  if (dbg != nullptr) {
+    dbg->mid.resize(model);
+    for (int i = 0; i < model; i++) {
+      boot_->LevelDown(dbg->mid[i], mid[i], param.NPToLevel(mid[i].GetNP()));
+    }
   }
   stages_.total = SinceSeconds(t_all);
 }
