@@ -4520,6 +4520,7 @@ TEST(CiBatch, TheDecodeLayerRunsOnTheRealLayer) {
   ASSERT_NE(bctx, nullptr);
   cheddar::CiDecodeLayer<word>::Config cfg;
   cfg.verbose = EnvInt("CHEDDAR_DECODE_VERBOSE", 0) != 0;
+  cfg.boot_group = EnvInt("CHEDDAR_DECODE_BOOT_GROUP", 32);
   cheddar::CiDecodeLayer<word> layer(bctx, cfg);
   const CiBatchLayout &layout = layer.GetLayout();
   const int B = layout.num_instances;

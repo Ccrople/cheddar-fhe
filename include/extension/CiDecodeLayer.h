@@ -117,6 +117,11 @@ class CiDecodeLayer {
     int silu_degree = 15;
     //! 1024: the tile GEMM buffers (rows x 2 x limbs) stay under 3 GiB.
     int rows_per_tile = 1024;
+    //! Bootstraps grouped through `BootBatch` (word-for-word the serial
+    //! loop; ~24.6 ms/boot at 32 vs ~48 serial on the A100). 32 makes
+    //! each site one batch: the norm's 32 groups, a feed-forward tile's
+    //! 16 gate/up pairs, the 32 heads' score boots. 1 = serial.
+    int boot_group = 32;
     bool verbose = false;
   };
 
@@ -208,6 +213,10 @@ class CiDecodeLayer {
   void LowerTo(std::vector<Ct> &x, int level) const;
   //! `Config::verbose`: the phase and the card's free MiB.
   void Note(const char *what) const;
+  //! Every input bootstrapped, `Config::boot_group` at a time through
+  //! `BootBatch` (word-for-word the serial loop).
+  void BootMany(std::vector<Ct> &out, const std::vector<Ct> &in,
+                const EvkMap<word> &evk) const;
   /**
    * @brief The residual stream parked in host memory while a half runs
    * (`CiBatchLayer`'s pattern): a half reads its stream at the norm and

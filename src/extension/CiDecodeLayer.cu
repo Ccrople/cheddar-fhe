@@ -172,6 +172,27 @@ void CiDecodeLayer<word>::Unpark(std::vector<Ct> &stream,
 }
 
 template <typename word>
+void CiDecodeLayer<word>::BootMany(std::vector<Ct> &out,
+                                   const std::vector<Ct> &in,
+                                   const EvkMap<word> &evk) const {
+  const int n = static_cast<int>(in.size());
+  const int group = Max(cfg_.boot_group, 1);
+  out.resize(n);
+  for (int i0 = 0; i0 < n; i0 += group) {
+    const int m = Min(n - i0, group);
+    if (m == 1) {
+      boot_->Boot(out[i0], in[i0], evk);
+      continue;
+    }
+    std::vector<const Ct *> ptrs(m);
+    for (int j = 0; j < m; j++) ptrs[j] = &in[i0 + j];
+    std::vector<Ct> up_g;
+    boot_->BootBatch(up_g, ptrs, evk);
+    for (int j = 0; j < m; j++) out[i0 + j] = std::move(up_g[j]);
+  }
+}
+
+template <typename word>
 void CiDecodeLayer<word>::Note(const char *what) const {
   if (!cfg_.verbose) return;
   size_t f = 0, t = 0;
@@ -307,15 +328,20 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
   const int land = boot_->GetBootParameter().GetEndLevel();
   auto masks = MakeRowMasks(ls, 1.0);
 
-  // Pack each group, ONE boot per group, and the squares AFTER the boot
-  // (dense^2 + the token ladder on the summed groups); no accumulator
-  // bootstraps -- the decode norm has no ride problem (Doing.md 7.42).
-  std::vector<Ct> up(groups);
+  // Pack each group, the boots GROUPED through BootBatch, and the
+  // squares AFTER the boot (dense^2 + the token ladder on the summed
+  // groups); no accumulator bootstraps -- the decode norm has no ride
+  // problem (Doing.md 7.42).
+  std::vector<Ct> up;
   Ct s2;
+  {
+    std::vector<Ct> dense(groups);
+    for (int g = 0; g < groups; g++) {
+      PackGroup(dense[g], stream, g * T, masks);
+    }
+    BootMany(up, dense, evk);
+  }
   for (int g = 0; g < groups; g++) {
-    Ct dense;
-    PackGroup(dense, stream, g * T, masks);
-    boot_->Boot(up[g], dense, evk);
     Ct sq;
     boot_->HMult(sq, up[g], up[g], mult_key);
     if (g == 0) {
@@ -616,12 +642,14 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   std::vector<Ct> o_acc;
   DeviceVector<float> o_dev;
   ToDev(o_dev, w.o, static_cast<size_t>(model) * model);
-  for (int h = 0; h < heads; h++) {
-    NvtxScope _h("decode: head");
-    if (h % 8 == 0) Note(("head " + std::to_string(h)).c_str());
-    const int kv = h / qgroup;
-    Ct sc;
-    {
+  // Every head's shifted score first, then the boots GROUPED -- and q
+  // dies before the per-head transients (its 4096 channels are 8 GiB).
+  std::vector<Ct> s_ups;
+  {
+    NvtxScope _s("decode: scores");
+    std::vector<Ct> scs(heads);
+    for (int h = 0; h < heads; h++) {
+      const int kv = h / qgroup;
       Ct acc;
       for (int d = 0; d < D; d++) {
         Ct m;
@@ -632,17 +660,22 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
           boot_->Add(acc, acc, m);
         }
       }
-      boot_->RelinearizeRescale(sc, acc, mult_key);
-    }
-    {
-      const int l0 = param.NPToLevel(sc.GetNP());
+      boot_->RelinearizeRescale(scs[h], acc, mult_key);
+      const int l0 = param.NPToLevel(scs[h].GetNP());
       Constant<word> shift;
-      boot_->encoder_.EncodeConstant(shift, l0, sc.GetScale(),
+      boot_->encoder_.EncodeConstant(shift, l0, scs[h].GetScale(),
                                      -gam[h] * c.s_hi[h]);
-      boot_->Add(sc, sc, shift);
+      boot_->Add(scs[h], scs[h], shift);
     }
-    Ct s_up;
-    boot_->Boot(s_up, sc, evk);
+    q.clear();
+    BootMany(s_ups, scs, evk);
+  }
+  Note("scores booted");
+  for (int h = 0; h < heads; h++) {
+    NvtxScope _h("decode: head");
+    if (h % 8 == 0) Note(("head " + std::to_string(h)).c_str());
+    const int kv = h / qgroup;
+    Ct s_up = std::move(s_ups[h]);
     // e = exp((s - s_hi) / sqd): a deg-7 Chebyshev on the 2^-k chunk, k
     // squarings, a canonical descent wherever the trim lands high (the
     // squarings SQUARE a declared-scale offset, so none may enter them).
@@ -727,7 +760,6 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       }
     }
   }
-  q.clear();
   stages_.heads = SinceSeconds(t0);
   t0 = Clock::now();
 
@@ -793,18 +825,22 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     proj_->Project(u, src2, "dec.up", j);
     stages_.gate_up += SinceSeconds(tt);
     tt = Clock::now();
+    // The tile's gate/up pairs packed first, their boots GROUPED.
+    std::vector<Ct> ups;
+    {
+      std::vector<Ct> denses(2 * groups_per_tile);
+      for (int gi = 0; gi < groups_per_tile; gi++) {
+        PackGroup(denses[2 * gi], g, gi * T, gmasks);
+        PackGroup(denses[2 * gi + 1], u, gi * T, umasks);
+      }
+      g.clear();
+      u.clear();
+      BootMany(ups, denses, evk);
+    }
     std::vector<Ct> chans(cfg_.rows_per_tile);
     for (int gi = 0; gi < groups_per_tile; gi++) {
-      Ct dg, du;
-      PackGroup(dg, g, gi * T, gmasks);
-      PackGroup(du, u, gi * T, umasks);
-      for (int r = 0; r < T; r++) {
-        g[gi * T + r] = Ct();
-        u[gi * T + r] = Ct();
-      }
-      Ct dg_up, du_up;
-      boot_->Boot(dg_up, dg, evk);
-      boot_->Boot(du_up, du, evk);
+      Ct dg_up = std::move(ups[2 * gi]);
+      Ct du_up = std::move(ups[2 * gi + 1]);
       Ct sg;
       EvalAtDepth(sg, dg_up, 1.0 / (gam_g * R), 0.0,
                   [R](double t) {
@@ -828,8 +864,6 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
         chans[gi * T + r] = std::move(gc[r]);
       }
     }
-    g.clear();
-    u.clear();
     stages_.mid += SinceSeconds(tt);
     tt = Clock::now();
     // This tile's rows of down, the stream's factor folded in.
