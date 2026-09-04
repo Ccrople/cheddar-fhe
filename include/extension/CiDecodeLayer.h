@@ -118,10 +118,11 @@ class CiDecodeLayer {
     //! 1024: the tile GEMM buffers (rows x 2 x limbs) stay under 3 GiB.
     int rows_per_tile = 1024;
     //! Bootstraps grouped through `BootBatch` (word-for-word the serial
-    //! loop; ~24.6 ms/boot at 32 vs ~48 serial on the A100). 32 makes
-    //! each site one batch: the norm's 32 groups, a feed-forward tile's
-    //! 16 gate/up pairs, the 32 heads' score boots. 1 = serial.
-    int boot_group = 32;
+    //! loop; ~24.6 ms/boot at 32 vs ~48 serial on the A100 in isolation).
+    //! A group holds every member's CtS/EvalMod intermediates at once --
+    //! group 32 wanted more than the 43 GiB free at the second norm --
+    //! so 8 is the default beside the step's standing set. 1 = serial.
+    int boot_group = 8;
     bool verbose = false;
   };
 
