@@ -201,6 +201,8 @@ class CiDecodeLayer {
   //! Every channel brought to `level` IN PLACE (the copies never coexist:
   //! at the model's width a spare limb set is gigabytes).
   void LowerTo(std::vector<Ct> &x, int level) const;
+  //! `Config::verbose`: the phase and the card's free MiB.
+  void Note(const char *what) const;
   //! A canonical descent: one 1.0-plaintext multiply and rescale per
   //! level, so a canonical input stays canonical at `target`.
   void CanonicalTo(Ct &ct, int target) const;

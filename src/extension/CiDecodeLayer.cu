@@ -129,6 +129,16 @@ void CiDecodeLayer<word>::LowerTo(std::vector<Ct> &x, int level) const {
 }
 
 template <typename word>
+void CiDecodeLayer<word>::Note(const char *what) const {
+  if (!cfg_.verbose) return;
+  size_t f = 0, t = 0;
+  cudaDeviceSynchronize();
+  cudaMemGetInfo(&f, &t);
+  std::cout << "  [decode] " << what << ": " << (f >> 20) << " MiB free"
+            << std::endl;
+}
+
+template <typename word>
 void CiDecodeLayer<word>::CanonicalTo(Ct &ct, int target) const {
   const Parameter<word> &param = boot_->param_;
   int l = param.NPToLevel(ct.GetNP());
@@ -312,6 +322,7 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
       y[g * T + r] = std::move(chans[r]);
     }
   }
+  Note("norm unpacked");
 }
 
 template <typename word>
@@ -427,18 +438,44 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       proj_->Prepare("dec.v", vd.data(), model, kv_heads * D, lv_proj, 1.0,
                      ratio(lv_proj));
     }
-    // Largest first, y walked DOWN in place between them: at the model's
-    // width a second copy of y is 17 GiB, which is what OOM'd the first
-    // run of this step.
-    proj_->Project(vnew, y, "dec.v");
-    proj_->Release("dec.v");
-    LowerTo(y, 4);
-    proj_->Project(knew, y, "dec.k");
-    proj_->Release("dec.k");
-    LowerTo(y, 3);
-    proj_->Project(q, y, "dec.q");
-    proj_->Release("dec.q");
-    y.clear();
+    Note("qkv prepared");
+    // Each projection from a split taken at y's current level, with y
+    // walked DOWN (or cleared) between the split and the product, so y
+    // and its int8 copy never both stand at the higher level -- the
+    // model's width is 2.1 GiB a limb and this moment OOM'd the first
+    // run of the step.
+    auto project_tiles = [&](std::vector<Ct> &res,
+                             const typename CiBatchProjection<word>::Source
+                                 &src,
+                             const std::string &name) {
+      res.clear();
+      for (int t2 = 0; t2 < proj_->NumTiles(name); t2++) {
+        std::vector<Ct> part;
+        proj_->Project(part, src, name, t2);
+        for (auto &ct : part) res.push_back(std::move(ct));
+      }
+      proj_->Release(name);
+    };
+    {
+      typename CiBatchProjection<word>::Source src;
+      proj_->Split(src, y, "dec.v");
+      LowerTo(y, 4);
+      project_tiles(vnew, src, "dec.v");
+    }
+    Note("v projected");
+    {
+      typename CiBatchProjection<word>::Source src;
+      proj_->Split(src, y, "dec.k");
+      LowerTo(y, 3);
+      project_tiles(knew, src, "dec.k");
+    }
+    {
+      typename CiBatchProjection<word>::Source src;
+      proj_->Split(src, y, "dec.q");
+      y.clear();
+      project_tiles(q, src, "dec.q");
+    }
+    Note("q/k projected");
   }
   stages_.qkv = SinceSeconds(t0);
   t0 = Clock::now();
@@ -471,6 +508,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     knew.clear();
     vnew.clear();
   }
+  Note("appends done");
   stages_.append = SinceSeconds(t0);
   t0 = Clock::now();
 
@@ -481,6 +519,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   std::vector<Ct> o_in(model);
   for (int h = 0; h < heads; h++) {
     NvtxScope _h("decode: head");
+    if (h % 8 == 0) Note(("head " + std::to_string(h)).c_str());
     const int kv = h / qgroup;
     Ct sc;
     {
@@ -597,6 +636,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     }
     stream.clear();
   }
+  Note("attention residual");
   stages_.o = SinceSeconds(t0);
   t0 = Clock::now();
   if (dbg != nullptr) {
@@ -634,6 +674,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     proj_->Split(src2, y2, "dec.gate");
     y2.clear();
   }
+  Note("ffn split");
   auto gmasks = MakeRowMasks(1, gam_g);
   auto umasks = MakeRowMasks(1, gam_u);
   const int silu_land = land - 1 - Log2Ceil(cfg_.silu_degree + 1);
@@ -704,6 +745,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     chans.clear();
     if (j == 0) {
       d_acc = std::move(d);
+      Note("ffn tile 0");
     } else {
       for (int i = 0; i < model; i++) {
         boot_->Add(d_acc[i], d_acc[i], d[i]);

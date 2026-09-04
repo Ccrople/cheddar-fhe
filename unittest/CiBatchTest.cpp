@@ -4603,6 +4603,8 @@ TEST(CiBatch, TheDecodeLayerRunsOnTheRealLayer) {
     }
   }
   auto t0 = Sync();
+  std::cout << "  [decode layer] encrypted (stream + cache): " << FreeMiB()
+            << " MiB free" << std::endl;
 
   // ---- The step.
   bctx->ResetBootCounts();
