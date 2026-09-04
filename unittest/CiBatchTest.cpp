@@ -47,6 +47,7 @@
 #include "extension/CiBatch.h"
 #include "extension/CiBatchAttention.h"
 #include "extension/CiBatchLayer.h"
+#include "extension/ChebyshevFit.h"
 #include "extension/CiDecode.h"
 #include "extension/Hoist.h"
 
@@ -3041,6 +3042,238 @@ TEST(CiBatch, TheHoistedUnpackMatchesTheHandler) {
             << ", " << Ms(t0, t1) << " ms for " << K << " channels"
             << std::endl;
   EXPECT_LT(worst, 2e-3);
+}
+
+// The DECODE NormTurn (Doing.md 7.40 roadmap [2]), one dense group in
+// isolation: broadcast channel ciphertexts pack into ONE dense ct, ONE
+// bootstrap refreshes all 128 channels, and -- unlike the prefill norm --
+// the square-sum is computed AFTER the boot (dense^2, one relinearization,
+// a 7-rotation ladder over the token axis), so nothing large is ever
+// bootstrapped and the ride lesson never applies. The inverse square root
+// runs at depth on the one accumulator (alpha at the geometric midpoint of
+// the measured range, window = ratio x 1.3, beta = sqrt(alpha) folded into
+// the declared scale), the normalizer multiplies the DENSE ct (one mult
+// for 128 channels), and the hoisted unpack returns normalized broadcast
+// channels. Host reference: y = x / sqrt(mean_c(x^2) + eps). Norm weights
+// are not applied here -- in decode they fold into the next Kang
+// projection's scalar weights.
+TEST(CiBatch, TheDecodeNormMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  const int K = kTokens;  // the group's channels = one dense ct
+  const double eps = 1e-5;
+  const int lvl_in = 1;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+  const int land = bctx->GetBootParameter().GetEndLevel();
+  for (int s = B; s < B * kTokens; s <<= 1) {
+    boot.ui->PrepareRotationKey(s, land);
+  }
+
+  // x[c][b], layer-like magnitudes, BROADCAST over the token axis (the
+  // decode-resident form every op preserves).
+  std::mt19937_64 gen(0x9107);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0);
+  std::vector<std::vector<double>> x(K, std::vector<double>(B));
+  for (auto &row : x)
+    for (auto &v : row) v = 0.2 * ux(gen);
+  HostTensor hx{B, kTokens, K, {}};
+  hx.v.resize(static_cast<size_t>(B) * kTokens * K);
+  for (int b = 0; b < B; b++)
+    for (int t = 0; t < kTokens; t++)
+      for (int c = 0; c < K; c++) hx.At(b, t, c) = x[c][b];
+  std::vector<Ciphertext<word>> stream;
+  EncryptChannels(boot, layout, hx, lvl_in, stream);
+
+  auto make_mask = [&](int c, int level, Plaintext<word> &pt) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + c] = 1.0;
+    std::vector<Complex> msg;
+    layout.Pack(msg, mv);
+    boot.context->gpu_encoder_.Encode(pt, level, boot.param->GetScale(level),
+                                      msg);
+  };
+
+  // The pack masks, compiled once (setup, untimed -- a deployment holds
+  // them for every step).
+  std::vector<Plaintext<word>> mask_in(K);
+  for (int c = 0; c < K; c++) make_mask(c, lvl_in, mask_in[c]);
+
+  // --- Pack: 128 broadcast channels into one dense ct.
+  auto t0 = Sync();
+  Ciphertext<word> dense;
+  {
+    Ciphertext<word> acc;
+    for (int c = 0; c < K; c++) {
+      Ciphertext<word> m;
+      bctx->Mult(m, stream[c], mask_in[c]);
+      if (c == 0) {
+        acc = std::move(m);
+      } else {
+        bctx->Add(acc, acc, m);
+      }
+    }
+    bctx->Rescale(dense, acc);
+  }
+  auto t1 = Sync();
+
+  // --- One boot for the whole group.
+  Ciphertext<word> dense_up;
+  bctx->Boot(dense_up, dense, boot.ui->GetEvkMap());
+  auto t2 = Sync();
+
+  // --- The accumulator AFTER the boot: dense^2, one relinearization, the
+  // ladder over the token axis -> sum of the group's squares, broadcast.
+  Ciphertext<word> s2;
+  {
+    Ciphertext<word> sq;
+    bctx->Mult(sq, dense_up, dense_up);
+    bctx->RelinearizeRescale(s2, sq, mult_key);
+    for (int s = B; s < B * kTokens; s <<= 1) {
+      Ciphertext<word> r;
+      bctx->HRot(r, s2, boot.ui->GetRotationKey(s), s);
+      bctx->Add(s2, s2, r);
+    }
+  }
+  auto t3 = Sync();
+
+  // --- The affine onto the window and the inverse square root at depth.
+  // Calibration from the data: u = alpha * (S / K + eps) with alpha at the
+  // geometric midpoint of u's range and window = ratio x 1.3.
+  double lo = 1e30, hi = 0.0;
+  for (int b = 0; b < B; b++) {
+    double s = 0.0;
+    for (int c = 0; c < K; c++) s += x[c][b] * x[c][b];
+    const double m = s / K + eps;
+    lo = std::min(lo, m);
+    hi = std::max(hi, m);
+  }
+  const double alpha = 1.0 / std::sqrt(lo * hi);
+  const double window = (hi / lo) * 1.3;
+  const double wl = 1.0 / std::sqrt(window), wh = std::sqrt(window);
+  const double aw = 0.5 * (wh - wl), bw = 0.5 * (wh + wl);
+  Ciphertext<word> r_inv;
+  {
+    const int l2 = boot.param->NPToLevel(s2.GetNP());
+    Plaintext<word> pk;
+    {
+      std::vector<double> kv(static_cast<size_t>(B) * kTokens,
+                             alpha / (static_cast<double>(K) * aw));
+      std::vector<Complex> msg;
+      layout.Pack(msg, kv);
+      boot.context->gpu_encoder_.Encode(pk, l2, boot.param->GetScale(l2), msg);
+    }
+    Ciphertext<word> v;
+    {
+      Ciphertext<word> tmp;
+      bctx->Mult(tmp, s2, pk);
+      bctx->Rescale(v, tmp);
+    }
+    const int lv = boot.param->NPToLevel(v.GetNP());
+    {
+      cheddar::Constant<word> shift;
+      boot.context->encoder_.EncodeConstant(
+          shift, lv, boot.param->GetScale(lv), (alpha * eps - bw) / aw);
+      bctx->Add(v, v, shift);
+    }
+    const int degree = 7;
+    auto coeffs = cheddar::chebfit::Interpolate(
+        [aw, bw](double t) { return 1.0 / std::sqrt(aw * t + bw); }, degree);
+    const double in_scale = boot.param->GetScale(lv);
+    const int used = cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale,
+                                             true)
+                         .GetPolyDegree();
+    int lr = lv;
+    for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
+    cheddar::EvalPoly<word> inv(coeffs, lv, in_scale, boot.param->GetScale(lr),
+                                true);
+    inv.Compile(bctx);
+    inv.Evaluate(bctx, r_inv, v, mult_key);
+    // beta = sqrt(alpha) rides the declared scale: the polynomial gave
+    // 1 / sqrt(alpha (m + eps)).
+    r_inv.SetScale(r_inv.GetScale() / std::sqrt(alpha));
+  }
+  auto t4 = Sync();
+
+  // --- Apply: ONE ciphertext multiply normalizes all 128 channels.
+  Ciphertext<word> dense_n;
+  {
+    const int lr = boot.param->NPToLevel(r_inv.GetNP());
+    Ciphertext<word> dd;
+    bctx->LevelDown(dd, dense_up, lr);
+    Ciphertext<word> prod;
+    bctx->Mult(prod, dd, r_inv);
+    bctx->RelinearizeRescale(dense_n, prod, mult_key);
+  }
+  auto t5 = Sync();
+
+  // --- The hoisted unpack back to broadcast channels.
+  const int lu = boot.param->NPToLevel(dense_n.GetNP());
+  std::vector<cheddar::Message> row_masks(K);
+  for (int j = 0; j < K; j++) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+    layout.Pack(row_masks[j], mv);
+  }
+  cheddar::CiDecodeUnpack<word> unpack(boot.context, row_masks, B, lu,
+                                       boot.param->GetRescalePrimeProd(lu));
+  {
+    cheddar::EvkRequest req;
+    unpack.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  auto t5b = Sync();
+  std::vector<Ciphertext<word>> outs;
+  unpack.Evaluate(boot.context, outs, dense_n, boot.ui->GetEvkMap());
+  auto t6 = Sync();
+
+  // --- Host reference: y = x / sqrt(mean_c(x^2) + eps).
+  double num = 0.0, den = 0.0, worst = 0.0;
+  for (int c : {0, 1, 63, 127}) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, outs[c]);
+    std::vector<Complex> m2;
+    boot.context->encoder_.Decode(m2, pt);
+    std::vector<double> got;
+    layout.Unpack(got, m2);
+    for (int b = 0; b < B; b += 23) {
+      double s = 0.0;
+      for (int cc = 0; cc < K; cc++) s += x[cc][b] * x[cc][b];
+      const double ref = x[c][b] / std::sqrt(s / K + eps);
+      for (int t = 0; t < kTokens; t += 31) {
+        const double g = got[static_cast<size_t>(b) * kTokens + t];
+        num += (g - ref) * (g - ref);
+        den += ref * ref;
+        worst = std::max(worst, std::abs(g - ref));
+      }
+    }
+  }
+  const double bits = 0.5 * std::log2(num / den);
+  std::cout << "  [decode norm] pack " << Ms(t0, t1) << " + boot "
+            << Ms(t1, t2) << " + accum " << Ms(t2, t3) << " + invsqrt "
+            << Ms(t3, t4) << " + apply " << Ms(t4, t5) << " + unpack "
+            << Ms(t5b, t6) << " = "
+            << Ms(t0, t5) + Ms(t5b, t6) << " ms for " << K << " channels"
+            << std::endl;
+  std::cout << "  [decode norm] rms rel 2^" << bits << ", worst abs "
+            << worst << "; window " << window << " alpha " << alpha
+            << ", out level " << boot.param->NPToLevel(outs[0].GetNP())
+            << std::endl;
+  EXPECT_LT(bits, -8.0);
+  EXPECT_LT(worst, 3e-2);
+#endif
 }
 
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
