@@ -3629,6 +3629,217 @@ TEST(CiBatch, TheDecodeAttentionHeadMatchesTheHost) {
 #endif
 }
 
+// The DECODE FFN middle (Doing.md 7.40 roadmap [5]), one dense group in
+// isolation: the gate and up pre-activations (layer-like +-3, far past
+// EvalMod's ride) pack into TWO dense cts with the ride gammas FOLDED INTO
+// THE PACK MASKS (a mask entry gamma instead of 1 -- free), each boots
+// once, SiLU runs at depth on the gate ct (the affine unfolds gamma_g),
+// the up ct unfolds ITS gamma through the declared scale (free), one
+// product, and the hoisted unpack returns silu(g) * u as broadcast
+// channels. Host reference: silu(g) * u. The Kang gate/up/down projections
+// around this are prefill-proven and level-agnostic; they are not re-gated
+// here.
+TEST(CiBatch, TheDecodeFfnMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  const int K = kTokens;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+
+  // Pre-activations, layer-like: |g|, |u| up to ~3.
+  std::mt19937_64 gen(0xff17);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0);
+  std::vector<std::vector<double>> g(K, std::vector<double>(B)), u = g;
+  double gmax = 0.0, umax = 0.0;
+  for (int c = 0; c < K; c++) {
+    for (int b = 0; b < B; b++) {
+      g[c][b] = 3.0 * ux(gen);
+      u[c][b] = 3.0 * ux(gen);
+      gmax = std::max(gmax, std::abs(g[c][b]));
+      umax = std::max(umax, std::abs(u[c][b]));
+    }
+  }
+  const double gam_g = 0.3 / gmax, gam_u = 0.3 / umax;
+  const int lvl_in = 1;
+  std::vector<Ciphertext<word>> g_cts, u_cts;
+  {
+    HostTensor hg{B, kTokens, K, {}};
+    hg.v.resize(static_cast<size_t>(B) * kTokens * K);
+    HostTensor hu = hg;
+    for (int b = 0; b < B; b++)
+      for (int t = 0; t < kTokens; t++)
+        for (int c = 0; c < K; c++) {
+          hg.At(b, t, c) = g[c][b];
+          hu.At(b, t, c) = u[c][b];
+        }
+    EncryptChannels(boot, layout, hg, lvl_in, g_cts);
+    EncryptChannels(boot, layout, hu, lvl_in, u_cts);
+  }
+
+  // Pack masks CARRYING the gammas (setup, untimed).
+  auto make_gmask = [&](int c, double gamma, Plaintext<word> &pt) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) {
+      mv[static_cast<size_t>(b) * kTokens + c] = gamma;
+    }
+    std::vector<Complex> msg;
+    layout.Pack(msg, mv);
+    boot.context->gpu_encoder_.Encode(pt, lvl_in,
+                                      boot.param->GetScale(lvl_in), msg);
+  };
+  std::vector<Plaintext<word>> mg(K), mu(K);
+  for (int c = 0; c < K; c++) {
+    make_gmask(c, gam_g, mg[c]);
+    make_gmask(c, gam_u, mu[c]);
+  }
+
+  auto pack = [&](const std::vector<Ciphertext<word>> &cts,
+                  const std::vector<Plaintext<word>> &masks,
+                  Ciphertext<word> &dense) {
+    Ciphertext<word> acc;
+    for (int c = 0; c < K; c++) {
+      Ciphertext<word> m;
+      bctx->Mult(m, cts[c], masks[c]);
+      if (c == 0) {
+        acc = std::move(m);
+      } else {
+        bctx->Add(acc, acc, m);
+      }
+    }
+    bctx->Rescale(dense, acc);
+  };
+
+  auto t0 = Sync();
+  Ciphertext<word> dg, du;
+  pack(g_cts, mg, dg);
+  pack(u_cts, mu, du);
+  auto t1 = Sync();
+  Ciphertext<word> dg_up, du_up;
+  bctx->Boot(dg_up, dg, boot.ui->GetEvkMap());
+  bctx->Boot(du_up, du, boot.ui->GetEvkMap());
+  auto t2 = Sync();
+
+  // SiLU at depth on the gate ct: the booted message is gam_g * g.
+  Ciphertext<word> sg;
+  {
+    const double lo = -gmax * 1.02, hi = gmax * 1.02;
+    const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+    const int l = boot.param->NPToLevel(dg_up.GetNP());
+    Plaintext<word> pk;
+    {
+      std::vector<double> kv(static_cast<size_t>(B) * kTokens,
+                             1.0 / (gam_g * a));
+      std::vector<Complex> msg;
+      layout.Pack(msg, kv);
+      boot.context->gpu_encoder_.Encode(pk, l, boot.param->GetScale(l), msg);
+    }
+    Ciphertext<word> v;
+    {
+      Ciphertext<word> tmp;
+      bctx->Mult(tmp, dg_up, pk);
+      bctx->Rescale(v, tmp);
+    }
+    const int lv = boot.param->NPToLevel(v.GetNP());
+    {
+      cheddar::Constant<word> shift;
+      boot.context->encoder_.EncodeConstant(shift, lv,
+                                            boot.param->GetScale(lv), -b / a);
+      bctx->Add(v, v, shift);
+    }
+    auto coeffs = cheddar::chebfit::Interpolate(
+        [a, b](double t) {
+          const double x = a * t + b;
+          return x / (1.0 + std::exp(-x));
+        },
+        15);
+    const double in_scale = boot.param->GetScale(lv);
+    const int used =
+        cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale, true)
+            .GetPolyDegree();
+    int lr = lv;
+    for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
+    cheddar::EvalPoly<word> silu(coeffs, lv, in_scale,
+                                 boot.param->GetScale(lr), true);
+    silu.Compile(bctx);
+    silu.Evaluate(bctx, sg, v, mult_key);
+  }
+  // The up ct unfolds its gamma through the declared scale, free.
+  du_up.SetScale(du_up.GetScale() * gam_u);
+  Ciphertext<word> dm;
+  {
+    const int lr = boot.param->NPToLevel(sg.GetNP());
+    Ciphertext<word> dd;
+    bctx->LevelDown(dd, du_up, lr);
+    Ciphertext<word> prod;
+    bctx->Mult(prod, sg, dd);
+    bctx->RelinearizeRescale(dm, prod, mult_key);
+  }
+  auto t3 = Sync();
+
+  // The hoisted unpack back to broadcast channels.
+  const int lu = boot.param->NPToLevel(dm.GetNP());
+  std::vector<cheddar::Message> row_masks(K);
+  for (int j = 0; j < K; j++) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+    layout.Pack(row_masks[j], mv);
+  }
+  cheddar::CiDecodeUnpack<word> unpack(boot.context, row_masks, B, lu,
+                                       boot.param->GetRescalePrimeProd(lu));
+  {
+    cheddar::EvkRequest req;
+    unpack.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  auto t3b = Sync();
+  std::vector<Ciphertext<word>> outs;
+  unpack.Evaluate(boot.context, outs, dm, boot.ui->GetEvkMap());
+  auto t4 = Sync();
+
+  // Host reference: silu(g) * u.
+  double num = 0.0, den = 0.0, worst = 0.0;
+  for (int c : {0, 1, 63, 127}) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, outs[c]);
+    std::vector<Complex> m2;
+    boot.context->encoder_.Decode(m2, pt);
+    std::vector<double> got;
+    layout.Unpack(got, m2);
+    for (int b = 0; b < B; b += 23) {
+      const double gg = g[c][b];
+      const double ref = gg / (1.0 + std::exp(-gg)) * u[c][b];
+      for (int t = 0; t < kTokens; t += 31) {
+        const double got_v = got[static_cast<size_t>(b) * kTokens + t];
+        num += (got_v - ref) * (got_v - ref);
+        den += ref * ref;
+        worst = std::max(worst, std::abs(got_v - ref));
+      }
+    }
+  }
+  const double bits = 0.5 * std::log2(num / den);
+  std::cout << "  [decode ffn] pack " << Ms(t0, t1) << " + 2 boots "
+            << Ms(t1, t2) << " + silu*u " << Ms(t2, t3) << " + unpack "
+            << Ms(t3b, t4) << " = " << Ms(t0, t3) + Ms(t3b, t4)
+            << " ms for " << K << " channels" << std::endl;
+  std::cout << "  [decode ffn] rms rel 2^" << bits << ", worst abs " << worst
+            << "; gam_g " << gam_g << " gam_u " << gam_u << ", out level "
+            << boot.param->NPToLevel(outs[0].GetNP()) << std::endl;
+  EXPECT_LT(bits, -7.0);
+#endif
+}
+
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
 // isolation: squares summed at level 1 BEFORE any bootstrap, relinearized
 // once, and the ONE sum bootstrapped on the deep ring -- against the same
