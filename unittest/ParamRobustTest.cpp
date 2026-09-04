@@ -319,8 +319,12 @@ TEST(ParamRobust, TheRideProbe) {
     const auto msg = RandomReal(num_slots, amp, 0x71DE);
     Ciphertext<word> ct;
     EncryptAt(r, ct, msg, 0);
-    Ciphertext<word> res;
-    b->HalfBoot(res, ct, r.ui->GetEvkMap());
+    // The HalfBoot -> SlotToCoeff cycle (as in the landing test): the
+    // direct HalfBoot output holds bit-reversed coefficients, whose
+    // residual measures the encoding, not EvalMod's tail.
+    Ciphertext<word> half, res;
+    b->HalfBoot(half, ct, r.ui->GetEvkMap());
+    b->SlotToCoeff(res, num_slots, half, r.ui->GetEvkMap());
     const auto got = Decrypt(r, res);
     const Fit f = FitResidual(msg, got);
     double rms = 0.0;
@@ -328,10 +332,9 @@ TEST(ParamRobust, TheRideProbe) {
       const double e = got[i].real() - f.carried * msg[i].real();
       rms += e * e;
     }
-    rms = std::sqrt(rms / num_slots) / b->GetMessageRatio();
+    rms = std::sqrt(rms / num_slots) / std::abs(f.carried);
     rms_at.push_back(rms);
-    std::cout << "[ride] amp " << amp << ": carried/derived "
-              << f.carried / b->GetMessageRatio() << ", rms residual 2^"
+    std::cout << "[ride] amp " << amp << ": rms residual 2^"
               << std::log2(rms) << " (message units)" << std::endl;
   }
   // Fit rms(m) ~ a * m + c * m^3 from the smallest and largest amplitude.
