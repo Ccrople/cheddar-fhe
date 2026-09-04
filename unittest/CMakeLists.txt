@@ -301,6 +301,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(boot_landing_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # The robust-parameter acceptance test: the scale/landing contract measured
+  # against the library's nominal numbers, one preset per process
+  # (CHEDDAR_ROBUST_PARAM; CHEDDAR_ROBUST_STRICT=1 is the v3 contract). The
+  # host half of the pair is reference/scripts/param_audit.py.
+  add_executable(param_robust_test ParamRobustTest.cpp)
+  target_link_libraries(param_robust_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Llama RoPE, [SYLPH] section 3.2. The real-weight case needs LLAMA3_REAL_DIR.
   add_executable(rope_test RoPeTest.cpp)
   target_link_libraries(rope_test
