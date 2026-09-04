@@ -313,7 +313,13 @@ TEST(ParamRobust, TheRideProbe) {
   auto b = PrepareBoot(r);
   const int num_slots = r.param->MaxNumSlots();
 
-  const double amps[] = {0.05, 0.1, 0.2, 0.3, 0.4};
+  // "Ride" is in EvalMod's message units: a slot amplitude a enters the
+  // modular reduction at m = a * GetMessageRatio() (~a/32), and the fitted
+  // tail is cubic in m -- the leg boots its scores at m ~ 0.35, and a sum
+  // booted past the fitted ride reads the polynomial's EXTRAPOLATION (the
+  // 7.38 ride lesson). Slot amplitudes 1..14 sweep m ~ 0.03 .. 0.44,
+  // crossing the fitted range's edge on purpose.
+  const double amps[] = {1.0, 4.0, 8.0, 11.0, 14.0};
   std::vector<double> rms_at;
   for (double amp : amps) {
     const auto msg = RandomReal(num_slots, amp, 0x71DE);
@@ -334,17 +340,22 @@ TEST(ParamRobust, TheRideProbe) {
     }
     rms = std::sqrt(rms / num_slots) / std::abs(f.carried);
     rms_at.push_back(rms);
-    std::cout << "[ride] amp " << amp << ": rms residual 2^"
-              << std::log2(rms) << " (message units)" << std::endl;
+    std::cout << "[ride] amp " << amp << " (ride m = "
+              << amp * b->GetMessageRatio() << "): rms residual 2^"
+              << std::log2(rms) << " (slot units)" << std::endl;
   }
-  // Fit rms(m) ~ a * m + c * m^3 from the smallest and largest amplitude.
-  const double m0 = amps[0], m1 = amps[4];
-  const double c3 = (rms_at[4] / m1 - rms_at[0] / m0) / (m1 * m1 - m0 * m0);
+  // Fit rms(m) ~ a * m + c * m^3 from the smallest and largest ride.
+  const double m0 = amps[0] * b->GetMessageRatio();
+  const double m1 = amps[4] * b->GetMessageRatio();
+  // rms(m)/m = a + c m^2, and rms(m)/m in ride units equals the slot-unit
+  // rms over the slot amplitude.
+  const double r0 = rms_at[0] / amps[0], r1 = rms_at[4] / amps[4];
+  const double c3 = (r1 - r0) / (m1 * m1 - m0 * m0);
   std::cout << "[ride] fitted cubic coefficient ~" << c3
-            << " (ci16_35's fitted EvalMod tail was -0.00258 m^3 on the "
-            << "mean; this is the rms view)" << std::endl;
-  EXPECT_LT(rms_at[2], 1e-3)
-      << "the residual at ride 0.2 is out of family for a working preset";
+            << " over rides " << m0 << " .. " << m1
+            << " (ci16_35's fitted EvalMod tail: -0.00258 m^3)" << std::endl;
+  EXPECT_LT(rms_at[2] / amps[2], 1e-3)
+      << "the relative residual at ride ~0.25 is out of family";
 }
 
 // (3, run LAST: a library Fail() aborts the process) EvalPoly at every
