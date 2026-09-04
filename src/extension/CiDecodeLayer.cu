@@ -129,6 +129,49 @@ void CiDecodeLayer<word>::LowerTo(std::vector<Ct> &x, int level) const {
 }
 
 template <typename word>
+void CiDecodeLayer<word>::Park(Parked &parked, std::vector<Ct> &stream) const {
+  NvtxScope _nv("decode: park the stream");
+  const size_t n = stream.size();
+  parked.bx.resize(n);
+  parked.ax.resize(n);
+  parked.np.resize(n);
+  parked.scale.resize(n);
+  parked.slots.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    Ct &ct = stream[i];
+    AssertFalse(ct.HasRx(), "CiDecodeLayer::Park: a stream ciphertext has rx");
+    parked.np[i] = ct.GetNP();
+    parked.scale[i] = ct.GetScale();
+    parked.slots[i] = ct.GetNumSlots();
+    CopyDeviceToHost(parked.bx[i], ct.bx_);
+    CopyDeviceToHost(parked.ax[i], ct.ax_);
+    ct = Ct();
+  }
+  stream.clear();
+}
+
+template <typename word>
+void CiDecodeLayer<word>::Unpark(std::vector<Ct> &stream,
+                                 Parked &parked) const {
+  NvtxScope _nv("decode: unpark the stream");
+  const size_t n = parked.bx.size();
+  stream.clear();
+  stream.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    Ct &ct = stream[i];
+    ct.RemoveRx();
+    ct.ModifyNP(parked.np[i]);
+    ct.SetScale(parked.scale[i]);
+    ct.SetNumSlots(parked.slots[i]);
+    CopyHostToDevice(ct.bx_, parked.bx[i]);
+    CopyHostToDevice(ct.ax_, parked.ax[i]);
+    parked.bx[i] = HostVector<word>();
+    parked.ax[i] = HostVector<word>();
+  }
+  parked = Parked();
+}
+
+template <typename word>
 void CiDecodeLayer<word>::Note(const char *what) const {
   if (!cfg_.verbose) return;
   size_t f = 0, t = 0;
@@ -394,9 +437,12 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   auto t_all = Clock::now();
   auto t0 = Clock::now();
 
-  // ---- The attention norm.
+  // ---- The attention norm; the stream then parks in host memory until
+  // its residual add (the card wants every byte for y and the splits).
   std::vector<Ct> y;
   NormTurn(y, stream, c.attn_alpha, c.attn_window, c.stream_scale, evk);
+  Parked parked;
+  Park(parked, stream);
   stages_.norm1 = SinceSeconds(t0);
   t0 = Clock::now();
 
@@ -431,13 +477,6 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       proj_->Prepare("dec.k", kd.data(), model, kv_heads * D, 4, 1.0,
                      ratio(4));
     }
-    {
-      auto vf = FoldRows(w.v, model, kv_heads * D, w.attn_norm);
-      DeviceVector<float> vd;
-      ToDev(vd, vf.data(), vf.size());
-      proj_->Prepare("dec.v", vd.data(), model, kv_heads * D, lv_proj, 1.0,
-                     ratio(lv_proj));
-    }
     Note("qkv prepared");
     // Each projection from a split taken at y's current level, with y
     // walked DOWN (or cleared) between the split and the product, so y
@@ -456,11 +495,39 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
       }
       proj_->Release(name);
     };
+    // V in channel HALVES: the projection is a sum over input channels,
+    // so each half projects from its own incremental split (the gated
+    // BeginSplit/AddColumn path) and the halves add -- a whole level-7
+    // split beside y is 17 GiB, half is the peak's ratchet.
     {
-      typename CiBatchProjection<word>::Source src;
-      proj_->Split(src, y, "dec.v");
+      const int block = model / 2;
+      for (int b0 = 0; b0 < model; b0 += block) {
+        {
+          std::vector<double> gain_slice(w.attn_norm.begin() + b0,
+                                         w.attn_norm.begin() + b0 + block);
+          auto vf = FoldRows(w.v + static_cast<size_t>(b0) * kv_heads * D,
+                             block, kv_heads * D, gain_slice);
+          DeviceVector<float> vd;
+          ToDev(vd, vf.data(), vf.size());
+          proj_->Prepare("dec.v", vd.data(), block, kv_heads * D, lv_proj,
+                         1.0, ratio(lv_proj));
+        }
+        typename CiBatchProjection<word>::Source src;
+        proj_->BeginSplit(src, block, lv_proj, layout_.num_slots);
+        for (int i = 0; i < block; i++) {
+          proj_->AddColumn(src, i, y[b0 + i]);
+        }
+        std::vector<Ct> part;
+        project_tiles(part, src, "dec.v");
+        if (b0 == 0) {
+          vnew = std::move(part);
+        } else {
+          for (size_t i = 0; i < vnew.size(); i++) {
+            boot_->Add(vnew[i], vnew[i], part[i]);
+          }
+        }
+      }
       LowerTo(y, 4);
-      project_tiles(vnew, src, "dec.v");
     }
     Note("v projected");
     {
@@ -630,6 +697,7 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
     proj_->Project(o_out, o_in, "dec.o");
     proj_->Release("dec.o");
     o_in.clear();
+    Unpark(stream, parked);
     for (int i = 0; i < model; i++) {
       CanonicalTo(o_out[i], StreamLevel());
       boot_->Add(mid[i], stream[i], o_out[i]);

@@ -203,6 +203,20 @@ class CiDecodeLayer {
   void LowerTo(std::vector<Ct> &x, int level) const;
   //! `Config::verbose`: the phase and the card's free MiB.
   void Note(const char *what) const;
+  /**
+   * @brief The residual stream parked in host memory while a half runs
+   * (`CiBatchLayer`'s pattern): a half reads its stream at the norm and
+   * again at the residual add, and between the two the card wants every
+   * byte -- 4096 level-1 ciphertexts are 4.3 GiB.
+   */
+  struct Parked {
+    std::vector<HostVector<word>> bx, ax;
+    std::vector<NPInfo> np;
+    std::vector<double> scale;
+    std::vector<int> slots;
+  };
+  void Park(Parked &parked, std::vector<Ct> &stream) const;
+  void Unpark(std::vector<Ct> &stream, Parked &parked) const;
   //! A canonical descent: one 1.0-plaintext multiply and rescale per
   //! level, so a canonical input stays canonical at `target`.
   void CanonicalTo(Ct &ct, int target) const;
