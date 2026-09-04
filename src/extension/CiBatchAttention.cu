@@ -100,7 +100,9 @@ CiBatchAttention<word>::CiBatchAttention(
     // prefix's entry first -- so a landing-15 layer rides the SHIPPED
     // land17c3e10 tower rather than a junction L16 ladder (whose EvalMod
     // measured 2^-7 against land17's 2^-15.5, Doing 7.36).
-    const int prefix_out = boot_->GetBootParameter().GetEndLevel();
+    // [3]: Config::score_top lowers the landing below the layer boot's
+    // (the aux boot split frees the levels the softmax no longer needs).
+    const int prefix_out = GetTopLevel();
     AssertTrue(prefix_out + 1 <= tp.GetEvalModEndLevel(),
                "CiBatchAttention: the tower's EvalMod ends below the layer "
                "boot's landing -- the prefix cannot reach it");
@@ -176,7 +178,7 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
   booted.clear();
   booted.resize(T);
   const int g_max = Max(group, 1);
-  const int prefix_level = boot_->GetBootParameter().GetEndLevel() + 1;
+  const int prefix_level = GetTopLevel() + 1;
   for (int l0 = 0; l0 < T; l0 += g_max) {
     const int g = Min(T - l0, g_max);
     std::vector<const Ct *> xs(g);
@@ -826,7 +828,34 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   // divided by the window's half-width and only the level-free constant
   // remains. One level, and with it the whole walk fits a Boot landing at
   // 16: ci16_35 as shipped, no thinner StC.
-  poly_in_ = calib_.causal ? sq_level_ : sq_level_ - 1;
+  // [3] with the aux boot the accumulator leaves the walk at sq_level_ and
+  // comes back at the aux ring's landing; the inverse square root is
+  // compiled THERE (causal only: the shift is level-free).
+  if (aux_boot_ != nullptr) {
+    AssertTrue(calib_.causal,
+               "CiBatchAttention::PrepareSoftMax: the aux boot split needs "
+               "the causal calibration (its affine shift is level-free)");
+    AssertTrue(sq_level_ >= 0,
+               "CiBatchAttention::PrepareSoftMax: the walk exhausts its "
+               "levels before the accumulator");
+    poly_in_ = aux_boot_->GetBootParameter().GetEndLevel();
+    // The accumulator must enter its bootstrap INSIDE EvalMod's ride
+    // (~0.3): its raw message is S/a in [norm_lo, norm_hi] / aff_a --
+    // up to 4.5 at the default window, an extrapolation of the fitted
+    // polynomial (the 7.38 bisection). gamma rides the masks (each
+    // carries sqrt(gamma) beside 1/sqrt(a)), the booted sum re-declares
+    // its scale by gamma (free), and the inverse square root gives
+    // 1/sqrt(gamma) back -- P is exact in gamma.
+    const double ride = [] {
+      const char *e = std::getenv("CHEDDAR_CI_BATCH_ACCUM_RIDE");
+      return (e && e[0] != '\0') ? std::atof(e) : 0.3;
+    }();
+    const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
+    aux_gamma_ = std::min(1.0, ride * aff_a / calib_.norm_hi);
+  } else {
+    poly_in_ = calib_.causal ? sq_level_ : sq_level_ - 1;
+    aux_gamma_ = 1.0;
+  }
   const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
   const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
   // Causal: the mask carries 1/sqrt(a), so the NUMERATOR y is scaled by it
@@ -835,11 +864,16 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   // (non-causal) the plain 1/sqrt(a t + b) stands. The host mirror
   // (softmax_mirror.py) puts the difference at 10x vs 2^-15.5 on the real
   // layer-0 scores.
+  // The aux path's masks carry sqrt(gamma) (BuildMasks), so the booted sum
+  // reads S gamma / a; its scale is re-declared by gamma in SoftMax (free)
+  // and the polynomial returns the leftover 1/sqrt(gamma) -- so its INPUT
+  // scale is gamma * canonical and its values carry gamma^-1/2.
+  const double gi = 1.0 / std::sqrt(aux_gamma_);
   auto inv_coeffs =
       calib_.causal
           ? chebfit::Interpolate(
-                [aff_a, aff_b](double v) {
-                  return 1.0 / std::sqrt(v + aff_b / aff_a);
+                [aff_a, aff_b, gi](double v) {
+                  return gi / std::sqrt(v + aff_b / aff_a);
                 },
                 calib_.inv_degree)
           : chebfit::Interpolate(
@@ -847,8 +881,8 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                   return 1.0 / std::sqrt(aff_a * v + aff_b);
                 },
                 calib_.inv_degree);
-  const int inv_used = EvalPoly<word>(inv_coeffs, poly_in_,
-                                      param.GetScale(poly_in_),
+  const double inv_in_scale = aux_gamma_ * param.GetScale(poly_in_);
+  const int inv_used = EvalPoly<word>(inv_coeffs, poly_in_, inv_in_scale,
                                       param.GetScale(poly_in_), true)
                            .GetPolyDegree();
   const int inv_out = poly_in_ - Log2Ceil(inv_used + 1);
@@ -856,9 +890,13 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
              "CiBatchAttention: the softmax walk overspends its levels; P "
              "would land below forward_level");
   polys_.push_back(std::make_unique<EvalPoly<word>>(
-      inv_coeffs, poly_in_, param.GetScale(poly_in_), param.GetScale(inv_out),
-      true));
+      inv_coeffs, poly_in_, inv_in_scale, param.GetScale(inv_out), true));
   polys_[1]->Compile(boot_);
+  if (aux_boot_ != nullptr) {
+    aux_inv_coeffs_ = inv_coeffs;
+    aux_inv_out_ = inv_out;
+    aux_inv_in_scale_ = inv_in_scale;
+  }
 
   // The per-head row shift as a per-token plaintext at exp_in_'s canonical
   // scale (it is ADDED to the affine's rescaled output). Masked keys keep
@@ -908,9 +946,10 @@ void CiBatchAttention<word>::BuildMasks(std::vector<Pt> &masks,
   masks.resize(T);
   std::vector<double> m(T);
   std::vector<Complex> msg;
-  // The affine's multiplicative half, folded (see PrepareSoftMax).
+  // The affine's multiplicative half, folded (see PrepareSoftMax); the aux
+  // path's ride factor gamma rides here too (1 without the aux boot).
   const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
-  const double fold = 1.0 / std::sqrt(aff_a);
+  const double fold = std::sqrt(aux_gamma_ / aff_a);
   for (int l = 0; l < T; l++) {
     for (int t = 0; t < T; t++) {
       double v = 0.0;
@@ -939,9 +978,9 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
   const int top = GetTopLevel();
   AssertTrue(static_cast<int>(scores.size()) == T,
              "CiBatchAttention::SoftMax: one head's key-token ciphertexts");
-  AssertTrue(param.NPToLevel(scores[0].GetNP()) == top,
-             "CiBatchAttention::SoftMax: the scores must be booted to the "
-             "top level");
+  AssertTrue(param.NPToLevel(scores[0].GetNP()) >= top,
+             "CiBatchAttention::SoftMax: the scores must be booted to at "
+             "least the top level");
   AssertTrue(carried > 0.0, "CiBatchAttention::SoftMax: carried");
   const auto &mult_key = evk.GetMultiplicationKey();
 
@@ -968,11 +1007,18 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
     Ct u;
     if (cfg_.affine_in_prefix) {
       // A LevelDown to the ciphertext's own level is a copy; the affine's
-      // multiply already rode the prefix.
+      // multiply already rode the prefix. (A serial boot landing above
+      // `score_top` comes down here too.)
       boot_->LevelDown(u, scores[l], top);
     } else {
       Ct t1;
-      boot_->Mult(t1, scores[l], c1);
+      if (param.NPToLevel(scores[l].GetNP()) > top) {
+        Ct down;
+        boot_->LevelDown(down, scores[l], top);
+        boot_->Mult(t1, down, c1);
+      } else {
+        boot_->Mult(t1, scores[l], c1);
+      }
       boot_->Rescale(u, t1);
     }
     if (calib_.causal) {
@@ -1009,6 +1055,38 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
   AssertTrue(param.NPToLevel(sq.GetNP()) == sq_level_,
              "CiBatchAttention::SoftMax: the square did not land at "
              "sq_level");
+  // [3] the aux boot split: the ONE accumulator rides its own short ring
+  // back up, and the inverse square root walks from that landing.
+  if (aux_boot_ != nullptr) {
+    AssertTrue(aux_evk_ != nullptr,
+               "CiBatchAttention::SoftMax: SetAuxBoot without its keys");
+    Ct up;
+    aux_boot_->Boot(up, sq, *aux_evk_);
+    sq = std::move(up);
+    AssertTrue(param.NPToLevel(sq.GetNP()) == poly_in_,
+               "CiBatchAttention::SoftMax: the aux boot did not land at "
+               "the compiled inverse square root's level");
+    // The masks carried sqrt(gamma): re-declare the scale by gamma (free)
+    // so the message reads S / a again; the polynomial was compiled at
+    // gamma * canonical and returns the leftover 1 / sqrt(gamma).
+    sq.SetScale(sq.GetScale() * aux_gamma_);
+    // The aux ladder's EvalMod may land off the nominal scale (the 7.37
+    // drift): recompile the inverse square root ONCE at the measured
+    // input scale.
+    const double in_scale = sq.GetScale();
+    if (std::abs(in_scale - aux_inv_in_scale_) > 1e-9 * in_scale) {
+      polys_[1] = std::make_unique<EvalPoly<word>>(
+          aux_inv_coeffs_, poly_in_, in_scale,
+          param.GetScale(aux_inv_out_), true);
+      polys_[1]->Compile(boot_);
+      aux_inv_in_scale_ = in_scale;
+      if (cfg_.verbose) {
+        std::cout << "  [batch] softmax: invsqrt recompiled at the "
+                  << "measured aux landing scale 2^" << std::log2(in_scale)
+                  << std::endl;
+      }
+    }
+  }
   {
     const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
     const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);

@@ -81,6 +81,32 @@ int EnvInt(const char *name, int fallback) {
 }
 constexpr int kTokens = 128;
 
+// The norm's channel-boot ring (Doing.md 7.38): CHEDDAR_CI_BATCH_CHAN_PARAM
+// names a gen_landing sub-ladder of the layer preset (ci16_35_land11c4e8s2,
+// landing 9) on the SAME secret; NormTurn then sums the squares before any
+// bootstrap, boots the one accumulator on the deep ring, and boots each
+// channel once on this ring. Returns the Ring to keep alive, or null.
+std::unique_ptr<Ring> WireChannelRing(Ring &boot,
+                                      cheddar::CiBatchLayer<word> &layer) {
+  const char *p = std::getenv("CHEDDAR_CI_BATCH_CHAN_PARAM");
+  if (p == nullptr || p[0] == '\0') return nullptr;
+  auto chan = std::make_unique<Ring>(p, boot.ui->GetSecretCoeffs());
+  auto cctx =
+      std::dynamic_pointer_cast<BootContext<word>>(chan->context);
+  cheddar::AssertTrue(cctx != nullptr, "the channel ring's preset must boot");
+  cctx->PrepareEvalMod();
+  cctx->PrepareEvalSpecialFFT(layer.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    cctx->AddRequiredRotations(req, layer.GetLayout().num_slots);
+    chan->ui->PrepareRotationKey(req);
+  }
+  layer.SetChannelBoot(cctx, &chan->ui->GetEvkMap());
+  std::cout << "  channel ring " << p << " landing "
+            << cctx->GetBootParameter().GetEndLevel() << std::endl;
+  return chan;
+}
+
 using Clock = std::chrono::steady_clock;
 double Ms(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();
@@ -664,6 +690,7 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
     layer.AddRequiredRotations(req);
     ring.ui->PrepareRotationKey(req);
   }
+  std::unique_ptr<Ring> chan = WireChannelRing(ring, layer);
   auto t1 = Sync();
   std::cout << "  setup (boot tables + keys): " << std::fixed
             << std::setprecision(1) << Ms(t0, t1) / 1000.0 << " s, " << FreeMiB()
@@ -683,11 +710,12 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
     }
   }
   std::vector<Ciphertext<word>> stream;
-  EncryptChannels(ring, layout, x, 0, stream);
+  EncryptChannels(ring, layout, x, chan ? 1 : 0, stream);
   x.v.clear();
   x.v.shrink_to_fit();
   auto t2 = Sync();
-  std::cout << "  encrypt the stream (" << kH << " ciphertexts at level 0): "
+  std::cout << "  encrypt the stream (" << kH << " ciphertexts at level "
+            << (chan ? 1 : 0) << "): "
             << Ms(t1, t2) / 1000.0 << " s, " << FreeMiB() << " MiB free"
             << std::endl;
 
@@ -1393,6 +1421,8 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
 
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.verbose = true;
+  // [3]: walk from a lower score landing (the aux boot split's freed top).
+  acfg.score_top = EnvInt("CHEDDAR_CI_BATCH_SCORE_TOP", 0);
 
   // Host: the real head-0 raw scores -- norm, Q/K, RoPE, the contraction.
   const int D = acfg.head_dim;
@@ -1519,13 +1549,25 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
   akeys.inverse_ring_switch =
       &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+  // [3]: the aux accumulator's own bootstrap on the channel ring, before
+  // PrepareSoftMax (the inverse square root compiles at its landing).
+  std::unique_ptr<Ring> chan = WireChannelRing(boot, layer);
+  if (chan && EnvInt("CHEDDAR_CI_BATCH_AUX_BOOT", 0) != 0) {
+    attn.SetAuxBoot(
+        std::dynamic_pointer_cast<BootContext<word>>(chan->context),
+        &chan->ui->GetEvkMap());
+    std::cout << "  aux boot on the channel ring" << std::endl;
+  }
   {
     typename cheddar::CiBatchAttention<word>::SoftMaxCalibration sc;
     sc.m_eff = m_eff;
     sc.span = cqk * span_raw;
     sc.shift = cqk * s_max;
     sc.causal = true;
-    sc.inv_degree = 15;
+    // The aux boot split fits the walk only at degree 7 (the layer's own):
+    // from the landing-9 aux ring, deg 15's four levels put P below the
+    // forward level.
+    sc.inv_degree = EnvInt("CHEDDAR_CI_BATCH_INV_DEGREE", 15);
     sc.row_shift.assign(kHeads, std::vector<double>(T, 0.0));
     sc.row_norm.assign(kHeads, std::vector<double>(T, 1.0));
     for (int h = 0; h < kHeads; h++) {
@@ -1865,6 +1907,9 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   acfg.fused_scores = fused_scores;
   acfg.affine_in_prefix =
       fused_scores && EnvInt("CHEDDAR_CI_BATCH_AFFINE_PREFIX", 0) != 0;
+  // [3]: the aux boot split -- the scores land at score_top (12 with the
+  // land13c3e10 tower) and the accumulator boots on the channel ring.
+  acfg.score_top = EnvInt("CHEDDAR_CI_BATCH_SCORE_TOP", 0);
   acfg.verbose = true;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg, tctx);
@@ -1874,6 +1919,13 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     cheddar::EvkRequest req;
     layer.AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
+  }
+  std::unique_ptr<Ring> chan = WireChannelRing(boot, layer);
+  if (chan && EnvInt("CHEDDAR_CI_BATCH_AUX_BOOT", 0) != 0) {
+    attn.SetAuxBoot(
+        std::dynamic_pointer_cast<BootContext<word>>(chan->context),
+        &chan->ui->GetEvkMap());
+    std::cout << "  aux boot on the channel ring" << std::endl;
   }
   const int chain_level = attn.GetChainLevel();
   swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
@@ -1929,7 +1981,7 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     }
   }
   std::vector<Ciphertext<word>> stream;
-  EncryptChannels(boot, layout, x, 0, stream);
+  EncryptChannels(boot, layout, x, chan ? 1 : 0, stream);
   x.v.clear();
   x.v.shrink_to_fit();
   auto t2 = Sync();
@@ -2328,6 +2380,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   acfg.fused_scores = fused_scores;
   acfg.affine_in_prefix =
       fused_scores && EnvInt("CHEDDAR_CI_BATCH_AFFINE_PREFIX", 0) != 0;
+  acfg.score_top = EnvInt("CHEDDAR_CI_BATCH_SCORE_TOP", 0);
   acfg.verbose = cfg.verbose;
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, acfg, tctx);
@@ -2370,6 +2423,14 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   akeys.ring_switch = &swtch.ui->GetRingSwitchKey(attn.GetChain().rank);
   akeys.inverse_ring_switch =
       &swtch.ui->GetInverseRingSwitchKey(attn.GetChain().rank);
+  // [2]/[3]: the channel-boot ring and the aux boot split.
+  std::unique_ptr<Ring> chan = WireChannelRing(boot, layer);
+  if (chan && EnvInt("CHEDDAR_CI_BATCH_AUX_BOOT", 0) != 0) {
+    attn.SetAuxBoot(
+        std::dynamic_pointer_cast<BootContext<word>>(chan->context),
+        &chan->ui->GetEvkMap());
+    std::cout << "  aux boot on the channel ring" << std::endl;
+  }
   auto t1 = Sync();
   std::cout << "  setup: " << std::fixed << std::setprecision(1)
             << Ms(t0, t1) / 1000.0 << " s, " << FreeMiB() << " MiB free"
@@ -2395,7 +2456,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
         }
       }
     }
-    EncryptChannels(boot, layout, x, 0, stream);
+    EncryptChannels(boot, layout, x, chan ? 1 : 0, stream);
   }
   auto t2 = Sync();
   std::cout << "  encrypt the stream: " << Ms(t1, t2) / 1000.0 << " s"
@@ -2592,6 +2653,130 @@ TEST(CiBatch, TheIncrementalSplitProjectsLikeTheWholeOne) {
 // 9. The norm alone, at a small width: NormTurn -> an identity projection
 //    onto the first channels -> the host's x / sqrt(mean(x^2) + eps).
 // ---------------------------------------------------------------------------
+// The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
+// isolation: squares summed at level 1 BEFORE any bootstrap, relinearized
+// once, and the ONE sum bootstrapped on the deep ring -- against the same
+// sum computed the old way (boot first, square after) and against the host.
+TEST(CiBatch, TheAccumulatorBootMatchesTheSquares) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const int model = EnvInt("CHEDDAR_CI_BATCH_NORM_MODEL", 32);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+
+  // Channel values at the layer's riding height (x s ~ +-0.35 max), so the
+  // sum's message magnitude is the real layer's per-channel-count.
+  std::mt19937_64 gen(0x517);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0);
+  HostTensor x{B, kTokens, model, {}};
+  x.v.resize(static_cast<size_t>(B) * kTokens * model);
+  for (auto &v : x.v) v = 0.2 * ux(gen);
+  std::vector<Ciphertext<word>> stream;
+  EncryptChannels(boot, layout, x, 1, stream);
+
+  // The new path sums ride-sized PARTIALS before their boots: a whole sum
+  // past EvalMod's fitted ride extrapolates the polynomial (measured
+  // 1.2e-3 rms at message 0.43, 7% at 2.8 -- the 2026-09-04 bisection).
+  const int chunk = EnvInt("CHEDDAR_CI_BATCH_ACCUM_CHUNK", 4);
+  auto sum_of_squares = [&](bool boot_first, Ciphertext<word> &s2) {
+    s2 = Ciphertext<word>();
+    for (int c0 = 0; c0 < model; c0 += (boot_first ? model : chunk)) {
+      const int g = std::min(model - c0, boot_first ? model : chunk);
+      Ciphertext<word> acc;
+      for (int j = 0; j < g; j++) {
+        const int c = c0 + j;
+        Ciphertext<word> sq;
+        if (boot_first) {
+          Ciphertext<word> up;
+          bctx->Boot(up, stream[c], boot.ui->GetEvkMap());
+          bctx->Mult(sq, up, up);
+        } else {
+          bctx->Mult(sq, stream[c], stream[c]);
+        }
+        if (j == 0) {
+          acc = std::move(sq);
+        } else {
+          bctx->Add(acc, acc, sq);
+        }
+      }
+      Ciphertext<word> rel;
+      bctx->RelinearizeRescale(rel, acc, mult_key);
+      Ciphertext<word> part;
+      if (boot_first) {
+        part = std::move(rel);
+      } else {
+        bctx->Boot(part, rel, boot.ui->GetEvkMap());
+      }
+      if (c0 == 0) {
+        s2 = std::move(part);
+      } else {
+        bctx->Add(s2, s2, part);
+      }
+    }
+  };
+  auto decode_sum = [&](const Ciphertext<word> &s2, std::vector<double> &out) {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, s2);
+    std::vector<Complex> got;
+    boot.context->encoder_.Decode(got, pt);
+    std::vector<double> vals;
+    layout.Unpack(vals, got);
+    out = std::move(vals);
+  };
+
+  Ciphertext<word> s2_new, s2_old;
+  sum_of_squares(false, s2_new);
+  sum_of_squares(true, s2_old);
+  std::cout << "  new path: level "
+            << boot.param->NPToLevel(s2_new.GetNP()) << " scale 2^"
+            << std::log2(s2_new.GetScale()) << "; old path: level "
+            << boot.param->NPToLevel(s2_old.GetNP()) << " scale 2^"
+            << std::log2(s2_old.GetScale()) << std::endl;
+  std::vector<double> got_new, got_old;
+  decode_sum(s2_new, got_new);
+  decode_sum(s2_old, got_old);
+
+  double e_new = 0.0, e_old = 0.0, ref = 0.0, worst = 0.0;
+  int worst_i = -1;
+  for (int b = 0; b < B; b += 97) {
+    for (int t = 0; t < kTokens; t++) {
+      double s = 0.0;
+      for (int c = 0; c < model; c++) {
+        const double v = x.At(b, t, c);
+        s += v * v;
+      }
+      const size_t i = static_cast<size_t>(b) * kTokens + t;
+      e_new += (got_new[i] - s) * (got_new[i] - s);
+      e_old += (got_old[i] - s) * (got_old[i] - s);
+      ref += s * s;
+      if (std::abs(got_new[i] - s) > worst) {
+        worst = std::abs(got_new[i] - s);
+        worst_i = static_cast<int>(i);
+      }
+    }
+  }
+  std::cout << "  sum of " << model << " squares vs host: new (square, boot) "
+            << std::scientific << std::sqrt(e_new / ref)
+            << ", old (boot, square) " << std::sqrt(e_old / ref)
+            << ", worst new abs " << worst << " at " << worst_i << std::fixed
+            << std::endl;
+  EXPECT_LT(std::sqrt(e_old / ref), 1e-3);
+  EXPECT_LT(std::sqrt(e_new / ref), 1e-3);
+#endif
+}
+
 TEST(CiBatch, TheNormTurnMatchesTheHost) {
 #ifndef USE_CUBLAS
   GTEST_SKIP() << "built without cuBLAS";
@@ -2616,6 +2801,7 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
     layer.AddRequiredRotations(req);
     boot.ui->PrepareRotationKey(req);
   }
+  std::unique_ptr<Ring> chan = WireChannelRing(boot, layer);
   const CiBatchLayout &layout = layer.GetLayout();
   const int B = layout.num_instances;
 
@@ -2653,7 +2839,8 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
   xs.v = x.v;
   for (auto &v : xs.v) v *= stream_scale;
   std::vector<Ciphertext<word>> stream;
-  EncryptChannels(boot, layout, xs, 0, stream);
+  // The channel-ring path squares the stream before any boot: level 1.
+  EncryptChannels(boot, layout, xs, chan ? 1 : 0, stream);
 
   auto t0 = Sync();
   typename cheddar::CiBatchProjection<word>::Source src;

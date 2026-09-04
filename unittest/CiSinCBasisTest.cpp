@@ -400,7 +400,8 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CiSinCBasisTest,
-    testing::Values("ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json"),
+    testing::Values("ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json",
+                    "ci16_35_land13c3e10.json"),
     [](const testing::TestParamInfo<CiSinCBasisTest::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

@@ -494,8 +494,17 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c4e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c4e10.json COPYONLY)
+# The aux-boot-split tower (Doing.md 7.39): EvalMod ends at 13, so the fused
+# score boots land at score_top 12 on a climb-26 ladder.
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
+# The norm channel-boot ring (Doing.md 7.38): L = 11 with num_stc 2, so the
+# channel Boot lands at 9 on a climb-23 ladder; the deep ladder then serves
+# only the norm's accumulator (2 boots a layer).
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c4e8s2.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c4e8s2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

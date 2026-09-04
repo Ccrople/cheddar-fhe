@@ -151,6 +151,17 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   AssertTrue(hold + 1 <= top,
              "CiBatchLayer::NormTurn: norm_apply_level is above the boot's "
              "landing");
+  const bool chan = chan_boot_ != nullptr;
+  if (chan) {
+    AssertTrue(chan_evk_ != nullptr,
+               "CiBatchLayer::NormTurn: SetChannelBoot without its keys");
+    AssertTrue(hold <= chan_boot_->GetBootParameter().GetEndLevel(),
+               "CiBatchLayer::NormTurn: norm_apply_level is above the "
+               "channel ring's landing");
+    AssertTrue(param.NPToLevel(stream[0].GetNP()) >= 1,
+               "CiBatchLayer::NormTurn: the pre-boot squares need the "
+               "stream at level >= 1");
+  }
 
   // The boot's tables, if the previous norm dropped them.
   auto t0 = Clock::now();
@@ -160,18 +171,65 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
     prepare_seconds_ += SinceSeconds(t0);
     t0 = Clock::now();
   }
+  if (chan && !chan_boot_->IsBootPrepared(layout_.num_slots)) {
+    NvtxScope _p("batch: prepare channel boot tables");
+    chan_boot_->PrepareEvalSpecialFFT(layout_.num_slots);
+    prepare_seconds_ += SinceSeconds(t0);
+    t0 = Clock::now();
+  }
 
   // The split's buffers FIRST -- twenty of a gigabyte -- so they sit below
   // everything the two passes allocate and free, rather than among it.
   proj_->BeginSplit(src, model, hold - 1, layout_.num_slots);
 
-  // Pass A: every channel booted, its square accumulated WITHOUT
-  // relinearization (the tensor product's three components add), and the
-  // channel itself either kept at the level the apply will meet it or
-  // dropped to be booted again (`Config::hold_channels`).
-  std::vector<Ct> xs(hold_ch ? model : 0);
+  // Pass A. With the channel ring (`SetChannelBoot`): the squares are
+  // accumulated at the STREAM's own level -- no bootstrap touches a
+  // channel here -- and the one relinearized sum rides the deep ladder
+  // alone. Without it: every channel booted, its square accumulated
+  // WITHOUT relinearization (the tensor product's three components add),
+  // and the channel itself either kept at the level the apply will meet
+  // it or dropped to be booted again (`Config::hold_channels`).
+  std::vector<Ct> xs(hold_ch && !chan ? model : 0);
   Ct acc;
-  {
+  std::vector<Ct> partials;
+  int accum_chunk = 0;
+  if (chan) {
+    NvtxScope _a("batch: norm pass A");
+    // A partial sum must enter its bootstrap INSIDE EvalMod's ride (~0.3
+    // in message units): past the fitted range the polynomial extrapolates
+    // (TheAccumulatorBootMatchesTheSquares: 1.2e-3 at 0.43, 7% at 2.8).
+    // The worst per-channel square is stream_scale^2 sqrt(window) / alpha
+    // (the window's top edge), a factor sink_min^2 above the sinked fit.
+    double sink_min = 1.0;
+    for (const double s : sink) sink_min = std::min(sink_min, std::abs(s));
+    const double ride = [] {
+      const char *e = std::getenv("CHEDDAR_CI_BATCH_ACCUM_RIDE");
+      return (e && e[0] != '\0') ? std::atof(e) : 0.3;
+    }();
+    const double sq_hi = stream_scale * stream_scale * std::sqrt(window) /
+                         (alpha * sink_min * sink_min);
+    accum_chunk = static_cast<int>(ride / sq_hi);
+    if (const char *e = std::getenv("CHEDDAR_CI_BATCH_ACCUM_CHUNK")) {
+      if (e[0] != '\0') accum_chunk = std::atoi(e);
+    }
+    accum_chunk = Min(Max(accum_chunk, 1), model);
+    for (int c0 = 0; c0 < model; c0 += accum_chunk) {
+      const int g = Min(model - c0, accum_chunk);
+      Ct pacc;
+      for (int j = 0; j < g; j++) {
+        Ct sq;
+        boot_->Mult(sq, stream[c0 + j], stream[c0 + j]);
+        if (j == 0) {
+          pacc = std::move(sq);
+        } else {
+          boot_->Add(pacc, pacc, sq);
+        }
+      }
+      Ct rel;
+      boot_->RelinearizeRescale(rel, pacc, mult_key);
+      partials.push_back(std::move(rel));
+    }
+  } else {
     NvtxScope _a("batch: norm pass A");
     const int group = BootGroupSize();
     for (int c0 = 0; c0 < model; c0 += group) {
@@ -200,17 +258,46 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
     }
   }
   // The last bootstrap of this norm, when the channels are held: the
-  // tables can go now.
-  if (hold_ch && release_tables && cfg_.release_boot_tables) {
+  // tables can go now (the channel-ring path boots on `boot_` once more,
+  // just below, so its release waits for pass B's end).
+  if (!chan && hold_ch && release_tables && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
+  }
+
+  // ONE relinearization for the whole channel sum; on the channel-ring
+  // path the ride-sized partial sums ride the deep ladder (grouped) and
+  // add back together at its landing.
+  Ct s2;
+  if (chan) {
+    const int np = static_cast<int>(partials.size());
+    const int group = BootGroupSize();
+    for (int p0 = 0; p0 < np; p0 += group) {
+      const int g = Min(np - p0, group);
+      std::vector<Ct> up_g;
+      if (g == 1) {
+        up_g.resize(1);
+        boot_->Boot(up_g[0], partials[p0], evk);
+      } else {
+        std::vector<const Ct *> in(g);
+        for (int j = 0; j < g; j++) in[j] = &partials[p0 + j];
+        boot_->BootBatch(up_g, in, evk);
+      }
+      for (int j = 0; j < g; j++) {
+        partials[p0 + j] = Ct();
+        if (p0 + j == 0) {
+          s2 = std::move(up_g[j]);
+        } else {
+          boot_->Add(s2, s2, up_g[j]);
+        }
+      }
+    }
+    partials.clear();
+  } else {
+    boot_->RelinearizeRescale(s2, acc, mult_key);
+    acc = Ct();
   }
   stages_.boot += SinceSeconds(t0);
   t0 = Clock::now();
-
-  // ONE relinearization for the whole channel sum.
-  Ct s2;
-  boot_->RelinearizeRescale(s2, acc, mult_key);
-  acc = Ct();
 
   // The affine map onto the polynomial's domain, with the per-token sink
   // and the stream's factor folded into its one multiply:
@@ -288,27 +375,29 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   t0 = Clock::now();
   {
     NvtxScope _b("batch: norm pass B");
-    const int group = hold_ch ? 1 : BootGroupSize();
+    BootContext<word> *cb = chan ? chan_boot_.get() : boot_.get();
+    const EvkMap<word> &cevk = chan ? *chan_evk_ : evk;
+    const int group = (!chan && hold_ch) ? 1 : BootGroupSize();
     for (int c0 = 0; c0 < model; c0 += group) {
       const int g = Min(model - c0, group);
       std::vector<Ct> up_g;
-      if (!hold_ch && g > 1) {
+      if ((chan || !hold_ch) && g > 1) {
         std::vector<const Ct *> in(g);
         for (int j = 0; j < g; j++) in[j] = &stream[c0 + j];
-        boot_->BootBatch(up_g, in, evk);
+        cb->BootBatch(up_g, in, cevk);
       }
       for (int j = 0; j < g; j++) {
         const int c = c0 + j;
         Ct x_c;
-        if (hold_ch) {
+        if (!chan && hold_ch) {
           x_c = std::move(xs[c]);
         } else if (g > 1) {
-          boot_->LevelDown(x_c, up_g[j], hold);
+          cb->LevelDown(x_c, up_g[j], hold);
           up_g[j] = Ct();
         } else {
           Ct up;
-          boot_->Boot(up, stream[c], evk);
-          boot_->LevelDown(x_c, up, hold);
+          cb->Boot(up, stream[c], cevk);
+          cb->LevelDown(x_c, up, hold);
         }
         Ct y_c;
         boot_->HMult(y_c, x_c, rh, mult_key);
@@ -316,10 +405,11 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
       }
     }
   }
-  if (!hold_ch && release_tables && cfg_.release_boot_tables) {
+  if ((chan || !hold_ch) && release_tables && cfg_.release_boot_tables) {
     boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
+    if (chan) chan_boot_->ReleaseEvalSpecialFFT(layout_.num_slots);
   }
-  if (hold_ch) {
+  if (!chan && hold_ch) {
     stages_.norm += SinceSeconds(t0);
   } else {
     stages_.boot += SinceSeconds(t0);
@@ -327,9 +417,16 @@ void CiBatchLayer<word>::NormTurn(typename CiBatchProjection<word>::Source &src,
   if (cfg_.verbose) {
     std::cout << "  [batch] NormTurn: window " << window << " degree " << used
               << ", r at level " << lr << ", y at level " << (hold - 1)
-              << ", split " << (hold_ch ? "from held channels"
-                                                    : "from a second boot")
-              << std::endl;
+              << ", split "
+              << (chan ? "from the channel ring's boots"
+                       : (hold_ch ? "from held channels"
+                                  : "from a second boot"));
+    if (chan) {
+      std::cout << ", accumulator chunk " << accum_chunk << " ("
+                << ((model + accum_chunk - 1) / accum_chunk)
+                << " deep boots)";
+    }
+    std::cout << std::endl;
   }
 }
 
@@ -582,7 +679,9 @@ void CiBatchLayer<word>::Attention(
   std::vector<std::vector<Ct>> k_heads, v_heads, q_heads;
   double o_ratio = 0.0;
   int o_level = -1;
-  const int top = boot_->GetBootParameter().GetEndLevel();
+  // [3]: with Config::score_top the softmax walks from below the layer
+  // boot's landing; a serial score boot then comes down inside SoftMax.
+  const int top = attn.GetTopLevel();
   // A projection tile split into its heads.
   auto split_heads = [&](std::vector<Ct> &tile,
                          std::vector<std::vector<Ct>> &heads_out) {
@@ -703,9 +802,9 @@ void CiBatchLayer<word>::Attention(
           }
         }
       }
-      AssertTrue(param.NPToLevel(booted[0].GetNP()) == top,
-                 "CiBatchLayer::Attention: the score bootstrap did not "
-                 "land at the top level");
+      AssertTrue(param.NPToLevel(booted[0].GetNP()) >= top,
+                 "CiBatchLayer::Attention: the score bootstrap landed "
+                 "below the softmax's top level");
       stages_.boot += SinceSeconds(t0);
       if (h == 0 && cfg_.verbose) {
         MemoryPool::Report("batch: head 0 after the score boots");

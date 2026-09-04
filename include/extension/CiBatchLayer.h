@@ -200,6 +200,28 @@ class CiBatchLayer {
   void AddRequiredRotations(EvkRequest &req) const;
 
   /**
+   * @brief Put the norm's CHANNEL bootstraps on a short landing ring
+   * (Doing.md 7.38): with it set, `NormTurn` sums the squares BEFORE any
+   * bootstrap (at the stream's own level, which must be >= 1), boots the
+   * ONE accumulator on the deep layer ring, and boots each channel exactly
+   * once -- on `chan` -- for the apply. The deep ladder then serves two
+   * bootstraps a layer, and the 8,192 channel boots ride `chan`'s shorter
+   * climb. `hold`/`hold_channels` become moot (there is no second pass to
+   * hold for). `chan` must share the layer's secret and its bottom primes
+   * up to its landing (a `gen_landing.py` sub-ladder of the layer preset),
+   * and `Config::norm_apply_level` must be <= `chan`'s landing.
+   *
+   * The caller keeps `chan`'s EvalMod and FFT tables prepared; this class
+   * prepares/releases them beside the deep ring's
+   * (`Config::release_boot_tables`).
+   */
+  void SetChannelBoot(std::shared_ptr<BootContext<word>> chan,
+                      const EvkMap<word> *chan_evk) {
+    chan_boot_ = std::move(chan);
+    chan_evk_ = chan_evk;
+  }
+
+  /**
    * @brief The residual stream through one RMSNorm: booted, squared and
    * summed over channels, the inverse square root on the ONE accumulator,
    * applied back. The gain is NOT applied -- fold it into the weight that
@@ -327,6 +349,10 @@ class CiBatchLayer {
   void Unpark(std::vector<Ct> &stream, ParkedStream &parked) const;
 
   std::shared_ptr<BootContext<word>> boot_;
+  //! The channel-boot ring (`SetChannelBoot`), or null = every bootstrap
+  //! on `boot_` with the squares summed after the channel boots.
+  std::shared_ptr<BootContext<word>> chan_boot_;
+  const EvkMap<word> *chan_evk_ = nullptr;
   Config cfg_;
   CiBatchLayout layout_;
   std::unique_ptr<CiBatchProjection<word>> proj_;

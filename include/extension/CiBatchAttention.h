@@ -136,6 +136,17 @@ class CiBatchAttention {
     //! calibration; `SoftMax` then expects the affine already applied and
     //! only adds the row shift.
     bool affine_in_prefix = false;
+    //! [3] the aux boot split (Doing.md 7.39): where the booted scores
+    //! land. 0 = the layer boot's own landing (no change). With
+    //! `SetAuxBoot` the softmax's Euclidean-norm accumulator (ONE
+    //! ciphertext a head) bootstraps on its own short ring and the walk
+    //! above `forward_level` shrinks to exp + mask + the two products --
+    //! 8 levels at exp degree 15 -- so the scores can land at 12: a
+    //! shorter tower for the fused boots (`ci16_35_land13c3e10`, EvalMod
+    //! ending at 13), and the serial route LevelDowns to it. Requires
+    //! `affine_in_prefix` on the fused route (the affine multiply has no
+    //! level of its own at 12).
+    int score_top = 0;
     bool verbose = false;
   };
 
@@ -315,7 +326,25 @@ class CiBatchAttention {
    */
   void PrepareSoftMax(const SoftMaxCalibration &calib);
   //! Where `SoftMax` expects its booted scores: the boot's landing.
-  int GetTopLevel() const { return boot_->GetBootParameter().GetEndLevel(); }
+  int GetTopLevel() const {
+    return cfg_.score_top > 0 ? cfg_.score_top
+                              : boot_->GetBootParameter().GetEndLevel();
+  }
+
+  /**
+   * @brief [3] Give the softmax's Euclidean-norm accumulator its own
+   * bootstrap ring (a gen_landing sub-ladder on the layer's secret and
+   * bottom primes -- the norm channel ring, landing 9, serves). Call
+   * BEFORE `PrepareSoftMax`: the inverse square root is then compiled at
+   * `aux`'s landing (9 -> deg 7 lands at 6, P at `forward_level` 4).
+   * Causal calibrations only (the affine shift is level-free there). The
+   * caller keeps `aux`'s EvalMod and FFT tables prepared around `SoftMax`.
+   */
+  void SetAuxBoot(std::shared_ptr<const BootContext<word>> aux,
+                  const EvkMap<word> *aux_evk) {
+    aux_boot_ = std::move(aux);
+    aux_evk_ = aux_evk;
+  }
 
   /**
    * @brief One head's softmax on the batched layout: the key axis is the
@@ -354,7 +383,14 @@ class CiBatchAttention {
   bool softmax_ready_ = false;
   int exp_in_ = 0, exp_out_ = 0, mask_level_ = 0, sq_level_ = 0,
       poly_in_ = 0;
-  std::vector<std::unique_ptr<EvalPoly<word>>> polys_;  // [0] exp, [1] invsqrt
+  // [1] is recompiled lazily on the aux path (its ladder's EvalMod can
+  // land ~0.3% off the nominal scale, the 7.37 drift), so mutable.
+  mutable std::vector<std::unique_ptr<EvalPoly<word>>> polys_;  // [0] exp, [1] invsqrt
+  //! [3] the invsqrt's fit and landing, kept so SoftMax can recompile [1]
+  //! at the MEASURED aux landing scale; in_scale 0 = not yet compiled.
+  std::vector<double> aux_inv_coeffs_;
+  int aux_inv_out_ = -1;
+  mutable double aux_inv_in_scale_ = 0.0;
   //! Per head: the row shift's per-token plaintext at `exp_in_`, and the
   //! 128 per-key-token causal masks (with `est^-1/2` folded) at `exp_out_`.
   //! The masks are built per head at its call (`BuildMasks`), 128
@@ -418,6 +454,13 @@ class CiBatchAttention {
   std::unique_ptr<CiSinCConverter<word>> inv_;
   //! The fused scores' tower ring and its basis (CtS' + prefix).
   std::shared_ptr<const BootContext<word>> tower_;
+  //! [3] the aux accumulator's own bootstrap ring (`SetAuxBoot`), or null.
+  std::shared_ptr<const BootContext<word>> aux_boot_;
+  const EvkMap<word> *aux_evk_ = nullptr;
+  //! [3] the accumulator's ride factor: the masks carry sqrt of it, the
+  //! booted sum re-declares its scale by it, the inverse square root
+  //! returns it. 1 without the aux boot.
+  double aux_gamma_ = 1.0;
   std::unique_ptr<CiSinCBasis<word>> basis_;
 
  public:
