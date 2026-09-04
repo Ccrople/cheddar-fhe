@@ -3840,6 +3840,479 @@ TEST(CiBatch, TheDecodeFfnMatchesTheHost) {
 #endif
 }
 
+// The DECODE attention on the REAL layer-0 weights (roadmap [6]'s first
+// assembly increment, [4]'s per-step appends included): 127 prompt tokens'
+// K/V cache computed on the host in float64 (RMSNorm, GQA weight slices,
+// RoPE at each position -- what the prefill leaves behind; the Sylph norm
+// sink cancels exactly and does not reach the cache), the decode token at
+// position 127 APPENDED encrypted (K: one masked add per channel; V: one
+// pack), and four query heads spanning three KV heads run the [3]
+// pipeline against the true float64 softmax(q k / sqrt(d)) V. Real-data
+// machinery new here: the max-shift folded into the gamma affine
+// (e <= 1), the exp WALK (a deg-15 polynomial on w / 2^k and k squarings,
+// k from the measured score range), and the reciprocal applied AFTER
+// ScoreV (one multiply on the output, saving a level and a
+// relinearization). RoPE at the fixed decode position is a public linear
+// map folded into the projection on the host, as the real layer folds it
+// into the Kang weights. Instances are replicated (the synthetic gates
+// varied them).
+TEST(CiBatch, TheDecodeAttentionRunsOnTheRealLayer) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  if (wdir_env == nullptr) GTEST_SKIP() << "LLAMA3_ALL_DIR is not set";
+  const std::string ld = std::string(wdir_env) + "/L00";
+  constexpr int kH = 4096, kKv = 1024;
+  const int D = kTokens, half = D / 2, T = kTokens, Tc = T - 1;
+  const double eps = 1e-5, rope_base = 500000.0;
+  const double sqd = std::sqrt(static_cast<double>(D));
+  const std::vector<int> heads = {0, 1, 4, 31};
+  std::vector<int> kvs;  // unique kv heads, in order
+  for (int h : heads) {
+    const int kv = h / 4;
+    if (std::find(kvs.begin(), kvs.end(), kv) == kvs.end()) kvs.push_back(kv);
+  }
+  auto kv_slot = [&](int h) {
+    return static_cast<int>(std::find(kvs.begin(), kvs.end(), h / 4) -
+                            kvs.begin());
+  };
+
+  std::vector<float> x0, wq, wk, wv, gain;
+  ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
+                      static_cast<size_t>(T) * kH, x0));
+  ASSERT_TRUE(ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, wq));
+  ASSERT_TRUE(ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
+  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, gain));
+
+  // Host float64: the norm, the per-position K/V (RoPE'd), the decode
+  // token's queries, the true softmax(q k / sqrt(d)) V.
+  std::vector<double> y(static_cast<size_t>(T) * kH);
+  for (int t = 0; t < T; t++) {
+    double ms = 0.0;
+    for (int c = 0; c < kH; c++) {
+      const double v = x0[static_cast<size_t>(t) * kH + c];
+      ms += v * v;
+    }
+    const double r = 1.0 / std::sqrt(ms / kH + eps);
+    for (int c = 0; c < kH; c++) {
+      y[static_cast<size_t>(t) * kH + c] =
+          x0[static_cast<size_t>(t) * kH + c] * r * gain[c];
+    }
+  }
+  auto rope = [&](std::vector<double> &m, int pos) {
+    for (int c = 0; c < half; c++) {
+      const double a = pos * std::pow(rope_base, -2.0 * c / D);
+      const double lo = m[c], hi = m[c + half];
+      m[c] = lo * std::cos(a) - hi * std::sin(a);
+      m[c + half] = hi * std::cos(a) + lo * std::sin(a);
+    }
+  };
+  const int nkv = static_cast<int>(kvs.size());
+  // k_host[kv][t*D+d], v_host[kv][t*D+d] for t = 0..T-1 (T-1 is the decode
+  // token at position T-1).
+  std::vector<std::vector<double>> k_host(nkv,
+                                          std::vector<double>(T * D)),
+      v_host = k_host;
+  cheddar::ParallelFor(T, [&](int begin, int end) {
+    for (int t = begin; t < end; t++) {
+      for (int s = 0; s < nkv; s++) {
+        const int col = kvs[s] * D;
+        std::vector<double> kk(D), vv(D);
+        for (int d = 0; d < D; d++) {
+          double ak = 0.0, av = 0.0;
+          for (int c = 0; c < kH; c++) {
+            const double yc = y[static_cast<size_t>(t) * kH + c];
+            ak += yc * wk[static_cast<size_t>(c) * kKv + col + d];
+            av += yc * wv[static_cast<size_t>(c) * kKv + col + d];
+          }
+          kk[d] = ak;
+          vv[d] = av;
+        }
+        rope(kk, t);
+        for (int d = 0; d < D; d++) {
+          k_host[s][static_cast<size_t>(t) * D + d] = kk[d];
+          v_host[s][static_cast<size_t>(t) * D + d] = vv[d];
+        }
+      }
+    }
+  });
+  const int nh = static_cast<int>(heads.size());
+  std::vector<std::vector<double>> q_host(nh, std::vector<double>(D));
+  for (int i = 0; i < nh; i++) {
+    for (int d = 0; d < D; d++) {
+      double a = 0.0;
+      for (int c = 0; c < kH; c++) {
+        a += y[static_cast<size_t>(Tc) * kH + c] *
+             wq[static_cast<size_t>(c) * kH + heads[i] * D + d];
+      }
+      q_host[i][d] = a;
+    }
+    rope(q_host[i], Tc);
+  }
+  std::vector<std::vector<double>> s_host(nh, std::vector<double>(T)),
+      ref(nh, std::vector<double>(D));
+  std::vector<double> s_lo(nh, 1e30), s_hi(nh, -1e30);
+  for (int i = 0; i < nh; i++) {
+    const int s = kv_slot(heads[i]);
+    for (int l = 0; l < T; l++) {
+      double a = 0.0;
+      for (int d = 0; d < D; d++) {
+        a += q_host[i][d] * k_host[s][static_cast<size_t>(l) * D + d];
+      }
+      s_host[i][l] = a;
+      s_lo[i] = std::min(s_lo[i], a);
+      s_hi[i] = std::max(s_hi[i], a);
+    }
+    double z = 0.0;
+    std::vector<double> p(T);
+    for (int l = 0; l < T; l++) {
+      p[l] = std::exp((s_host[i][l] - s_hi[i]) / sqd);
+      z += p[l];
+    }
+    for (int d = 0; d < D; d++) {
+      double a = 0.0;
+      for (int l = 0; l < T; l++) {
+        a += (p[l] / z) * v_host[s][static_cast<size_t>(l) * D + d];
+      }
+      ref[i][d] = a;
+    }
+  }
+
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+  const int land = bctx->GetBootParameter().GetEndLevel();
+  for (int s = B; s < B * kTokens; s <<= 1) {
+    boot.ui->PrepareRotationKey(s, land);
+  }
+
+  // The walk's squaring count from the widest head's range.
+  double r_w = 0.0;
+  for (int i = 0; i < nh; i++) {
+    r_w = std::max(r_w, (s_hi[i] - s_lo[i]) / sqd);
+  }
+  int k_sq = 0;
+  while (r_w / (1 << k_sq) > 2.0) k_sq++;
+  const int le = land - 1 - 3;        // exp poly's landing (deg 7)
+  const int lf = le - k_sq;           // e after the squarings = fanout level
+  const int lv_v = lf - 1;            // the V cache's level
+
+  // Encryptions. The K cache rows 0..T-2 (row T-1 empty), the V cache
+  // tokens 0..T-2, the decode token's k/v/q as broadcast channels.
+  auto enc_group = [&](int level, auto fill,
+                       std::vector<Ciphertext<word>> &cts) {
+    HostTensor hx{B, kTokens, D, {}};
+    hx.v.resize(static_cast<size_t>(B) * kTokens * D);
+    for (int b = 0; b < B; b++)
+      for (int t = 0; t < kTokens; t++)
+        for (int c = 0; c < D; c++) hx.At(b, t, c) = fill(t, c);
+    EncryptChannels(boot, layout, hx, level, cts);
+  };
+  std::vector<std::vector<Ciphertext<word>>> kc(nkv), vt(nkv), knew(nkv),
+      vnew(nkv);
+  for (int s = 0; s < nkv; s++) {
+    enc_group(2,
+              [&](int t, int c) {
+                return t < Tc ? k_host[s][static_cast<size_t>(t) * D + c]
+                              : 0.0;
+              },
+              kc[s]);
+    enc_group(3,
+              [&](int, int c) {
+                return k_host[s][static_cast<size_t>(Tc) * D + c];
+              },
+              knew[s]);
+    // V in the token-outside form: channel = token, rows = head dim.
+    enc_group(lv_v,
+              [&](int d, int t) {
+                return t < Tc ? v_host[s][static_cast<size_t>(t) * D + d]
+                              : 0.0;
+              },
+              vt[s]);
+    enc_group(lf,
+              [&](int, int c) {
+                return v_host[s][static_cast<size_t>(Tc) * D + c];
+              },
+              vnew[s]);
+  }
+  // The ride gamma folds into q BEFORE the product (in the real layer,
+  // into the Kang Q weights -- free): the scores then flow at <= 0.3 from
+  // the first partial sum, never near the low-level message headroom (the
+  // unscaled route wrapped head 31's +-251 scores at level 1's ~2^8 cap).
+  std::vector<double> gammas(nh);
+  std::vector<std::vector<Ciphertext<word>>> q_cts(nh);
+  for (int i = 0; i < nh; i++) {
+    gammas[i] = 0.3 / std::max(s_hi[i] - s_lo[i], 1e-6);
+    enc_group(2, [&](int, int c) { return gammas[i] * q_host[i][c]; },
+              q_cts[i]);
+  }
+  auto make_mask = [&](int row, int level, double value,
+                       Plaintext<word> &pt) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) {
+      mv[static_cast<size_t>(b) * kTokens + row] = value;
+    }
+    std::vector<Complex> msg;
+    layout.Pack(msg, mv);
+    boot.context->gpu_encoder_.Encode(pt, level, boot.param->GetScale(level),
+                                      msg);
+  };
+
+  // --- [4] The per-step APPENDS, encrypted: K row T-1 by one masked add
+  // per channel; the V token ct by one pack.
+  auto t0 = Sync();
+  {
+    Plaintext<word> mk;
+    make_mask(Tc, 3, 1.0, mk);
+    std::vector<Plaintext<word>> mp(D);
+    for (int d = 0; d < D; d++) make_mask(d, lf, 1.0, mp[d]);
+    for (int s = 0; s < nkv; s++) {
+      for (int c = 0; c < D; c++) {
+        Ciphertext<word> m, r;
+        bctx->Mult(m, knew[s][c], mk);
+        bctx->Rescale(r, m);
+        bctx->Add(kc[s][c], kc[s][c], r);
+      }
+      Ciphertext<word> acc;
+      for (int d = 0; d < D; d++) {
+        Ciphertext<word> m;
+        bctx->Mult(m, vnew[s][d], mp[d]);
+        if (d == 0) {
+          acc = std::move(m);
+        } else {
+          bctx->Add(acc, acc, m);
+        }
+      }
+      bctx->Rescale(vt[s][Tc], acc);
+    }
+  }
+  auto t1 = Sync();
+
+  // The fan-out, compiled once at the e level (shared by every head).
+  std::vector<cheddar::Message> row_masks(T);
+  for (int j = 0; j < T; j++) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+    layout.Pack(row_masks[j], mv);
+  }
+  cheddar::CiDecodeUnpack<word> fanout(boot.context, row_masks, B, lf,
+                                       boot.param->GetRescalePrimeProd(lf));
+  {
+    cheddar::EvkRequest req;
+    fanout.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  auto t1b = Sync();
+
+  // --- Per head: scores, gamma + max shift, boot, the exp walk, Z, the
+  // fan-out, ScoreV, and the reciprocal LAST.
+  double worst_bits = -1e30;
+  for (int i = 0; i < nh; i++) {
+    const int s = kv_slot(heads[i]);
+    const double range = s_hi[i] - s_lo[i];
+    const double gamma = gammas[i];
+    Ciphertext<word> s_up;
+    {
+      Ciphertext<word> acc;
+      for (int c = 0; c < D; c++) {
+        Ciphertext<word> m;
+        bctx->Mult(m, q_cts[i][c], kc[s][c]);
+        if (c == 0) {
+          acc = std::move(m);
+        } else {
+          bctx->Add(acc, acc, m);
+        }
+      }
+      Ciphertext<word> sc;
+      bctx->RelinearizeRescale(sc, acc, mult_key);
+      const int l0 = boot.param->NPToLevel(sc.GetNP());
+      cheddar::Constant<word> shift;
+      boot.context->encoder_.EncodeConstant(
+          shift, l0, boot.param->GetScale(l0), -gamma * s_hi[i]);
+      bctx->Add(sc, sc, shift);
+      bctx->Boot(s_up, sc, boot.ui->GetEvkMap());
+    }
+    // e = exp((s - s_hi) / sqd): a deg-15 polynomial on w / 2^k, then k
+    // squarings. The booted message is gamma (s - s_hi).
+    Ciphertext<word> e;
+    {
+      const double rg = range / sqd / (1 << k_sq);  // g in [-rg, 0]
+      const double lo = -rg - 0.02 * rg - 1e-9, hi = 0.02 * rg + 1e-9;
+      const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+      const double in_factor = gamma * sqd * (1 << k_sq);
+      const int l = boot.param->NPToLevel(s_up.GetNP());
+      Plaintext<word> pk;
+      {
+        std::vector<double> kv2(static_cast<size_t>(B) * kTokens,
+                                1.0 / (in_factor * a));
+        std::vector<Complex> msg;
+        layout.Pack(msg, kv2);
+        boot.context->gpu_encoder_.Encode(pk, l, boot.param->GetScale(l),
+                                          msg);
+      }
+      Ciphertext<word> v;
+      {
+        Ciphertext<word> tmp;
+        bctx->Mult(tmp, s_up, pk);
+        bctx->Rescale(v, tmp);
+      }
+      const int lvv = boot.param->NPToLevel(v.GetNP());
+      {
+        cheddar::Constant<word> shift;
+        boot.context->encoder_.EncodeConstant(
+            shift, lvv, boot.param->GetScale(lvv), -b / a);
+        bctx->Add(v, v, shift);
+      }
+      auto coeffs = cheddar::chebfit::Interpolate(
+          [a, b](double t) { return std::exp(a * t + b); }, 7);
+      const double in_scale = boot.param->GetScale(lvv);
+      const int used =
+          cheddar::EvalPoly<word>(coeffs, lvv, in_scale, in_scale, true)
+              .GetPolyDegree();
+      // Degree 7, never higher: at a requested degree 15 the narrow heads'
+      // Chebyshev tails underflow (used 5-6, fine) but the sink head's a of
+      // ~0.7 keeps a used degree past 7, where the compiled tree's landing
+      // no longer matches Log2Ceil(used + 1) and the evaluation returns
+      // 2^400-scale garbage (the 2026-09-04 bisection). The walk's
+      // squarings make high degrees unnecessary anyway.
+      int lr = lvv;
+      for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
+      cheddar::EvalPoly<word> pexp(coeffs, lvv, in_scale,
+                                   boot.param->GetScale(lr), true);
+      pexp.Compile(bctx);
+      {
+        Ciphertext<word> e_raw;
+        pexp.Evaluate(bctx, e_raw, v, mult_key);
+        bctx->LevelDown(e, e_raw, le);
+      }
+      for (int j = 0; j < k_sq; j++) {
+        Ciphertext<word> m, e2;
+        bctx->Mult(m, e, e);
+        bctx->RelinearizeRescale(e2, m, mult_key);
+        e = std::move(e2);
+      }
+    }
+    // Z = sum_t e (the token ladder), and 1 / Z compiled on its range.
+    Ciphertext<word> r_inv;
+    {
+      Ciphertext<word> z;
+      bctx->LevelDown(z, e, boot.param->NPToLevel(e.GetNP()));
+      for (int st = B; st < B * kTokens; st <<= 1) {
+        Ciphertext<word> r;
+        bctx->HRot(r, z, boot.ui->GetRotationKey(st), st);
+        bctx->Add(z, z, r);
+      }
+      double zh = 0.0;
+      for (int l = 0; l < T; l++) {
+        zh += std::exp((s_host[i][l] - s_hi[i]) / sqd);
+      }
+      const double lo = zh * 0.9, hi = zh * 1.1;
+      const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+      const int l = boot.param->NPToLevel(z.GetNP());
+      Plaintext<word> pk;
+      {
+        std::vector<double> kv2(static_cast<size_t>(B) * kTokens, 1.0 / a);
+        std::vector<Complex> msg;
+        layout.Pack(msg, kv2);
+        boot.context->gpu_encoder_.Encode(pk, l, boot.param->GetScale(l),
+                                          msg);
+      }
+      Ciphertext<word> v;
+      {
+        Ciphertext<word> tmp;
+        bctx->Mult(tmp, z, pk);
+        bctx->Rescale(v, tmp);
+      }
+      const int lvv = boot.param->NPToLevel(v.GetNP());
+      {
+        cheddar::Constant<word> shift;
+        boot.context->encoder_.EncodeConstant(
+            shift, lvv, boot.param->GetScale(lvv), -b / a);
+        bctx->Add(v, v, shift);
+      }
+      auto coeffs = cheddar::chebfit::Interpolate(
+          [a, b](double t) { return 1.0 / (a * t + b); }, 7);
+      const double in_scale = boot.param->GetScale(lvv);
+      const int used =
+          cheddar::EvalPoly<word>(coeffs, lvv, in_scale, in_scale, true)
+              .GetPolyDegree();
+      int lr = lvv;
+      for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
+      cheddar::EvalPoly<word> rec(coeffs, lvv, in_scale,
+                                  boot.param->GetScale(lr), true);
+      rec.Compile(bctx);
+      rec.Evaluate(bctx, r_inv, v, mult_key);
+    }
+    // The fan-out of the UNNORMALIZED e, ScoreV, then the reciprocal.
+    std::vector<Ciphertext<word>> e_t;
+    fanout.Evaluate(boot.context, e_t, e, boot.ui->GetEvkMap());
+    Ciphertext<word> out_raw;
+    {
+      Ciphertext<word> acc;
+      for (int t = 0; t < T; t++) {
+        Ciphertext<word> m;
+        bctx->Mult(m, e_t[t], vt[s][t]);
+        if (t == 0) {
+          acc = std::move(m);
+        } else {
+          bctx->Add(acc, acc, m);
+        }
+      }
+      bctx->RelinearizeRescale(out_raw, acc, mult_key);
+    }
+    Ciphertext<word> out_ct;
+    {
+      const int lr = boot.param->NPToLevel(r_inv.GetNP());
+      Ciphertext<word> dd;
+      bctx->LevelDown(dd, out_raw, lr);
+      Ciphertext<word> prod;
+      bctx->Mult(prod, dd, r_inv);
+      bctx->RelinearizeRescale(out_ct, prod, mult_key);
+    }
+
+    double num = 0.0, den = 0.0;
+    {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, out_ct);
+      std::vector<Complex> m2;
+      boot.context->encoder_.Decode(m2, pt);
+      std::vector<double> got;
+      layout.Unpack(got, m2);
+      for (int b = 0; b < B; b += 129) {
+        for (int d = 0; d < D; d++) {
+          const double g = got[static_cast<size_t>(b) * kTokens + d];
+          num += (g - ref[i][d]) * (g - ref[i][d]);
+          den += ref[i][d] * ref[i][d];
+        }
+      }
+    }
+    const double bits = 0.5 * std::log2(num / den);
+    worst_bits = std::max(worst_bits, bits);
+    std::cout << "  [decode real] head " << heads[i] << " (kv "
+              << heads[i] / 4 << "): rms rel 2^" << bits << ", score range "
+              << s_lo[i] << ".." << s_hi[i] << std::endl;
+  }
+  auto t2 = Sync();
+  std::cout << "  [decode real] appends " << Ms(t0, t1) << " ms, " << nh
+            << " heads " << Ms(t1b, t2) << " ms (" << Ms(t1b, t2) / nh
+            << " ms/head); walk k=" << k_sq << ", e level " << lf
+            << ", V level " << lv_v << std::endl;
+  EXPECT_LT(worst_bits, -6.0);
+#endif
+}
+
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
 // isolation: squares summed at level 1 BEFORE any bootstrap, relinearized
 // once, and the ONE sum bootstrapped on the deep ring -- against the same
