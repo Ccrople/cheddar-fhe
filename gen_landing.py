@@ -39,6 +39,20 @@ SRC, LAND, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 # wrap-around wants (Doing.md 3.9), and the preset then pins `num_double_angle`.
 NUM_CTS_ARG = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 NE_ARG = int(sys.argv[5]) if len(sys.argv) > 5 else 8
+# Optional 6th argument: "v3" SOLVES EvalMod's scale recursion instead of
+# tolerating it. The recursion e <- e^2 / prod, unrolled over the band's NE
+# levels, leaves end = 58 + sum_L 2^(L-LAND-1) (58 - w(L)) bits, so v2's
+# 30-bit extra pairs (w = 60) at the bottom hand every e9/e10 ladder a
+# DIFFERENT landing scale (land17c3e10: 2^51.8; the deviation map,
+# Doing 7.49). v3 mines the free levels' pair products to targets chosen by
+# back-substitution so end == 2^58.000 exactly (sub-millibit): the
+# half/fused landing scale becomes ONE number across every ladder. A
+# junction landing's swapped-main levels are pinned by the keyless bottom;
+# their contribution is absorbed by the free levels above them (converting
+# inherited 29-bit pairs to mined ones when the extras' range is short).
+# v3 also emits a "scale_manifest" into the JSON (per-level rescale and
+# scale bits, the EvalMod start/end) that param_audit.py checks.
+V3 = len(sys.argv) > 6 and sys.argv[6] == "v3"
 j = json.load(open(SRC, encoding="utf-8"))
 main, term, aux = j["main_primes"], j["terminal_primes"], j["auxiliary_primes"]
 lc = [tuple(x) for x in j["level_config"]]
@@ -149,9 +163,106 @@ else:
     assert t == NT
 max_level = len(new_lc) - 1
 
+if V3:
+    # SOLVE the recursion. end - 58 = sum_L 2^(L-LAND-1) * (58 - w(L)) over
+    # the band (start = 2^58 exactly: the band's top is an inherited 29-bit
+    # pair), so re-mining one free level L to width w + S/2^(L-LAND-1)
+    # zeroes S; low-weight levels give millibit granularity. Free mains are
+    # the indices >= peak (extras and inherited 29-bit primes both -- only
+    # 0..LAND is pinned by the keyless crossing); a junction's swapped
+    # mains below peak stay, and the free levels above absorb them.
+    emS3 = max_level - NUM_CTS
+    band = list(range(LAND + 1, emS3 + 1))  # bottom -> top
+
+    def level_mains(L):
+        return list(range(new_lc[L - 1][0], new_lc[L][0]))
+
+    def width(L):
+        return sum(bits(new_main[i]) for i in level_mains(L))
+
+    def mine_pool(log_degree, lo_bits, hi_bits):
+        mod = 4 << log_degree
+        out = []
+        p = (int(2 ** hi_bits) // mod) * mod + 1
+        floor = int(2 ** lo_bits)
+        # reuse mine_primes' Miller-Rabin via a tiny local
+        def isp(n):
+            if n < 2: return False
+            for sp in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+                if n % sp == 0: return n == sp
+            d, r = n - 1, 0
+            while d % 2 == 0: d //= 2; r += 1
+            for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+                x = pow(a, d, n)
+                if x in (1, n - 1): continue
+                for _ in range(r - 1):
+                    x = x * x % n
+                    if x == n - 1: break
+                else:
+                    return False
+            return True
+        while p > floor:
+            if isp(p): out.append(p)
+            p -= mod
+        return out
+
+    # HOIST_MAIN_CAP = 2^30.2 (design_sylphflow40.py); stay under it.
+    pool = mine_pool(j["log_degree"], 27.8, 30.19)
+
+    slots = []  # (level, replaceable main indices), bottom-up, low weight
+    for L in band:
+        free_idx = [i for i in level_mains(L) if i >= peak]
+        if free_idx:
+            slots.append((L, free_idx))
+        if len(slots) == 3:
+            break
+    assert slots, "v3: no free EvalMod level to solve with"
+
+    for _ in range(6):
+        S = sum((1 << (L - LAND - 1)) * (58.0 - width(L)) for L in band)
+        if abs(S) < 5e-4:
+            break
+        taken3 = set(new_main) | set(new_term) | set(aux)
+        for si, (L, free_idx) in enumerate(slots):
+            wgt = 1 << (L - LAND - 1)
+            tgt = width(L) + S / wgt
+            last = si == len(slots) - 1
+            if 56.2 <= tgt <= 60.5 or last:
+                tgt = min(60.5, max(56.2, tgt))
+                for i in free_idx:
+                    taken3.discard(new_main[i])
+                need = tgt - sum(bits(new_main[i]) for i in level_mains(L)
+                                 if i not in free_idx)
+                if len(free_idx) == 2:
+                    cands = [p for p in pool if p not in taken3]
+                    best, bd = None, 1e18
+                    for ai, a in enumerate(cands):
+                        rem = need - bits(a)
+                        for b in cands[ai + 1:]:
+                            d = abs(bits(b) - rem)
+                            if d < bd: best, bd = (a, b), d
+                    new_main[free_idx[0]], new_main[free_idx[1]] = best
+                else:
+                    best, bd = None, 1e18
+                    for p in pool:
+                        if p in taken3: continue
+                        d = abs(bits(p) - need)
+                        if d < bd: best, bd = p, d
+                    new_main[free_idx[0]] = best
+                break
+    S = sum((1 << (L - LAND - 1)) * (58.0 - width(L)) for L in band)
+    print("  (v3 solved the EvalMod recursion: end = 2^%.6f, |end - 58| = "
+          "%.3f millibits; band widths bottom->top %s)"
+          % (58.0 + S, abs(S) * 1000,
+             ["%.3f" % width(L) for L in band]))
+    assert abs(S) < 2e-3, "v3: the recursion did not converge"
+    assert len(set(new_main)) == len(new_main), "v3: duplicate main"
+    assert not (set(new_main) & set(new_term)), "v3: main/ter collision"
+
 def resc(hi, lo):
     dm, dt = hi[0]-lo[0], hi[1]-lo[1]; b = 0.0
     if dm > 0: b += sum(bits(new_main[lo[0]+k]) for k in range(dm))
+    if dm < 0: b -= sum(bits(new_main[hi[0]+k]) for k in range(-dm))  # grafts
     if dt > 0: b += sum(bits(new_term[lo[1]+k]) for k in range(dt))
     if dt < 0: b -= sum(bits(new_term[hi[1]+k]) for k in range(-dt))
     return b
@@ -165,7 +276,9 @@ if new_lc[-1] != [total_main, NT]: print(" last"); ok = False
 emS, emE = max_level - NUM_CTS, max_level - NUM_CTS - NE
 em = [resc(new_lc[L], new_lc[L-1]) for L in range(emS, emE, -1)]
 ct = [resc(new_lc[L], new_lc[L-1]) for L in range(max_level, emS, -1)]  # top..bottom
-ok = ok and emE == LAND and all(57 <= x <= 61 for x in em)
+# v3's compensator levels may sit a shade under 57 by design (the solve
+# clamps to [56.2, 60.5]); EvalMod's own tolerance is the 2^62 assert.
+ok = ok and emE == LAND and all((56 if V3 else 57) <= x <= 61 for x in em)
 # the only sub-30-bit CtS rescale allowed is the even landing's single thin top
 thin = [round(x) for x in ct if round(x) < 49]
 ok = ok and (thin == [25] if even else thin == [])
@@ -187,5 +300,23 @@ out = {"log_degree": j["log_degree"], "log_default_scale": j["log_default_scale"
 # process default: NE = 5 (the degree-30 polynomial) + r.
 if NE != 8:
     out["num_double_angle"] = NE - 5
+if V3:
+    # The scale manifest: what every level's rescale and canonical scale
+    # ARE, stated by the generator and checked by param_audit.py (and by
+    # param_robust_test against the library). scale_bits runs 0..LAND (the
+    # sqrt recursion only exists up to default_encryption_level).
+    prods = [round(resc(new_lc[i], new_lc[i - 1]), 6)
+             for i in range(1, len(new_lc))]
+    sb = [float(j["log_default_scale"])]
+    for i in range(1, LAND + 1):
+        sb.append(round(0.5 * (sb[i - 1] + prods[i - 1]), 6))
+    out["scale_manifest"] = {
+        "prod_bits": prods,
+        "scale_bits": [round(x, 6) for x in sb],
+        "evalmod": {"start_level": max_level - NUM_CTS,
+                    "num_levels": NE,
+                    "start_bits": 58,
+                    "end_bits": round(58.0 + S, 6)},
+    }
 json.dump(out, open(OUT, "w"), indent=2)
 print(f"LANDING={LAND}")

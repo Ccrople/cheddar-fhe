@@ -508,6 +508,16 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
+# The gen_landing v3 twins (Doing.md 7.49): the EvalMod recursion SOLVED so
+# the half/fused landing scale is 2^58.000 on every ladder (v2 towers wander
+# to 2^51.8), with the scale manifest in the JSON. param_robust_test runs
+# them under CHEDDAR_ROBUST_STRICT=1.
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10v3.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10v3.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10v3.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10v3.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9v3.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9v3.json COPYONLY)
 # The norm channel-boot ring (Doing.md 7.38): L = 11 with num_stc 2, so the
 # channel Boot lands at 9 on a climb-23 ladder; the deep ladder then serves
 # only the norm's accumulator (2 boots a layer).
