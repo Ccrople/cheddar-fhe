@@ -513,7 +513,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
                          1.0, ratio(lv_proj));
         }
         typename CiBatchProjection<word>::Source src;
-        proj_->BeginSplit(src, block, lv_proj, layout_.num_slots);
+        proj_->BeginSplit(src, block, lv_proj, layout_.num_slots,
+                          y[0].GetScale());
         for (int i = 0; i < block; i++) {
           proj_->AddColumn(src, i, y[b0 + i]);
         }

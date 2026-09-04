@@ -248,11 +248,13 @@ bool CiBatchProjection<word>::RescaleSerial() {
 
 template <typename word>
 void CiBatchProjection<word>::BeginSplit(Source &src, int in, int level,
-                                         int num_slots) const {
+                                         int num_slots, double scale) const {
   AssertTrue(in > 0 && level >= 1 && level <= context_->param_.max_level_,
              "CiBatchProjection::BeginSplit: bad shape or level");
-  blas_->PrepareSourceBegin(src.split, level, in, cfg_.rows_per_tile,
-                            context_->param_.GetScale(level), num_slots);
+  AssertTrue(scale >= 0.0, "CiBatchProjection::BeginSplit: negative scale");
+  blas_->PrepareSourceBegin(
+      src.split, level, in, cfg_.rows_per_tile,
+      scale > 0.0 ? scale : context_->param_.GetScale(level), num_slots);
   src.in = in;
   src.level = level;
 }
