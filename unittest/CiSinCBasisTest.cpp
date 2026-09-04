@@ -401,7 +401,11 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CiSinCBasisTest,
     testing::Values("ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json",
-                    "ci16_35_land13c3e10.json"),
+                    "ci16_35_land13c3e10.json",
+                    // The gen_landing v3 twins (Doing 7.50): the same towers
+                    // with the EvalMod recursion solved, landing 2^58.000.
+                    "ci16_35_land17c3e10v3.json",
+                    "ci16_35_land13c3e10v3.json"),
     [](const testing::TestParamInfo<CiSinCBasisTest::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
