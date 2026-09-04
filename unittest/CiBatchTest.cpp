@@ -47,6 +47,7 @@
 #include "extension/CiBatch.h"
 #include "extension/CiBatchAttention.h"
 #include "extension/CiBatchLayer.h"
+#include "extension/CiDecode.h"
 #include "extension/Hoist.h"
 
 using word = uint32_t;
@@ -2687,6 +2688,12 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
     boot.ui->PrepareRotationKey(s, land);
     boot.ui->PrepareRotationKey(s, 3);
   }
+  // Keys for the hoisted unpack's baby strides (the power-of-two ladder
+  // strides are above; a key made at `land` serves every level below it).
+  const int n_baby = std::max(2, EnvInt("CHEDDAR_DECODE_UNPACK_BABY", 16));
+  for (int b = 1; b < n_baby; b++) {
+    boot.ui->PrepareRotationKey(b * B, land);
+  }
   const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
   (void)mult_key;
 
@@ -2752,6 +2759,18 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
   Ciphertext<word> dense_up;
   bctx->Boot(dense_up, dense, boot.ui->GetEvkMap());
   auto t3 = Sync();
+  // The decode WORKING level: both unpacks may run below the landing (the
+  // consumers do not need the full boot budget), which shrinks every rotation
+  // and mask. Untimed: this models where decode would already sit.
+  const int u_lvl =
+      std::min(land, std::max(4, EnvInt("CHEDDAR_DECODE_UNPACK_LEVEL", land)));
+  if (u_lvl < land) {
+    Ciphertext<word> down;
+    bctx->LevelDown(down, dense_up, u_lvl);
+    dense_up = std::move(down);
+    for (int c = 0; c < K; c++) make_mask(c, u_lvl, mask_land[c]);
+  }
+  auto t3b = Sync();
   std::vector<Ciphertext<word>> unpacked(K);
   {
     for (int c = 0; c < K; c++) {
@@ -2767,6 +2786,46 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
     }
   }
   auto t4 = Sync();
+
+  // --- Hoisted unpack: the babies rot_{bB}(dense_up) are computed ONCE and
+  // shared by every channel (the hoisting); channel c is then an indicator
+  // SELECT over the babies (n_baby masked babies summed, one rescale) and a
+  // log ladder over the remaining strides. Key switches:
+  // (n_baby - 1) + K * log2(K / n_baby) against the naive K * log2(K).
+  std::vector<Ciphertext<word>> hoisted(K);
+  {
+    const int dir = EnvInt("CHEDDAR_DECODE_UNPACK_DIR", -1);
+    std::vector<Ciphertext<word>> baby_store(n_baby);
+    std::vector<const Ciphertext<word> *> babies(n_baby);
+    babies[0] = &dense_up;
+    for (int b = 1; b < n_baby; b++) {
+      bctx->HRot(baby_store[b], dense_up, boot.ui->GetRotationKey(b * B),
+                 b * B);
+      babies[b] = &baby_store[b];
+    }
+    for (int c = 0; c < K; c++) {
+      Ciphertext<word> acc;
+      for (int b = 0; b < n_baby; b++) {
+        const int row = ((c + dir * b) % K + K) % K;
+        Ciphertext<word> pm;
+        bctx->Mult(pm, *babies[b], mask_land[row]);
+        if (b == 0) {
+          acc = std::move(pm);
+        } else {
+          bctx->Add(acc, acc, pm);
+        }
+      }
+      Ciphertext<word> sel;
+      bctx->Rescale(sel, acc);
+      for (int s = n_baby * B; s < B * kTokens; s <<= 1) {
+        Ciphertext<word> r;
+        bctx->HRot(r, sel, boot.ui->GetRotationKey(s), s);
+        bctx->Add(sel, sel, r);
+      }
+      hoisted[c] = std::move(sel);
+    }
+  }
+  auto t5 = Sync();
 
   // --- Dense-VMM primitive triple at a decode working level.
   double triple_ms = 0.0;
@@ -2791,27 +2850,37 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
     triple_ms = Ms(p0, p1) / reps;
   }
 
-  // Correctness on sample channels (boot-family precision).
-  double worst = 0.0;
-  for (int c : {0, 63, 127}) {
+  // Correctness on sample channels (boot-family precision), both unpacks,
+  // and the two unpacks against each other on one channel.
+  double worst = 0.0, worst_h = 0.0, cross = 0.0;
+  auto sample = [&](const Ciphertext<word> &ct, int c, double &w,
+                    std::vector<double> *keep) {
     Plaintext<word> pt;
-    boot.ui->Decrypt(pt, unpacked[c]);
+    boot.ui->Decrypt(pt, ct);
     std::vector<Complex> msg;
     boot.context->encoder_.Decode(msg, pt);
     std::vector<double> vals;
     layout.Unpack(vals, msg);
     for (int b = 0; b < B; b += 37) {
       for (int t = 0; t < kTokens; t += 17) {
-        worst = std::max(
-            worst,
-            std::abs(vals[static_cast<size_t>(b) * kTokens + t] - x[c][b]));
+        w = std::max(
+            w, std::abs(vals[static_cast<size_t>(b) * kTokens + t] - x[c][b]));
       }
     }
+    if (keep != nullptr) *keep = std::move(vals);
+  };
+  std::vector<double> naive63, hoist63;
+  for (int c : {0, 63, 127}) {
+    sample(unpacked[c], c, worst, c == 63 ? &naive63 : nullptr);
+    sample(hoisted[c], c, worst_h, c == 63 ? &hoist63 : nullptr);
+  }
+  for (size_t i = 0; i < naive63.size(); i++) {
+    cross = std::max(cross, std::abs(naive63[i] - hoist63[i]));
   }
 
   const double base_ms = Ms(t0, t1);
   const double pack_ms = Ms(t1, t2), boot_ms = Ms(t2, t3),
-               unpack_ms = Ms(t3, t4);
+               unpack_ms = Ms(t3b, t4), hoist_ms = Ms(t4, t5);
   const double cand_ms = pack_ms + boot_ms + unpack_ms;
   std::cout << "  [bench] baseline 128 grouped boots: " << base_ms << " ms ("
             << base_ms / K << " ms/ct)" << std::endl;
@@ -2820,6 +2889,18 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
             << " ms  -> speedup x" << base_ms / cand_ms << std::endl;
   std::cout << "  [bench] unpack alone: " << unpack_ms / K
             << " ms/channel (7 HRot + mask)" << std::endl;
+  int ladder = 0;
+  for (int s = n_baby; s < kTokens; s <<= 1) ladder++;
+  std::cout << "  [bench] hoisted unpack (" << n_baby << " babies + select + "
+            << ladder << "-step ladder, level " << u_lvl << "): " << hoist_ms
+            << " ms (" << hoist_ms / K << " ms/channel) -> x"
+            << unpack_ms / hoist_ms << " vs naive" << std::endl;
+  std::cout << "  [bench] pack+boot+hoisted = "
+            << pack_ms + boot_ms + hoist_ms << " ms -> x"
+            << base_ms / (pack_ms + boot_ms + hoist_ms) << " vs 128 boots"
+            << std::endl;
+  std::cout << "  [bench] hoisted worst abs err " << worst_h
+            << ", |hoisted - naive| ch63 max " << cross << std::endl;
   // Sum over the four projections of in*out/65536 = 3,322 triples per
   // token-layer (B-independent); naive, no hoisting.
   std::cout << "  [bench] dense-VMM triple (HRot+mask+add @L3): " << triple_ms
@@ -2828,7 +2909,138 @@ TEST(CiBatch, DecodePackBootUnpackBench) {
   std::cout << "  [bench] worst abs error after pack/boot/unpack: " << worst
             << std::endl;
   EXPECT_LT(worst, 5e-3);
+  EXPECT_LT(worst_h, 5e-3);
+
+  // --- The LIBRARY unpack (`CiDecodeUnpack`): all K rotations hoisted from
+  // ONE ModUp, the select as ONE PAccumRotBatchCt launch, one mod-down per
+  // channel, no ladder. Setup (mask compile, keys) is untimed, as a decode
+  // deployment would hold both.
+  {
+    std::vector<cheddar::Message> row_masks(K);
+    for (int j = 0; j < K; j++) {
+      std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+      for (int b = 0; b < B; b++) {
+        mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+      }
+      layout.Pack(row_masks[j], mv);
+    }
+    cheddar::CiDecodeUnpack<word> fast(
+        boot.context, row_masks, B, u_lvl,
+        boot.param->GetRescalePrimeProd(u_lvl));
+    {
+      cheddar::EvkRequest req;
+      fast.AddRequiredRotations(req);
+      boot.ui->PrepareRotationKey(req);
+    }
+    std::vector<Ciphertext<word>> fouts;
+    auto f0 = Sync();
+    fast.Evaluate(boot.context, fouts, dense_up, boot.ui->GetEvkMap());
+    auto f1 = Sync();
+    double worst_f = 0.0;
+    for (int c : {0, 63, 127}) sample(fouts[c], c, worst_f, nullptr);
+    const double fast_ms = Ms(f0, f1);
+    std::cout << "  [bench] library unpack (hoisted, no ladder): " << fast_ms
+              << " ms -> x" << unpack_ms / fast_ms << " vs naive; worst abs err "
+              << worst_f << std::endl;
+    std::cout << "  [bench] pack+boot+library = "
+              << pack_ms + boot_ms + fast_ms << " ms -> x"
+              << base_ms / (pack_ms + boot_ms + fast_ms) << " vs 128 boots"
+              << std::endl;
+    EXPECT_LT(worst_f, 5e-3);
+  }
 #endif
+}
+
+// The library unpack (`CiDecodeUnpack`, Doing.md 7.40 roadmap [1]) in
+// isolation, no bootstrap anywhere: the dense ciphertext is encrypted
+// directly at the working level. Channel 0 must be WORD-FOR-WORD the
+// serial `HoistHandler::Evaluate` of the map the class compiles (same
+// babies, same plaintexts, modular sums in a commuting order, same final
+// mod-down); sampled channels must carry the broadcast values.
+TEST(CiBatch, TheHoistedUnpackMatchesTheHandler) {
+  Ring ring(Param());
+  const CiBatchLayout layout(ring.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  const int K = kTokens;
+  const int lvl = EnvInt("CHEDDAR_DECODE_UNPACK_LEVEL", 8);
+
+  // x[c][b] in token row c of the dense ciphertext.
+  std::mt19937_64 gen(0xdec0de);
+  std::uniform_real_distribution<double> ux(-0.3, 0.3);
+  std::vector<std::vector<double>> x(K, std::vector<double>(B));
+  for (auto &row : x)
+    for (auto &v : row) v = ux(gen);
+  std::vector<double> vals(static_cast<size_t>(B) * kTokens);
+  for (int b = 0; b < B; b++)
+    for (int t = 0; t < kTokens; t++)
+      vals[static_cast<size_t>(b) * kTokens + t] = x[t][b];
+  std::vector<Complex> msg;
+  layout.Pack(msg, vals);
+  Plaintext<word> dpt;
+  ring.context->gpu_encoder_.Encode(dpt, lvl, ring.param->GetScale(lvl), msg);
+  Ciphertext<word> dense;
+  ring.ui->Encrypt(dense, dpt);
+
+  std::vector<cheddar::Message> row_masks(K);
+  for (int j = 0; j < K; j++) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+    layout.Pack(row_masks[j], mv);
+  }
+  cheddar::CiDecodeUnpack<word> unpack(ring.context, row_masks, B, lvl,
+                                       ring.param->GetRescalePrimeProd(lvl));
+  {
+    cheddar::EvkRequest req;
+    unpack.AddRequiredRotations(req);
+    ring.ui->PrepareRotationKey(req);
+  }
+
+  std::vector<Ciphertext<word>> outs;
+  auto t0 = Sync();
+  unpack.Evaluate(ring.context, outs, dense, ring.ui->GetEvkMap());
+  auto t1 = Sync();
+  ASSERT_EQ(static_cast<int>(outs.size()), K);
+
+  // The word gate: channel 0 against the serial evaluation of the same map.
+  Ciphertext<word> ref0;
+  unpack.Handler().Evaluate(ring.context, ref0, dense, ring.ui->GetEvkMap());
+  EXPECT_EQ(ref0.GetScale(), outs[0].GetScale());
+  size_t diff = 0, total = 0;
+  for (int part = 0; part < 2; part++) {
+    const auto &da = part ? ref0.ax_ : ref0.bx_;
+    const auto &db = part ? outs[0].ax_ : outs[0].bx_;
+    ASSERT_EQ(da.size(), db.size());
+    cheddar::HostVector<word> ha, hb;
+    cheddar::CopyDeviceToHost(ha, da);
+    cheddar::CopyDeviceToHost(hb, db);
+    total += ha.size();
+    for (size_t w = 0; w < ha.size(); w++) diff += (ha[w] != hb[w]);
+  }
+  std::cout << "  unpack vs handler: " << diff << " of " << total
+            << " words differ" << std::endl;
+  EXPECT_EQ(diff, 0u);
+
+  // The values: sampled channels carry x[c][b] in every sampled row.
+  double worst = 0.0;
+  for (int c : {0, 1, 63, 127}) {
+    Plaintext<word> pt;
+    ring.ui->Decrypt(pt, outs[c]);
+    std::vector<Complex> m2;
+    ring.context->encoder_.Decode(m2, pt);
+    std::vector<double> got;
+    layout.Unpack(got, m2);
+    for (int b = 0; b < B; b += 37) {
+      for (int t = 0; t < kTokens; t += 17) {
+        worst = std::max(
+            worst,
+            std::abs(got[static_cast<size_t>(b) * kTokens + t] - x[c][b]));
+      }
+    }
+  }
+  std::cout << "  unpack worst abs err " << worst << " at level " << lvl
+            << ", " << Ms(t0, t1) << " ms for " << K << " channels"
+            << std::endl;
+  EXPECT_LT(worst, 2e-3);
 }
 
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in

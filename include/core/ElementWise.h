@@ -185,6 +185,18 @@ class ElementWiseHandler {
                      const std::vector<DvConstView<word>> &pt_srcs, int batch,
                      size_t dst_stride,
                      const std::vector<size_t> &src_strides) const;
+  // PAccum with the plaintext ROTATED per batch element: output c of the
+  // batch is sum_b pt_srcs[(c - b) mod pt_srcs.size()] * ct_srcs[b], the ct
+  // sources SHARED across the batch (the transpose of PAccumBatchCt's
+  // sharing) and every (source, output) pair in ONE launch. The decode
+  // unpack's SELECT: the sources are one ciphertext's hoisted rotations, the
+  // plaintexts the token-row indicators. Sources and outputs are (bx, ax)
+  // pairs; per output the arithmetic and its order (ascending b) are the
+  // serial PAccum's, so the words are too.
+  void PAccumRotBatchCt(
+      std::vector<std::vector<DvView<word>>> &dst, const NPInfo &np,
+      const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+      const std::vector<DvConstView<word>> &pt_srcs) const;
 
   // ----- Batched key switching (Cmt, and anything else that switches many
   // ciphertexts with many keys at one level) ----- //

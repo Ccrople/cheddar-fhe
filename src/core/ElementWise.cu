@@ -365,6 +365,80 @@ __global__ void CPAccumAdd(int log_degree, OutputPtrList<word, num_poly> dst,
   }
 }
 
+// PAccum with the plaintext index rotating with the output: output c is
+// sum_b pt[(c - b) mod num_pts] * ct_b over ct sources SHARED by every
+// output. Pointer tables instead of the variadic lists (the source count is
+// a runtime 16..128), staged into shared memory once per block. Each thread
+// carries c_tile CONSECUTIVE outputs at one coefficient, so a source value
+// is loaded once per c_tile mult-adds and the output-tile index rides the
+// FAST grid dimension for L2 reuse of the source lines across tiles (one
+// output per thread on the slow dimension re-streamed every source per
+// output -- measured 289 ms against a ~40 ms Montgomery floor). Per output
+// the accumulation order is ascending b, exactly CPAccum's, and modular
+// sums commute exactly, so the words are the serial PAccum's.
+template <typename word, int c_tile>
+__global__ void PAccumRotBatch(int log_degree, const word *primes,
+                               const make_signed_t<word> *inv_primes,
+                               int num_q_primes, int num_srcs, int num_pts,
+                               int batch, int src_extra, int pt_extra,
+                               const word *const *ct_table,
+                               const word *const *pt_table,
+                               word *const *dst_table) {
+  using signed_word = make_signed_t<word>;
+  extern __shared__ uint64_t table_smem[];
+  for (int t = threadIdx.x; t < 2 * num_srcs + num_pts; t += blockDim.x) {
+    table_smem[t] =
+        (t < 2 * num_srcs)
+            ? reinterpret_cast<const uint64_t *>(ct_table)[t]
+            : reinterpret_cast<const uint64_t *>(pt_table)[t - 2 * num_srcs];
+  }
+  __syncthreads();
+  const word *const *s_ct = reinterpret_cast<const word *const *>(table_smem);
+  const word *const *s_pt = s_ct + 2 * num_srcs;
+
+  int i = blockIdx.y * blockDim.x + threadIdx.x;
+  int c0 = blockIdx.x * c_tile;
+  int prime_index = (i >> log_degree);
+  const word prime = basic::StreamingLoadConst(primes + prime_index);
+  const signed_word inv_prime =
+      basic::StreamingLoadConst(inv_primes + prime_index);
+  const bool aux_part = (prime_index >= num_q_primes);
+  const int src_index = aux_part ? i + src_extra : i;
+  const int pt_index = aux_part ? i + pt_extra : i;
+
+  word res_bx[c_tile] = {0};
+  word res_ax[c_tile] = {0};
+  for (int b = 0; b < num_srcs; b++) {
+    const word bx_value = s_ct[2 * b][src_index];
+    const word ax_value = s_ct[2 * b + 1][src_index];
+#pragma unroll
+    for (int t = 0; t < c_tile; t++) {
+      const int c = c0 + t;
+      if (c < batch) {
+        int j = c - b;
+        j += (j >> 31) & num_pts;
+        const word pt_value = s_pt[j][pt_index];
+        res_bx[t] = basic::Add(
+            res_bx[t],
+            basic::MultMontgomery(pt_value, bx_value, prime, inv_prime),
+            prime);
+        res_ax[t] = basic::Add(
+            res_ax[t],
+            basic::MultMontgomery(pt_value, ax_value, prime, inv_prime),
+            prime);
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < c_tile; t++) {
+    const int c = c0 + t;
+    if (c < batch) {
+      dst_table[2 * c][i] = res_bx[t];
+      dst_table[2 * c + 1][i] = res_ax[t];
+    }
+  }
+}
+
 // dst = permute(src1, r1) + permute(src2, r2) + ... + permute(src_last,
 // r_last); {src1, r1} embedded in a single PtrList
 template <typename word, int num_poly, typename... PtrLists>
@@ -1094,6 +1168,65 @@ void ElementWiseHandler<word>::PAccumBatchCt(
     size_t dst_stride, const std::vector<size_t> &src_strides) const {
   CPAccumWorkerBatch<false>(dst, np, ct_srcs, pt_srcs, batch, dst_stride,
                             src_strides);
+}
+
+template <typename word>
+void ElementWiseHandler<word>::PAccumRotBatchCt(
+    std::vector<std::vector<DvView<word>>> &dst, const NPInfo &np,
+    const std::vector<std::vector<DvConstView<word>>> &ct_srcs,
+    const std::vector<DvConstView<word>> &pt_srcs) const {
+  const int batch = static_cast<int>(dst.size());
+  const int num_srcs = static_cast<int>(ct_srcs.size());
+  const int num_pts = static_cast<int>(pt_srcs.size());
+  AssertTrue(batch > 0 && num_srcs > 0 && num_pts > 0,
+             "PAccumRotBatchCt: empty inputs");
+  AssertTrue(batch <= num_pts, "PAccumRotBatchCt: more outputs than masks");
+  const int num_q_primes = np.GetNumQ();
+  const int q_size = num_q_primes * param_.degree_;
+  for (auto &d : dst) {
+    AssertTrue(static_cast<int>(d.size()) == 2,
+               "PAccumRotBatchCt: (bx, ax) outputs only");
+    AssertNPMatch(d, np);
+  }
+  for (const auto &s : ct_srcs) {
+    AssertTrue(static_cast<int>(s.size()) == 2,
+               "PAccumRotBatchCt: (bx, ax) sources only");
+  }
+  const int src_extra = ct_srcs.at(0).at(0).QSize() - q_size;
+  const int pt_extra = pt_srcs.at(0).QSize() - q_size;
+
+  // One pointer table per launch: [2 * num_srcs] ct, [num_pts] pt,
+  // [2 * batch] dst, uploaded through the pinned staging ring.
+  HostVector<uint64_t> host_table(2 * num_srcs + num_pts + 2 * batch);
+  size_t k = 0;
+  for (const auto &s : ct_srcs) {
+    host_table[k++] = reinterpret_cast<uint64_t>(s.at(0).data());
+    host_table[k++] = reinterpret_cast<uint64_t>(s.at(1).data());
+  }
+  for (const auto &p : pt_srcs) {
+    host_table[k++] = reinterpret_cast<uint64_t>(p.data());
+  }
+  for (auto &d : dst) {
+    host_table[k++] = reinterpret_cast<uint64_t>(d.at(0).data());
+    host_table[k++] = reinterpret_cast<uint64_t>(d.at(1).data());
+  }
+  DeviceVector<uint64_t> table(static_cast<int>(host_table.size()));
+  CopyHostToDevice(table, host_table);
+  const word *const *ct_table =
+      reinterpret_cast<const word *const *>(table.data());
+  const word *const *pt_table = ct_table + 2 * num_srcs;
+  word *const *dst_table = reinterpret_cast<word *const *>(
+      const_cast<uint64_t *>(table.data()) + 2 * num_srcs + num_pts);
+
+  constexpr int c_tile = 8;
+  dim3 grid_dim((batch + c_tile - 1) / c_tile,
+                np.GetNumTotal() * param_.degree_ / kernel_block_dim_, 1);
+  const int smem_bytes = (2 * num_srcs + num_pts) * sizeof(uint64_t);
+  kernel::PAccumRotBatch<word, c_tile>
+      <<<grid_dim, kernel_block_dim_, smem_bytes>>>(
+          param_.log_degree_, param_.GetPrimesPtr(np),
+          param_.GetInvPrimesPtr(np), num_q_primes, num_srcs, num_pts, batch,
+          src_extra, pt_extra, ct_table, pt_table, dst_table);
 }
 
 template <typename word>
