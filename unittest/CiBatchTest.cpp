@@ -3276,6 +3276,359 @@ TEST(CiBatch, TheDecodeNormMatchesTheHost) {
 #endif
 }
 
+// The DECODE attention, one head in isolation (Doing.md 7.40 roadmap [3]):
+// the query is a broadcast channel ct per head dim, the K cache is the
+// prefill channel layout VERBATIM, and the score product is a pure
+// channel reduction -- 128 elementwise ct products summed, one
+// relinearization, the scores landing in the token rows of ONE ct. A
+// gamma from the data folds the scores inside EvalMod's ride before the
+// ONE boot; softmax is exp + a token-axis ladder + a reciprocal, all at
+// depth on that one ct; the probabilities FAN OUT through the same
+// hoisted unpack (row masks = token rows); and ScoreV is 128 elementwise
+// products against V_t[d, b] (token-outside), landing the head's output
+// in the d rows of one dense ct. Host reference: softmax(q K / sqrt(d)) V.
+// No sinks, no GQA here -- assembly business.
+TEST(CiBatch, TheDecodeAttentionHeadMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  Ring boot(Param());
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  const CiBatchLayout layout(boot.param->MaxNumSlots(), kTokens);
+  const int B = layout.num_instances;
+  const int D = kTokens;  // head dim = token rows = 128
+  const int T = kTokens;  // cached history
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(layout.num_slots);
+  {
+    cheddar::EvkRequest req;
+    bctx->AddRequiredRotations(req, layout.num_slots);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const auto &mult_key = boot.ui->GetEvkMap().GetMultiplicationKey();
+  const int land = bctx->GetBootParameter().GetEndLevel();
+  for (int s = B; s < B * kTokens; s <<= 1) {
+    boot.ui->PrepareRotationKey(s, land);
+  }
+
+  // q[c][b] (the decode token's head), K[c][t][b] (the cache, prefill
+  // layout), V[d][t][b] (token-outside).
+  std::mt19937_64 gen(0xa77e);
+  std::uniform_real_distribution<double> ux(-1.0, 1.0);
+  std::vector<std::vector<double>> q(D, std::vector<double>(B));
+  std::vector<std::vector<std::vector<double>>> Kc(
+      D, std::vector<std::vector<double>>(T, std::vector<double>(B)));
+  auto Vc = Kc;  // V[d][t][b]
+  for (auto &r : q)
+    for (auto &v : r) v = 0.2 * ux(gen);
+  for (auto &m : Kc)
+    for (auto &r : m)
+      for (auto &v : r) v = 0.2 * ux(gen);
+  for (auto &m : Vc)
+    for (auto &r : m)
+      for (auto &v : r) v = 0.2 * ux(gen);
+
+  const int lvl_qk = 2;
+  std::vector<Ciphertext<word>> q_cts, k_cts;
+  {
+    HostTensor hq{B, kTokens, D, {}};
+    hq.v.resize(static_cast<size_t>(B) * kTokens * D);
+    HostTensor hk = hq;
+    for (int b = 0; b < B; b++) {
+      for (int t = 0; t < kTokens; t++) {
+        for (int c = 0; c < D; c++) {
+          hq.At(b, t, c) = q[c][b];        // broadcast
+          hk.At(b, t, c) = Kc[c][t][b];    // per-token rows
+        }
+      }
+    }
+    EncryptChannels(boot, layout, hq, lvl_qk, q_cts);
+    EncryptChannels(boot, layout, hk, lvl_qk, k_cts);
+  }
+
+  // Host scores and softmax, and the calibration ranges.
+  const double sqd = std::sqrt(static_cast<double>(D));
+  std::vector<std::vector<double>> s_host(T, std::vector<double>(B));
+  double smax = 0.0, s_lo = 1e30, s_hi = -1e30;
+  for (int t = 0; t < T; t++) {
+    for (int b = 0; b < B; b++) {
+      double s = 0.0;
+      for (int c = 0; c < D; c++) s += q[c][b] * Kc[c][t][b];
+      s_host[t][b] = s;
+      smax = std::max(smax, std::abs(s));
+      s_lo = std::min(s_lo, s);
+      s_hi = std::max(s_hi, s);
+    }
+  }
+  const double gamma = 0.3 / smax;  // the booted score rides at <= 0.3
+
+  // --- The score product: a channel reduction, one relinearization.
+  auto t0 = Sync();
+  Ciphertext<word> s_ct;
+  {
+    Ciphertext<word> acc;
+    for (int c = 0; c < D; c++) {
+      Ciphertext<word> m;
+      bctx->Mult(m, q_cts[c], k_cts[c]);
+      if (c == 0) {
+        acc = std::move(m);
+      } else {
+        bctx->Add(acc, acc, m);
+      }
+    }
+    Ciphertext<word> rel;
+    bctx->RelinearizeRescale(rel, acc, mult_key);
+    // gamma folds the scores inside the ride; the exp affine unfolds it.
+    const int l = boot.param->NPToLevel(rel.GetNP());
+    Plaintext<word> pg;
+    {
+      std::vector<double> gv(static_cast<size_t>(B) * kTokens, gamma);
+      std::vector<Complex> msg;
+      layout.Pack(msg, gv);
+      boot.context->gpu_encoder_.Encode(pg, l, boot.param->GetScale(l), msg);
+    }
+    Ciphertext<word> gm;
+    bctx->Mult(gm, rel, pg);
+    bctx->Rescale(s_ct, gm);
+  }
+  auto t1 = Sync();
+  Ciphertext<word> s_up;
+  bctx->Boot(s_up, s_ct, boot.ui->GetEvkMap());
+  auto t2 = Sync();
+
+  // A generic "affine onto [-1, 1] then a Chebyshev polynomial" step.
+  auto poly_step = [&](const Ciphertext<word> &in, double in_factor,
+                       double lo, double hi, auto f, int degree,
+                       Ciphertext<word> &out) {
+    // in holds in_factor * u for u in [lo, hi]; out = f(u).
+    const double pad = 0.02 * (hi - lo) + 1e-12;
+    lo -= pad;
+    hi += pad;
+    const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+    const int l = boot.param->NPToLevel(in.GetNP());
+    Plaintext<word> pk;
+    {
+      std::vector<double> kv(static_cast<size_t>(B) * kTokens,
+                             1.0 / (in_factor * a));
+      std::vector<Complex> msg;
+      layout.Pack(msg, kv);
+      boot.context->gpu_encoder_.Encode(pk, l, boot.param->GetScale(l), msg);
+    }
+    Ciphertext<word> v;
+    {
+      Ciphertext<word> tmp;
+      bctx->Mult(tmp, in, pk);
+      bctx->Rescale(v, tmp);
+    }
+    const int lv = boot.param->NPToLevel(v.GetNP());
+    {
+      cheddar::Constant<word> shift;
+      boot.context->encoder_.EncodeConstant(shift, lv,
+                                            boot.param->GetScale(lv), -b / a);
+      bctx->Add(v, v, shift);
+    }
+    auto coeffs = cheddar::chebfit::Interpolate(
+        [a, b, f](double t) { return f(a * t + b); }, degree);
+    const double in_scale = boot.param->GetScale(lv);
+    const int used =
+        cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale, true)
+            .GetPolyDegree();
+    int lr = lv;
+    for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
+    cheddar::EvalPoly<word> poly(coeffs, lv, in_scale,
+                                 boot.param->GetScale(lr), true);
+    poly.Compile(bctx);
+    poly.Evaluate(bctx, out, v, mult_key);
+  };
+
+  // --- Softmax on the ONE score ct: exp, the ladder, a reciprocal.
+  Ciphertext<word> p_ct;
+  {
+    // e = exp(u), u = s / sqrt(d): the booted message is gamma * s
+    // = (gamma * sqrt(d)) * u.
+    Ciphertext<word> e;
+    poly_step(s_up, gamma * sqd, s_lo / sqd, s_hi / sqd,
+              [](double u) { return std::exp(u); }, 15, e);
+    // Z = sum_t e, broadcast over the rows.
+    Ciphertext<word> z;
+    bctx->LevelDown(z, e, boot.param->NPToLevel(e.GetNP()));
+    for (int s = B; s < B * kTokens; s <<= 1) {
+      Ciphertext<word> r;
+      bctx->HRot(r, z, boot.ui->GetRotationKey(s), s);
+      bctx->Add(z, z, r);
+    }
+    // The reciprocal's range from the host.
+    double z_lo = 1e30, z_hi = -1e30;
+    for (int b = 0; b < B; b++) {
+      double zz = 0.0;
+      for (int t = 0; t < T; t++) zz += std::exp(s_host[t][b] / sqd);
+      z_lo = std::min(z_lo, zz);
+      z_hi = std::max(z_hi, zz);
+    }
+    Ciphertext<word> r_inv;
+    poly_step(z, 1.0, z_lo, z_hi, [](double u) { return 1.0 / u; }, 15,
+              r_inv);
+    // P = e * (1 / Z).
+    Ciphertext<word> ed;
+    bctx->LevelDown(ed, e, boot.param->NPToLevel(r_inv.GetNP()));
+    Ciphertext<word> prod;
+    bctx->Mult(prod, ed, r_inv);
+    bctx->RelinearizeRescale(p_ct, prod, mult_key);
+  }
+  auto t3 = Sync();
+
+  // --- The fan-out: the same hoisted unpack, row masks = token rows.
+  const int lp = boot.param->NPToLevel(p_ct.GetNP());
+  std::vector<cheddar::Message> row_masks(T);
+  for (int j = 0; j < T; j++) {
+    std::vector<double> mv(static_cast<size_t>(B) * kTokens, 0.0);
+    for (int b = 0; b < B; b++) mv[static_cast<size_t>(b) * kTokens + j] = 1.0;
+    layout.Pack(row_masks[j], mv);
+  }
+  cheddar::CiDecodeUnpack<word> fanout(boot.context, row_masks, B, lp,
+                                       boot.param->GetRescalePrimeProd(lp));
+  {
+    cheddar::EvkRequest req;
+    fanout.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  auto t3b = Sync();
+  std::vector<Ciphertext<word>> p_t;
+  fanout.Evaluate(boot.context, p_t, p_ct, boot.ui->GetEvkMap());
+  auto t4 = Sync();
+
+  // --- ScoreV: 128 elementwise products against V_t[d, b].
+  const int lv_v = boot.param->NPToLevel(p_t[0].GetNP());
+  std::vector<Ciphertext<word>> v_cts;
+  {
+    HostTensor hv{B, kTokens, T, {}};
+    hv.v.resize(static_cast<size_t>(B) * kTokens * T);
+    for (int b = 0; b < B; b++) {
+      for (int d = 0; d < kTokens; d++) {
+        for (int t = 0; t < T; t++) hv.At(b, d, t) = Vc[d][t][b];
+      }
+    }
+    EncryptChannels(boot, layout, hv, lv_v, v_cts);
+  }
+  auto t4b = Sync();
+  Ciphertext<word> out_ct;
+  {
+    Ciphertext<word> acc;
+    for (int t = 0; t < T; t++) {
+      Ciphertext<word> m;
+      bctx->Mult(m, p_t[t], v_cts[t]);
+      if (t == 0) {
+        acc = std::move(m);
+      } else {
+        bctx->Add(acc, acc, m);
+      }
+    }
+    bctx->RelinearizeRescale(out_ct, acc, mult_key);
+  }
+  auto t5 = Sync();
+
+  // --- Host reference: softmax(q K / sqrt(d)) V, sampled.
+  double num = 0.0, den = 0.0, worst = 0.0;
+  {
+    Plaintext<word> pt;
+    boot.ui->Decrypt(pt, out_ct);
+    std::vector<Complex> m2;
+    boot.context->encoder_.Decode(m2, pt);
+    std::vector<double> got;
+    layout.Unpack(got, m2);
+    for (int b = 0; b < B; b += 23) {
+      std::vector<double> p(T);
+      double z = 0.0;
+      for (int t = 0; t < T; t++) {
+        p[t] = std::exp(s_host[t][b] / sqd);
+        z += p[t];
+      }
+      for (int t = 0; t < T; t++) p[t] /= z;
+      for (int d = 0; d < kTokens; d += 7) {
+        double ref = 0.0;
+        for (int t = 0; t < T; t++) ref += p[t] * Vc[d][t][b];
+        const double g = got[static_cast<size_t>(b) * kTokens + d];
+        num += (g - ref) * (g - ref);
+        den += ref * ref;
+        worst = std::max(worst, std::abs(g - ref));
+      }
+    }
+  }
+  const double bits = 0.5 * std::log2(num / den);
+  std::cout << "  [decode attn] qk+gamma " << Ms(t0, t1) << " + boot "
+            << Ms(t1, t2) << " + softmax " << Ms(t2, t3) << " + fanout "
+            << Ms(t3b, t4) << " + scorev " << Ms(t4b, t5) << " = "
+            << Ms(t0, t3) + Ms(t3b, t4) + Ms(t4b, t5) << " ms for one head"
+            << std::endl;
+  std::cout << "  [decode attn] rms rel 2^" << bits << ", worst abs " << worst
+            << "; gamma " << gamma << ", P level " << lp << ", out level "
+            << boot.param->NPToLevel(out_ct.GetNP()) << std::endl;
+  EXPECT_LT(bits, -6.0);
+
+  // --- ScoreV route B: V kept in the K LAYOUT (channel cts V_d[t, b], no
+  // one-time transpose, no fan-out): out_d = rowsum(P . V_d), one mult and
+  // a 7-rotation ladder per head dim, output BROADCAST channel cts -- the
+  // form the Kang O projection wants anyway.
+  {
+    std::vector<Ciphertext<word>> vk_cts;
+    {
+      HostTensor hv{B, kTokens, kTokens, {}};
+      hv.v.resize(static_cast<size_t>(B) * kTokens * kTokens);
+      for (int b = 0; b < B; b++) {
+        for (int t = 0; t < kTokens; t++) {
+          for (int d = 0; d < kTokens; d++) hv.At(b, t, d) = Vc[d][t][b];
+        }
+      }
+      EncryptChannels(boot, layout, hv, lp, vk_cts);
+    }
+    auto b0 = Sync();
+    std::vector<Ciphertext<word>> out_b(kTokens);
+    for (int d = 0; d < kTokens; d++) {
+      Ciphertext<word> m, y;
+      bctx->Mult(m, p_ct, vk_cts[d]);
+      bctx->RelinearizeRescale(y, m, mult_key);
+      for (int s = B; s < B * kTokens; s <<= 1) {
+        Ciphertext<word> r;
+        bctx->HRot(r, y, boot.ui->GetRotationKey(s), s);
+        bctx->Add(y, y, r);
+      }
+      out_b[d] = std::move(y);
+    }
+    auto b1 = Sync();
+    double num_b = 0.0, den_b = 0.0;
+    for (int d : {0, 63, 127}) {
+      Plaintext<word> pt;
+      boot.ui->Decrypt(pt, out_b[d]);
+      std::vector<Complex> m2;
+      boot.context->encoder_.Decode(m2, pt);
+      std::vector<double> got;
+      layout.Unpack(got, m2);
+      for (int b = 0; b < B; b += 23) {
+        std::vector<double> p(T);
+        double z = 0.0;
+        for (int t = 0; t < T; t++) {
+          p[t] = std::exp(s_host[t][b] / sqd);
+          z += p[t];
+        }
+        double ref = 0.0;
+        for (int t = 0; t < T; t++) ref += (p[t] / z) * Vc[d][t][b];
+        for (int t = 0; t < kTokens; t += 31) {
+          const double g = got[static_cast<size_t>(b) * kTokens + t];
+          num_b += (g - ref) * (g - ref);
+          den_b += ref * ref;
+        }
+      }
+    }
+    std::cout << "  [decode attn] route B (V in the K layout, mult+ladder "
+              << "per dim): " << Ms(b0, b1) << " ms, rms rel 2^"
+              << 0.5 * std::log2(num_b / den_b)
+              << " -- no V transpose, no fan-out" << std::endl;
+    EXPECT_LT(0.5 * std::log2(num_b / den_b), -6.0);
+  }
+#endif
+}
+
 // The accumulator's half of the channel-ring NormTurn (Doing.md 7.38), in
 // isolation: squares summed at level 1 BEFORE any bootstrap, relinearized
 // once, and the ONE sum bootstrapped on the deep ring -- against the same
