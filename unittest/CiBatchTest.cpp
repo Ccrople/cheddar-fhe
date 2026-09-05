@@ -68,15 +68,19 @@ const char *Param() {
 }
 // The fused scores' tower ring: K = 64 with the prefix landing where the
 // layer preset's own Boot does. The default pairs the default layer preset
-// `ci16_35` (landing 16, `bdeafd3`'s causal fold): the shipped
-// `land17c3e10` (EvalMod ends at 17). ci16_35_stc2 (17) needs
-// `land18c4e10`. The landing-15 layer preset `ci16_35_land17c4e8s2`
-// rides the SAME land17c3e10 (the prefix enters after a LevelDown; the
-// junction L16 ladder's EvalMod measured 2^-7) plus
-// `CHEDDAR_CI_BATCH_AFFINE_PREFIX=1`.
+// `ci16_35` (landing 16, `bdeafd3`'s causal fold): the ROBUST
+// `land17c3e10v3` -- gen_landing v3's twin of the shipped land17c3e10, whose
+// EvalMod recursion lands the honest 2^58 fixed point (v2 wandered to 2^51.8;
+// param_robust_test STRICT + the ci_sinc_basis hunt1 diagnostic prove 0 ppm
+// measured-vs-nominal, and the fused-vs-serial gate is 2^-9.74, = v2). It is
+// a drop-in: same K = 64, same 3 CtS + 10 EvalMod levels, and the prefix
+// re-encodes from the measured landing regardless. ci16_35_stc2 (17) needs
+// `land18c4e10`. The landing-15 layer preset `ci16_35_land17c4e8s2` rides
+// the SAME tower (the prefix enters after a LevelDown; the junction L16
+// ladder's EvalMod measured 2^-7) plus `CHEDDAR_CI_BATCH_AFFINE_PREFIX=1`.
 const char *TowerParam() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_TOWER_PARAM");
-  return (env && env[0]) ? env : "ci16_35_land17c3e10.json";
+  return (env && env[0]) ? env : "ci16_35_land17c3e10v3.json";
 }
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);

@@ -194,16 +194,17 @@ void CiBatchAttention<word>::BootScoresFused(std::vector<Ct> &booted,
         tower_->LevelDown(down, halves[j], prefix_level);
         halves[j] = std::move(down);
       }
-      // The prefix's plaintexts are (re-)encoded at the first ciphertext
-      // from the MEASURED input scale: the ctor's encode assumed the
-      // tower's nominal StCInputScale, but EvalMod's tree declares its own
-      // recursion result, ~0.3% off it on some ladders (the grafting drift
-      // SiLu.cu documents), and a landing that is not EXACTLY the layer's
-      // canonical scale fails the softmax's first Add. Folded in here too,
-      // under affine_in_prefix: the softmax's multiply
-      // `a1 = 2 / (span * carried)` (the landing-15 lever). Same
-      // structure, same rotations -- only the values change, so the keys
-      // stand.
+      // The prefix's plaintexts are (re-)encoded at the first ciphertext.
+      // The measured HalfBootTower output scale EQUALS the nominal
+      // GetStCInputScale the ctor used (ci_sinc_basis_test hunt1: 0 ppm on
+      // both the v2 and v3 towers -- the boot SetScales exactly that number),
+      // so the scale half of this re-encode reproduces the ctor's plaintexts
+      // and is redundant. It stays for the AFFINE fold under affine_in_prefix:
+      // the softmax's multiply `a1 = 2 / (span * carried)` (the landing-15
+      // lever), folded into the same prefix. Same structure, same rotations --
+      // only the values change, so the keys stand. (The 7.37 "0.28%" was the
+      // v2 EvalMod landing WANDER, 2^51.8 vs the 2^58 contract, not a
+      // measured/nominal miss; the v3 tower default lands 2^58 exactly.)
       const double in_scale = halves[j].GetScale();
       if (std::abs(prefix_in_scale_ - in_scale) > 1e-9 * in_scale) {
         AssertTrue(prefix_in_scale_ == 0.0,
