@@ -221,7 +221,15 @@ template <typename word>
 void Context<word>::Add(Ct &res, const Ct &a, const Ct &b) const {
   AssertSameNP(a, b);
   AssertSameScale(a, b);
-  bool rx_add = a.HasRx() && b.HasRx();
+  // Capture the operands' Rx state BEFORE MatchResultWith: when res aliases a
+  // (the in-place Add(x, x, y)), MatchResultWith may PrepareRx() on res -- and
+  // hence on a -- so a later `a.HasRx()` would read the just-allocated (empty)
+  // buffer, not a's original state. That mis-fired the copy below for a no-Rx
+  // accum plus a lazy-relin Rx operand (EvalPoly's is_high_constant node at a
+  // power-of-two degree: the deg-8 2^400 blow-up, Doing.md 7.52).
+  const bool a_has_rx = a.HasRx();
+  const bool b_has_rx = b.HasRx();
+  const bool rx_add = a_has_rx && b_has_rx;
   MatchResultWith(res, a, b);
   res.SetNumSlots(Max(a.GetNumSlots(), b.GetNumSlots()));
   res.SetScale(a.GetScale());
@@ -234,9 +242,9 @@ void Context<word>::Add(Ct &res, const Ct &a, const Ct &b) const {
     auto res_temp = res.ViewVector(0, true);
     elem_handler_.Add(res_temp, np, a.ConstViewVector(0, true),
                       b.ConstViewVector(0, true));
-    if (a.HasRx()) {
+    if (a_has_rx) {
       CopyDeviceToDevice(res.rx_, a.rx_);
-    } else if (b.HasRx()) {
+    } else if (b_has_rx) {
       CopyDeviceToDevice(res.rx_, b.rx_);
     }
   }
@@ -280,7 +288,12 @@ template <typename word>
 void Context<word>::Sub(Ct &res, const Ct &a, const Ct &b) const {
   AssertSameNP(a, b);
   AssertSameScale(a, b);
-  bool rx_sub = a.HasRx() && b.HasRx();
+  // See Add: capture the Rx state before MatchResultWith, which may
+  // PrepareRx() on res (and so on a, when res aliases a) and corrupt a later
+  // a.HasRx() read.
+  const bool a_has_rx = a.HasRx();
+  const bool b_has_rx = b.HasRx();
+  const bool rx_sub = a_has_rx && b_has_rx;
   MatchResultWith(res, a, b);
   res.SetNumSlots(Max(a.GetNumSlots(), b.GetNumSlots()));
   res.SetScale(a.GetScale());
@@ -293,9 +306,9 @@ void Context<word>::Sub(Ct &res, const Ct &a, const Ct &b) const {
     auto res_temp = res.ViewVector(0, true);
     elem_handler_.Sub(res_temp, np, a.ConstViewVector(0, true),
                       b.ConstViewVector(0, true));
-    if (a.HasRx()) {
+    if (a_has_rx) {
       CopyDeviceToDevice(res.rx_, a.rx_);
-    } else if (b.HasRx()) {
+    } else if (b_has_rx) {
       auto res_temp = std::vector<DvView<word>>{res.RxView()};
       elem_handler_.Neg(res_temp, np, {b.RxConstView()});
     }

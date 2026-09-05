@@ -325,6 +325,21 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
   __ProfileStart("HalfBootTower", 1, );
   boot->HalfBootTower(half, down, interface_->GetEvkMap(), basis);
   __ProfileEnd("HalfBootTower");
+  // HUNT 1 (the 0.28%): the tower boot's ACTUAL output scale against the
+  // NOMINAL GetStCInputScale the prefix ctor assumes. On a v2 ladder these
+  // differ (EvalMod's recursion wandered off 2^58, so end_scale_ is not the
+  // scale the boot delivers); on a v3 ladder that lands 2^58.000 they should
+  // agree to ppm -- if so, BootScoresFused's measured-scale re-encode (7.37)
+  // is dead code and the ctor's encode suffices.
+  {
+    const double nominal = boot->GetStCInputScale();
+    const double measured = half.GetScale();
+    std::cout << "[hunt1] HalfBootTower output measured 2^"
+              << std::log2(measured) << " vs GetStCInputScale (nominal) 2^"
+              << std::log2(nominal) << "; miss " << (measured / nominal - 1.0)
+              << " = " << (measured / nominal - 1.0) * 1e6 << " ppm"
+              << std::endl;
+  }
   __ProfileStart("prefix", 1, );
   basis.Prefix(out, half, interface_->GetEvkMap());
   __ProfileEnd("prefix");

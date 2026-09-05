@@ -507,9 +507,12 @@ void EvalPolyNode<word>::Compile(ConstContextPtr<word> context,
       // the scale were the other way round here, so a double scale was
       // narrowed to int and used as a level -- LevelToNP then indexed
       // level_config_ with INT_MIN. Every other call site in this file has the
-      // right order; this branch only runs when a tree node's high part is a
-      // constant, which no polynomial in the library or the bootstrap happens
-      // to produce, so it had never been reached.
+      // right order; this branch runs when a tree node's high part is a single
+      // constant, which happens exactly when the node's degree is a power of
+      // two (split_degree_ == degree) -- e.g. a used degree of 8. Its
+      // Evaluate then adds a no-Rx accum (split x const) to a lazy-relin low
+      // subtree in place; that path exposed the Context::Add aliasing bug
+      // fixed in Context.cpp (Doing.md 7.52).
       context->encoder_.EncodeConstant(high_constant_, working_level,
                                        high_scale,
                                        coefficients_[split_degree_]);

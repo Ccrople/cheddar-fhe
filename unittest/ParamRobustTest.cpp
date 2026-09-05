@@ -52,6 +52,7 @@
 
 #include "RingFixture.h"
 #include "common/CommonUtils.h"
+#include "extension/ChebyshevFit.h"
 #include "extension/EvalPoly.h"
 
 namespace {
@@ -356,6 +357,122 @@ TEST(ParamRobust, TheRideProbe) {
             << " (ci16_35's fitted EvalMod tail: -0.00258 m^3)" << std::endl;
   EXPECT_LT(rms_at[2] / amps[2], 1e-3)
       << "the relative residual at ride ~0.25 is out of family";
+}
+
+// HUNT 2 (the decode-only 2^400, Doing.md 7.45). The existing
+// TrimmedPolynomialsLandAtEveryDegree passes 2..15 on a PURE T_d from a
+// CANONICAL input; the decode's EvalAtDepth differs on three axes:
+//   (d) a DENSE real-function fit (chebfit of exp/recip/invsqrt), not a
+//       single T_d, so the whole compiled tree is exercised;
+//   (a) the pk-multiply + Rescale ENTRY, which lands the input at
+//       GetScale(l)^2 / prod(l) -- canonical only to a float ulp;
+//   (b) a Constant shift added at that measured scale before the poly.
+// These two tests isolate the axes. Both check the ENCRYPTED result against
+// the SAME compiled tree's host PlainEvaluate (not the ideal function), so
+// only an arithmetic blow-up -- the 2^400 -- registers as error, never the
+// fit's own truncation. Each MAY abort a run (EvalPoly's Fail()), so run
+// each under its own --gtest_filter. A dense reciprocal fit keeps every
+// coefficient above the 1e-9 drop through degree 15.
+namespace {
+// The reciprocal decode actually evaluates: 1/(0.5 t + 1.2) on [-1, 1],
+// coefficients decaying ~0.54^k, so used == requested degree through 15.
+double DenseRecip(double t) { return 1.0 / (0.5 * t + 1.2); }
+
+// Probe the used degree, trim the landing to lv - Log2Ceil(used + 1),
+// compile at that level's canonical scale, evaluate -- EvalAtDepth's tail
+// verbatim. Returns the max |decrypted - PlainEvaluate| over the slots.
+double EvalTrimmed(const Ring &r, const Ciphertext<word> &v, int lv,
+                   const std::vector<double> &coeffs,
+                   const std::vector<Complex> &probe_msg, double &declared,
+                   int &landed) {
+  auto ctx = r.context;
+  const auto &mult_key = r.ui->GetEvkMap().GetMultiplicationKey();
+  const double in_scale = v.GetScale();
+  const int used = cheddar::EvalPoly<word>(coeffs, lv, in_scale, in_scale, true)
+                       .GetPolyDegree();
+  const int lr = lv - Log2Ceil(used + 1);
+  cheddar::EvalPoly<word> poly(coeffs, lv, in_scale, r.param->GetScale(lr),
+                               true);
+  poly.Compile(ctx);
+  Ciphertext<word> out;
+  poly.Evaluate(ctx, out, v, mult_key);
+  declared = std::log2(out.GetScale());
+  landed = r.param->NPToLevel(out.GetNP());
+  const auto got = Decrypt(r, out);
+  double err = 0.0;
+  for (int i = 0; i < (int)probe_msg.size(); i++) {
+    const double want = poly.PlainEvaluate(probe_msg[i].real());
+    err = std::max(err, std::abs(got[i].real() - want));
+  }
+  return err;
+}
+}  // namespace
+
+// (d) alone: a dense reciprocal fit from a CANONICAL input.
+TEST(ParamRobust, DenseRealFnFromCanonicalInput) {
+  Ring r(RobustParam());
+  const int num_slots = r.param->MaxNumSlots();
+  const int dec = r.param->default_encryption_level_;
+  const int lv = std::min(dec, 6);
+  ASSERT_GE(lv, 1) << "no levels";
+  const auto msg = RandomReal(num_slots, 0.9, 0x9017);
+  for (int d = 2; d <= std::min(15, (1 << lv) - 1); d++) {
+    auto coeffs = cheddar::chebfit::Interpolate(DenseRecip, d);
+    Ciphertext<word> in;
+    EncryptAt(r, in, msg, lv);
+    double declared;
+    int landed;
+    const double err = EvalTrimmed(r, in, lv, coeffs, msg, declared, landed);
+    std::cout << "[hunt2-d] degree " << d << ": lands " << landed
+              << ", declared 2^" << declared << ", max |ct - plain| " << err
+              << " = 2^" << std::log2(std::max(err, 1e-300)) << std::endl;
+    EXPECT_LT(err, 1e-2) << "dense fit degree " << d << " blew up (2^400 class)";
+  }
+}
+
+// (a)+(b): the full EvalAtDepth entry -- pk-multiply + Rescale, then a
+// Constant shift at the measured scale -- before the same dense fit.
+TEST(ParamRobust, DecodeVerbatimEntry) {
+  Ring r(RobustParam());
+  auto ctx = r.context;
+  const int num_slots = r.param->MaxNumSlots();
+  const int dec = r.param->default_encryption_level_;
+  const int l = std::min(dec, 7);
+  const int lv = l - 1;
+  ASSERT_GE(lv, 1) << "no levels for the pk entry";
+  const auto msg = RandomReal(num_slots, 0.9, 0x9017);
+  const double pk_value = 1.0, shift_value = 1e-3;
+  for (int d = 2; d <= std::min(15, (1 << lv) - 1); d++) {
+    auto coeffs = cheddar::chebfit::Interpolate(DenseRecip, d);
+    // in @ l, pk-multiply + Rescale -> v @ lv at GetScale(l)^2/prod(l).
+    Ciphertext<word> in;
+    EncryptAt(r, in, msg, l);
+    Plaintext<word> pk;
+    ctx->encoder_.Encode(pk, l, r.param->GetScale(l),
+                         std::vector<Complex>(num_slots, Complex(pk_value, 0.0)),
+                         0);
+    Ciphertext<word> tmp, v;
+    ctx->Mult(tmp, in, pk);
+    ctx->Rescale(v, tmp);
+    // The shift at the MEASURED scale (EvalAtDepth's Constant add).
+    cheddar::Constant<word> shift;
+    ctx->encoder_.EncodeConstant(shift, lv, v.GetScale(), shift_value);
+    ctx->Add(v, v, shift);
+    // The probe message the poly sees: pk_value * msg + shift_value.
+    std::vector<Complex> seen(num_slots);
+    for (int i = 0; i < num_slots; i++)
+      seen[i] = Complex(pk_value * msg[i].real() + shift_value, 0.0);
+    double declared;
+    int landed;
+    const double err = EvalTrimmed(r, v, lv, coeffs, seen, declared, landed);
+    std::cout << "[hunt2-ab] degree " << d << ": v scale 2^"
+              << std::log2(v.GetScale()) << " (canonical 2^"
+              << std::log2(r.param->GetScale(lv)) << "), lands " << landed
+              << ", max |ct - plain| " << err << " = 2^"
+              << std::log2(std::max(err, 1e-300)) << std::endl;
+    EXPECT_LT(err, 1e-2) << "decode-entry degree " << d
+                         << " blew up (2^400 class)";
+  }
 }
 
 // (3, run LAST: a library Fail() aborts the process) EvalPoly at every
