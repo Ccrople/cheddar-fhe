@@ -71,8 +71,13 @@ CiDecodeLayer<word>::CiDecodeLayer(std::shared_ptr<BootContext<word>> boot,
              "pack groups");
   AssertTrue(cfg_.exp_degree <= 7 && cfg_.recip_degree <= 7 &&
                  cfg_.invsqrt_degree <= 7,
-             "CiDecodeLayer: EvalPoly past used degree 7 is broken on this "
-             "path (Doing.md 7.45); only SiLU's prefill-proven 15 stands");
+             "CiDecodeLayer: the attention/norm level plan (le, lf, land - 5) "
+             "allocates the levels a used degree <= 7 consumes; a used degree "
+             "of 8 needs one more and overruns a downstream LevelDown. This is "
+             "now a level-budget bound only -- the EvalPoly 2^400 that used to "
+             "ALSO strike a used degree of 8 is fixed (Context::Add Rx "
+             "aliasing, Doing.md 7.52), proven by param_robust_test's "
+             "DecodeVerbatimEntry at degrees 2..15");
   typename CiBatchProjection<word>::Config pcfg;
   pcfg.rows_per_tile = cfg_.rows_per_tile;
   pcfg.verbose = cfg_.verbose;

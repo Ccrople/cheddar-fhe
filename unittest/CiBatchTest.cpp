@@ -4176,18 +4176,22 @@ TEST(CiBatch, TheDecodeAttentionRunsOnTheRealLayer) {
             shift, lvv, boot.param->GetScale(lvv), -b / a);
         bctx->Add(v, v, shift);
       }
+      // Degree 7 (the env knob raises it for experiments): the walk's k
+      // squarings carry the range, and the attention level plan (le, lf) is
+      // built for a used degree <= 7. Requesting a higher degree makes the
+      // sink head's fit land a used degree of 8, which needs one more level
+      // than le leaves and overruns a downstream LevelDown -- a level-budget
+      // limit, not the old 2^400: that arithmetic blow-up (a used degree of 8
+      // hit EvalPoly's is_high_constant node and the Context::Add Rx aliasing
+      // bug) is fixed (Doing.md 7.52), so a used degree of 8 now evaluates
+      // cleanly whenever the levels are there.
+      const int exp_deg = EnvInt("CHEDDAR_DECODE_EXP_DEGREE", 7);
       auto coeffs = cheddar::chebfit::Interpolate(
-          [a, b](double t) { return std::exp(a * t + b); }, 7);
+          [a, b](double t) { return std::exp(a * t + b); }, exp_deg);
       const double in_scale = boot.param->GetScale(lvv);
       const int used =
           cheddar::EvalPoly<word>(coeffs, lvv, in_scale, in_scale, true)
               .GetPolyDegree();
-      // Degree 7, never higher: at a requested degree 15 the narrow heads'
-      // Chebyshev tails underflow (used 5-6, fine) but the sink head's a of
-      // ~0.7 keeps a used degree past 7, where the compiled tree's landing
-      // no longer matches Log2Ceil(used + 1) and the evaluation returns
-      // 2^400-scale garbage (the 2026-09-04 bisection). The walk's
-      // squarings make high degrees unnecessary anyway.
       int lr = lvv;
       for (int d = used + 1; d > 1; d = (d + 1) / 2) lr--;
       cheddar::EvalPoly<word> pexp(coeffs, lvv, in_scale,

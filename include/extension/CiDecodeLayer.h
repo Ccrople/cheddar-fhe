@@ -107,9 +107,11 @@ class CiDecodeLayer {
     //! gamma, and the gate/up pack-mask gammas, are `ride / range`.
     double ride = 0.3;
     int invsqrt_degree = 7;
-    //! Capped at 7: EvalPoly past a used degree 7 on this path returns
-    //! 2^400-scale garbage (Doing.md 7.45); the walk's squarings carry
-    //! the range instead.
+    //! Capped at 7 by the level plan (le/lf), not by arithmetic: a used degree
+    //! of 8 consumes one more level than the walk's squarings leave room for.
+    //! The EvalPoly 2^400 that used to also strike a used degree of 8 is fixed
+    //! (Context::Add Rx aliasing, Doing.md 7.52); the walk's squarings still
+    //! make a low degree the natural choice for exp.
     int exp_degree = 7;
     //! The Z window is +-10%, where degree 3 is ~1e-5 relative -- and its
     //! two levels (not three) are what lets the O output reach level 1.
