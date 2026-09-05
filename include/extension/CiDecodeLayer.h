@@ -131,6 +131,16 @@ class CiDecodeLayer {
   /** @brief Fitted offline on the clear model, never measured in the run. */
   struct Calibration {
     double stream_scale = 1.0;
+    //! The height each norm's bootstrapped residual rides at, decoupled from
+    //! `stream_scale`: the residual stream is carried at one global
+    //! `stream_scale` across a chain (residual adds are exact at any
+    //! magnitude), but a norm BOOTS its packed channels, so a small early
+    //! layer riding 10x below the design point starves the boot. These give
+    //! each norm its own public per-layer boot ride (0.35 / the layer's
+    //! residual absmax) folded FREE into the pack masks; `y` is unchanged
+    //! because the norm's scale cancels through the invsqrt and the apply.
+    //! 0 = fall back to `stream_scale` (the single-scale behaviour).
+    double attn_norm_scale = 0.0, ffn_norm_scale = 0.0;
     //! Each norm's layer constant and invsqrt window (already widened if
     //! the instances ride factors).
     double attn_alpha = 1.0, attn_window = 1.3;
@@ -264,9 +274,15 @@ class CiDecodeLayer {
    * consumers allow (7 for the attention's V append, 3 for the
    * feed-forward's gate/up).
    */
+  //! `stream_scale` is the height the input residual physically rides at;
+  //! `norm_scale` is the height its packed channels are BOOTED at (folded
+  //! into the pack masks, so a starved residual still boots near the design
+  //! ride). `y` is independent of `norm_scale`: it cancels through the
+  //! invsqrt's argument and the apply's declared scale.
   void NormTurn(std::vector<Ct> &y, const std::vector<Ct> &stream,
                 double alpha, double window, double stream_scale,
-                int unpack_pt_level, const EvkMap<word> &evk);
+                double norm_scale, int unpack_pt_level,
+                const EvkMap<word> &evk);
   //! The q/k weight fold: the norm gain on the rows, a per-head factor
   //! and RoPE at `position` on the columns. `head_scale` empty = 1.
   std::vector<float> FoldQK(const float *w, int out,

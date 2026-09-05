@@ -4897,11 +4897,13 @@ TEST(CiBatch, TheDecodeChainRunsOnTheRealLayers) {
           m.out[c2] = m.mid[c2] + a;
         }
       });
-      double msA = 0.0, msF = 0.0;
+      double msA = 0.0, msF = 0.0, amaxA = 0.0, amaxF = 0.0;
       for (int c2 = 0; c2 < kH; c2++) {
         const double xa = x[static_cast<size_t>(Tc) * kH + c2];
         msA += xa * xa;
         msF += m.mid[c2] * m.mid[c2];
+        amaxA = std::max(amaxA, std::abs(xa));
+        amaxF = std::max(amaxF, std::abs(m.mid[c2]));
         absmax = std::max({absmax, std::abs(xa), std::abs(m.mid[c2]),
                            std::abs(m.out[c2])});
       }
@@ -4909,6 +4911,13 @@ TEST(CiBatch, TheDecodeChainRunsOnTheRealLayers) {
       cal.attn_window = 1.3;
       cal.ffn_alpha = 1.0 / (msF / kH + eps);
       cal.ffn_window = 1.3;
+      // Each norm's boot rides at 0.35 / the layer's residual absmax -- a
+      // PUBLIC per-layer calibration (like attn_alpha), so a small early
+      // layer boots near the design point even while the residual stream is
+      // carried at one global stream_scale set by the deepest layer. Folded
+      // free into the pack masks; the carried stream is untouched.
+      cal.attn_norm_scale = 0.35 / amaxA;
+      cal.ffn_norm_scale = 0.35 / amaxF;
       cal.silu_gmax = gmax;
       cal.up_umax = umax;
 

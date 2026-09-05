@@ -320,6 +320,7 @@ template <typename word>
 void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
                                    const std::vector<Ct> &stream, double alpha,
                                    double window, double stream_scale,
+                                   double norm_scale,
                                    int unpack_pt_level,
                                    const EvkMap<word> &evk) {
   NvtxScope _nv("decode: NormTurn");
@@ -331,7 +332,13 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
   AssertTrue(ls >= 1,
              "CiDecodeLayer::NormTurn: the stream needs a level to pack");
   const int land = boot_->GetBootParameter().GetEndLevel();
-  auto masks = MakeRowMasks(ls, 1.0);
+  // The pack rides the residual at `norm_scale` instead of the carried
+  // `stream_scale`: fold the ratio into the mask value (free), and use
+  // `norm_scale` wherever `stream_scale` set the boot height below (the
+  // invsqrt's argument and the apply's declared scale both cancel it, so
+  // `y` is unchanged -- only the boot's message magnitude moves).
+  const double ns = norm_scale > 0.0 ? norm_scale : stream_scale;
+  auto masks = MakeRowMasks(ls, ns / stream_scale);
 
   // Pack each group, the boots GROUPED through BootBatch, and the
   // squares AFTER the boot (dense^2 + the token ladder on the summed
@@ -369,13 +376,13 @@ void CiDecodeLayer<word>::NormTurn(std::vector<Ct> &y,
   Ct r_inv;
   EvalAtDepth(
       r_inv, s2,
-      alpha / (static_cast<double>(model) * stream_scale * stream_scale * a),
+      alpha / (static_cast<double>(model) * ns * ns * a),
       (alpha * cfg_.eps - b) / a,
       [a, b](double t) { return 1.0 / std::sqrt(a * t + b); },
       cfg_.invsqrt_degree, evk);
   const int lr = land - 5;
   CanonicalTo(r_inv, lr);
-  r_inv.SetScale(r_inv.GetScale() * stream_scale / std::sqrt(alpha));
+  r_inv.SetScale(r_inv.GetScale() * ns / std::sqrt(alpha));
 
   // Apply: ONE multiply normalises a group's 128 channels; the product
   // then descends to the caller's level BEFORE the unpack -- 4096
@@ -472,7 +479,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
   // ---- The attention norm; the stream then parks in host memory until
   // its residual add (the card wants every byte for y and the splits).
   std::vector<Ct> y;
-  NormTurn(y, stream, c.attn_alpha, c.attn_window, c.stream_scale, lf, evk);
+  NormTurn(y, stream, c.attn_alpha, c.attn_window, c.stream_scale,
+           c.attn_norm_scale, lf, evk);
   Parked parked;
   Park(parked, stream);
   stages_.norm1 = SinceSeconds(t0);
@@ -786,7 +794,8 @@ void CiDecodeLayer<word>::Step(std::vector<Ct> &next, std::vector<Ct> &stream,
 
   // ---- The feed-forward norm; mid then parks until its residual add.
   std::vector<Ct> y2;
-  NormTurn(y2, mid, c.ffn_alpha, c.ffn_window, c.stream_scale, 3, evk);
+  NormTurn(y2, mid, c.ffn_alpha, c.ffn_window, c.stream_scale,
+           c.ffn_norm_scale, 3, evk);
   Parked parked_mid;
   Park(parked_mid, mid);
   stages_.norm2 = SinceSeconds(t0);
