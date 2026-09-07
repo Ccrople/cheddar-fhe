@@ -45,9 +45,17 @@ CiBatchAttention<word>::CiBatchAttention(
              "token per block -- d = " +
                  std::to_string(chain_.dim) + " against T = " +
                  std::to_string(cfg_.num_tokens));
+  // NOT the CC-MM's constraint any more. `BatchCcmm::Multiply` contracts a
+  // rectangular inner dimension (BatchCcmmContractsARectangularInner), and
+  // `Scores` already passes K row-wise, so the score product would take any
+  // head_dim. What still pins it is `Values`: its V is one ciphertext a
+  // CHANNEL, so it goes to Algorithm 4 column-wise and step 1's CMT
+  // transposes it -- and [KANG] Algorithm 3 is square by construction,
+  // exactly `degree / sub_degree` ciphertexts. Freeing head_dim means handing
+  // `Values` a row-wise V, which is the transpose CMT was there to do.
   AssertTrue(cfg_.head_dim == cfg_.num_tokens,
-             "CiBatchAttention: Algorithm 4 is square here: head_dim must "
-             "equal the token count");
+             "CiBatchAttention: Values hands V to Algorithm 4 column-wise, so "
+             "step 1's square CMT pins head_dim to the token count");
   AssertTrue(cfg_.num_heads % cfg_.num_kv_heads == 0,
              "CiBatchAttention: GQA needs num_kv_heads | num_heads");
   AssertTrue(cfg_.forward_level - 1 >= 1 && cfg_.inverse_level >= 1 &&
