@@ -560,4 +560,14 @@ if (ENABLE_EXTENSION)
   add_executable(converter_compare_test ConverterCompareTest.cpp)
   target_link_libraries(converter_compare_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The batched layer on the PLAIN slot map, with the chain addressing folded
+  # into the CC-MM's forward as a `forward_premap`: the premap is the block
+  # index's bit reversal, and the fold must cost nothing (same BSGS split,
+  # same diagonals, same plaintext bytes) and compute the same operand. What
+  # the plain map buys is a PC-attention plaintext that is sparsely packed
+  # (512 coefficients of 65536) instead of dense.
+  add_executable(pc_premap_test PcPremapTest.cpp)
+  target_link_libraries(pc_premap_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
