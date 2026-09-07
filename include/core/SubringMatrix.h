@@ -6,6 +6,7 @@
 #include "core/Context.h"
 #include "core/DeviceVector.h"
 #include "core/Encode.h"
+#include "core/EncodeGpu.h"
 #include "core/NPInfo.h"
 #include "core/Parameter.h"
 
@@ -195,6 +196,58 @@ class SubringMatrixHandler {
                      const std::vector<std::vector<Complex>> &values,
                      int cols_in, int cols_out, int sub_degree,
                      int num_aux = 0, bool compact = false) const;
+
+  /**
+   * @brief The same weights, encoded on the DEVICE from a real lane-major
+   * array -- the encode a per-user PC-attention can afford.
+   *
+   * `EncodeWeights` above is the reference route and it is a WEIGHT's route:
+   * it goes through `Encoder::EncodeSinC`, which runs `degree / sub_degree`
+   * host transforms of size `sub_degree` (127 of them on zeros, for a subring
+   * element), recomposes `degree` coefficients, and hands them to the host
+   * `EncodeCoeff` -- a `BigInt` and a GMP `mpz_mod` per (coefficient, prime).
+   * Encoded once and read for the whole run, that is free. A PC-attention
+   * operand is not: it is one plaintext per (public token, channel) per kv
+   * head, 4.06M a layer, and at that count the encode IS the algorithm.
+   *
+   * What makes the device route available is the same sentence `EncodeSinC`'s
+   * own documentation ends on -- "a sparse message *is* a subring element".
+   * Take the lane vector as a message of `sub_degree` SLOTS. The slot encoding
+   * derives its twiddle stride from the slot count, so the transform is the
+   * size-`sub_degree` one either way, and `GpuEncoder::FftToCoeff` writes slot
+   * `i` to coefficient `i * gap` with `gap = degree / num_slots` = `d`. That
+   * is exactly where `EncodeSinC` puts block 0 -- `CiSinCRecompose` with only
+   * component 0 non-zero collapses to `out[t * d] = comp[0][t]`, every other
+   * coefficient zero, because its second term reaches `comp[num_blocks - i]`
+   * and only `i = num_blocks` would hit component 0. So the two routes encode
+   * the same polynomial, and this one does it in ONE transform of size k on
+   * the device with no host arithmetic at all.
+   *
+   * `compact` defaults to true here because the caller is the one that could
+   * not afford the expanded store either.
+   *
+   * Word-for-word against `EncodeWeights` in PcPremapTest's
+   * TheDeviceSubringEncodeIsTheSinCOne, which also prices both.
+   *
+   * @param res output weights
+   * @param gpu the device encoder (`Context::gpu_encoder_`)
+   * @param level level to encode at
+   * @param scale scale to apply
+   * @param values `cols_in * cols_out * lanes` reals, ENTRY-major:
+   *        `values[(j * cols_out + l) * lanes + t]` is lane `t` of entry
+   *        `(j, l)`, so an entry's lanes are contiguous and cross to the
+   *        device as one message
+   * @param cols_in d', the number of input ciphertexts
+   * @param cols_out d'', the number of output ciphertexts
+   * @param sub_degree k, a power of two dividing the ring degree
+   * @param num_aux number of auxiliary primes (default: 0 --> none)
+   * @param compact store `sub_degree` words a limb instead of `degree`
+   */
+  void EncodeWeightsReal(SubringWeights<word> &res, const GpuEncoder<word> &gpu,
+                         int level, double scale,
+                         const std::vector<double> &values, int cols_in,
+                         int cols_out, int sub_degree, int num_aux = 0,
+                         bool compact = true) const;
 
   /**
    * @brief [KANG] Algorithm 1: `(B, A) <- (B*U, A*U)`, then rescale.

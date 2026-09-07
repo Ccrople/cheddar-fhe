@@ -1154,3 +1154,113 @@ TEST(PcPremap, TheShiftComposedWithThePremapStillFoldsAtTheCeiling) {
   EXPECT_EQ(fa->PlaintextBytes(), fc->PlaintextBytes());
   EXPECT_LE(fc->GetBS() * fc->GetGS(), num_blocks);
 }
+
+// ---------------------------------------------------------------------------
+// 12. THE ENCODE, which is the last thing standing between the plain map and a
+//     PC-attention that runs. Tests 8 and 9 fixed the STORE -- 128x, word for
+//     word -- and left the encode on the reference route, which is a WEIGHT's
+//     route: `Encoder::EncodeSinC` runs `d` = 128 host transforms of size k
+//     (127 of them on zeros), recomposes `degree` coefficients, and hands them
+//     to the host `EncodeCoeff`, a GMP `mpz_mod` per (coefficient, prime).
+//     Encoded once and read for a whole run, that is free. A PC-attention
+//     operand is one plaintext per (public token, channel) per kv head --
+//     4.06M a layer -- and at that count the encode IS the algorithm.
+//
+//     `EncodeWeightsReal` takes the other route the encoding already has.
+//     `Encode.h` says it outright: "a sparse message *is* a subring element".
+//     A message of k SLOTS goes through the size-k special IFFT (the twiddle
+//     stride comes from the slot count, not the ring degree) and `FftToCoeff`
+//     writes slot t to coefficient `t * degree/k` -- exactly where
+//     `CiSinCRecompose` puts block 0, every other coefficient zero. So the
+//     device's ordinary sparse encode and the SinC block-0 encode are the same
+//     polynomial by construction, and this measures that they are the same
+//     WORDS, at the shape and level the PC-attention uses.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  constexpr int kSubDegree = kInstances;  // 512 = the batch = the lanes
+  constexpr int kLevel = 4;
+  // A small tile of the PC-attention shape: the contraction is head_dim wide
+  // and each output ciphertext is one public key token. 8 x 8 keeps the
+  // reference route -- which is the slow one, on purpose -- to a minute.
+  constexpr int kColsIn = 8;
+  constexpr int kColsOut = 8;
+  const int entries = kColsIn * kColsOut;
+  const double scale = boot.param->GetScale(kLevel);
+
+  std::mt19937_64 gen(0x5CA1AB1EULL);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+
+  // The same numbers in the two input formats: the reference takes
+  // [lane][j * cols_out + l] complex, the device route entry-major reals.
+  std::vector<std::vector<Complex>> u(kSubDegree,
+                                      std::vector<Complex>(entries));
+  std::vector<double> flat(static_cast<size_t>(entries) * kSubDegree);
+  for (int e = 0; e < entries; e++) {
+    for (int t = 0; t < kSubDegree; t++) {
+      const double v = dist(gen);
+      u[t][e] = Complex(v, 0.0);
+      flat[static_cast<size_t>(e) * kSubDegree + t] = v;
+    }
+  }
+
+  cheddar::SubringMatrixHandler<word> subring(*boot.param,
+                                              boot.context->encoder_);
+  cheddar::SubringWeights<word> ref, fast;
+
+  cudaDeviceSynchronize();
+  const auto t0 = std::chrono::steady_clock::now();
+  subring.EncodeWeights(ref, kLevel, scale, u, kColsIn, kColsOut, kSubDegree, 0,
+                        /*compact=*/true);
+  cudaDeviceSynchronize();
+  const auto t1 = std::chrono::steady_clock::now();
+  subring.EncodeWeightsReal(fast, boot.context->gpu_encoder_, kLevel, scale,
+                            flat, kColsIn, kColsOut, kSubDegree);
+  cudaDeviceSynchronize();
+  const auto t2 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(fast.GetEntryDegree(), kSubDegree);
+  ASSERT_EQ(fast.GetColsIn(), kColsIn);
+  ASSERT_EQ(fast.GetColsOut(), kColsOut);
+  ASSERT_EQ(fast.data_.size(), ref.data_.size());
+
+  cheddar::HostVector<word> a, b;
+  cheddar::CopyDeviceToHost(a, ref.data_);
+  cheddar::CopyDeviceToHost(b, fast.data_);
+  size_t diff = 0;
+  for (size_t i = 0; i < a.size(); i++) {
+    if (a[i] != b[i]) diff++;
+  }
+
+  // A guard against a vacuous pass: an all-zero store would agree perfectly.
+  size_t nonzero = 0;
+  for (size_t i = 0; i < b.size(); i++) {
+    if (b[i] != 0) nonzero++;
+  }
+
+  const double ref_us = 1e6 * Seconds(t0, t1) / entries;
+  const double fast_us = 1e6 * Seconds(t1, t2) / entries;
+  // What a layer would pay: one plaintext per (public token, channel) per kv
+  // head, at Sylph's 3968 public tokens.
+  const double per_layer = 3968.0 * 128 * 8;
+  std::cout << std::fixed << std::setprecision(1)
+            << "  entries                          : " << entries << " at k "
+            << kSubDegree << ", level " << kLevel << std::endl
+            << "  EncodeWeights   (host SinC)      : " << ref_us
+            << " us an entry" << std::endl
+            << "  EncodeWeightsReal (device slots) : " << fast_us
+            << " us an entry   (" << (ref_us / fast_us) << "x)" << std::endl
+            << "  a layer's 4.06M operands would be: " << std::setprecision(0)
+            << (per_layer * ref_us / 1e6) << " s  ->  "
+            << (per_layer * fast_us / 1e6) << " s" << std::endl
+            << "  word-for-word differences        : " << diff << " of "
+            << a.size() << std::endl;
+
+  EXPECT_GT(nonzero, a.size() / 2)
+      << "the device store is mostly zero -- nothing was encoded";
+  EXPECT_EQ(diff, 0u)
+      << "the sparse slot encode is not the SinC block-0 encode; if this is a "
+         "handful of words it is the host/device rounding of the same real, "
+         "and if it is most of them the coefficient placement moved";
+}

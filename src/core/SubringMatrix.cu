@@ -205,6 +205,80 @@ void SubringMatrixHandler<word>::EncodeWeights(
 }
 
 template <typename word>
+void SubringMatrixHandler<word>::EncodeWeightsReal(
+    SubringWeights<word> &res, const GpuEncoder<word> &gpu, int level,
+    double scale, const std::vector<double> &values, int cols_in, int cols_out,
+    int sub_degree, int num_aux /*= 0*/, bool compact /*= true*/) const {
+  const int degree = param_.degree_;
+  AssertTrue(cols_in > 0 && cols_out > 0,
+             "EncodeWeightsReal: Invalid matrix shape");
+  AssertTrue(sub_degree >= 2 && sub_degree <= degree &&
+                 IsPowOfTwo(sub_degree) && degree % sub_degree == 0,
+             "EncodeWeightsReal: sub_degree must be a power of two dividing "
+             "the ring degree");
+  // A lane is one REAL slot only on R+; on the ordinary ring a block holds
+  // k/2 complex slots and the message this takes would have to be complex.
+  // The batched layer is conjugate-invariant throughout, so rather than carry
+  // a second input format the fast route says which ring it is for.
+  AssertTrue(param_.conjugate_invariant_,
+             "EncodeWeightsReal: the real lane-major encode is the "
+             "conjugate-invariant ring's -- off R+ a lane is complex, so use "
+             "EncodeWeights");
+  // The gather below reads the plaintext the encoder just wrote, and the two
+  // are ordered only by sharing a stream. The Context's own encoder is on the
+  // legacy stream; the layer prefetch's second encoder is not, and passing it
+  // here would read a half-written buffer.
+  AssertTrue(gpu.GetStream() == cudaStreamLegacy,
+             "EncodeWeightsReal: the gather follows the encode on the legacy "
+             "stream, so the encoder must be on it");
+
+  const int lanes = sub_degree;
+  const int num_blocks = degree / sub_degree;  // d, the Vec dimension
+  const size_t entries = static_cast<size_t>(cols_in) * cols_out;
+  AssertTrue(values.size() == entries * lanes,
+             "EncodeWeightsReal: expected cols_in * cols_out * sub_degree "
+             "lane values, entry-major");
+
+  const NPInfo np = param_.LevelToNP(level, num_aux);
+  const int num_total_primes = np.GetNumTotal();
+  const int entry_degree = compact ? sub_degree : degree;
+  const size_t entry_words =
+      static_cast<size_t>(num_total_primes) * entry_degree;
+
+  res.cols_in_ = cols_in;
+  res.cols_out_ = cols_out;
+  res.sub_degree_ = sub_degree;
+  res.entry_degree_ = entry_degree;
+  res.scale_ = scale;
+  res.np_ = np;
+  res.data_.resize(static_cast<int>(entry_words * entries));
+
+  // One message of `sub_degree` slots an entry. `GpuEncoder::EncodeReal`
+  // stages it into its pinned buffer, runs the size-k special IFFT and lands
+  // slot t at coefficient t * (degree / k) -- the subring element's own
+  // coefficients, and nothing else non-zero.
+  std::vector<double> message(lanes);
+  Pt entry;
+  for (size_t e = 0; e < entries; e++) {
+    const double *src = values.data() + e * lanes;
+    std::copy(src, src + lanes, message.begin());
+    gpu.EncodeReal(entry, level, scale, message, num_aux);
+
+    const size_t offset = e * entry_words;
+    if (compact) {
+      const int num_words = static_cast<int>(entry_words);
+      const int grid = (num_words + kernel_block_dim_ - 1) / kernel_block_dim_;
+      kernel::SubringCompact<word><<<grid, kernel_block_dim_>>>(
+          res.data_.data() + offset, entry.mx_.data(), num_words, num_blocks);
+    } else {
+      cudaMemcpyAsync(res.data_.data() + offset, entry.mx_.data(),
+                      entry_words * sizeof(word), cudaMemcpyDeviceToDevice,
+                      cudaStreamLegacy);
+    }
+  }
+}
+
+template <typename word>
 void SubringMatrixHandler<word>::Multiply(ConstContextPtr<word> context,
                                           std::vector<Ct> &res,
                                           const SubringWeights<word> &u,
