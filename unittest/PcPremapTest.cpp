@@ -65,6 +65,7 @@ constexpr int kRank = 16;
 constexpr int kLanes = 32;  // = sub_degree
 constexpr int kInstances = kRank * kLanes;
 constexpr int kForwardLevel = 4;
+constexpr int kInverseLevel = 2;
 constexpr int kBabySteps = 256;
 
 int BitRev(int x, int bits) {
@@ -284,5 +285,130 @@ TEST(PcPremap, ThePlainMapThroughThePremapIsTheChainMap) {
   // plaintexts (ConverterCompareTest's subject).
   EXPECT_LT(worst, 8.0 * floor_gap)
       << "the premap route disagrees by more than the encryption floor";
+  EXPECT_LT(worst, 1e-4 * mag);
+}
+
+// ---------------------------------------------------------------------------
+// 4. The INVERSE side. `forward_premap` relabels the transform's columns;
+//    `inverse_premap` (added with this test) relabels its ROWS, which is what
+//    a plain-native layer needs so that `SinCToSlot` writes the plain map
+//    rather than the chain one. Same lattice, so the same ceiling argument
+//    must hold -- and the SAME vector serves both directions, since a block
+//    bit reversal is its own inverse.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheInversePremapDoesNotGrowTheInverse) {
+  Ring swtch("ci_ringswitch16_35_boot.json", {}, 0,
+             /*build_user_interface=*/false);
+  const int degree = swtch.Degree();
+  const CiSwitchedCcmmLayout layout(degree, degree / kRank, kLanes);
+  const auto premap = BuildPremap(degree);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> a(swtch.context, kLanes, /*forward_level=*/-1,
+                          kInverseLevel, &layout, /*forward_premap=*/nullptr,
+                          kBabySteps);
+  const auto t1 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> b(swtch.context, kLanes, /*forward_level=*/-1,
+                          kInverseLevel, &layout, /*forward_premap=*/nullptr,
+                          kBabySteps, &premap);
+  const auto t2 = std::chrono::steady_clock::now();
+
+  ASSERT_NE(a.GetInverse(), nullptr);
+  ASSERT_NE(b.GetInverse(), nullptr);
+  const auto *ia = a.GetInverse();
+  const auto *ib = b.GetInverse();
+
+  std::cout << std::fixed << std::setprecision(2)
+            << "  chain-native inverse : bs " << ia->GetBS() << " x gs "
+            << ia->GetGS() << " = " << (ia->GetBS() * ia->GetGS())
+            << " diagonals, " << (ia->PlaintextBytes() >> 20)
+            << " MiB, built in " << Seconds(t0, t1) << " s" << std::endl;
+  std::cout << "  plain + premap       : bs " << ib->GetBS() << " x gs "
+            << ib->GetGS() << " = " << (ib->GetBS() * ib->GetGS())
+            << " diagonals, " << (ib->PlaintextBytes() >> 20)
+            << " MiB, built in " << Seconds(t1, t2) << " s" << std::endl;
+
+  EXPECT_EQ(ia->GetBS(), ib->GetBS());
+  EXPECT_EQ(ia->GetGS(), ib->GetGS());
+  EXPECT_EQ(ia->GetPreRotationAmount(), ib->GetPreRotationAmount());
+  EXPECT_EQ(ia->PlaintextBytes(), ib->PlaintextBytes());
+  EXPECT_LE(ib->GetBS() * ib->GetGS(), degree / kLanes);
+}
+
+// ---------------------------------------------------------------------------
+// 5. And it is the same values at the caller's addresses: ONE ciphertext
+//    through both inverses, read at the chain map's slots out of the first
+//    and at the plain map's out of the second.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, ThePlainMapInverseIsTheChainMapRelabelled) {
+  Ring boot("ci16_35.json");
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  const int degree = swtch.Degree();
+  const CiSwitchedCcmmLayout layout(degree, degree / kRank, kLanes);
+  const auto premap = BuildPremap(degree);
+
+  CiSinCConverter<word> a(swtch.context, kLanes, -1, kInverseLevel, &layout,
+                          nullptr, kBabySteps);
+  CiSinCConverter<word> b(swtch.context, kLanes, -1, kInverseLevel, &layout,
+                          nullptr, kBabySteps, &premap);
+  EvkRequest req;
+  a.AddRequiredRotations(req);
+  b.AddRequiredRotations(req);
+  swtch.ui->PrepareRotationKey(req);
+
+  // Any ciphertext at the inverse's level: the claim is about where the
+  // OUTPUT rows are written, and the input convention is untouched.
+  std::mt19937_64 gen(0x1E5E9A17ULL);
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+  std::vector<Complex> msg(degree);
+  for (auto &v : msg) v = Complex(dist(gen), 0.0);
+  const double s = boot.param->GetScale(kInverseLevel);
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, kInverseLevel, s, msg);
+  Ciphertext<word> in, in2;
+  boot.ui->Encrypt(in, pt);
+  boot.ui->Encrypt(in2, pt);  // the control's second encryption
+
+  Ciphertext<word> oa, oa2, ob;
+  a.SinCToSlot(swtch.context, oa, in, swtch.ui->GetEvkMap());
+  a.SinCToSlot(swtch.context, oa2, in2, swtch.ui->GetEvkMap());
+  b.SinCToSlot(swtch.context, ob, in, swtch.ui->GetEvkMap());
+
+  const auto read = [&](const Ciphertext<word> &ct) {
+    Plaintext<word> p;
+    boot.ui->Decrypt(p, ct);
+    std::vector<Complex> v;
+    boot.context->encoder_.Decode(v, p);
+    return v;
+  };
+  const std::vector<Complex> va = read(oa), va2 = read(oa2), vb = read(ob);
+
+  // Read each at ITS OWN map's primary addresses -- the only slots the
+  // inverse gives meaning to (EvalSpecialFFT.h: it "returns the true
+  // (unsummed) values at their primary addresses").
+  const CiBatchLayout plain(degree, kTokens);
+  const CiBatchLayout chain(degree, kTokens, kLanes, kRank);
+  double mag = 0.0, floor_gap = 0.0, worst = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int bi = 0; bi < kInstances; bi++) {
+      const double ca = va[chain.Slot(t, bi)].real();
+      const double ca2 = va2[chain.Slot(t, bi)].real();
+      const double pb = vb[plain.Slot(t, bi)].real();
+      mag = std::max(mag, std::abs(ca));
+      floor_gap = std::max(floor_gap, std::abs(ca - ca2));
+      worst = std::max(worst, std::abs(ca - pb));
+    }
+  }
+  std::cout << std::scientific << std::setprecision(3)
+            << "  |chain inverse| max                 " << mag << std::endl
+            << "  CONTROL |chain(enc1) - chain(enc2)| " << floor_gap
+            << "   (relative 2^" << std::fixed << std::setprecision(2)
+            << std::log2(floor_gap / mag) << ")" << std::endl
+            << std::scientific << std::setprecision(3)
+            << "  |plain+premap - chain| at own slots " << worst
+            << "   (relative 2^" << std::fixed << std::setprecision(2)
+            << std::log2(worst / mag) << ")" << std::endl;
+  EXPECT_LT(worst, 8.0 * floor_gap)
+      << "the inverse premap disagrees by more than the encryption floor";
   EXPECT_LT(worst, 1e-4 * mag);
 }

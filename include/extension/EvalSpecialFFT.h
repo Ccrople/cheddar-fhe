@@ -429,12 +429,25 @@ class CiSinCConverter {
    *        left on the balanced split until the ratio is measured at the
    *        converter's own level and shape; this parameter is how it gets
    *        measured.
+   * @param inverse_premap the mirror image of `forward_premap` for the
+   *        INVERSE, folded on its OUTPUT side: `(*inverse_premap)[b]` is the
+   *        block of the inverse's own convention (primary `LocateSlot`
+   *        blocks under `chain`, flat SinC blocks without) holding what the
+   *        caller wants at block `b` of its own slot index, lanes untouched.
+   *        A caller that simply lives in another lane-preserving layout
+   *        passes the SAME vector to both. Same lattice, same ceiling, same
+   *        column relabelling read from the other end -- measured on the
+   *        A100 at zero cost either way (`pc_premap_test`). Ignored when the
+   *        inverse is not built. It sits after `baby_steps` so that adding
+   *        it did not renumber the positional argument every existing caller
+   *        passes there.
    */
   CiSinCConverter(ConstContextPtr<word> context, int sub_degree,
                   int forward_level, int inverse_level,
                   const CiSwitchedCcmmLayout *chain = nullptr,
                   const std::vector<int> *forward_premap = nullptr,
-                  int baby_steps = 0);
+                  int baby_steps = 0,
+                  const std::vector<int> *inverse_premap = nullptr);
 
   // disable copying (or moving also)
   CiSinCConverter(const CiSinCConverter &) = delete;

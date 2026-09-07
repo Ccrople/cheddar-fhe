@@ -1661,6 +1661,38 @@ StripedMatrix FoldColumnPremap(const StripedMatrix &m,
   return PackLattice(acc, n, k);
 }
 
+// The same caller-supplied lane-preserving block permutation folded on the
+// OUTPUT (row) side, which is what the INVERSE direction needs: `M -> P M`,
+// so the conversion writes the caller's layout directly. `premap[B]` is the
+// block of the conversion's own output convention holding what the caller
+// wants at its block `B` -- the same vector the forward takes, read from the
+// other end. This is `FoldNestedUnpack` with exactly one source per output
+// block and no sign, so it inherits that fold's lattice and its ceiling: the
+// bucket `(a_in - a_out + shift)` is a whole number of blocks and never
+// depends on the lane.
+StripedMatrix FoldRowPremap(const StripedMatrix &m,
+                            const std::vector<int> &premap, int k) {
+  const int n = m.GetHeight();
+  const int num_blocks = n / k;
+  const auto diags = LatticeDiagonals(m, k, "FoldRowPremap");
+  auto acc = Lattice(num_blocks, n);
+  ParallelFor(num_blocks, [&](int b0, int b1) {
+    for (int a_out = b0; a_out < b1; a_out++) {
+      const int a_in = premap[a_out];
+      const int row0 = a_out * k;
+      for (const auto &[idx, diag] : diags) {
+        const int shift = (((idx % n) + n) % n) / k;
+        const int bucket =
+            ((a_in - a_out + shift) % num_blocks + num_blocks) % num_blocks;
+        Complex *dst = acc[bucket].data() + row0;
+        const Complex *in = diag + a_in * k;
+        for (int lane = 0; lane < k; lane++) dst[lane] += in[lane];
+      }
+    }
+  });
+  return PackLattice(acc, n, k);
+}
+
 }  // namespace
 
 template <typename word>
@@ -1669,7 +1701,8 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
                                        int inverse_level,
                                        const CiSwitchedCcmmLayout *chain,
                                        const std::vector<int> *forward_premap,
-                                       int baby_steps)
+                                       int baby_steps,
+                                       const std::vector<int> *inverse_premap)
     : sub_degree_{sub_degree} {
   const auto &param = context->param_;
   AssertTrue(param.conjugate_invariant_,
@@ -1799,6 +1832,24 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
     // matrix is the one whose output rows hold the flat message, and the
     // scan is a map on those values.
     if (chain != nullptr) m = FoldNestedUnpack(m, *chain);
+    // The caller's premap composes OUTERMOST here too, but on the OUTPUT
+    // side: it relabels which slot each row of whatever convention the folds
+    // above fixed is written to. `forward_premap` does the mirror image of
+    // this on the input side, and for a caller that simply lives in another
+    // lane-preserving layout the two vectors are the same one.
+    if (inverse_premap != nullptr) {
+      const int nb = num_slots / sub_degree;
+      AssertTrue(static_cast<int>(inverse_premap->size()) == nb,
+                 "CiSinCConverter: inverse_premap must cover every block");
+      std::vector<int> seen(nb, 0);
+      for (int b = 0; b < nb; b++) {
+        const int src = (*inverse_premap)[b];
+        AssertTrue(src >= 0 && src < nb && seen[src] == 0,
+                   "CiSinCConverter: inverse_premap is not a bijection");
+        seen[src] = 1;
+      }
+      m = FoldRowPremap(m, *inverse_premap, sub_degree);
+    }
     auto [bs, gs] = split(m.GetNumDiag());
     const auto t_folded = Clock::now();
     inverse_.emplace_back(context, m, inverse_level,
@@ -1807,7 +1858,8 @@ CiSinCConverter<word>::CiSinCConverter(ConstContextPtr<word> context,
     std::cout << "CiSinCConverter inverse: " << p << " stages, "
               << m.GetNumDiag() << " diagonals, level " << inverse_level
               << ", BSGS " << bs << "x" << gs
-              << (chain != nullptr ? ", nested fold" : "") << "; stages "
+              << (chain != nullptr ? ", nested fold" : "")
+              << (inverse_premap != nullptr ? ", premap" : "") << "; stages "
               << seconds(t_start, t_stages) << " s, folds "
               << seconds(t_stages, t_folded) << " s, compile "
               << seconds(t_folded, Clock::now()) << " s" << std::endl;
