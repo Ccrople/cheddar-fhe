@@ -99,6 +99,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiBatch.cu
     src/extension/CiBatchLayer.cu
     src/extension/CiBatchAttention.cu
+    src/extension/CiPcAttention.cu
     src/extension/CiDecode.cu
     src/extension/CiDecodeLayer.cu
     src/extension/CiModuleBasis.cpp

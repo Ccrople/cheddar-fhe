@@ -570,4 +570,13 @@ if (ENABLE_EXTENSION)
   add_executable(pc_premap_test PcPremapTest.cpp)
   target_link_libraries(pc_premap_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The first CONSUMER of the plain map: [SYLPH] section 4's public-context
+  # attention, which under that map is [KANG] Algorithm 1 twice with one exp
+  # between -- the encrypted queries against a public KV cache that differs
+  # per instance, streamed so the residency does not follow the context
+  # length.
+  add_executable(pc_attention_test PcAttentionTest.cpp)
+  target_link_libraries(pc_attention_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
