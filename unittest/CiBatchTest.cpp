@@ -1402,6 +1402,125 @@ TEST(CiBatch, TheFusedScoreBootMatchesTheSerialBoot) {
 //     (reference: softmax_mirror.py) puts the algorithm at 2^-15.5 on these
 //     scores, so anything worse here is the crypto seam, not the fit.
 // ---------------------------------------------------------------------------
+// The softmax's exp is ONE polynomial over the `num_tokens` key-token
+// ciphertexts, which differ only in their data -- the shape
+// `EvalPoly::EvaluateBatch` exists for, and the lever that took the decode's
+// heads from 15.5 s to 8.3 s. The claim it makes is not "close": the compiled
+// tree is walked once with the batch on gridDim.z and every key switch
+// `MultKeyBatch`-shaped, so it is WORD FOR WORD the per-ciphertext loop.
+//
+// That is what this checks, and it is why it needs no weights and no
+// meaningful calibration: the two routes see identical inputs, so any
+// difference at all is the batching's. A synthetic calibration is a VALID
+// one, not a realistic one -- the invsqrt's interval is not where the data
+// lands, which does not matter to a bit-exactness claim and does keep this
+// test off the real-weights path. The guard against a vacuous pass is that
+// the output must actually carry something.
+TEST(CiBatch, TheBatchedSoftMaxExpIsTheSerialOneWordForWord) {
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+
+  cheddar::CiBatchAttention<word>::Config cfg;
+  cfg.plain_map = PlainMap();
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, cfg);
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int T = cfg.num_tokens;
+  const int B = layout.num_instances;
+  const int top = attn.GetTopLevel();
+
+  cheddar::CiBatchAttention<word>::SoftMaxCalibration calib;
+  calib.m_eff = 8.0;
+  calib.span = 1.0;
+  calib.shift = 0.0;
+  calib.causal = true;
+  calib.row_shift.assign(cfg.num_heads, std::vector<double>(T, 0.0));
+  calib.row_norm.assign(cfg.num_heads, std::vector<double>(T, 1.0));
+  for (int h = 0; h < cfg.num_heads; h++) {
+    for (int t = 0; t < T; t++) {
+      calib.row_shift[h][t] = 0.05 * ((t % 7) - 3);
+      calib.row_norm[h][t] = 1.0 + 0.01 * (t % 5);
+    }
+  }
+  attn.PrepareSoftMax(calib);
+
+  // The scores, one ciphertext a key token, at the boot's landing.
+  std::mt19937_64 gen(0x50F7A1);
+  std::uniform_real_distribution<double> dist(-0.3, 0.3);
+  std::vector<double> vals(static_cast<size_t>(B) * T);
+  std::vector<Complex> msg;
+  std::vector<Ciphertext<word>> scores(T);
+  for (int l = 0; l < T; l++) {
+    for (auto &v : vals) v = dist(gen);
+    layout.Pack(msg, vals);
+    Plaintext<word> pt;
+    boot.context->encoder_.Encode(pt, top, boot.param->GetScale(top), msg);
+    boot.ui->Encrypt(scores[l], pt);
+  }
+
+  const auto &evk = boot.ui->GetEvkMap();
+  const std::vector<int> widths{1, 8, 32, 128};
+  std::vector<Ciphertext<word>> serial;
+  size_t differ = 0, total = 0;
+  for (int w : widths) {
+    std::vector<Ciphertext<word>> got;
+    attn.SetExpBatch(w);
+    // Twice: the first call warms the pool, the second is the number.
+    attn.SoftMax(got, scores, /*head=*/0, /*carried=*/1.0, evk);
+    auto ta = Sync();
+    attn.SoftMax(got, scores, /*head=*/0, /*carried=*/1.0, evk);
+    auto tb = Sync();
+    ASSERT_EQ(static_cast<int>(got.size()), T);
+    std::cout << std::fixed << std::setprecision(3) << "  softmax, exp batch "
+              << w << (w <= 1 ? " (the per-ciphertext loop)" : "") << ": "
+              << Ms(ta, tb) / 1000.0 << " s, " << FreeMiB() << " MiB free"
+              << std::endl;
+    if (w == widths.front()) {
+      serial = std::move(got);
+      continue;
+    }
+    for (int l = 0; l < T; l++) {
+      ASSERT_EQ(serial[l].GetNP(), got[l].GetNP()) << "width " << w << " l "
+                                                   << l;
+      ASSERT_DOUBLE_EQ(serial[l].GetScale(), got[l].GetScale());
+      ASSERT_EQ(serial[l].GetNumSlots(), got[l].GetNumSlots());
+      const cheddar::DeviceVector<word> *a_p[2] = {&got[l].bx_, &got[l].ax_};
+      const cheddar::DeviceVector<word> *b_p[2] = {&serial[l].bx_,
+                                                   &serial[l].ax_};
+      for (int p = 0; p < 2; p++) {
+        cheddar::HostVector<word> a, b;
+        cheddar::CopyDeviceToHost(a, *a_p[p]);
+        cheddar::CopyDeviceToHost(b, *b_p[p]);
+        ASSERT_EQ(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); i++) differ += (a[i] != b[i]);
+        total += a.size();
+      }
+    }
+  }
+
+  // The guard: a route that produced nothing would agree with itself.
+  Plaintext<word> out;
+  boot.ui->Decrypt(out, serial[0]);
+  std::vector<Complex> v;
+  boot.context->encoder_.Decode(v, out);
+  double biggest = 0.0;
+  for (const auto &c : v) biggest = std::max(biggest, std::abs(c.real()));
+
+  std::cout << "  batched vs serial softmax: " << differ << " of " << total
+            << " words differ" << std::endl
+            << std::scientific << std::setprecision(3)
+            << "  |P[0]| max (the output is not empty): " << biggest
+            << std::endl;
+  EXPECT_EQ(differ, 0u);
+  EXPECT_GT(biggest, 1e-6) << "both routes produced nothing";
+}
+
 TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
 #ifndef USE_CUBLAS
   GTEST_SKIP() << "built without cuBLAS";

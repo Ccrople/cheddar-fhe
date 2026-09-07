@@ -352,6 +352,11 @@ class CiBatchAttention {
    * per-token plaintexts of the causal mask and the row shift. Cheap.
    */
   void PrepareSoftMax(const SoftMaxCalibration &calib);
+  //! How many exp evaluations `SoftMax` batches (<= 1 = the per-ciphertext
+  //! loop, the default). `CHEDDAR_BATCH_SOFTMAX_EXP` overrides; a setter so
+  //! one object can run both routes for a word-for-word comparison.
+  void SetExpBatch(int n) { exp_batch_ = n; }
+  int GetExpBatch() const { return exp_batch_; }
   //! Where `SoftMax` expects its booted scores: the boot's landing.
   int GetTopLevel() const {
     return cfg_.score_top > 0 ? cfg_.score_top
@@ -408,6 +413,11 @@ class CiBatchAttention {
   //! The compiled softmax walk.
   SoftMaxCalibration calib_;
   bool softmax_ready_ = false;
+  //! How many of the softmax's `num_tokens` exp evaluations go through
+  //! `EvalPoly::EvaluateBatch` at once. <= 1 is the per-ciphertext loop, and
+  //! that is the DEFAULT because the batch measured flat -- see `SoftMax`.
+  //! `CHEDDAR_BATCH_SOFTMAX_EXP` overrides.
+  int exp_batch_ = 1;
   int exp_in_ = 0, exp_out_ = 0, mask_level_ = 0, sq_level_ = 0,
       poly_in_ = 0;
   // [1] is recompiled lazily on the aux path (its ladder's EvalMod can

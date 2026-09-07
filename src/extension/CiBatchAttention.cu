@@ -51,6 +51,14 @@ CiBatchAttention<word>::CiBatchAttention(
       lift_{small_ctx_, lifted_ctx_},
       ccmm_{lifted_ctx_->param_, lifted_ctx_->ntt_handler_},
       tower_{std::move(tower)} {
+  {
+    // The softmax's exp is one polynomial over `num_tokens` ciphertexts that
+    // differ only in their data -- exactly the shape `EvaluateBatch` is for.
+    // The knob bounds the live basis, and <= 1 restores the per-ciphertext
+    // loop for an A/B.
+    const char *e = std::getenv("CHEDDAR_BATCH_SOFTMAX_EXP");
+    if (e != nullptr && e[0] != '\0') exp_batch_ = std::atoi(e);
+  }
   AssertTrue(boot_->param_.degree_ == switch_ctx_->param_.degree_,
              "CiBatchAttention: the switching ring must have the layer's "
              "degree");
@@ -1081,10 +1089,26 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
   } else {
     boot_->encoder_.EncodeConstant(c1, top, param.GetScale(top), a1);
   }
+  // The affine is per key token and key-switch free; the exp is ONE
+  // polynomial over ciphertexts that differ only in their data, so it CAN go
+  // through `EvaluateBatch` -- the compiled tree walked once, every key
+  // switch `MultKeyBatch`-shaped, word for word the per-ciphertext loop.
+  //
+  // It does not pay here, and the default is the loop. Measured on the A100
+  // (`ci16_35`, T = 128, one head, exp from a deg-15 fit), one softmax:
+  //
+  //     batch 1 (the loop) 1.088 s | 8  1.042 s | 32  1.089 s | 128  1.041 s
+  //
+  // flat inside the run-to-run noise, and word for word identical at every
+  // width (TheBatchedSoftMaxExpIsTheSerialOneWordForWord). The reason is
+  // that this evaluation is not launch-bound: each ciphertext is 65536 slots
+  // at a high level, so one exp already fills the card. The same lever moved
+  // the DECODE's heads 15.5 -> 8.3 s because there the per-head work is
+  // small. Kept behind `exp_batch_` for a shape where that changes; the
+  // chunk bounds the live basis, which a deg-15 tree holds several of.
   std::vector<Ct> y(T);
-  Ct sq_acc;
-  for (int l = 0; l < T; l++) {
-    Ct u;
+  const int chunk = (exp_batch_ > 1) ? Min(exp_batch_, T) : 1;
+  const auto affine = [&](Ct &u, int l) {
     if (cfg_.affine_in_prefix) {
       // A LevelDown to the ciphertext's own level is a copy; the affine's
       // multiply already rode the prefix. (A serial boot landing above
@@ -1109,14 +1133,66 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
                                      1.0 - 2.0 * calib_.shift / calib_.span);
       boot_->Add(u, u, c0);
     }
-    Ct y_full;
-    polys_[0]->Evaluate(boot_, y_full, u, mult_key);
+  };
+
+  {
+    NvtxScope _e("batch attn: softmax exp");
+    for (int start = 0; start < T; start += chunk) {
+      const int end = Min(T, start + chunk);
+      if (chunk == 1) {
+        Ct u;
+        affine(u, start);
+        polys_[0]->Evaluate(boot_, y[start], u, mult_key);
+        continue;
+      }
+      std::vector<Ct> u(end - start);
+      for (int l = start; l < end; l++) affine(u[l - start], l);
+
+      CtBatch<word> in;
+      const NPInfo in_np = u[0].GetNP();
+      in.Allocate(in_np, end - start, false);
+      in.scale_ = u[0].GetScale();
+      in.num_slots_ = u[0].GetNumSlots();
+      const size_t in_bytes = in.PolyWords() * sizeof(word);
+      for (int b = 0; b < end - start; b++) {
+        AssertTrue(u[b].GetNP() == in_np && !u[b].HasRx(),
+                   "CiBatchAttention::SoftMax: the affine left the group at "
+                   "different levels");
+        AssertTrue(std::abs(u[b].GetScale() - in.scale_) <= 1e-9 * in.scale_,
+                   "CiBatchAttention::SoftMax: the affine left the group at "
+                   "different scales");
+        cudaMemcpyAsync(in.CtData(b), u[b].bx_.data(), in_bytes,
+                        cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+        cudaMemcpyAsync(in.CtData(b) + in.PolyWords(), u[b].ax_.data(),
+                        in_bytes, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+      }
+      u.clear();
+
+      CtBatch<word> out;
+      polys_[0]->EvaluateBatch(boot_, out, in, mult_key);
+      in = CtBatch<word>();
+
+      const size_t out_bytes = out.PolyWords() * sizeof(word);
+      for (int b = 0; b < end - start; b++) {
+        Ct &dst = y[start + b];
+        dst.RemoveRx();
+        dst.ModifyNP(out.np_);
+        dst.SetScale(out.scale_);
+        dst.SetNumSlots(out.num_slots_);
+        cudaMemcpyAsync(dst.bx_.data(), out.CtData(b), out_bytes,
+                        cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+        cudaMemcpyAsync(dst.ax_.data(), out.CtData(b) + out.PolyWords(),
+                        out_bytes, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+      }
+    }
+  }
+
+  Ct sq_acc;
+  for (int l = 0; l < T; l++) {
     if (calib_.causal) {
       Ct t2;
-      boot_->Mult(t2, y_full, masks[l]);
+      boot_->Mult(t2, y[l], masks[l]);
       boot_->Rescale(y[l], t2);
-    } else {
-      y[l] = std::move(y_full);
     }
     // The Euclidean norm over the key axis is a sum over these
     // ciphertexts: the tensor squares accumulate, one relinearization.
