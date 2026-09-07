@@ -1239,8 +1239,27 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
     if (b[i] != 0) nonzero++;
   }
 
+  // WHERE THE REMAINING COST IS, in one line: encode the same entries again
+  // at a level with three times the limbs. Every full-degree stage the route
+  // still runs -- RnsDecompose and the NTT -- is linear in the limb count, so
+  // if the entry cost tracks the limbs it is bandwidth and the lever is an
+  // O(k) transform; if it does not, it is per-entry OVERHEAD and the lever is
+  // batching. Levels 4 and 16 differ by 7 limbs against 19.
+  constexpr int kHighLevel = 16;
+  const cheddar::NPInfo np = boot.param->LevelToNP(kLevel, 0);
+  const cheddar::NPInfo np_hi = boot.param->LevelToNP(kHighLevel, 0);
+  cheddar::SubringWeights<word> tall;
+  cudaDeviceSynchronize();
+  const auto t3 = std::chrono::steady_clock::now();
+  subring.EncodeWeightsReal(tall, boot.context->gpu_encoder_, kHighLevel,
+                            boot.param->GetScale(kHighLevel), flat, kColsIn,
+                            kColsOut, kSubDegree);
+  cudaDeviceSynchronize();
+  const auto t4 = std::chrono::steady_clock::now();
+
   const double ref_us = 1e6 * Seconds(t0, t1) / entries;
   const double fast_us = 1e6 * Seconds(t1, t2) / entries;
+  const double tall_us = 1e6 * Seconds(t3, t4) / entries;
   // What a layer would pay: one plaintext per (public token, channel) per kv
   // head, at Sylph's 3968 public tokens.
   const double per_layer = 3968.0 * 128 * 8;
@@ -1254,8 +1273,22 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
             << "  a layer's 4.06M operands would be: " << std::setprecision(0)
             << (per_layer * ref_us / 1e6) << " s  ->  "
             << (per_layer * fast_us / 1e6) << " s" << std::endl
+            << std::setprecision(1)
+            << "  the same at level " << kHighLevel << " ("
+            << np_hi.GetNumTotal() << " limbs vs " << np.GetNumTotal()
+            << ")  : " << tall_us << " us an entry   ("
+            << (tall_us / fast_us) << "x the limbs' "
+            << (double(np_hi.GetNumTotal()) / np.GetNumTotal()) << "x)"
+            << std::endl
             << "  word-for-word differences        : " << diff << " of "
             << a.size() << std::endl;
+
+  // Not an assertion about the hardware -- a claim about which lever is next,
+  // recorded so it is not re-guessed. If the entry cost were bandwidth-bound
+  // it would follow the limb count.
+  EXPECT_LT(tall_us, 2.0 * fast_us)
+      << "the encode tracks the limb count, so it IS the full-degree "
+         "transform and an O(k) one is the lever";
 
   EXPECT_GT(nonzero, a.size() / 2)
       << "the device store is mostly zero -- nothing was encoded";
