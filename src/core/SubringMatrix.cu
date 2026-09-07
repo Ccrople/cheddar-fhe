@@ -20,6 +20,13 @@ namespace kernel {
 // drops the extra factor so the result stays in the ciphertext's own
 // representation.
 //
+// `entry_degree` is the words a limb an entry holds and `gather_shift` is
+// `log2(degree / entry_degree)`. An expanded store is `entry_degree = degree`,
+// `gather_shift = 0`, and the read is the plain one; a COMPACT store keeps
+// only the `k` distinct words a subring element can have, and the read is
+// `x >> gather_shift` -- which is the same word for the `degree / k`
+// consecutive threads that share it, so it broadcasts.
+//
 // grid: (degree / block, cols_out, num_total_primes)
 template <typename word>
 __global__ void SubringPAccum(word *const *dst_ptrs,
@@ -27,7 +34,7 @@ __global__ void SubringPAccum(word *const *dst_ptrs,
                               const word *primes,
                               const make_signed_t<word> *inv_primes,
                               int cols_in, int cols_out, int num_total_primes,
-                              int degree) {
+                              int degree, int entry_degree, int gather_shift) {
   using signed_word = make_signed_t<word>;
 
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -39,13 +46,14 @@ __global__ void SubringPAccum(word *const *dst_ptrs,
       basic::StreamingLoadConst(inv_primes + prime_index);
 
   const int limb_offset = prime_index * degree + x;
-  const size_t entry_stride = static_cast<size_t>(num_total_primes) * degree;
+  const int u_offset = prime_index * entry_degree + (x >> gather_shift);
+  const size_t entry_stride =
+      static_cast<size_t>(num_total_primes) * entry_degree;
 
   word acc = 0;
   for (int j = 0; j < cols_in; j++) {
     const word u_value = basic::StreamingLoad(
-        u + (static_cast<size_t>(j) * cols_out + l) * entry_stride +
-        limb_offset);
+        u + (static_cast<size_t>(j) * cols_out + l) * entry_stride + u_offset);
     const word src_value = basic::StreamingLoad(src_ptrs[j] + limb_offset);
     const word product =
         basic::MultMontgomery(u_value, src_value, prime, inv_prime);
@@ -53,6 +61,17 @@ __global__ void SubringPAccum(word *const *dst_ptrs,
   }
 
   dst_ptrs[l][limb_offset] = acc;
+}
+
+// The compact store, built from the encoded plaintext: take every `stride`-th
+// word. A gather rather than a `cudaMemcpy2D` because the rows are one word
+// wide and there are `num_total_primes * sub_degree` of them.
+template <typename word>
+__global__ void SubringCompact(word *dst, const word *src, int num_words,
+                               int stride) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_words) return;
+  dst[i] = src[static_cast<size_t>(i) * stride];
 }
 
 }  // namespace kernel
@@ -70,6 +89,11 @@ int SubringWeights<word>::GetColsOut() const {
 template <typename word>
 int SubringWeights<word>::GetSubDegree() const {
   return sub_degree_;
+}
+
+template <typename word>
+int SubringWeights<word>::GetEntryDegree() const {
+  return entry_degree_;
 }
 
 template <typename word>
@@ -94,7 +118,7 @@ template <typename word>
 void SubringMatrixHandler<word>::EncodeWeights(
     SubringWeights<word> &res, int level, double scale,
     const std::vector<std::vector<Complex>> &values, int cols_in, int cols_out,
-    int sub_degree, int num_aux /*= 0*/) const {
+    int sub_degree, int num_aux /*= 0*/, bool compact /*= false*/) const {
   const int degree = param_.degree_;
   AssertTrue(cols_in > 0 && cols_out > 0,
              "EncodeWeights: Invalid matrix shape");
@@ -117,11 +141,14 @@ void SubringMatrixHandler<word>::EncodeWeights(
 
   const NPInfo np = param_.LevelToNP(level, num_aux);
   const int num_total_primes = np.GetNumTotal();
-  const size_t entry_words = static_cast<size_t>(num_total_primes) * degree;
+  const int entry_degree = compact ? sub_degree : degree;
+  const size_t entry_words =
+      static_cast<size_t>(num_total_primes) * entry_degree;
 
   res.cols_in_ = cols_in;
   res.cols_out_ = cols_out;
   res.sub_degree_ = sub_degree;
+  res.entry_degree_ = entry_degree;
   res.scale_ = scale;
   res.np_ = np;
   res.data_.resize(static_cast<int>(entry_words * cols_in * cols_out));
@@ -157,9 +184,22 @@ void SubringMatrixHandler<word>::EncodeWeights(
 
       const size_t offset =
           (static_cast<size_t>(j) * cols_out + l) * entry_words;
-      cudaMemcpyAsync(res.data_.data() + offset, entry.mx_.data(),
-                      entry_words * sizeof(word), cudaMemcpyDeviceToDevice,
-                      cudaStreamLegacy);
+      if (compact) {
+        // The NTT image is constant on runs of `num_blocks`, so the k
+        // distinct words are the buffer read at that stride -- and since
+        // `degree` is a multiple of `num_blocks`, the same stride carries
+        // across the limb boundaries with no per-limb bookkeeping.
+        const int num_words = static_cast<int>(entry_words);
+        const int grid =
+            (num_words + kernel_block_dim_ - 1) / kernel_block_dim_;
+        kernel::SubringCompact<word><<<grid, kernel_block_dim_>>>(
+            res.data_.data() + offset, entry.mx_.data(), num_words,
+            num_blocks);
+      } else {
+        cudaMemcpyAsync(res.data_.data() + offset, entry.mx_.data(),
+                        entry_words * sizeof(word), cudaMemcpyDeviceToDevice,
+                        cudaStreamLegacy);
+      }
     }
   }
 }
@@ -197,6 +237,18 @@ void SubringMatrixHandler<word>::Multiply(ConstContextPtr<word> context,
   const int degree = param_.degree_;
   const int num_total_primes = np.GetNumTotal();
 
+  // An expanded store reads word `x`; a compact one reads the `x`-th run,
+  // `x >> log2(degree / entry_degree)`. Both are this one expression, and an
+  // expanded store makes the shift zero.
+  const int entry_degree =
+      (u.entry_degree_ > 0) ? u.entry_degree_ : degree;
+  AssertTrue(entry_degree > 0 && IsPowOfTwo(entry_degree) &&
+                 degree % entry_degree == 0,
+             "Subring::Multiply: the weights' entry degree must be a power of "
+             "two dividing the ring degree");
+  int gather_shift = 0;
+  while ((entry_degree << gather_shift) < degree) gather_shift++;
+
   // The accumulation cannot write into `res`: it is rescaled into `res`
   // afterwards, and mod-switching reads a different number of limbs than it
   // writes.
@@ -233,10 +285,10 @@ void SubringMatrixHandler<word>::Multiply(ConstContextPtr<word> context,
   // B*U and A*U are the same product against the same weights.
   kernel::SubringPAccum<word><<<grid_dim, kernel_block_dim_>>>(
       d_dst_bx.data(), d_src_bx.data(), u.data_.data(), primes, inv_primes,
-      cols_in, cols_out, num_total_primes, degree);
+      cols_in, cols_out, num_total_primes, degree, entry_degree, gather_shift);
   kernel::SubringPAccum<word><<<grid_dim, kernel_block_dim_>>>(
       d_dst_ax.data(), d_src_ax.data(), u.data_.data(), primes, inv_primes,
-      cols_in, cols_out, num_total_primes, degree);
+      cols_in, cols_out, num_total_primes, degree, entry_degree, gather_shift);
 
   res.resize(cols_out);
   for (int l = 0; l < cols_out; l++) {

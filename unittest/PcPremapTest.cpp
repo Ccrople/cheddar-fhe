@@ -788,3 +788,200 @@ TEST(PcPremap, TheSubringLaneIsThePlainMapsInstance) {
   EXPECT_GT(chain_lanes.size(), 1u)
       << "the chain map should NOT give one instance a single lane";
 }
+
+// ---------------------------------------------------------------------------
+// 8. THE BLOCKER, looked at directly. Test 7 priced it from the outside (128x,
+//    the block count); this opens the buffer. A subring element has `k`
+//    degrees of freedom, so its NTT-domain image can only take `k` distinct
+//    values -- `q(X^d)` evaluates at `psi^(d * e)` and `psi^d` has order `2k`.
+//    WHERE those k values sit in the `degree`-long buffer is the one thing a
+//    compact store has to know, and it is a fact about the NTT's output
+//    ordering, not about the subring: a natural-order NTT makes the buffer
+//    periodic with period k, a Cooley-Tukey one (natural in, BIT-REVERSED
+//    out, which is what `SubringCtMatrix.cu` says of its own) makes it
+//    constant on runs of `d` instead. Both compress to k words; the gather
+//    index differs (`x & (k-1)` against `x >> log2 d`), so measure it rather
+//    than assume it.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheExpandedSubringStoreIsOneBlockRepeated) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  constexpr int kSubDegree = kInstances;       // 512
+  const int num_blocks = degree / kSubDegree;  // d = 128
+  const int log_blocks = 31 - __builtin_clz(num_blocks);
+  ASSERT_EQ(1 << log_blocks, num_blocks);
+
+  constexpr int kLevel = 4;
+  const double scale = boot.param->GetScale(kLevel);
+  const cheddar::NPInfo np = boot.param->LevelToNP(kLevel, /*num_aux=*/0);
+  const int limbs = np.GetNumTotal();
+
+  std::mt19937_64 gen(0xC0FFEE77ULL);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+  std::vector<std::vector<Complex>> u(kSubDegree,
+                                      std::vector<Complex>(1, Complex()));
+  for (int t = 0; t < kSubDegree; t++) u[t][0] = Complex(dist(gen), 0.0);
+
+  cheddar::SubringMatrixHandler<word> subring(*boot.param,
+                                              boot.context->encoder_);
+  cheddar::SubringWeights<word> weights;
+  subring.EncodeWeights(weights, kLevel, scale, u, 1, 1, kSubDegree);
+
+  cheddar::HostVector<word> h;
+  cheddar::CopyDeviceToHost(h, weights.data_);
+  ASSERT_EQ(static_cast<int>(h.size()), limbs * degree);
+
+  int period_off = 0, run_off = 0;
+  for (int p = 0; p < limbs; p++) {
+    const size_t base = static_cast<size_t>(p) * degree;
+    for (int x = 0; x < degree; x++) {
+      if (h[base + x] != h[base + (x & (kSubDegree - 1))]) period_off++;
+      if (h[base + x] != h[base + ((x >> log_blocks) << log_blocks)]) run_off++;
+    }
+  }
+  std::set<word> distinct;
+  for (int x = 0; x < degree; x++) distinct.insert(h[x]);
+
+  std::cout << "  limbs x degree                   : " << limbs << " x "
+            << degree << std::endl
+            << "  distinct words in limb 0         : " << distinct.size()
+            << " (a subring element has " << kSubDegree << " freedoms)"
+            << std::endl
+            << "  H1  w[x] == w[x & (k-1)]         : "
+            << (period_off == 0 ? "HOLDS" : "no") << "  (" << period_off
+            << " off)" << std::endl
+            << "  H2  w[x] == w[(x >> log d) << log d] : "
+            << (run_off == 0 ? "HOLDS" : "no") << "  (" << run_off << " off)"
+            << std::endl;
+
+  EXPECT_LE(distinct.size(), static_cast<size_t>(kSubDegree))
+      << "the NTT image of a subring element takes more than k values";
+  EXPECT_EQ(distinct.size(), static_cast<size_t>(kSubDegree))
+      << "a random subring element should use all k of its freedoms";
+  EXPECT_EQ(run_off, 0)
+      << "Cheddar's forward NTT leaves the image constant on runs of d; if "
+         "this moved, the compact store's gather index moved with it";
+}
+
+// ---------------------------------------------------------------------------
+// 9. THE COMPACT STORE. Test 8 says the `degree`-long entry is one `k`-word
+//    block repeated `d` times, so `EncodeWeights(..., compact = true)` keeps
+//    the k words and `Multiply` gathers them with `x >> log2 d`. The claim is
+//    not that it is close: it is that it is the SAME PRODUCT, word for word,
+//    because the gather hands the kernel the identical operand it read
+//    before. Anything less would be a new approximation in a chain that has
+//    none.
+//
+//    Then the point of the exercise, at the shape PC-attention has: the
+//    contraction runs over `head_dim` ciphertexts, so the weights are
+//    `cols_in = 128` entries and the store is what has to be streamed.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheCompactSubringStoreIsWordForWord) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  constexpr int kSubDegree = kInstances;       // 512
+  const int num_blocks = degree / kSubDegree;  // d = 128
+  constexpr int kLevel = 4;
+  constexpr int kFanIn = 128;  // head_dim ciphertexts contracted
+  constexpr int kReps = 20;
+  const double scale = boot.param->GetScale(kLevel);
+
+  std::mt19937_64 gen(0xC1EA9DA7ULL);
+  std::uniform_real_distribution<double> dist(-0.5, 0.5);
+  cheddar::SubringMatrixHandler<word> subring(*boot.param,
+                                              boot.context->encoder_);
+
+  const auto same_words = [](const cheddar::DeviceVector<word> &x,
+                             const cheddar::DeviceVector<word> &y) {
+    cheddar::HostVector<word> a, b;
+    cheddar::CopyDeviceToHost(a, x);
+    cheddar::CopyDeviceToHost(b, y);
+    if (a.size() != b.size()) return static_cast<size_t>(-1);
+    size_t diff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+      if (a[i] != b[i]) diff++;
+    }
+    return diff;
+  };
+
+  // One shared ciphertext message; the fan-in copies differ only in their
+  // encryption noise, which the word-for-word comparison does not care about
+  // because both products read the SAME ciphertexts.
+  std::vector<Complex> z(degree);
+  for (int s = 0; s < degree; s++) z[s] = Complex(dist(gen), 0.0);
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, kLevel, scale, z);
+
+  // --- A. one entry ------------------------------------------------------
+  std::vector<std::vector<Complex>> u1(kSubDegree,
+                                       std::vector<Complex>(1, Complex()));
+  for (int t = 0; t < kSubDegree; t++) u1[t][0] = Complex(dist(gen), 0.0);
+
+  cheddar::SubringWeights<word> wide, thin;
+  subring.EncodeWeights(wide, kLevel, scale, u1, 1, 1, kSubDegree, 0, false);
+  subring.EncodeWeights(thin, kLevel, scale, u1, 1, 1, kSubDegree, 0, true);
+  EXPECT_EQ(wide.GetEntryDegree(), degree);
+  EXPECT_EQ(thin.GetEntryDegree(), kSubDegree);
+  ASSERT_EQ(thin.data_.size() * num_blocks, wide.data_.size());
+
+  std::vector<Ciphertext<word>> one(1);
+  boot.ui->Encrypt(one[0], pt);
+  std::vector<Ciphertext<word>> rw, rt;
+  subring.Multiply(boot.context, rw, wide, one);
+  subring.Multiply(boot.context, rt, thin, one);
+  ASSERT_EQ(rw.size(), 1u);
+  ASSERT_EQ(rt.size(), 1u);
+  const size_t diff_one =
+      same_words(rw[0].bx_, rt[0].bx_) + same_words(rw[0].ax_, rt[0].ax_);
+  EXPECT_EQ(diff_one, 0u) << "cols_in = 1: the gather is not the expansion";
+
+  // --- B. the PC-attention shape -----------------------------------------
+  std::vector<std::vector<Complex>> uf(kSubDegree,
+                                       std::vector<Complex>(kFanIn));
+  for (int t = 0; t < kSubDegree; t++) {
+    for (int j = 0; j < kFanIn; j++) uf[t][j] = Complex(dist(gen), 0.0);
+  }
+  cheddar::SubringWeights<word> fat, lean;
+  subring.EncodeWeights(fat, kLevel, scale, uf, kFanIn, 1, kSubDegree, 0,
+                        false);
+  subring.EncodeWeights(lean, kLevel, scale, uf, kFanIn, 1, kSubDegree, 0,
+                        true);
+
+  std::vector<Ciphertext<word>> many(kFanIn);
+  for (int j = 0; j < kFanIn; j++) boot.ui->Encrypt(many[j], pt);
+
+  subring.Multiply(boot.context, rw, fat, many);
+  subring.Multiply(boot.context, rt, lean, many);
+  const size_t diff_many =
+      same_words(rw[0].bx_, rt[0].bx_) + same_words(rw[0].ax_, rt[0].ax_);
+  EXPECT_EQ(diff_many, 0u) << "cols_in = 128: the gather is not the expansion";
+
+  cudaDeviceSynchronize();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int r = 0; r < kReps; r++) subring.Multiply(boot.context, rw, fat, many);
+  cudaDeviceSynchronize();
+  const auto t1 = std::chrono::steady_clock::now();
+  for (int r = 0; r < kReps; r++) {
+    subring.Multiply(boot.context, rt, lean, many);
+  }
+  cudaDeviceSynchronize();
+  const auto t2 = std::chrono::steady_clock::now();
+
+  const double fat_mb = fat.data_.size() * sizeof(word) / 1048576.0;
+  const double lean_mb = lean.data_.size() * sizeof(word) / 1048576.0;
+  std::cout << std::fixed << std::setprecision(2)
+            << "  cols_in " << kFanIn << " (head_dim), cols_out 1, k "
+            << kSubDegree << std::endl
+            << "  weight store expanded            : " << fat_mb << " MiB"
+            << std::endl
+            << "  weight store compact             : " << lean_mb << " MiB   ("
+            << (fat_mb / lean_mb) << "x smaller)" << std::endl
+            << "  Multiply expanded                : "
+            << (1000.0 * Seconds(t0, t1) / kReps) << " ms" << std::endl
+            << "  Multiply compact                 : "
+            << (1000.0 * Seconds(t1, t2) / kReps) << " ms" << std::endl
+            << "  word-for-word differences        : " << diff_one << " + "
+            << diff_many << std::endl;
+
+  EXPECT_EQ(lean.data_.size() * num_blocks, fat.data_.size());
+}

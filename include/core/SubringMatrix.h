@@ -110,6 +110,7 @@ class SubringWeights {
   int GetColsIn() const;
   int GetColsOut() const;
   int GetSubDegree() const;
+  int GetEntryDegree() const;
   double GetScale() const;
   NPInfo GetNP() const;
 
@@ -117,6 +118,10 @@ class SubringWeights {
   int cols_in_ = 0;      // d', the number of input ciphertexts (contracted)
   int cols_out_ = 0;     // d'', the number of output ciphertexts
   int sub_degree_ = 0;   // k
+  //! Words a limb an entry: the ring degree when the element is stored
+  //! expanded, `sub_degree_` when it is stored as what it is. See
+  //! `EncodeWeights`'s `compact`.
+  int entry_degree_ = 0;
   double scale_ = 1.0;
   NPInfo np_;
   DeviceVector<word> data_;
@@ -161,15 +166,35 @@ class SubringMatrixHandler {
    * @param values the batch, indexed `values[t][j * cols_out + l]` with
    *        `t < sub_degree / 2` lanes and each inner vector of length
    *        `cols_in * cols_out`
+   * ## `compact`: storing a subring element as one
+   *
+   * A subring element has `k` degrees of freedom, so its NTT image can take
+   * only `k` distinct values -- `q(X^d)` evaluates at `psi^(d*e)` and `psi^d`
+   * has order `2k`. The default store nevertheless writes the whole ring
+   * degree, which is right for a WEIGHT (encoded once, read many times) and
+   * fatal for DATA: a per-user PC-attention operand is a plaintext per
+   * (public token, channel), millions a layer, and 127 words in 128 are
+   * copies.
+   *
+   * With `compact`, an entry is `num_total_primes * sub_degree` words instead
+   * -- the `k` distinct words, in the order the NTT leaves them. Cheddar's
+   * forward NTT is Cooley-Tukey (natural in, bit-reversed out), so the image
+   * is constant on runs of `d = degree / sub_degree` and the distinct words
+   * are the buffer read at stride `d`; `Multiply` gathers them back with
+   * `x >> log2(d)`, which makes 128 consecutive threads read one broadcast
+   * word. Pinned by PcPremapTest's TheExpandedSubringStoreIsOneBlockRepeated
+   * and TheCompactSubringStoreIsWordForWord.
+   *
    * @param cols_in d', the number of input ciphertexts
    * @param cols_out d'', the number of output ciphertexts
    * @param sub_degree k, a power of two dividing the ring degree
    * @param num_aux number of auxiliary primes (default: 0 --> none)
+   * @param compact store `sub_degree` words a limb instead of `degree`
    */
   void EncodeWeights(SubringWeights<word> &res, int level, double scale,
                      const std::vector<std::vector<Complex>> &values,
                      int cols_in, int cols_out, int sub_degree,
-                     int num_aux = 0) const;
+                     int num_aux = 0, bool compact = false) const;
 
   /**
    * @brief [KANG] Algorithm 1: `(B, A) <- (B*U, A*U)`, then rescale.
