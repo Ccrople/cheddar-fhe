@@ -32,12 +32,15 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <set>
+#include <utility>
 #include <vector>
 
 #include "RingFixture.h"
@@ -411,4 +414,187 @@ TEST(PcPremap, ThePlainMapInverseIsTheChainMapRelabelled) {
   EXPECT_LT(worst, 8.0 * floor_gap)
       << "the inverse premap disagrees by more than the encryption floor";
   EXPECT_LT(worst, 1e-4 * mag);
+}
+
+namespace {
+
+int Gcd(int a, int b) {
+  while (b != 0) {
+    const int t = a % b;
+    a = b;
+    b = t;
+  }
+  return a < 0 ? -a : a;
+}
+
+// `CiSinCBasis::Split`, so that what this test prices is what a phase of the
+// real chain would be given: at most 32 baby steps, never a gs == 1 layout.
+std::pair<int, int> Split(int num_diag) {
+  int lg = 0;
+  while ((1 << lg) < num_diag) lg++;
+  int bs = 1 << ((lg + 1) / 2);
+  if (bs > 32) bs = 32;
+  if (bs > num_diag) bs = 1 << lg;
+  if (bs < 1) bs = 1;
+  int gs = (num_diag + bs - 1) / bs;
+  if (gs < 2) {
+    bs = (num_diag + 1) / 2;
+    gs = 2;
+  }
+  return {bs, gs};
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 6. WHERE THE PLAIN MAP IS NOT FREE -- and what it costs there.
+//
+//    The converters fold the premap at no cost because every diagonal they
+//    carry already sits on the stride-`sub_degree` lattice: a block
+//    relabelling only moves a diagonal to another lattice point, and the
+//    compiled matrix is already at that lattice's `degree / sub_degree`
+//    ceiling. The tower's LANE PREFIX is the opposite. It is
+//    `CiButterflyStages(0 .. log2 T_l - 1)` -- it mixes only WITHIN a lane
+//    group, so its `2 T_l - 1` offsets are lane offsets, off the lattice
+//    entirely -- and composing a block premap on its output side multiplies
+//    the two offset sets with nothing to collide. That is checked below in
+//    the same binary as the rest, and it is why the fused score return
+//    (`CiBatchAttention::BootScoresFused`, one prefix call per score
+//    ciphertext, 128 a head) must keep the scores CHAIN-addressed.
+//
+//    Which is affordable only because of the softmax's shape: the one thing
+//    in the score branch that a plain-mapped PC-attention has to meet is the
+//    Euclidean-norm accumulator, and that is ONE ciphertext a head
+//    (`Config::score_top`: "the softmax's Euclidean-norm accumulator (ONE
+//    ciphertext a head) bootstraps on its own short ring"). So the join is
+//    32 standalone permutations a layer, and this test prices one.
+//
+//    The price is small for a reason worth writing down. An 11-bit reversal
+//    pairs bit i with bit 10 - i and fixes the middle bit, so the
+//    displacement `rev(b) - b` is a sum of five independent terms
+//    `2^(10-i) - 2^i`, each taken with a sign or dropped: 3^5 = 243 distinct
+//    displacements out of 2048 blocks, and 3^floor(bits/2) at any width.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheStandaloneBlockPermutationIsThreeToTheFive) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  const auto premap = BuildPremap(degree);
+  const int num_blocks = degree / kLanes;
+  const int bits = 31 - __builtin_clz(num_blocks);
+  ASSERT_EQ(1 << bits, num_blocks);
+
+  // chain -> plain as a matrix: the output slot `p` is a PLAIN address, and
+  // it takes whatever the CHAIN map put the same (token, instance) at. The
+  // StripedMatrix convention is `m[off][row]` = the entry at (row, row+off).
+  cheddar::StripedMatrix perm(degree, degree);
+  for (int p = 0; p < degree; p++) {
+    const int c = premap[p / kLanes] * kLanes + (p % kLanes);
+    const int off = ((c - p) % degree + degree) % degree;
+    perm.try_emplace(off, degree, Complex(0.0, 0.0));
+    perm[off][p] = Complex(1.0, 0.0);
+  }
+  const int nd = perm.GetNumDiag();
+  int three_to_the = 1;
+  for (int i = 0; i < bits / 2; i++) three_to_the *= 3;
+  EXPECT_EQ(nd, three_to_the)
+      << "the displacement set is not a bit reversal's " << bits / 2
+      << " independent signed terms";
+
+  // The BSGS the code's own rule gives it. `pre_rotation` is left at 0: the
+  // window would shrink the span, but it also leaves the output rotated by
+  // the window (`CiSinCBasis::Compile` carries it to a closing HRot), and
+  // what is being priced here is a transform that stands alone.
+  int gcd = 0, max_rot = 0;
+  for (const auto &[idx, unused] : perm) {
+    const int rot = ((idx % degree) + degree) % degree;
+    gcd = Gcd(gcd, rot);
+    max_rot = std::max(max_rot, rot);
+  }
+  const int span = (gcd > 0) ? max_rot / gcd + 1 : nd;
+  const auto [bs, gs] = Split(std::max(nd, span));
+
+  constexpr int kLevel = 4;
+  const auto t0 = std::chrono::steady_clock::now();
+  cheddar::LinearTransform<word> lt(boot.context, perm, kLevel,
+                                    boot.param->GetRescalePrimeProd(kLevel), bs,
+                                    gs, /*pre_rotation=*/0,
+                                    /*additional_pt_rot=*/0);
+  const auto t1 = std::chrono::steady_clock::now();
+  EvkRequest req;
+  lt.AddRequiredRotations(req);
+  boot.ui->PrepareRotationKey(req);
+
+  std::cout << std::fixed << std::setprecision(2)
+            << "  displacements (diagonals)        : " << nd << " of "
+            << num_blocks << "   (3^" << (bits / 2) << ")" << std::endl
+            << "  on stride " << gcd << ", span " << span << ", BSGS " << bs
+            << "x" << gs << std::endl
+            << "  KEY SWITCHES a call              : " << req.size()
+            << std::endl
+            << "  plaintexts                       : "
+            << (lt.PlaintextBytes() >> 20) << " MiB, built in "
+            << Seconds(t0, t1) << " s" << std::endl;
+
+  // The negative half of the claim, in the same binary.
+  std::set<int> composed;
+  for (int q = 0; q < num_blocks; q++) {
+    const int shift = ((premap[q] - q) % num_blocks + num_blocks) % num_blocks;
+    for (int d = -(kLanes - 1); d < kLanes; d++) {
+      composed.insert(((shift * kLanes + d) % degree + degree) % degree);
+    }
+  }
+  std::cout << "  the tower's lane prefix alone    : " << (2 * kLanes - 1)
+            << " diagonals" << std::endl
+            << "  the lane prefix o this premap    : " << composed.size()
+            << " diagonals  (= " << nd << " x " << (2 * kLanes - 1)
+            << ", nothing collides)" << std::endl;
+  EXPECT_EQ(static_cast<int>(composed.size()), nd * (2 * kLanes - 1));
+
+  // And it computes the permutation.
+  std::mt19937_64 gen(0xB10CBEEDULL);
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+  std::vector<double> x(static_cast<size_t>(kTokens) * kInstances);
+  for (auto &v : x) v = dist(gen);
+
+  const CiBatchLayout plain(degree, kTokens);
+  const CiBatchLayout chain(degree, kTokens, kLanes, kRank);
+  std::vector<Complex> mc(degree, Complex(0.0, 0.0));
+  for (int t = 0; t < kTokens; t++) {
+    for (int bi = 0; bi < kInstances; bi++) {
+      mc[chain.Slot(t, bi)] =
+          Complex(x[static_cast<size_t>(t) * kInstances + bi], 0.0);
+    }
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, kLevel, boot.param->GetScale(kLevel), mc);
+  Ciphertext<word> in;
+  boot.ui->Encrypt(in, pt);
+  Ciphertext<word> out;
+  lt.Evaluate(boot.context, out, in, boot.ui->GetEvkMap());
+
+  Plaintext<word> got;
+  boot.ui->Decrypt(got, out);
+  std::vector<Complex> v;
+  boot.context->encoder_.Decode(v, got);
+
+  double mag = 0.0, worst = 0.0, at_chain = 0.0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int bi = 0; bi < kInstances; bi++) {
+      const double want = x[static_cast<size_t>(t) * kInstances + bi];
+      mag = std::max(mag, std::abs(want));
+      worst = std::max(worst, std::abs(v[plain.Slot(t, bi)].real() - want));
+      // A guard against a silently-identity transform: read the OUTPUT at
+      // the addresses the input used and the values must have moved.
+      at_chain = std::max(at_chain, std::abs(v[chain.Slot(t, bi)].real() - want));
+    }
+  }
+  std::cout << std::scientific << std::setprecision(3)
+            << "  |permuted - exact| at plain slots: " << worst
+            << "   (relative 2^" << std::fixed << std::setprecision(2)
+            << std::log2(worst / mag) << ")" << std::endl
+            << std::scientific << std::setprecision(3)
+            << "  the same read at the CHAIN slots : " << at_chain
+            << "   (must be O(1): the map is not the identity)" << std::endl;
+  EXPECT_LT(worst, 1e-4 * mag);
+  EXPECT_GT(at_chain, 0.1 * mag);
 }
