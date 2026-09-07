@@ -46,6 +46,7 @@
 #include "RingFixture.h"
 #include "core/CiSwitchedCcmm.h"
 #include "core/EvkRequest.h"
+#include "core/SubringMatrix.h"
 #include "extension/CiBatch.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
@@ -597,4 +598,193 @@ TEST(PcPremap, TheStandaloneBlockPermutationIsThreeToTheFive) {
             << "   (must be O(1): the map is not the identity)" << std::endl;
   EXPECT_LT(worst, 1e-4 * mag);
   EXPECT_GT(at_chain, 0.1 * mag);
+}
+
+// ---------------------------------------------------------------------------
+// 7. WHAT THE PLAIN MAP IS FOR. A PC-attention plaintext is constant over the
+//    token axis and varies over the instance axis, and under the plain map
+//    that is a SUBRING element -- so it is not a new operator at all, it is
+//    `SubringMatrixHandler` ([KANG] Algorithm 1: depth 1, no rotation, no
+//    automorphism, no relinearization key), which is already in the tree.
+//    `SubringMatrix.cu` reads
+//
+//        lanes      = conjugate_invariant ? sub_degree : sub_degree / 2
+//        num_blocks = degree / sub_degree
+//
+//    so on this ring at `sub_degree = 512` that is 512 REAL lanes and 128
+//    blocks -- numerically the plain map's own two axes, 512 instances and
+//    128 tokens.
+//
+//    The arithmetic does NOT settle the ORDER, and the order is the whole
+//    question. `EncodeWeights` hands lane `t` to `EncodeSinC`'s block-0
+//    transform; a subring element then multiplies full slot `s` by its
+//    k-point spectrum read at SOME index, and whether that index is `s % 512`
+//    -- so that lane `t` is `CiBatchLayout::Slot`'s instance `t`, at every
+//    token -- is a fact about the encoder's slot convention, not about the
+//    algebra. If it is a permutation instead, a plain-native PC-attention
+//    has to pre-permute every weight; if the lanes leak, the whole approach
+//    is gone. So this measures three things in one pass: that the scaling is
+//    PERIODIC in the slot index (the lanes are the structure), that the 512
+//    lanes are INDEPENDENT (no blend), and which lane lands where.
+//
+//    The negative control is in the same read: under the CHAIN map one
+//    instance's 128 tokens do not share a lane, which is exactly why the map
+//    matters.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheSubringLaneIsThePlainMapsInstance) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  ASSERT_TRUE(boot.param->conjugate_invariant_)
+      << "the lane count is sub_degree only on the conjugate-invariant ring";
+  constexpr int kSubDegree = kInstances;  // 512, the batch
+  ASSERT_EQ(degree / kSubDegree, kTokens) << "blocks should be the tokens";
+
+  constexpr int kLevel = 4;
+  const double scale = boot.param->GetScale(kLevel);
+
+  // The weight: one distinct value a lane, laid on a ramp so that the lane
+  // index can be read straight back off the value. `cols_in = cols_out = 1`
+  // -- this is a scaling, and the only question is which slots each lane
+  // scales.
+  const auto lane_value = [](int t) { return (t + 1) / 1024.0; };
+  std::vector<std::vector<Complex>> u(kSubDegree,
+                                      std::vector<Complex>(1, Complex()));
+  for (int t = 0; t < kSubDegree; t++) u[t][0] = Complex(lane_value(t), 0.0);
+
+  cheddar::SubringMatrixHandler<word> subring(*boot.param,
+                                              boot.context->encoder_);
+  cheddar::SubringWeights<word> weights;
+  subring.EncodeWeights(weights, kLevel, scale, u, /*cols_in=*/1,
+                        /*cols_out=*/1, kSubDegree);
+
+  // The store, while it is in hand: this is the one line that stands between
+  // the algebra and a per-user PC-attention, so price it here rather than
+  // assert it from the source.
+  const cheddar::NPInfo np = boot.param->LevelToNP(kLevel, /*num_aux=*/0);
+  const size_t words = static_cast<size_t>(np.GetNumTotal()) * degree;
+  // What the same element needs if it is stored as what it is: the RNS limbs
+  // are needed either way, the 128 blocks are not.
+  const size_t compact_words = static_cast<size_t>(np.GetNumTotal()) * kSubDegree;
+  EXPECT_EQ(weights.data_.size(), words)
+      << "EncodeWeights expands a subring element to the full ring degree";
+  EXPECT_EQ(words / compact_words, static_cast<size_t>(degree / kSubDegree));
+
+  // The ciphertext: an ORDINARY slot message, as the batched layer's channels
+  // are. A random one, not a constant -- a constant would not notice a
+  // transform that mixed the blocks.
+  std::mt19937_64 gen(0xD1F7C0DEULL);
+  std::uniform_real_distribution<double> dist(0.5, 1.0);
+  std::vector<Complex> z(degree);
+  for (int s = 0; s < degree; s++) z[s] = Complex(dist(gen), 0.0);
+
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, kLevel, scale, z);
+  std::vector<Ciphertext<word>> in(1);
+  boot.ui->Encrypt(in[0], pt);
+
+  std::vector<Ciphertext<word>> res;
+  subring.Multiply(boot.context, res, weights, in);
+  ASSERT_EQ(res.size(), 1u);
+  EXPECT_EQ(boot.param->NPToLevel(res[0].GetNP()), kLevel - 1)
+      << "Algorithm 1 rescales, so the output is one level down";
+
+  Plaintext<word> out;
+  boot.ui->Decrypt(out, res[0]);
+  std::vector<Complex> v;
+  boot.context->encoder_.Decode(v, out);
+  ASSERT_EQ(static_cast<int>(v.size()), degree);
+
+  // Read the lane index off every slot. A blended lane -- the leak this is
+  // here to catch -- would land between two lane values, half a spacing away
+  // (4.9e-4), so the residual is the independence check.
+  std::vector<int> lane_of(degree, -1);
+  double worst = 0.0;
+  int worst_slot = -1;
+  for (int s = 0; s < degree; s++) {
+    const double ratio = v[s].real() / z[s].real();
+    int t = static_cast<int>(std::lround(ratio * 1024.0)) - 1;
+    t = std::max(0, std::min(kSubDegree - 1, t));
+    const double gap = std::abs(ratio - lane_value(t));
+    if (gap > worst) {
+      worst = gap;
+      worst_slot = s;
+    }
+    lane_of[s] = t;
+  }
+
+  // (a) periodic with the sub-degree: the lanes ARE the structure.
+  int off_period = 0;
+  for (int s = 0; s < degree; s++) {
+    if (lane_of[s] != lane_of[s % kSubDegree]) off_period++;
+  }
+  // (b) a bijection on one period: 512 lanes, none lost, none doubled. Checked
+  //     separately from (c) so that a mere reordering reads differently from
+  //     a leak.
+  std::vector<int> seen(kSubDegree, 0);
+  for (int t = 0; t < kSubDegree; t++) seen[lane_of[t]]++;
+  int not_once = 0;
+  for (int t = 0; t < kSubDegree; t++) {
+    if (seen[t] != 1) not_once++;
+  }
+  // (c) and the order itself.
+  int off_identity = 0;
+  for (int s = 0; s < degree; s++) {
+    if (lane_of[s] != s % kSubDegree) off_identity++;
+  }
+
+  // In the layer's own terms: under the plain map, instance b is scaled by
+  // lane b at every one of its tokens.
+  const CiBatchLayout plain(degree, kTokens);
+  const CiBatchLayout chain(degree, kTokens, kLanes, kRank);
+  int plain_bad = 0;
+  for (int t = 0; t < kTokens; t++) {
+    for (int b = 0; b < kInstances; b++) {
+      if (lane_of[plain.Slot(t, b)] != b) plain_bad++;
+    }
+  }
+  // The control: the same weight read through the CHAIN map, one instance
+  // across its tokens.
+  std::set<int> chain_lanes;
+  for (int t = 0; t < kTokens; t++) {
+    chain_lanes.insert(lane_of[chain.Slot(t, 0)]);
+  }
+
+  std::cout << "  sub_degree " << kSubDegree << " on R+ : " << kSubDegree
+            << " real lanes x " << (degree / kSubDegree) << " blocks"
+            << std::endl
+            << "  periodic in the slot index       : "
+            << (off_period == 0 ? "YES" : "NO") << "  (" << off_period
+            << " slots off)" << std::endl
+            << "  512 distinct lanes on one period : "
+            << (not_once == 0 ? "YES" : "NO") << "  (" << not_once
+            << " lanes not seen exactly once)" << std::endl
+            << "  lane t scales the slots s = t (mod k): "
+            << (off_identity == 0 ? "YES" : "NO") << "  (" << off_identity
+            << " slots off)" << std::endl
+            << "  => under the PLAIN map lane t IS instance t, every token: "
+            << (plain_bad == 0 ? "YES" : "NO") << std::endl
+            << "  CONTROL: under the CHAIN map instance 0 sees "
+            << chain_lanes.size() << " different lanes across its " << kTokens
+            << " tokens" << std::endl
+            << std::scientific << std::setprecision(3)
+            << "  |ratio - lane value| worst       : " << worst << " at slot "
+            << worst_slot << "   (lane spacing " << (1.0 / 1024.0) << ")"
+            << std::endl
+            << std::fixed << std::setprecision(1)
+            << "  EncodeWeights stored             : "
+            << (weights.data_.size() * sizeof(word) / 1024) << " KiB ("
+            << np.GetNumTotal() << " limbs x " << degree << ")" << std::endl
+            << "  a COMPACT subring store would be : "
+            << (compact_words * sizeof(word) / 1024) << " KiB ("
+            << np.GetNumTotal() << " limbs x " << kSubDegree << ") -- "
+            << (words / compact_words) << "x, the block count" << std::endl;
+
+  EXPECT_LT(worst, 2e-4) << "a lane blended into its neighbours";
+  EXPECT_EQ(off_period, 0) << "the scaling is not periodic in the slot index";
+  EXPECT_EQ(not_once, 0) << "one period does not see the 512 lanes exactly once";
+  EXPECT_EQ(off_identity, 0) << "lane t does not scale slot t (mod k)";
+  EXPECT_EQ(plain_bad, 0)
+      << "a subring weight is not the plain map's per-instance plaintext";
+  EXPECT_GT(chain_lanes.size(), 1u)
+      << "the chain map should NOT give one instance a single lane";
 }
