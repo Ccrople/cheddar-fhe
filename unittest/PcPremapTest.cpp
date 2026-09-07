@@ -985,3 +985,172 @@ TEST(PcPremap, TheCompactSubringStoreIsWordForWord) {
 
   EXPECT_EQ(lean.data_.size() * num_blocks, fat.data_.size());
 }
+
+// ---------------------------------------------------------------------------
+// 10. THE KEY-TOKEN SHIFT, under the plain map. `CiBatchAttention` splits the
+//     score product into two calls over the key tokens, and the second call's
+//     tokens `T/2 .. T-1` have to arrive where the first call's sat. Under the
+//     chain addressing that is ONE slot rotation by `lanes` (32), because bit
+//     `T/2` of the token is bit 0 of the block index -- the constructor
+//     asserts it so a layout change fails loudly.
+//
+//     Under the plain map the token is the SLOW axis, so the same shift is
+//     `T/2 * B` slots. That is a much bigger index (32768 against 32) and the
+//     question a plain-native attention has to answer is whether it is still
+//     ONE rotation, with a key that exists. It is: a rotation index is an
+//     index, its cost does not grow with its size, and the map is still
+//     lane-preserving at the CC-MM's sub-degree. Checked on the device rather
+//     than argued, because "the key exists" is not something arithmetic
+//     settles.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, ThePlainMapsKeyTokenShiftIsStillOneRotation) {
+  Ring boot("ci16_35.json");
+  const int degree = boot.Degree();
+  const CiBatchLayout plain(degree, kTokens);
+  const CiBatchLayout chain(degree, kTokens, kLanes, kRank);
+  const int half = kTokens / 2;
+
+  // The chain map's claim, as `CiBatchAttention`'s own constructor states it.
+  for (int t = 0; t < half; t++) {
+    for (int g = 0; g < kRank; g++) {
+      ASSERT_EQ(chain.BlockOf(t + half, g), chain.BlockOf(t, g) + 1);
+      ASSERT_EQ(chain.Slot(t + half, g * kLanes) - chain.Slot(t, g * kLanes),
+                kLanes);
+    }
+  }
+  // The plain map's.
+  const int r = half * kInstances;
+  for (int t = 0; t < half; t++) {
+    for (int b = 0; b < kInstances; b++) {
+      ASSERT_EQ(plain.Slot(t + half, b) - plain.Slot(t, b), r);
+    }
+  }
+  ASSERT_EQ(r, 32768);
+  ASSERT_EQ(r % kLanes, 0) << "the shift must stay lane-preserving";
+
+  constexpr int kLevel = 4;
+  EvkRequest req;
+  req.AddRequest(r, kLevel);
+  boot.ui->PrepareRotationKey(req);
+
+  std::mt19937_64 gen(0x5A17EDULL);
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+  std::vector<double> x(static_cast<size_t>(kTokens) * kInstances);
+  for (auto &v : x) v = dist(gen);
+  std::vector<Complex> m(degree, Complex(0.0, 0.0));
+  for (int t = 0; t < kTokens; t++) {
+    for (int b = 0; b < kInstances; b++) {
+      m[plain.Slot(t, b)] =
+          Complex(x[static_cast<size_t>(t) * kInstances + b], 0.0);
+    }
+  }
+  Plaintext<word> pt;
+  boot.context->encoder_.Encode(pt, kLevel, boot.param->GetScale(kLevel), m);
+  Ciphertext<word> in, out;
+  boot.ui->Encrypt(in, pt);
+  boot.context->HRot(out, in, boot.ui->GetRotationKey(r), r);
+
+  Plaintext<word> got;
+  boot.ui->Decrypt(got, out);
+  std::vector<Complex> v;
+  boot.context->encoder_.Decode(v, got);
+
+  double mag = 0.0, worst = 0.0, unmoved = 0.0;
+  for (int t = 0; t < half; t++) {
+    for (int b = 0; b < kInstances; b++) {
+      const double want = x[static_cast<size_t>(t + half) * kInstances + b];
+      mag = std::max(mag, std::abs(want));
+      worst = std::max(worst, std::abs(v[plain.Slot(t, b)].real() - want));
+      // The guard: the values must actually have travelled.
+      unmoved = std::max(
+          unmoved, std::abs(v[plain.Slot(t, b)].real() -
+                            x[static_cast<size_t>(t) * kInstances + b]));
+    }
+  }
+  std::cout << "  chain-map key-token shift        : " << kLanes
+            << " slots (one block)" << std::endl
+            << "  plain-map key-token shift        : " << r << " slots (T/2 x B"
+            << "), ONE rotation either way" << std::endl
+            << std::scientific << std::setprecision(3)
+            << "  |shifted - exact| at plain slots : " << worst
+            << "   (relative 2^" << std::fixed << std::setprecision(2)
+            << std::log2(worst / mag) << ")" << std::endl;
+  EXPECT_LT(worst, 1e-4 * mag);
+  EXPECT_GT(unmoved, 0.1 * mag) << "the rotation did nothing";
+}
+
+// ---------------------------------------------------------------------------
+// 11. AND THE SHIFT COMPOSES WITH THE PREMAP FOR FREE. The shift above is a
+//     rotation because `CiBatchAttention` chose it over a second forward
+//     converter (3.8 GiB of plaintexts) -- but it is ALSO a block-granularity
+//     lane-preserving permutation, so it could instead ride the conversion as
+//     part of the premap and cost no key switch at all. The ceiling argument
+//     says the composition is free: the converter's diagonals are already on
+//     the stride-`sub_degree` lattice and already at `degree / sub_degree`, so
+//     ANY block permutation folds, and composing two of them is still one.
+//
+//     Measured here so the trade is a number rather than a hope: 1024 HRots a
+//     layer (one a channel a call a kv head) against one more converter's
+//     plaintexts. This test does not make the choice; it prices the option.
+// ---------------------------------------------------------------------------
+TEST(PcPremap, TheShiftComposedWithThePremapStillFoldsAtTheCeiling) {
+  Ring swtch("ci_ringswitch16_35_boot.json", {}, 0,
+             /*build_user_interface=*/false);
+  const int degree = swtch.Degree();
+  const CiSwitchedCcmmLayout layout(degree, degree / kRank, kLanes);
+  const auto premap = BuildPremap(degree);
+  const int num_blocks = degree / kLanes;
+  const int shift_blocks = (kTokens / 2) * kInstances / kLanes;
+  ASSERT_EQ(shift_blocks, 1024);
+
+  // The composed map: take the shifted source block, then relabel it the way
+  // the plain -> chain premap does.
+  std::vector<int> composed(num_blocks);
+  for (int p = 0; p < num_blocks; p++) {
+    composed[p] = premap[(p + shift_blocks) % num_blocks];
+  }
+  std::vector<int> seen(num_blocks, 0);
+  for (int p = 0; p < num_blocks; p++) seen[composed[p]]++;
+  for (int b = 0; b < num_blocks; b++) {
+    ASSERT_EQ(seen[b], 1) << "the composition is not a bijection at block " << b;
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> a(swtch.context, kLanes, kForwardLevel, -1, &layout,
+                          nullptr, kBabySteps);
+  const auto t1 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> b(swtch.context, kLanes, kForwardLevel, -1, &layout,
+                          &premap, kBabySteps);
+  const auto t2 = std::chrono::steady_clock::now();
+  CiSinCConverter<word> c(swtch.context, kLanes, kForwardLevel, -1, &layout,
+                          &composed, kBabySteps);
+  const auto t3 = std::chrono::steady_clock::now();
+
+  const auto *fa = a.GetForward();
+  const auto *fb = b.GetForward();
+  const auto *fc = c.GetForward();
+  ASSERT_NE(fa, nullptr);
+  ASSERT_NE(fb, nullptr);
+  ASSERT_NE(fc, nullptr);
+
+  std::cout << std::fixed << std::setprecision(2)
+            << "  chain-native            : bs " << fa->GetBS() << " x gs "
+            << fa->GetGS() << " = " << (fa->GetBS() * fa->GetGS())
+            << " diagonals, " << (fa->PlaintextBytes() >> 20) << " MiB, "
+            << Seconds(t0, t1) << " s" << std::endl
+            << "  premap                  : bs " << fb->GetBS() << " x gs "
+            << fb->GetGS() << " = " << (fb->GetBS() * fb->GetGS())
+            << " diagonals, " << (fb->PlaintextBytes() >> 20) << " MiB, "
+            << Seconds(t1, t2) << " s" << std::endl
+            << "  premap o the shift      : bs " << fc->GetBS() << " x gs "
+            << fc->GetGS() << " = " << (fc->GetBS() * fc->GetGS())
+            << " diagonals, " << (fc->PlaintextBytes() >> 20) << " MiB, "
+            << Seconds(t2, t3) << " s" << std::endl
+            << "  ceiling (degree / sub_degree) = " << num_blocks << std::endl;
+
+  EXPECT_EQ(fa->GetBS(), fc->GetBS());
+  EXPECT_EQ(fa->GetGS(), fc->GetGS());
+  EXPECT_EQ(fa->GetPreRotationAmount(), fc->GetPreRotationAmount());
+  EXPECT_EQ(fa->PlaintextBytes(), fc->PlaintextBytes());
+  EXPECT_LE(fc->GetBS() * fc->GetGS(), num_blocks);
+}
