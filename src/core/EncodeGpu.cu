@@ -77,17 +77,25 @@ __global__ void SpecialIfftStagesKernel(double2 *data, const double2 *tw,
 // writing in order keeps the write coalesced, which is the side that carries
 // two values per slot off the conjugate-invariant ring.
 // ---------------------------------------------------------------------------
+//
+// `batch` messages at once: the transforms are independent and equal-sized, so
+// the entry index is the high bits of the thread index and the only thing it
+// changes is which slice of `fft` is read and which of `coeff` is written.
 __global__ void FftToCoeffKernel(double *coeff, const double2 *fft,
                                  int num_slots, int log_slots, int gap,
-                                 int half_degree, bool conjugate_invariant) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= num_slots) return;
+                                 int half_degree, bool conjugate_invariant,
+                                 int batch, int coeff_stride) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_slots * batch) return;
+  const int e = idx >> log_slots;
+  const int i = idx & (num_slots - 1);
   const int src = static_cast<int>(__brev(static_cast<unsigned>(i)) >>
                                    (32 - log_slots));
-  const double2 v = fft[src];
+  const double2 v = fft[static_cast<size_t>(e) * num_slots + src];
   const double inv = 1.0 / static_cast<double>(num_slots);
-  coeff[i * gap] = v.x * inv;
-  if (!conjugate_invariant) coeff[i * gap + half_degree] = v.y * inv;
+  double *out = coeff + static_cast<size_t>(e) * coeff_stride;
+  out[i * gap] = v.x * inv;
+  if (!conjugate_invariant) out[i * gap + half_degree] = v.y * inv;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,19 +203,29 @@ __device__ __forceinline__ void WriteLimbs(word *dst, int64_t index,
   }
 }
 
+// `batch` decompositions at once. The source is one contiguous run of
+// `batch * n` values; the destination is NOT -- a plaintext is
+// `[prime][coefficient]` and the batch stacks whole plaintexts, so the entry
+// index scales `dst_batch_stride` while the limb stride inside an entry stays
+// `n`. That is the layout every batched transform in `NTTHandler` takes, which
+// is the point: the NTT that follows reads this buffer as it stands.
 template <typename word>
 __global__ void RnsDecomposeKernel(word *dst, const double *src, int n,
                                    int num_primes, const uint64_t *consts,
                                    const make_signed_t<word> *inv_primes,
-                                   double scale, bool montgomery) {
+                                   double scale, bool montgomery, int batch,
+                                   int64_t dst_batch_stride) {
   extern __shared__ uint64_t sh_const[];
   const PrimeTable<word> table =
       LoadPrimeTable<word>(sh_const, num_primes, consts, inv_primes);
 
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  WriteLimbs<word>(dst, i, n, round(src[i] * scale), num_primes, table,
-                   montgomery);
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<int64_t>(n) * batch) return;
+  const int64_t e = (batch == 1) ? 0 : idx / n;
+  const int64_t i = idx - e * n;
+  WriteLimbs<word>(dst + e * dst_batch_stride, i, n, round(src[idx] * scale),
+                   num_primes, table, montgomery);
 }
 
 // ---------------------------------------------------------------------------
@@ -431,20 +449,22 @@ void GpuEncoder<word>::StageFromBuffer(int num_slots, bool real) const {
 }
 
 template <typename word>
-void GpuEncoder<word>::SpecialIFFT(double *data, int num_slots) const {
+void GpuEncoder<word>::SpecialIFFT(double *data, int num_slots,
+                                   int batch /*= 1*/) const {
   AssertTrue(num_slots == (1 << Log2Ceil(num_slots)),
              "GpuEncoder::SpecialIFFT: Power of 2 num slots only");
   AssertTrue(num_slots <= max_slots_,
              "GpuEncoder::SpecialIFFT: too many slots for this ring");
+  AssertTrue(batch >= 1, "GpuEncoder::SpecialIFFT: invalid batch");
   if (num_slots <= 1) return;
 
   const int log_slots = Log2Ceil(num_slots);
   double2 *d = reinterpret_cast<double2 *>(data);
   const double2 *tw = reinterpret_cast<const double2 *>(twiddle_.data());
 
-  auto launch = [&](int log_chunk, int log_elem_stride) {
+  auto launch = [&](int log_chunk, int log_elem_stride, int span) {
     const int chunk = 1 << log_chunk;
-    const int blocks = num_slots >> log_chunk;
+    const int blocks = span >> log_chunk;
     const int threads = std::min(chunk >> 1, 256);
     const size_t smem = static_cast<size_t>(chunk) * sizeof(double2);
     kernel::SpecialIfftStagesKernel<<<blocks, std::max(threads, 1), smem,
@@ -453,9 +473,23 @@ void GpuEncoder<word>::SpecialIFFT(double *data, int num_slots) const {
   };
 
   if (log_slots <= kMaxLogChunk) {
-    launch(log_slots, 0);
+    // A BATCH IS JUST MORE BLOCKS HERE, and that is a fact about the kernel
+    // rather than a convenience. With `log_elem_stride = 0` block `g` owns
+    // the contiguous chunk at `g << log_chunk`, and every twiddle it reads is
+    // indexed by `(group_base + lo) & (half - 1)` with `half <= chunk/2`:
+    // `group_base` is a multiple of `chunk`, so it drops out of the mask and
+    // every block runs the SAME size-`num_slots` transform on its own slice.
+    // Batching therefore costs one launch parameter and changes no arithmetic.
+    launch(log_slots, 0, batch * num_slots);
     return;
   }
+  // Above a block's chunk the transform is two passes and the high pass's
+  // groups are strided across the whole message, so a batch would have to
+  // enter the index map itself. No caller needs it: the batched route is the
+  // subring encoder's, whose slot count is the subring degree.
+  AssertTrue(batch == 1,
+             "GpuEncoder::SpecialIFFT: the batched transform is the one-pass "
+             "one, so the slot count must fit a block's chunk");
   // Split so that both passes stage a chunk that fits, and so that neither
   // ends up with so few blocks that the machine goes idle -- which is the
   // failure mode of the lopsided split, not a shared-memory limit.
@@ -464,26 +498,28 @@ void GpuEncoder<word>::SpecialIFFT(double *data, int num_slots) const {
   const int log_high = log_slots - log_low;
   AssertTrue(log_high <= kMaxLogChunk,
              "GpuEncoder::SpecialIFFT: slot count too large for two passes");
-  launch(log_high, log_low);  // the stages with stride >= 2^log_low
-  launch(log_low, 0);         // the rest, inside a contiguous chunk
+  launch(log_high, log_low, num_slots);  // the stages with stride >= 2^log_low
+  launch(log_low, 0, num_slots);         // the rest, inside a contiguous chunk
 }
 
 template <typename word>
 void GpuEncoder<word>::FftToCoeff(double *coeff, const double *fft,
-                                  int num_slots) const {
+                                  int num_slots, int batch /*= 1*/) const {
+  AssertTrue(batch >= 1, "GpuEncoder::FftToCoeff: invalid batch");
   const int log_slots = Log2Ceil(num_slots);
   const bool ci = param_.conjugate_invariant_;
   const int half_degree = degree_ / 2;
   const int gap = (ci ? degree_ : half_degree) / num_slots;
   if (gap > 1) {
-    cudaMemsetAsync(coeff, 0, static_cast<size_t>(degree_) * sizeof(double),
-                    stream_);
+    cudaMemsetAsync(
+        coeff, 0,
+        static_cast<size_t>(batch) * degree_ * sizeof(double), stream_);
   }
   const int threads = 256;
-  const int blocks = (num_slots + threads - 1) / threads;
+  const int blocks = (num_slots * batch + threads - 1) / threads;
   kernel::FftToCoeffKernel<<<blocks, threads, 0, stream_>>>(
       coeff, reinterpret_cast<const double2 *>(fft), num_slots, log_slots, gap,
-      half_degree, ci);
+      half_degree, ci, batch, degree_);
 }
 
 template <typename word>
@@ -524,16 +560,19 @@ void GpuEncoder<word>::PrepareLevel(int level, int num_aux /*= 0*/) const {
 template <typename word>
 void GpuEncoder<word>::RnsDecompose(word *dst, const double *src, int n,
                                     const NPInfo &np, double scale,
-                                    bool montgomery) const {
+                                    bool montgomery, int batch /*= 1*/,
+                                    int64_t dst_batch_stride /*= 0*/) const {
+  AssertTrue(batch >= 1, "GpuEncoder::RnsDecompose: invalid batch");
   const int num_primes = np.GetNumTotal();
   const uint64_t *consts = PrimeConstants(np);
   const int threads = kRnsBlockDim;
-  const int blocks = (n + threads - 1) / threads;
+  const int64_t total = static_cast<int64_t>(n) * batch;
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
   const size_t smem = static_cast<size_t>(num_primes) *
                       (3 * sizeof(uint64_t) + sizeof(make_signed_t<word>));
   kernel::RnsDecomposeKernel<word><<<blocks, threads, smem, stream_>>>(
       dst, src, n, num_primes, consts, param_.GetInvPrimesPtr(np), scale,
-      montgomery);
+      montgomery, batch, dst_batch_stride);
 }
 
 template <typename word>
@@ -589,6 +628,54 @@ void GpuEncoder<word>::EncodeReal(Plaintext<word> &ptxt, int level,
   RnsDecompose(ptxt.mx_.data(), coeff_.data(), degree_, np, scale, false);
   auto view = ptxt.View();
   ntt_handler_.NTT(view, np, ptxt.ConstView(), true);
+}
+
+// One encoding of `batch` real messages, and the reason it exists is the
+// launch count and nothing else. `EncodeReal` at 512 slots on a degree-65536
+// ring runs a one-block transform, a two-block placement and four full-degree
+// passes behind a host-side wait for the staging DMA, and it costs the same
+// wall clock at 21 limbs as at 7 -- three times the arithmetic, 0.9x the time,
+// which says the entry price is per-entry OVERHEAD and not the transform. This
+// pays that price once for `batch` entries: one host copy, one transfer, one
+// wait, and one launch of each of the six stages.
+template <typename word>
+void GpuEncoder<word>::EncodeRealBatch(word *dst, int level, double scale,
+                                       const double *values, int num_slots,
+                                       int batch, int num_aux /*= 0*/) const {
+  AssertTrue(batch >= 1, "GpuEncoder::EncodeRealBatch: invalid batch");
+  AssertTrue(num_slots >= 1 && num_slots == (1 << Log2Ceil(num_slots)),
+             "GpuEncoder::EncodeRealBatch: Power of 2 num slots only");
+  AssertTrue(num_slots <= max_slots_,
+             "GpuEncoder::EncodeRealBatch: too many slots for this ring");
+  const int64_t total_slots = static_cast<int64_t>(batch) * num_slots;
+  AssertTrue(total_slots <= INT32_MAX,
+             "GpuEncoder::EncodeRealBatch: batch too large to stage");
+
+  // The messages are already contiguous in the caller's array -- a batch of
+  // lane vectors is what a lane-major weight array IS -- so the staging copy
+  // is one memcpy and the transfer is one descriptor instead of `batch` of
+  // 4 KiB each.
+  const int staged_slots = static_cast<int>(total_slots);
+  double *stage = StagingBuffer(staged_slots);
+  std::memcpy(stage, values, static_cast<size_t>(staged_slots) * sizeof(double));
+  StageFromBuffer(staged_slots, true);
+
+  SpecialIFFT(fft_.data(), num_slots, batch);
+
+  const size_t coeff_need = static_cast<size_t>(batch) * degree_;
+  if (coeff_.size() < coeff_need) coeff_.resize(coeff_need, stream_);
+  FftToCoeff(coeff_.data(), fft_.data(), num_slots, batch);
+
+  const NPInfo np = param_.LevelToNP(level, num_aux);
+  const int num_total_primes = np.GetNumTotal();
+  const int entry_words = num_total_primes * degree_;
+  RnsDecompose(dst, coeff_.data(), degree_, np, scale, false, batch,
+               entry_words);
+
+  DvView<word> view(dst, batch * entry_words,
+                    batch * np.num_aux_ * degree_);
+  DvConstView<word> src(view);
+  ntt_handler_.NTT(view, np, src, true, batch);
 }
 
 template <typename word>

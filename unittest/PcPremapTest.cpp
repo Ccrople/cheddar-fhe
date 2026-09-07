@@ -1218,7 +1218,6 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
   subring.EncodeWeightsReal(fast, boot.context->gpu_encoder_, kLevel, scale,
                             flat, kColsIn, kColsOut, kSubDegree);
   cudaDeviceSynchronize();
-  const auto t2 = std::chrono::steady_clock::now();
 
   ASSERT_EQ(fast.GetEntryDegree(), kSubDegree);
   ASSERT_EQ(fast.GetColsIn(), kColsIn);
@@ -1239,27 +1238,45 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
     if (b[i] != 0) nonzero++;
   }
 
+  // WHAT IT COSTS -- measured at the shape the consumer encodes, and warm.
+  // The 8x8 tile above is the CORRECTNESS sample and the wrong one to price:
+  // the device route encodes in CHUNKS, so at 64 entries the first allocation
+  // of a chunk's scratch, the pinned staging and the level's prime table are
+  // most of the wall clock and none of them is a per-entry cost. The
+  // PC-attention's contraction is `head_dim` wide, so this is a real call.
+  constexpr int kPriceIn = 128;
+  constexpr int kPriceOut = 8;
+  const int price_entries = kPriceIn * kPriceOut;
+  std::vector<double> price(static_cast<size_t>(price_entries) * kSubDegree);
+  for (auto &v : price) v = dist(gen);
+
+  auto price_at = [&](int level) {
+    const double s = boot.param->GetScale(level);
+    cheddar::SubringWeights<word> w;
+    subring.EncodeWeightsReal(w, boot.context->gpu_encoder_, level, s, price,
+                              kPriceIn, kPriceOut, kSubDegree);
+    cudaDeviceSynchronize();
+    const auto a0 = std::chrono::steady_clock::now();
+    subring.EncodeWeightsReal(w, boot.context->gpu_encoder_, level, s, price,
+                              kPriceIn, kPriceOut, kSubDegree);
+    cudaDeviceSynchronize();
+    const auto a1 = std::chrono::steady_clock::now();
+    return 1e6 * Seconds(a0, a1) / price_entries;
+  };
+
   // WHERE THE REMAINING COST IS, in one line: encode the same entries again
   // at a level with three times the limbs. Every full-degree stage the route
   // still runs -- RnsDecompose and the NTT -- is linear in the limb count, so
   // if the entry cost tracks the limbs it is bandwidth and the lever is an
-  // O(k) transform; if it does not, it is per-entry OVERHEAD and the lever is
-  // batching. Levels 4 and 16 differ by 7 limbs against 19.
+  // O(k) transform; if it does not, there is still fixed cost to amortise.
+  // Levels 4 and 16 differ by 7 limbs against 21.
   constexpr int kHighLevel = 16;
   const cheddar::NPInfo np = boot.param->LevelToNP(kLevel, 0);
   const cheddar::NPInfo np_hi = boot.param->LevelToNP(kHighLevel, 0);
-  cheddar::SubringWeights<word> tall;
-  cudaDeviceSynchronize();
-  const auto t3 = std::chrono::steady_clock::now();
-  subring.EncodeWeightsReal(tall, boot.context->gpu_encoder_, kHighLevel,
-                            boot.param->GetScale(kHighLevel), flat, kColsIn,
-                            kColsOut, kSubDegree);
-  cudaDeviceSynchronize();
-  const auto t4 = std::chrono::steady_clock::now();
 
   const double ref_us = 1e6 * Seconds(t0, t1) / entries;
-  const double fast_us = 1e6 * Seconds(t1, t2) / entries;
-  const double tall_us = 1e6 * Seconds(t3, t4) / entries;
+  const double fast_us = price_at(kLevel);
+  const double tall_us = price_at(kHighLevel);
   // What a layer would pay: one plaintext per (public token, channel) per kv
   // head, at Sylph's 3968 public tokens.
   const double per_layer = 3968.0 * 128 * 8;
@@ -1268,8 +1285,9 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
             << kSubDegree << ", level " << kLevel << std::endl
             << "  EncodeWeights   (host SinC)      : " << ref_us
             << " us an entry" << std::endl
-            << "  EncodeWeightsReal (device slots) : " << fast_us
-            << " us an entry   (" << (ref_us / fast_us) << "x)" << std::endl
+            << "  EncodeWeightsReal (device, batched, " << price_entries
+            << " entries): " << fast_us << " us an entry   ("
+            << (ref_us / fast_us) << "x)" << std::endl
             << "  a layer's 4.06M operands would be: " << std::setprecision(0)
             << (per_layer * ref_us / 1e6) << " s  ->  "
             << (per_layer * fast_us / 1e6) << " s" << std::endl
@@ -1284,11 +1302,17 @@ TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
             << a.size() << std::endl;
 
   // Not an assertion about the hardware -- a claim about which lever is next,
-  // recorded so it is not re-guessed. If the entry cost were bandwidth-bound
-  // it would follow the limb count.
-  EXPECT_LT(tall_us, 2.0 * fast_us)
-      << "the encode tracks the limb count, so it IS the full-degree "
-         "transform and an O(k) one is the lever";
+  // recorded so it is not re-guessed. IT HAS ALREADY FLIPPED ONCE. Before the
+  // encode was batched an entry cost the SAME at 21 limbs as at 7 (0.9x
+  // against 3.0x), which said the price was per-entry overhead -- the staging
+  // wait and six launches -- and that amortising it came first. It did:
+  // 81.3 -> 11.6 us an entry. What that uncovered is the full-degree transform
+  // itself, and the cost now tracks the limbs, so the O(k) route -- k points
+  // instead of `degree` for a message with k degrees of freedom -- is next.
+  EXPECT_GT(tall_us, 2.0 * fast_us)
+      << "the encode has stopped tracking the limb count, so fixed cost is "
+         "back in front of the transform and amortising it comes before the "
+         "O(k) route again";
 
   EXPECT_GT(nonzero, a.size() / 2)
       << "the device store is mostly zero -- nothing was encoded";

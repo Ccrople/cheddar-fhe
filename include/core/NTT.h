@@ -86,8 +86,16 @@ class NTTHandler {
   NTTHandler &operator=(const NTTHandler &) = delete;
 
   // dst = NTT(src), montgomery_conversion is false by default
+  //
+  // `batch` transforms over the same prime set, laid out back to back --
+  // `[transform][prime][coefficient]`, stride `np.GetNumTotal() * degree` --
+  // exactly as NTTForModUp already takes them. Every stage of this transform
+  // is already written against `blockIdx.z` and a batch stride, so a batch is
+  // one grid dimension and nothing else; it is here because the encoder's
+  // subring route runs a transform per PLAINTEXT and there are millions of
+  // them in a layer, so the three launches were the cost, not the arithmetic.
   void NTT(DvView<word> &dst, const NPInfo &np, const DvConstView<word> &src,
-           bool montgomery_conversion = false) const;
+           bool montgomery_conversion = false, int batch = 1) const;
 
   // dst = INTT(src), montgomery_conversion is true by default
   void INTT(DvView<word> &dst, const NPInfo &np, const DvConstView<word> &src,

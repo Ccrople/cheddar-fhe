@@ -229,6 +229,24 @@ class SubringMatrixHandler {
    * Word-for-word against `EncodeWeights` in PcPremapTest's
    * TheDeviceSubringEncodeIsTheSinCOne, which also prices both.
    *
+   * ## Why it encodes in CHUNKS
+   *
+   * Once the host arithmetic is gone the entry price is not the transform
+   * either. Measured by the limb count -- which every full-degree stage left
+   * in the route is linear in -- an entry costs 74 us at 21 limbs against
+   * 81 us at 7: three times the arithmetic, 0.9x the wall clock. So what a
+   * single entry pays for is per-entry OVERHEAD (a host wait on the staging
+   * DMA, six kernel launches, a 4 KiB transfer), and the lever is to spend it
+   * once for many entries. `GpuEncoder::EncodeRealBatch` does exactly that,
+   * and the input format above is why it is free to: a chunk of entries is
+   * already a contiguous run of `values`.
+   *
+   * The chunk is a byte budget rather than an entry count because the
+   * intermediate is FULL-DEGREE -- 11 MiB an entry at 21 limbs, of which only
+   * `sub_degree` words a limb survive the gather. Shrinking that intermediate
+   * to the k points it can actually take is the NEXT lever, and it is second
+   * because this one is what the measurement pointed at.
+   *
    * @param res output weights
    * @param gpu the device encoder (`Context::gpu_encoder_`)
    * @param level level to encode at

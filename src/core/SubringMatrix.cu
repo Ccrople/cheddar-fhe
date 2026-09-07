@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cstdint>
+
 #include "common/Assert.h"
 #include "common/Basic.cuh"
 #include "common/CommonUtils.h"
@@ -204,6 +207,29 @@ void SubringMatrixHandler<word>::EncodeWeights(
   }
 }
 
+namespace {
+
+// The batched encode's scratch budget, in words -- 256 MiB of 64-bit ones.
+// The intermediate a chunk holds is `chunk` FULL-DEGREE plaintexts, which at
+// the ring's 21 limbs is 11 MiB an entry, so this buys a chunk of 24.
+//
+// Chosen by measurement, not by feel. On the A100 at ci16_35, k=512, level 16
+// (21 limbs), 1024 entries, warm:
+//
+//     64 MiB (chunk 6)    38.3 us an entry
+//    256 MiB (chunk 24)   32.8 us an entry
+//    512 MiB (chunk 48)   31.5 us an entry
+//
+// The knee is here: doubling again buys 4 %, because once the launches are
+// amortised the route is bandwidth-bound on the full-degree intermediate --
+// the entry cost tracks the limb count 2.9x against 3.0x -- and a bigger chunk
+// cannot move that. Shrinking the intermediate to the k points a subring
+// element can actually take is what moves it next. The transient is bounded
+// and per-call, so it does not follow the context length.
+constexpr size_t kEncodeChunkWords = (size_t{256} << 20) / sizeof(uint64_t);
+
+}  // namespace
+
 template <typename word>
 void SubringMatrixHandler<word>::EncodeWeightsReal(
     SubringWeights<word> &res, const GpuEncoder<word> &gpu, int level,
@@ -253,27 +279,49 @@ void SubringMatrixHandler<word>::EncodeWeightsReal(
   res.np_ = np;
   res.data_.resize(static_cast<int>(entry_words * entries));
 
-  // One message of `sub_degree` slots an entry. `GpuEncoder::EncodeReal`
-  // stages it into its pinned buffer, runs the size-k special IFFT and lands
+  // One message of `sub_degree` slots an entry. The size-k special IFFT lands
   // slot t at coefficient t * (degree / k) -- the subring element's own
   // coefficients, and nothing else non-zero.
-  std::vector<double> message(lanes);
-  Pt entry;
-  for (size_t e = 0; e < entries; e++) {
-    const double *src = values.data() + e * lanes;
-    std::copy(src, src + lanes, message.begin());
-    gpu.EncodeReal(entry, level, scale, message, num_aux);
+  //
+  // IT IS DONE IN CHUNKS, and the reason is measured rather than assumed: a
+  // single entry's encode costs the same at 21 limbs as at 7, so its price is
+  // the six launches and the host wait on the staging DMA, not the transform.
+  // `EncodeRealBatch` pays that once for a whole chunk. What bounds the chunk
+  // is the intermediate, which is FULL-DEGREE even though only `sub_degree`
+  // words an entry survive the gather -- 11 MiB an entry at 21 limbs -- so the
+  // chunk is a byte budget and not an entry count.
+  //
+  // The messages a chunk needs are already contiguous in `values`: the input
+  // is entry-major and lane-contiguous, so a chunk of entries IS a run of
+  // `width * lanes` doubles and the staging copy stays one memcpy.
+  const size_t full_words = static_cast<size_t>(num_total_primes) * degree;
+  int chunk = static_cast<int>(kEncodeChunkWords / full_words);
+  if (chunk < 1) chunk = 1;
+  if (chunk > static_cast<int>(entries)) chunk = static_cast<int>(entries);
 
-    const size_t offset = e * entry_words;
+  // An expanded store IS the encoder's own output, so it lands in `res`
+  // directly and the scratch is never allocated.
+  DeviceVector<word> stage(
+      compact ? static_cast<int>(full_words * chunk) : 0);
+
+  for (size_t base = 0; base < entries; base += chunk) {
+    const int width =
+        static_cast<int>(std::min<size_t>(chunk, entries - base));
+    const size_t offset = base * entry_words;
+    word *encoded = compact ? stage.data() : res.data_.data() + offset;
+
+    gpu.EncodeRealBatch(encoded, level, scale, values.data() + base * lanes,
+                        lanes, width, num_aux);
+
     if (compact) {
-      const int num_words = static_cast<int>(entry_words);
+      // `dst[i] = src[i * num_blocks]` over the WHOLE chunk in one launch:
+      // entry e's words start at `e * entry_words` in the destination and at
+      // `e * entry_words * num_blocks` = `e * full_words` in the source, so
+      // the batched gather is the same expression the single one is.
+      const int num_words = static_cast<int>(entry_words * width);
       const int grid = (num_words + kernel_block_dim_ - 1) / kernel_block_dim_;
       kernel::SubringCompact<word><<<grid, kernel_block_dim_>>>(
-          res.data_.data() + offset, entry.mx_.data(), num_words, num_blocks);
-    } else {
-      cudaMemcpyAsync(res.data_.data() + offset, entry.mx_.data(),
-                      entry_words * sizeof(word), cudaMemcpyDeviceToDevice,
-                      cudaStreamLegacy);
+          res.data_.data() + offset, stage.data(), num_words, num_blocks);
     }
   }
 }
