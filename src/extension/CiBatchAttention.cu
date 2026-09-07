@@ -18,6 +18,20 @@
 
 namespace cheddar {
 
+namespace {
+
+// The layout the attention runs on: chain-addressed by default, the plain
+// map `Slot(t, b) = t * B + b` when the config asks for it. A function
+// because the member initialiser list cannot branch between two
+// constructors.
+CiBatchLayout MakeBatchLayout(int num_slots, int num_tokens, int lanes,
+                              int rank, bool plain) {
+  if (plain) return CiBatchLayout(num_slots, num_tokens);
+  return CiBatchLayout(num_slots, num_tokens, lanes, rank);
+}
+
+}  // namespace
+
 template <typename word>
 CiBatchAttention<word>::CiBatchAttention(
     std::shared_ptr<const BootContext<word>> boot,
@@ -31,8 +45,8 @@ CiBatchAttention<word>::CiBatchAttention(
       cfg_{cfg},
       chain_{switch_ctx_->param_.degree_, small_ctx_->param_.degree_,
              cfg.sub_degree},
-      layout_{boot_->param_.MaxNumSlots(), cfg.num_tokens, cfg.sub_degree,
-              chain_.rank},
+      layout_{MakeBatchLayout(boot_->param_.MaxNumSlots(), cfg.num_tokens,
+                              cfg.sub_degree, chain_.rank, cfg.plain_map)},
       switcher_{switch_ctx_, small_ctx_},
       lift_{small_ctx_, lifted_ctx_},
       ccmm_{lifted_ctx_->param_, lifted_ctx_->ntt_handler_},
@@ -69,18 +83,75 @@ CiBatchAttention<word>::CiBatchAttention(
   // `lanes` on the masked ciphertext -- checked here, so a layout change
   // fails loudly rather than in the product.
   const int T = cfg_.num_tokens;
-  for (int t = 0; t < T / 2; t++) {
-    for (int g = 0; g < chain_.rank; g++) {
-      AssertTrue(layout_.BlockOf(t + T / 2, g) == layout_.BlockOf(t, g) + 1,
-                 "CiBatchAttention: the key-token shift is not one block");
+  if (!cfg_.plain_map) {
+    for (int t = 0; t < T / 2; t++) {
+      for (int g = 0; g < chain_.rank; g++) {
+        AssertTrue(layout_.BlockOf(t + T / 2, g) == layout_.BlockOf(t, g) + 1,
+                   "CiBatchAttention: the key-token shift is not one block");
+      }
     }
+  } else {
+    // The plain map's own version of the same claim: the token is the SLOW
+    // axis, so the shift is `T/2 * B` slots -- one rotation, and still
+    // lane-preserving so nothing downstream notices its size.
+    const int r = GetShiftRotation();
+    for (int t = 0; t < T / 2; t++) {
+      for (int b = 0; b < layout_.num_instances; b++) {
+        AssertTrue(layout_.Slot(t + T / 2, b) - layout_.Slot(t, b) == r,
+                   "CiBatchAttention: the key-token shift is not one "
+                   "rotation under the plain map");
+      }
+    }
+    AssertTrue(r % cfg_.sub_degree == 0,
+               "CiBatchAttention: the key-token shift must preserve lanes");
   }
+
+  // The premap the plain map needs, built from the two layouts themselves so
+  // that a layout change cannot silently disagree with a transcription of it.
+  // `premap_[b]` is the block the CHAIN addressing holds what the plain map
+  // holds at block `b`; lanes -- the low log2(sub_degree) slot bits -- are
+  // untouched, which is the contract `forward_premap` states. The same vector
+  // serves the inverse, a block bit reversal being its own inverse.
+  const std::vector<int> *premap = nullptr;
+  if (cfg_.plain_map) {
+    AssertTrue(!cfg_.fused_scores,
+               "CiBatchAttention: the tower's lane prefix mixes only within a "
+               "lane group, so it cannot carry a block premap (63 -> 15309 "
+               "diagonals) -- the plain map's scores must come back through "
+               "the inverse converter");
+    const CiBatchLayout chain_layout(layout_.num_slots, T, cfg_.sub_degree,
+                                     chain_.rank);
+    const int num_blocks = layout_.num_slots / cfg_.sub_degree;
+    premap_.assign(num_blocks, -1);
+    for (int t = 0; t < T; t++) {
+      for (int b = 0; b < layout_.num_instances; b++) {
+        const int ps = layout_.Slot(t, b), cs = chain_layout.Slot(t, b);
+        AssertTrue(ps % cfg_.sub_degree == cs % cfg_.sub_degree,
+                   "CiBatchAttention: the premap is not lane-preserving");
+        const int pb = ps / cfg_.sub_degree, cb = cs / cfg_.sub_degree;
+        AssertTrue(premap_[pb] < 0 || premap_[pb] == cb,
+                   "CiBatchAttention: the premap is not well defined");
+        premap_[pb] = cb;
+      }
+    }
+    std::vector<int> seen(num_blocks, 0);
+    for (int b = 0; b < num_blocks; b++) {
+      AssertTrue(premap_[b] >= 0, "CiBatchAttention: the premap misses a block");
+      seen[premap_[b]]++;
+    }
+    for (int b = 0; b < num_blocks; b++) {
+      AssertTrue(seen[b] == 1,
+                 "CiBatchAttention: the premap is not a bijection over blocks");
+    }
+    premap = &premap_;
+  }
+
   fwd_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, cfg_.forward_level, /*inverse_level=*/-1,
-      &chain_, nullptr, cfg_.converter_baby_steps);
+      &chain_, premap, cfg_.converter_baby_steps);
   inv_ = std::make_unique<CiSinCConverter<word>>(
       switch_ctx_, cfg_.sub_degree, /*forward_level=*/-1, cfg_.inverse_level,
-      &chain_, nullptr, cfg_.converter_baby_steps);
+      &chain_, nullptr, cfg_.converter_baby_steps, premap);
   BuildRope();
 
   AssertTrue(!cfg_.affine_in_prefix || cfg_.fused_scores,

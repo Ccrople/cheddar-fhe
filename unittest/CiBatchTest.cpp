@@ -86,6 +86,14 @@ int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
   return (e && e[0]) ? std::atoi(e) : fallback;
 }
+// The PLAIN slot map (`Config::plain_map`) is selected by environment so the
+// single-head tests run BOTH ways in one binary, against the same host
+// reference. That is the strongest check available for it: the map is the
+// only thing that changes, so any drift is the premap's and not the test's.
+bool PlainMap() {
+  const char *e = std::getenv("CHEDDAR_BATCH_PLAIN_MAP");
+  return e != nullptr && e[0] == '1';
+}
 constexpr int kTokens = 128;
 
 // The norm's channel-boot ring (Doing.md 7.38): CHEDDAR_CI_BATCH_CHAN_PARAM
@@ -939,6 +947,7 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
 
   cheddar::CiBatchAttention<word>::Config cfg;
   cfg.verbose = true;
+  cfg.plain_map = PlainMap();
   auto t0 = Sync();
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, cfg);
@@ -962,6 +971,10 @@ TEST(CiBatch, TheScoresOfOneHeadMatchTheHost) {
     boot.ui->PrepareRotationKey(req);
   }
   auto t1 = Sync();
+  std::cout << "  slot map: " << (cfg.plain_map ? "PLAIN (premap'd converters)"
+                                                : "chain")
+            << ", key-token shift " << attn.GetShiftRotation() << " slots"
+            << std::endl;
   std::cout << "  setup (three converters + keys): " << std::fixed
             << std::setprecision(1) << Ms(t0, t1) / 1000.0 << " s, "
             << FreeMiB() << " MiB free" << std::endl;
@@ -1109,6 +1122,7 @@ TEST(CiBatch, TheBatchedConverterIsWordForWord) {
   ASSERT_NE(bctx, nullptr);
 
   cheddar::CiBatchAttention<word>::Config cfg;
+  cfg.plain_map = PlainMap();
   cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
                                        lifted.context, cfg);
   const int chain_level = attn.GetChainLevel();
@@ -1428,6 +1442,7 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
 
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.verbose = true;
+  acfg.plain_map = PlainMap();
   // [3]: walk from a lower score landing (the aux boot split's freed top).
   acfg.score_top = EnvInt("CHEDDAR_CI_BATCH_SCORE_TOP", 0);
 

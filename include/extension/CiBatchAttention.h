@@ -147,6 +147,26 @@ class CiBatchAttention {
     //! `affine_in_prefix` on the fused route (the affine multiply has no
     //! level of its own at 12).
     int score_top = 0;
+    //! Run on the PLAIN slot map `Slot(t, b) = t * B + b` instead of the
+    //! chain addressing, with the chain's block map folded into the two
+    //! converters as a premap (`CiSinCConverter`'s `forward_premap` /
+    //! `inverse_premap`, the block index's bit reversal). It is free: those
+    //! transforms are already on the stride-`sub_degree` diagonal lattice
+    //! and already at its `degree / sub_degree` ceiling, so a block
+    //! relabelling costs no diagonal, no plaintext byte and no key
+    //! (PcPremapTest). Nothing inside the attention reads the map except
+    //! the per-token plaintexts, which follow it.
+    //!
+    //! What it BUYS is outside: a PC-attention operand is constant over the
+    //! token axis and varies over the instance axis, and under this map that
+    //! is a k = B subring element -- 512 coefficients of 65536, and lane t
+    //! is instance t exactly. Under the chain map the token sits in the
+    //! middle slot bits and the same operand is dense.
+    //!
+    //! Not compatible with `fused_scores`: the tower's lane prefix mixes
+    //! only WITHIN a lane group, so its offsets are off the block lattice
+    //! and a block relabelling multiplies the two sets (63 -> 15309).
+    bool plain_map = false;
     bool verbose = false;
   };
 
@@ -235,7 +255,14 @@ class CiBatchAttention {
   //! the shift down is ONE slot rotation by `lanes` -- no second forward
   //! converter (3.8 GiB of plaintexts) for it.
   void AddBootRotations(EvkRequest &req) const;
-  int GetShiftRotation() const { return cfg_.sub_degree; }
+  //! Under the PLAIN map the token is the SLOW axis instead, so the same
+  //! shift is `T/2 * B` slots -- a bigger index, still ONE rotation, still
+  //! lane-preserving (PcPremapTest).
+  int GetShiftRotation() const {
+    return layout_.lanes == 0
+               ? (cfg_.num_tokens / 2) * layout_.num_instances
+               : cfg_.sub_degree;
+  }
   //! Automorphism indices on the lifted ring.
   std::vector<int> LiftedRotationIndices() const {
     return ccmm_.RotationIndices(2 * cfg_.sub_degree);
@@ -449,6 +476,10 @@ class CiBatchAttention {
   RingSwitchHandler<word> switcher_;
   CiLiftHandler<word> lift_;
   BatchCcmmHandler<word> ccmm_;
+  //! `plain_map` only: the block permutation both converters fold, built
+  //! from the two layouts rather than transcribed from them. Held because
+  //! the converters take a pointer to it.
+  std::vector<int> premap_;
   //! The forward (slots -> SinC) and the inverse converter.
   std::unique_ptr<CiSinCConverter<word>> fwd_;
   std::unique_ptr<CiSinCConverter<word>> inv_;
