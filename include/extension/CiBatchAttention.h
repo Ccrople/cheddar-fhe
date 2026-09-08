@@ -318,6 +318,43 @@ class CiBatchAttention {
     //! on [0.9, 1.1] is 2^-13.
     int inv_degree = 7;
     bool causal = true;
+
+    // --- Full Cho [25] normalize-and-square iteration (heterogeneous B=512) ---
+    //! Extra squaring iterations `k`. 0 = the single-square shortcut above
+    //! (one prompt, or the ride-factor proxy): exp -> sq -> one invsqrt(sq/est)
+    //! -> P=(y r)^2, valid only when sq/est stays in [norm_lo,norm_hi].
+    //!
+    //! k>0 = the FAITHFUL Cho circuit for 512 DIFFERENT prompts sharing ONE
+    //! population calibration. The shared `row_shift` is the POPULATION row-max,
+    //! so a prompt whose true row-max sits far below it underflows the exp and
+    //! sq collapses out of any fixed window; the single-square path then fails
+    //! (whole layer 2^-0.3). Cho fixes it by DOWN-SCALING the exp argument by
+    //! 2^k and doing k squarings:
+    //!     x' = (S - shift)/2^k ;  y0 = exp(x') ;
+    //!     y^j = ( y^{j-1} / || y^{j-1} || )^2 ,  j = 1..k ;  P = y^k .
+    //! The 2^k down-scale compresses the FIRST normalization's cross-prompt
+    //! window (host: k=4 3010x, k=5 617x, k=6 280x); the LATER normalizations
+    //! see the data-INDEPENDENT [1/n,1] (~128x). Host-proven across 512 prompts
+    //! (cho_softmax.py) to 2^-45 with exact ops. See [[quarot-heterogeneous-softmax]].
+    //!
+    //! Level cost: each squaring + its invsqrt-normalize descends the MAIN path
+    //! (T ciphertexts), so ~k iterations need main-path bootstraps (Sylph's
+    //! "wide main path" -- the aux boot already handles the narrow norm path).
+    //! Intermediate invsqrts "need not be accurate" (a per-row scalar error is
+    //! absorbed by the next normalize), so a LOW `iter_inv_degree` minimax over
+    //! the ~128x [1/n,1] window suffices (host probe: deg-7 ~2^-2, fine as an
+    //! intermediate scalar). Only the LAST normalization sets the final scale;
+    //! it uses `last_inv_degree` (host probe: deg-31 ~2^-5.9 in 5 levels, cheaper
+    //! than Newton's ~3 levels/step for the same accuracy) over [norm_lo,norm_hi].
+    //! Both are the library's single-Chebyshev invsqrt idiom (as RmsNorm), on a
+    //! landing ring that affords the degree; no Newton needed.
+    int niter = 0;
+    int iter_inv_degree = 7;    //!< intermediate normalizations (crude, ~128x)
+    int last_inv_degree = 31;   //!< the final normalization (accurate, ~128x)
+    //! The FIRST normalization's window (wider, k-dependent: the underflow
+    //! spread not yet compressed). 0 = fall back to [norm_lo,norm_hi]. Later
+    //! iterations use the data-independent [norm_lo,norm_hi] ~ [1/n,1].
+    double first_lo = 0.0, first_hi = 0.0;
   };
 
   /**
@@ -364,6 +401,22 @@ class CiBatchAttention {
                double carried, const EvkMap<word> &evk) const;
 
   /**
+   * @brief The FULL Cho [25] iteration (SoftMaxCalibration::niter > 0) for 512
+   * DIFFERENT prompts sharing one population calibration. Downscales the exp
+   * argument by 2^k and runs k squarings, re-bootstrapping the MAIN path (the
+   * T ciphertexts) between iterations:
+   *     y0 = exp((S - shift)/2^k) (.) causal ;
+   *     for j = 0..k-1: sq = sum_l y_l^2 ; r = invsqrt_j(sq) ; y = (y r)^2 [; boot y]
+   *     P = y_k .
+   * Booting the main path each iteration keeps sq at a high level, so no aux
+   * boot is needed. invsqrt_0 uses the wide first window; the rest the data-
+   * independent [norm_lo,norm_hi]~[1/n,1], crude (iter_inv_degree) except the
+   * last (last_inv_degree). Plain causal path only (no fused/affine-prefix).
+   */
+  void SoftMaxCho(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
+                  double carried, const EvkMap<word> &evk) const;
+
+  /**
    * @brief `res = P V` for one head: the 128 attention-output channel
    * ciphertexts (blocks = query tokens) in slots at `GetOutputLevel()`,
    * the chain's factor in the recorded scale.
@@ -396,6 +449,22 @@ class CiBatchAttention {
   //! The masks are built per head at its call (`BuildMasks`), 128
   //! plaintexts at a time.
   std::vector<Pt> a0_;
+  //! niter>0 (SoftMaxCho): the k+... invsqrt polynomials -- [0] the wide FIRST
+  //! window, [1] the crude intermediate (iter_inv_degree), [2] the accurate
+  //! LAST (last_inv_degree); both later ones over [norm_lo,norm_hi]. Plus their
+  //! affine (fit domain -> window) and the exp's downscaled landing.
+  mutable std::vector<std::unique_ptr<EvalPoly<word>>> cho_inv_;  // 0 first,1 mid,2 last
+  double cho_first_lo_ = 0.0, cho_first_hi_ = 0.0;  //!< the first window
+  //! The LATER window (iterations >0), starting from calib [norm_lo,norm_hi] but
+  //! with its upper end WIDENED by construction to cover the crude first
+  //! invsqrt's data-independent overshoot (WorstCaseChoLaterSq) so the unclamped
+  //! last invsqrt cannot blow for any prompt. Used by both PrepareSoftMax (the
+  //! compiled poly) and SoftMaxCho (the runtime affine) -- they must agree.
+  double cho_later_lo_ = 0.0, cho_later_hi_ = 0.0;
+  int cho_inv_in_ = 0;   //!< the level the later invsqrts read sq at (booted)
+  //! The FIRST iteration skips the main-path boot (y0 is fresh from exp), so its
+  //! invsqrt reads sq at a LOWER level -- compiled separately here.
+  int cho_first_in_ = 0;
   //! `affine_in_prefix`: the `carried` the prefix plaintexts were encoded
   //! with (0 = the plain ctor encode, no affine folded). The chain's scale
   //! walk is deterministic, so after the first fold this never changes.

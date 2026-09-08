@@ -667,6 +667,19 @@ void CiBatchLayer<word>::Attention(
     sc.norm_lo = 0.75;
     sc.norm_hi = 1.35;
     sc.inv_degree = 7;
+    // The heterogeneous path (512 distinct prompts): the full Cho iteration,
+    // its invsqrt windows the population host simulation's (gen512.py). The
+    // LATER window is [1/n, 1] (data-independent, shared by every head); the
+    // FIRST window is the population's, wide but need not be accurate (Cho).
+    if (c.softmax_niter > 0) {
+      sc.niter = c.softmax_niter;
+      sc.iter_inv_degree = c.softmax_iter_inv_degree;
+      sc.last_inv_degree = c.softmax_last_inv_degree;
+      sc.first_lo = c.softmax_first_lo;
+      sc.first_hi = c.softmax_first_hi;
+      sc.norm_lo = c.softmax_later_lo;
+      sc.norm_hi = c.softmax_later_hi;
+    }
     AssertTrue(static_cast<int>(c.row_shift_raw.size()) == heads,
                "CiBatchLayer::Attention: row_shift_raw is [heads][tokens]");
     sc.row_shift.assign(heads, std::vector<double>(T, 0.0));
