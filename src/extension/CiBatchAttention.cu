@@ -877,6 +877,42 @@ int ExpDegree(double m_eff) {
   return 15;
 }
 
+// The DATA-INDEPENDENT worst-case of the LATER sum-of-squares, given the crude
+// degree-`iter_degree` FIRST inverse square root over the wide window
+// [first_lo, first_hi]. The Cho iteration is
+//     y1 = (y0 * r0)^2 ,  sq1 = sum_t y1[t]^2 = r0^4 * sum_t y0[t]^4 ,
+// and sum_t y0^4 <= (sum_t y0^2)^2 = sq0^2 (a row concentrated on one key --
+// reachable: a sink-dominated early row). With r0 = finv(sq0) the crude
+// invsqrt, sq1 <= (finv(sq0) * sqrt(sq0))^4, maximised over sq0 in the window.
+// The FIRST invsqrt is deliberately crude, so this overshoots 1 (host: ~2.28 at
+// [0.016, 128] deg 31) and the UNCLAMPED last invsqrt blows (cosh) unless its
+// window's upper end covers it. This bound depends ONLY on the fit, not on any
+// prompt, so it makes the last window population-safe by construction.
+// See [[quarot-heterogeneous-softmax]] and reference/scripts (robust_windows.py).
+double WorstCaseChoLaterSq(double first_lo, double first_hi, int iter_degree) {
+  const double aff_a = 0.5 * (first_hi - first_lo);
+  const double aff_b = 0.5 * (first_hi + first_lo);
+  const auto c = chebfit::Interpolate(
+      [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+      iter_degree);
+  double worst = 0.0;
+  const int grid = 4000;
+  for (int i = 0; i <= grid; i++) {
+    const double sq0 = first_lo + (first_hi - first_lo) * i / grid;
+    const double v = (sq0 - aff_b) / aff_a;  // in [-1, 1]
+    double b0 = 0.0, b1 = 0.0;               // Clenshaw of sum c_k T_k(v)
+    for (size_t j = c.size() - 1; j > 0; j--) {
+      const double t = 2.0 * v * b0 - b1 + c[j];
+      b1 = b0;
+      b0 = t;
+    }
+    const double finv = v * b0 - b1 + c[0];
+    const double factor = finv * std::sqrt(sq0);  // (1 + relative error)
+    worst = std::max(worst, factor * factor * factor * factor);
+  }
+  return worst;
+}
+
 }  // namespace
 
 template <typename word>
@@ -895,7 +931,13 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   const int exp_degree =
       (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(calib_.m_eff);
   // k = 1 (Cho): y = exp(m_eff (u - 1) / 4), squared later by the norm.
-  const double hb = calib_.m_eff / 4.0;
+  // niter = k > 0: the 2^k down-scale -- y0 = exp((S-shift)/2^k), the k
+  // squarings raise it to exp(S-shift). The affine a1/a0 is unchanged (it
+  // maps (S-shift)/span into [-1,0]); only the exp's slope shrinks:
+  // hb_k = m_eff / 2^(k+1) so exp(hb_k (v-1)) = exp(m_eff (S-shift)/(span 2^k)).
+  const double hb = (calib_.niter > 0)
+                        ? calib_.m_eff / std::ldexp(1.0, calib_.niter + 1)
+                        : calib_.m_eff / 4.0;
   auto exp_coeffs = chebfit::Interpolate(
       [hb](double v) { return std::exp(hb * (v - 1.0)); }, exp_degree);
   const int exp_used = EvalPoly<word>(exp_coeffs, exp_in_,
@@ -1013,6 +1055,103 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                  msg);
     }
   }
+  // niter = k > 0: the full Cho iteration's invsqrt polynomials. The main
+  // path is booted each iteration, so sq always arrives at `top - 1`; every
+  // invsqrt is compiled THERE. [0] the WIDE first window (population underflow
+  // not yet compressed by the squarings), [1] the crude intermediate and [2]
+  // the accurate last, both over [norm_lo, norm_hi] ~ [1/n, 1]. No est fold
+  // (the mask is plain causal), so the plain 1/sqrt(a v + b) form. See
+  // SoftMaxCho and [[quarot-heterogeneous-softmax]].
+  cho_inv_.clear();
+  if (calib_.niter > 0) {
+    AssertTrue(calib_.causal,
+               "CiBatchAttention::PrepareSoftMax: niter>0 needs the causal "
+               "calibration (per-token row shift)");
+    AssertTrue(!cfg_.affine_in_prefix && !cfg_.fused_scores,
+               "CiBatchAttention::PrepareSoftMax: niter>0 is the plain causal "
+               "path (no fused/affine-prefix yet)");
+    // Booted iterations: sq = sum(y^2) lands at top-1, the invsqrt's affine
+    // multiply rescales to top-2. The FIRST iteration skips the boot (y0 is
+    // fresh from exp at exp_out_), so its sq lands at exp_out_-1 and its affine
+    // at exp_out_-2 -- compile the first invsqrt THERE.
+    // sq = sum(y^2) costs a level, its affine multiply another, so the invsqrt
+    // reads at (y level) - 2. Booted y is at `top`; the un-booted y0 is at
+    // exp_out_-1 (exp then the causal-mask rescale).
+    cho_inv_in_ = top - 2;
+    cho_first_in_ = exp_out_ - 3;
+    AssertTrue(cho_first_in_ > 0,
+               "CiBatchAttention::PrepareSoftMax: niter>0 needs exp_out above 3");
+    cho_first_lo_ = (calib_.first_lo > 0.0) ? calib_.first_lo : calib_.norm_lo;
+    cho_first_hi_ = (calib_.first_hi > 0.0) ? calib_.first_hi : calib_.norm_hi;
+    // The later window: start from the calibrated [norm_lo, norm_hi] ~ [1/n, 1],
+    // but WIDEN its upper end (by construction, no data) to cover the crude
+    // first invsqrt's worst-case overshoot -- else the unclamped last invsqrt
+    // blows (cosh) for a prompt whose row concentrates near the crude region
+    // (host: sq1 up to ~2.28 at [0.016,128] deg 31, REACHABLE by a sink-dominated
+    // row). A 10% margin above the bound; this only relaxes the last invsqrt's
+    // fit (accuracy is set by the LOW end, host robust_windows.py: negligible)
+    // and costs no level or bootstrap. See [[quarot-heterogeneous-softmax]].
+    cho_later_lo_ = calib_.norm_lo;
+    const double worst_later =
+        WorstCaseChoLaterSq(cho_first_lo_, cho_first_hi_, calib_.iter_inv_degree);
+    cho_later_hi_ = std::max(calib_.norm_hi, 1.10 * worst_later);
+    // `is_last` lands P at forward_level (its apply is the final square);
+    // the first/intermediate invsqrts' output is booted, so they only need
+    // their apply to stay above 0.
+    auto compile_inv = [&](double lo, double hi, int degree, int in_level,
+                           bool is_last) {
+      const double aff_a = 0.5 * (hi - lo);
+      const double aff_b = 0.5 * (hi + lo);
+      auto coeffs = chebfit::Interpolate(
+          [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+          degree);
+      const int used = EvalPoly<word>(coeffs, in_level, param.GetScale(in_level),
+                                      param.GetScale(in_level), true)
+                           .GetPolyDegree();
+      const int out = in_level - Log2Ceil(used + 1);
+      const int floor = is_last ? cfg_.forward_level + 2 : 3;
+      AssertTrue(out >= floor,
+                 "CiBatchAttention::PrepareSoftMax: niter invsqrt overspends "
+                 "its levels");
+      auto p = std::make_unique<EvalPoly<word>>(coeffs, in_level,
+                                                param.GetScale(in_level),
+                                                param.GetScale(out), true);
+      p->Compile(boot_);
+      return p;
+    };
+    cho_inv_.push_back(compile_inv(cho_first_lo_, cho_first_hi_,
+                                   calib_.iter_inv_degree, cho_first_in_, false));
+    cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_,
+                                   calib_.iter_inv_degree, cho_inv_in_, false));
+    cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_,
+                                   calib_.last_inv_degree, cho_inv_in_, true));
+    // The plain-causal 0/1 masks at exp_out_ are HEAD-INDEPENDENT, so encode the
+    // 128 of them ONCE here (SoftMaxCho, called once per head, read cho_masks_[l]
+    // instead of re-encoding 128 x NHEAD a layer). mask[l] is live at t >= l.
+    cho_masks_.clear();
+    cho_masks_.resize(T);
+    {
+      std::vector<double> m(T);
+      std::vector<Complex> msg;
+      for (int l = 0; l < T; l++) {
+        for (int t = 0; t < T; t++) m[t] = (t >= l) ? 1.0 : 0.0;
+        layout_.PackPerToken(msg, m);
+        boot_->gpu_encoder_.Encode(cho_masks_[l], exp_out_,
+                                   param.GetScale(exp_out_), msg);
+      }
+    }
+    if (cfg_.verbose) {
+      std::cout << "  [batch] softmax Cho: niter " << calib_.niter
+                << ", exp hb " << hb << " @" << exp_in_ << ".." << exp_out_
+                << ", invsqrt @" << cho_inv_in_ << " first[" << cho_first_lo_
+                << "," << cho_first_hi_ << "] deg " << calib_.iter_inv_degree
+                << ", later[" << cho_later_lo_ << "," << cho_later_hi_
+                << "] (calib_hi " << calib_.norm_hi << ", worst "
+                << WorstCaseChoLaterSq(cho_first_lo_, cho_first_hi_,
+                                       calib_.iter_inv_degree)
+                << "), last deg " << calib_.last_inv_degree << std::endl;
+    }
+  }
   softmax_ready_ = true;
   if (cfg_.verbose) {
     std::cout << "  [batch] softmax: exp deg " << exp_used << " @" << exp_in_
@@ -1061,6 +1200,10 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
                                      const EvkMap<word> &evk) const {
   NvtxScope _nv("batch attn: SoftMax");
   AssertTrue(softmax_ready_, "CiBatchAttention: call PrepareSoftMax first");
+  if (calib_.niter > 0) {
+    SoftMaxCho(P, scores, head, carried, evk);
+    return;
+  }
   const Parameter<word> &param = boot_->param_;
   const int T = cfg_.num_tokens;
   const int top = GetTopLevel();
@@ -1287,6 +1430,150 @@ void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
       boot_->LevelDown(down, P[l], cfg_.forward_level);
       P[l] = std::move(down);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The FULL Cho [25] iteration -- 512 DIFFERENT prompts, one population calib.
+// ---------------------------------------------------------------------------
+template <typename word>
+void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
+                                        const std::vector<Ct> &scores, int head,
+                                        double carried,
+                                        const EvkMap<word> &evk) const {
+  NvtxScope _nv("batch attn: SoftMaxCho");
+  const Parameter<word> &param = boot_->param_;
+  const int T = cfg_.num_tokens;
+  const int top = GetTopLevel();
+  const int k = calib_.niter;
+  AssertTrue(static_cast<int>(scores.size()) == T,
+             "CiBatchAttention::SoftMaxCho: one head's key-token ciphertexts");
+  AssertTrue(param.NPToLevel(scores[0].GetNP()) >= top,
+             "CiBatchAttention::SoftMaxCho: the scores must be booted to top");
+  AssertTrue(carried > 0.0, "CiBatchAttention::SoftMaxCho: carried");
+  AssertTrue(calib_.causal, "CiBatchAttention::SoftMaxCho: causal only");
+  AssertTrue(static_cast<int>(cho_inv_.size()) == 3,
+             "CiBatchAttention::SoftMaxCho: call PrepareSoftMax with niter>0");
+  const auto &mult_key = evk.GetMultiplicationKey();
+
+  // The plain causal 0/1 masks at exp_out_ are HEAD-INDEPENDENT (no est/gamma
+  // fold -- the iteration does the normalization), so they were encoded ONCE in
+  // PrepareSoftMax; read cho_masks_[l] here. mask[l] is live (1) at t >= l.
+  AssertTrue(static_cast<int>(cho_masks_.size()) == T,
+             "CiBatchAttention::SoftMaxCho: PrepareSoftMax must build cho_masks_");
+
+  // y0 = exp((S - shift)/2^k) (.) causal.  u = a1 S + a0[row], exp, mask.
+  const double a1 = 2.0 / (calib_.span * carried);
+  Constant<word> c1;
+  boot_->encoder_.EncodeConstant(c1, top, param.GetScale(top), a1);
+  std::vector<Ct> y(T);
+  for (int l = 0; l < T; l++) {
+    Ct t1, u;
+    if (param.NPToLevel(scores[l].GetNP()) > top) {
+      Ct down;
+      boot_->LevelDown(down, scores[l], top);
+      boot_->Mult(t1, down, c1);
+    } else {
+      boot_->Mult(t1, scores[l], c1);
+    }
+    boot_->Rescale(u, t1);              // exp_in_ = top - 1
+    boot_->Add(u, u, a0_[head]);
+    Ct yf, t2;
+    polys_[0]->Evaluate(boot_, yf, u, mult_key);   // exp -> exp_out_
+    boot_->Mult(t2, yf, cho_masks_[l]);
+    boot_->Rescale(y[l], t2);           // exp_out_ - 1
+  }
+
+  // The main-path boots batch across the T key-token ciphertexts, exactly the
+  // score boots' CHEDDAR_CI_BATCH_BOOT_GROUP (BootBatch is word-for-word equal
+  // to the loop; default 8, matching CiBatchLayer::BootGroupSize; group 1 = the
+  // serial A/B baseline).
+  static const int boot_group = [] {
+    const char *e = std::getenv("CHEDDAR_CI_BATCH_BOOT_GROUP");
+    const int v = (e != nullptr) ? std::atoi(e) : 0;
+    return v >= 1 ? v : 8;
+  }();
+
+  // k normalize-and-square iterations. Boot the MAIN path to top each time
+  // (so sq arrives at top-1 uniformly), norm via invsqrt, then y = (y r)^2.
+  for (int j = 0; j < k; j++) {
+    // (1) main-path bootstrap to top -- SKIPPED on iteration 0 (y0 is fresh
+    //     from exp, still high), so the first invsqrt reads at cho_first_in_.
+    if (j > 0) {
+      for (int l0 = 0; l0 < T; l0 += boot_group) {
+        const int g = Min(T - l0, boot_group);
+        if (g == 1) {
+          Ct up;
+          boot_->Boot(up, y[l0], evk);
+          y[l0] = std::move(up);
+          continue;
+        }
+        std::vector<const Ct *> in(g);
+        for (int j2 = 0; j2 < g; j2++) in[j2] = &y[l0 + j2];
+        std::vector<Ct> out_g;
+        boot_->BootBatch(out_g, in, evk);
+        for (int j2 = 0; j2 < g; j2++) y[l0 + j2] = std::move(out_g[j2]);
+      }
+    }
+    // (2) sq = sum_l y_l^2  (one relinearization), landing at top-1.
+    Ct sq_acc;
+    for (int l = 0; l < T; l++) {
+      Ct sq;
+      boot_->Mult(sq, y[l], y[l]);
+      if (l == 0)
+        sq_acc = std::move(sq);
+      else
+        boot_->Add(sq_acc, sq_acc, sq);
+    }
+    Ct sq;
+    boot_->RelinearizeRescale(sq, sq_acc, mult_key);
+    sq_acc = Ct();
+    // (3) the window and its invsqrt: first iteration wide, later [norm_lo,hi];
+    //     crude except the last.
+    const bool first = (j == 0);
+    const bool last = (j == k - 1);
+    const double lo = first ? cho_first_lo_ : cho_later_lo_;
+    const double hi = first ? cho_first_hi_ : cho_later_hi_;
+    EvalPoly<word> *inv =
+        first ? cho_inv_[0].get() : (last ? cho_inv_[2].get() : cho_inv_[1].get());
+    const double aff_a = 0.5 * (hi - lo);
+    const double aff_b = 0.5 * (hi + lo);
+    Constant<word> inva;
+    const int sq_lvl = param.NPToLevel(sq.GetNP());
+    boot_->encoder_.EncodeConstant(inva, sq_lvl, param.GetScale(sq_lvl),
+                                   1.0 / aff_a);
+    Ct scaled, sqv;
+    boot_->Mult(scaled, sq, inva);
+    boot_->Rescale(sqv, scaled);        // cho_inv_in_ = top - 2
+    Constant<word> shift;
+    boot_->encoder_.EncodeConstant(shift, param.NPToLevel(sqv.GetNP()),
+                                   sqv.GetScale(), -aff_b / aff_a);
+    boot_->Add(sqv, sqv, shift);
+    Ct r;
+    inv->Evaluate(boot_, r, sqv, mult_key);
+    // (4) y = (y r)^2  -- each y_l meets r, multiplies, squares; the result
+    //     sums to 1 over live keys (r = 1/||y||).
+    const int meet = param.NPToLevel(r.GetNP());
+    for (int l = 0; l < T; l++) {
+      Ct levelled, prod, out;
+      boot_->LevelDown(levelled, y[l], meet);
+      boot_->HMult(prod, levelled, r, mult_key);
+      boot_->HMult(out, prod, prod, mult_key);
+      y[l] = std::move(out);
+    }
+  }
+
+  // P = y_k, landed at forward_level.
+  P.clear();
+  P.resize(T);
+  const int y_level = param.NPToLevel(y[0].GetNP());
+  AssertTrue(y_level >= cfg_.forward_level,
+             "CiBatchAttention::SoftMaxCho: P landed below forward_level");
+  for (int l = 0; l < T; l++) {
+    if (y_level > cfg_.forward_level)
+      boot_->LevelDown(P[l], y[l], cfg_.forward_level);
+    else
+      P[l] = std::move(y[l]);
   }
 }
 

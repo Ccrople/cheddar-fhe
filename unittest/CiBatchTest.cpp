@@ -94,6 +94,10 @@ bool PlainMap() {
   const char *e = std::getenv("CHEDDAR_BATCH_PLAIN_MAP");
   return e != nullptr && e[0] == '1';
 }
+double EnvDouble(const char *name, double fallback) {
+  const char *e = std::getenv(name);
+  return (e && e[0]) ? std::atof(e) : fallback;
+}
 constexpr int kTokens = 128;
 
 // The norm's channel-boot ring (Doing.md 7.38): CHEDDAR_CI_BATCH_CHAN_PARAM
@@ -611,6 +615,13 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   const std::string rd = rdir_env;
   constexpr int kH = 4096, kI = 14336, kSinkTokens = 2;
   const double eps = 1e-5;
+  // CHEDDAR_CI_BATCH_PROMPTS: 512 GENUINELY DIFFERENT real prompts (gen512.py).
+  // The FFN input is then each prompt's OWN post-attention residual (h512.f64)
+  // and the population norm/SiLU calibration -- no softmax, so this isolates
+  // whether the feed-forward alone carries real prompt heterogeneity.
+  const char *prompts_env = std::getenv("CHEDDAR_CI_BATCH_PROMPTS");
+  const std::string prompts = prompts_env ? prompts_env : "";
+  const std::string cdir = prompts.empty() ? rd : prompts;
 
   // The layer's inputs and the reference: x0 (the embedding), the clear
   // attention output av, so that h = x0 + av Wo is the post-attention
@@ -644,8 +655,8 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   cheddar::CiBatchLayer<word>::Calibration cal;
   double resid_absmax = 1.0;
   {
-    std::ifstream f(rd + "/calib.json");
-    ASSERT_TRUE(f.good()) << rd << "/calib.json";
+    std::ifstream f(cdir + "/calib.json");
+    ASSERT_TRUE(f.good()) << cdir << "/calib.json";
     nlohmann::json cj = nlohmann::json::parse(f)["layers"][0];
     cal.alpha = cj["alpha"];
     cal.norm_window = cj["norm_window"];
@@ -664,15 +675,19 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
   cal.stream_scale = ride / resid_absmax;
-  WidenForInstanceFactors(cal.alpha, cal.norm_window);
+  // The factored ride widens the single-prompt norm window; in prompts mode the
+  // window is already the population's, used as-is.
+  if (prompts.empty()) WidenForInstanceFactors(cal.alpha, cal.norm_window);
   std::cout << "  calibration: alpha " << cal.alpha << " window "
             << cal.norm_window << " silu_range " << cal.silu_range
             << " resid_absmax " << resid_absmax << " -> stream_scale "
             << cal.stream_scale << " (ride " << ride << ")" << std::endl;
 
   // The host reference of MY feed-forward on the recorded prompt must be
-  // the exporter's layer output, or the reference below is not one.
-  {
+  // the exporter's layer output, or the reference below is not one. (Skipped in
+  // prompts mode, where each instance carries its own residual and the per-
+  // instance reference is HostFfn(h512[b]) computed below.)
+  if (prompts.empty()) {
     std::vector<double> y1, out1;
     HostFfn(h, kTokens, kH, kI, cal.ffn_sink, gain, wg, wu, wd, eps, y1, out1);
     const double d = RmsRel(out1, h_ref, kTokens, kH, 0);
@@ -716,11 +731,21 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   HostTensor x{B, kTokens, kH, {}};
   x.v.resize(static_cast<size_t>(B) * kTokens * kH);
   auto factor = [&](int b) { return 0.5 + static_cast<double>(b) / B; };
+  std::vector<double> hbig;  // [B,T,H] per-prompt residuals in prompts mode
+  if (!prompts.empty()) {
+    ASSERT_TRUE(ReadF64(prompts + "/h512.f64",
+                        static_cast<size_t>(B) * kTokens * kH, hbig));
+  }
   for (int b = 0; b < B; b++) {
     const double f = factor(b) * cal.stream_scale;
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < kH; c++) {
-        x.At(b, t, c) = f * h[static_cast<size_t>(t) * kH + c];
+        const size_t i = static_cast<size_t>(t) * kH + c;
+        x.At(b, t, c) =
+            prompts.empty()
+                ? f * h[i]
+                : cal.stream_scale *
+                      hbig[(static_cast<size_t>(b) * kTokens + t) * kH + c];
       }
     }
   }
@@ -758,8 +783,15 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
             << st.down << " s; " << FreeMiB() << " MiB free" << std::endl;
   ASSERT_EQ(static_cast<int>(res.size()), kH);
 
-  // Checked instances: the four spread over the batch, B/2 among them.
-  std::vector<int> bs = {0, B / 4, B / 2, B - 1};
+  // Checked instances: four spread over the batch by default, or CHECK of them
+  // in prompts mode (each a different real prompt).
+  std::vector<int> bs;
+  if (prompts.empty()) {
+    bs = {0, B / 4, B / 2, B - 1};
+  } else {
+    const int nchk = EnvInt("CHEDDAR_CI_BATCH_CHECK", 16);
+    for (int i = 0; i < nchk; i++) bs.push_back((i * B) / nchk);
+  }
   std::vector<int> all_c(kH);
   for (int c = 0; c < kH; c++) all_c[c] = c;
   HostTensor got{B, kTokens, kH, {}};
@@ -772,7 +804,10 @@ TEST(CiBatch, TheFeedForwardRunsOnTheRealLayerZero) {
   double worst_layer = 0.0;
   for (int b : bs) {
     std::vector<double> hb(static_cast<size_t>(kTokens) * kH);
-    for (size_t i = 0; i < hb.size(); i++) hb[i] = factor(b) * h[i];
+    for (size_t i = 0; i < hb.size(); i++)
+      hb[i] = prompts.empty()
+                  ? factor(b) * h[i]
+                  : hbig[static_cast<size_t>(b) * kTokens * kH + i];
     std::vector<double> y_ref, out_ref;
     HostFfn(hb, kTokens, kH, kI, cal.ffn_sink, gain, wg, wu, wd, eps, y_ref,
             out_ref);
@@ -1709,6 +1744,15 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
     // from the landing-9 aux ring, deg 15's four levels put P below the
     // forward level.
     sc.inv_degree = EnvInt("CHEDDAR_CI_BATCH_INV_DEGREE", 15);
+    // The full Cho [25] iteration (512 heterogeneous prompts). niter>0 turns
+    // on SoftMaxCho; the first window and the two degrees are tuning knobs.
+    sc.niter = EnvInt("CHEDDAR_CI_BATCH_NITER", 0);
+    sc.iter_inv_degree = EnvInt("CHEDDAR_CI_BATCH_ITER_INV_DEG", 7);
+    sc.last_inv_degree = EnvInt("CHEDDAR_CI_BATCH_LAST_INV_DEG", 31);
+    sc.first_lo = EnvDouble("CHEDDAR_CI_BATCH_FIRST_LO", 0.0);
+    sc.first_hi = EnvDouble("CHEDDAR_CI_BATCH_FIRST_HI", 0.0);
+    sc.norm_lo = EnvDouble("CHEDDAR_CI_BATCH_NORM_LO", sc.norm_lo);
+    sc.norm_hi = EnvDouble("CHEDDAR_CI_BATCH_NORM_HI", sc.norm_hi);
     sc.row_shift.assign(kHeads, std::vector<double>(T, 0.0));
     sc.row_norm.assign(kHeads, std::vector<double>(T, 1.0));
     for (int h = 0; h < kHeads; h++) {
@@ -1900,6 +1944,215 @@ TEST(CiBatch, TheSoftMaxOfOneHeadMatchesTheHost) {
 }
 
 // ---------------------------------------------------------------------------
+// 5c. The FULL Cho [25] iteration on 512 DIFFERENT prompts' head-0 scores, one
+//     SHARED population calibration -- the multi-user softmax. Reads
+//     scores512_h0.f64 [B,T,T] + scores_calib.json (scores_h0.py). Each lane b
+//     carries prompt b's raw q.k; the calib's row_shift is the POPULATION max.
+//     The single-square shortcut (niter=0) fails here (a prompt whose true
+//     row-max is below the population max underflows the exp); SoftMaxCho's k
+//     squarings + 2^k downscale fix it. The invsqrt windows are DERIVED from a
+//     host simulation of the same iteration over the real scores.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheHeterogeneousSoftMaxMatchesEachPrompt) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  const char *hdir = std::getenv("CHEDDAR_HETERO_DIR");
+  if (hdir == nullptr) {
+    GTEST_SKIP() << "CHEDDAR_HETERO_DIR (scores512_h0.f64 + scores_calib.json)";
+  }
+  const std::string hd = hdir;
+  const int T = kTokens, head = 0, D = 128;
+  std::ifstream cf(hd + "/scores_calib.json");
+  ASSERT_TRUE(cf.good()) << hd << "/scores_calib.json";
+  nlohmann::json cj = nlohmann::json::parse(cf);
+  const int nprompt = cj["nprompt"];
+  const double span_raw = cj["span_raw"], m_eff = cj["m_eff"];
+  const double s_min = cj["s_min"], s_max = cj["s_max"];
+  std::vector<double> shift_pop(T);
+  for (int t = 0; t < T; t++) shift_pop[t] = cj["row_shift_pop"][t].get<double>();
+  std::vector<double> scores;
+  ASSERT_TRUE(ReadF64(hd + "/scores512_h0.f64",
+                      static_cast<size_t>(nprompt) * T * T, scores));
+  auto SC = [&](int b, int t, int l) -> double {
+    return scores[(static_cast<size_t>(b) * T + t) * T + l];
+  };
+  const double score_ride = 0.35;
+  const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
+  const int niter = EnvInt("CHEDDAR_CI_BATCH_NITER", 2);  // Sylph's two iterations
+  ASSERT_GT(niter, 0);
+  const double kscale = std::ldexp(1.0, niter);       // 2^k
+  const double invsD = 1.0 / std::sqrt(static_cast<double>(D));
+
+  // Per-lane TRUE causal softmax (scale-invariant: exp(s/sqrt(D))/sum).
+  auto true_softmax = [&](int b, int t, std::vector<double> &p) {
+    p.assign(T, 0.0);
+    double mx = -1e300;
+    for (int l = 0; l <= t; l++) mx = std::max(mx, SC(b, t, l) * invsD);
+    double sum = 0.0;
+    for (int l = 0; l <= t; l++) {
+      p[l] = std::exp(SC(b, t, l) * invsD - mx);
+      sum += p[l];
+    }
+    for (int l = 0; l <= t; l++) p[l] /= sum;
+  };
+
+  // Host simulation of SoftMaxCho's iteration to DERIVE the invsqrt windows:
+  // y0 = exp((s - shift_pop)/(sqrt(D) 2^k)); k squarings. Record sq per
+  // iteration over all live rows (t>=1; t=0 is a trivial single key).
+  double first_lo = 1e300, first_hi = -1e300, later_lo = 1e300, later_hi = -1e300;
+  std::vector<double> y(T);
+  for (int b = 0; b < nprompt; b++) {
+    for (int t = 1; t < T; t++) {
+      for (int l = 0; l <= t; l++)
+        y[l] = std::exp((SC(b, t, l) - shift_pop[t]) * invsD / kscale);
+      for (int j = 0; j < niter; j++) {
+        double sq = 0.0;
+        for (int l = 0; l <= t; l++) sq += y[l] * y[l];
+        if (j == 0) {
+          first_lo = std::min(first_lo, sq);
+          first_hi = std::max(first_hi, sq);
+        } else {
+          later_lo = std::min(later_lo, sq);
+          later_hi = std::max(later_hi, sq);
+        }
+        const double r = 1.0 / std::sqrt(sq);
+        for (int l = 0; l <= t; l++) y[l] = (y[l] * r) * (y[l] * r);
+      }
+    }
+  }
+  // Margins that RESPECT the theory so an approximate trajectory (the crypto
+  // invsqrts drift the sq off the exact host prediction) stays inside the fit
+  // domain -- a degree-31 Chebyshev EXPLODES outside [-1,1]. The normalized
+  // sq is in [1/n, 1] for the later iterations (cap hi at 1.1 with headroom),
+  // and up to ~n for the first. Compounding: an intermediate invsqrt error c
+  // scales the NEXT sq by c^4, so keep generous headroom.
+  first_lo = std::max(first_lo * 0.5, 1e-3);
+  first_hi = first_hi * 1.6;
+  later_lo = std::max(later_lo * 0.4, 1e-3);
+  later_hi = std::max(later_hi * 1.25, 1.1);
+  std::cout << "  [hetero] windows: first [" << first_lo << "," << first_hi
+            << "] later [" << later_lo << "," << later_hi << "], niter " << niter
+            << ", span_raw " << span_raw << std::endl;
+
+  cheddar::CiBatchAttention<word>::Config acfg;
+  acfg.verbose = true;
+  acfg.score_top = EnvInt("CHEDDAR_CI_BATCH_SCORE_TOP", 0);
+
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  cheddar::CiBatchLayer<word>::Config lcfg;
+  lcfg.num_tokens = T;
+  lcfg.model = 32;
+  lcfg.hidden = 64;
+  lcfg.rows_per_tile = 32;
+  cheddar::CiBatchLayer<word> layer(bctx, lcfg);
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, acfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  {
+    cheddar::EvkRequest req;
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+
+  {
+    constexpr int kHeads = 32;
+    typename cheddar::CiBatchAttention<word>::SoftMaxCalibration sc;
+    sc.m_eff = m_eff;
+    sc.span = cqk * span_raw;
+    sc.shift = cqk * s_max;
+    sc.causal = true;
+    sc.niter = niter;
+    // deg-31 on ALL iterations: a crude intermediate invsqrt error c scales the
+    // next sq by c^4 and a low-degree Chebyshev drifts it out of the window
+    // (explodes). We boot every iteration, so the level budget affords it.
+    // iter stays deg-31 (deg-63 FIRST invsqrt overspends its level budget);
+    // the LAST invsqrt is deg-63 by default -- deg-31 gives softmax ~2^-5.4
+    // (below 2^-6) at the widened later window, deg-63 gives ~2^-9.7 and still
+    // fits the budget (out = 14-6 = 8 >= forward_level+2). PrepareSoftMax
+    // widens later_hi by construction to cover the crude first invsqrt's
+    // overshoot, so the measured `later_hi` here need not be worst-case.
+    sc.iter_inv_degree = EnvInt("CHEDDAR_CI_BATCH_ITER_INV_DEG", 31);
+    sc.last_inv_degree = EnvInt("CHEDDAR_CI_BATCH_LAST_INV_DEG", 63);
+    sc.first_lo = first_lo;
+    sc.first_hi = first_hi;
+    sc.norm_lo = later_lo;
+    sc.norm_hi = later_hi;
+    sc.row_shift.assign(kHeads, std::vector<double>(T, 0.0));
+    sc.row_norm.clear();
+    for (int h = 0; h < kHeads; h++)
+      for (int t = 0; t < T; t++) sc.row_shift[h][t] = cqk * shift_pop[t];
+    attn.PrepareSoftMax(sc);
+  }
+
+  const CiBatchLayout &layout = attn.GetLayout();
+  const int B = std::min(layout.num_instances, nprompt);
+  std::vector<int> bs = {0, B / 4, B / 2, (3 * B) / 4, B - 1};
+  std::vector<int> all_l(T);
+  for (int l = 0; l < T; l++) all_l[l] = l;
+
+  const double carried = 1.8;
+  HostTensor s{layout.num_instances, T, T, {}};
+  s.v.assign(static_cast<size_t>(layout.num_instances) * T * T, 0.0);
+  for (int b = 0; b < B; b++)
+    for (int t = 0; t < T; t++)
+      for (int l = 0; l < T; l++) s.At(b, t, l) = carried * cqk * SC(b, t, l);
+  std::vector<Ciphertext<word>> cts;
+  EncryptChannels(boot, layout, s, 1, cts);
+  for (auto &ct : cts) ct.SetScale(carried * boot.param->GetScale(1));
+
+  auto t0 = Sync();
+  std::vector<Ciphertext<word>> booted(T);
+  for (int l = 0; l < T; l++)
+    bctx->Boot(booted[l], cts[l], boot.ui->GetEvkMap());
+  cts.clear();
+  std::vector<Ciphertext<word>> P;
+  attn.SoftMax(P, booted, head, carried, boot.ui->GetEvkMap());
+  auto t1 = Sync();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  HostTensor got{layout.num_instances, T, T, {}};
+  got.v.assign(static_cast<size_t>(layout.num_instances) * T * T, 0.0);
+  DecryptChannels(boot, layout, P, all_l, got);
+  HostTensor want{layout.num_instances, T, T, {}};
+  want.v.assign(got.v.size(), 0.0);
+  std::vector<double> p(T);
+  for (int b : bs)
+    for (int t = 0; t < T; t++) {
+      true_softmax(b, t, p);
+      for (int l = 0; l < T; l++) want.At(b, t, l) = p[l];
+    }
+  const Err e = Compare(got, want, bs, all_l);
+  std::cout << "  [hetero] softmax over " << bs.size() << " DIFFERENT prompts: "
+            << "rms rel 2^-" << std::fixed << std::setprecision(2)
+            << Bits(e.rms_rel) << " (max abs " << std::scientific << e.max_abs
+            << ", ref rms " << e.rms_ref << ") in " << std::fixed
+            << Ms(t0, t1) / 1000.0 << " s" << std::endl;
+  // Per-lane so a single bad prompt is visible.
+  for (int b : bs) {
+    const Err eb = Compare(got, want, {b}, all_l);
+    std::cout << "    prompt " << b << ": rms rel 2^-" << std::fixed
+              << std::setprecision(2) << Bits(eb.rms_rel) << " (max abs "
+              << std::scientific << eb.max_abs << ")" << std::endl;
+  }
+  EXPECT_LT(e.rms_rel, std::ldexp(1.0, -6));
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // 6. The attention half of layer 0 on the real weights, B instances at once:
 //    norm, Q/K/V, per head scores -> Boot -> softmax -> P V, O, residual --
 //    against the exporter's clear attention output. RMSNorm is scale
@@ -1917,6 +2170,20 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   const std::string rd = rdir_env;
   constexpr int kH = 4096, kKv = 1024, kHeads = 32, kSinkTokens = 2;
 
+  // HETEROGENEOUS MODE: 512 GENUINELY DIFFERENT prompts, one shared POPULATION
+  // calibration (the multi-user service model). gen512.py writes inputs512.f32
+  // [B,T,kH] (each prompt's layer-0 input), h512.f64 [B,T,kH] (each prompt's
+  // post-attention residual x+o = the whole reference), and a population
+  // calib.json carrying the full Cho softmax windows. The single-prompt
+  // broadcast + [0.98,1.02] factor path is the homogeneous baseline; hetero
+  // mode replaces both the input and the reference per lane and runs the Cho
+  // softmax (softmax_niter>0). See [[quarot-heterogeneous-softmax]].
+  const char *hetero_env = std::getenv("CHEDDAR_CI_BATCH_HETERO_DIR");
+  const bool hetero = hetero_env != nullptr && hetero_env[0] != '\0';
+  const std::string cdir = hetero ? std::string(hetero_env) : rd;
+  std::vector<float> x0_all;   // [nprompt,T,kH], hetero only
+  std::vector<double> h_all;   // [nprompt,T,kH], hetero only
+
   std::vector<float> x0, wq, wk, wv, wo, gain;
   std::vector<double> av;
   ASSERT_TRUE(ReadF32(ld + "/../input_nosink.f32",
@@ -1926,28 +2193,49 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   ASSERT_TRUE(ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kKv, wv));
   ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
   ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, gain));
-  ASSERT_TRUE(ReadF64(rd + "/av_L00.f64", static_cast<size_t>(kTokens) * kH, av));
-  // o = av Wo, the clear O output; the reference layer input is x0.
+  // o = av Wo, the clear O output; the reference layer input is x0. In hetero
+  // mode the per-lane input and O reference come from gen512.py's tensors
+  // (o_ref[b] = h512[b] - inputs512[b]), so this single-prompt reference is
+  // unused.
   std::vector<double> o_ref(static_cast<size_t>(kTokens) * kH);
-  cheddar::ParallelFor(kH, [&](int begin, int end) {
-    for (int c = begin; c < end; c++) {
-      for (int t = 0; t < kTokens; t++) {
-        double acc = 0.0;
-        for (int m = 0; m < kH; m++) {
-          acc += av[static_cast<size_t>(t) * kH + m] *
-                 static_cast<double>(wo[static_cast<size_t>(m) * kH + c]);
+  if (!hetero) {
+    ASSERT_TRUE(
+        ReadF64(rd + "/av_L00.f64", static_cast<size_t>(kTokens) * kH, av));
+    cheddar::ParallelFor(kH, [&](int begin, int end) {
+      for (int c = begin; c < end; c++) {
+        for (int t = 0; t < kTokens; t++) {
+          double acc = 0.0;
+          for (int m = 0; m < kH; m++) {
+            acc += av[static_cast<size_t>(t) * kH + m] *
+                   static_cast<double>(wo[static_cast<size_t>(m) * kH + c]);
+          }
+          o_ref[static_cast<size_t>(t) * kH + c] = acc;
         }
-        o_ref[static_cast<size_t>(t) * kH + c] = acc;
       }
-    }
-  });
+    });
+  }
 
   cheddar::CiBatchLayer<word>::Calibration cal;
   double in_absmax = 1.0, resid_absmax = 1.0;
   {
-    std::ifstream f(rd + "/calib.json");
-    ASSERT_TRUE(f.good()) << rd << "/calib.json";
+    std::ifstream f(cdir + "/calib.json");
+    ASSERT_TRUE(f.good()) << cdir << "/calib.json";
     nlohmann::json cj = nlohmann::json::parse(f)["layers"][0];
+    if (hetero) {
+      // The full Cho iteration and its POPULATION invsqrt windows (gen512.py).
+      cal.softmax_niter = EnvInt("CHEDDAR_CI_BATCH_NITER",
+                                 cj.value("softmax_niter", 2));
+      // Prefer calib.json's degrees; env overrides; robust defaults (iter 31,
+      // last 63 -- see the measured-window path above and PrepareSoftMax).
+      cal.softmax_iter_inv_degree = EnvInt(
+          "CHEDDAR_CI_BATCH_ITER_INV_DEG", cj.value("softmax_iter_inv_degree", 31));
+      cal.softmax_last_inv_degree = EnvInt(
+          "CHEDDAR_CI_BATCH_LAST_INV_DEG", cj.value("softmax_last_inv_degree", 63));
+      cal.softmax_first_lo = cj.at("softmax_first_lo").get<double>();
+      cal.softmax_first_hi = cj.at("softmax_first_hi").get<double>();
+      cal.softmax_later_lo = cj.at("softmax_later_lo").get<double>();
+      cal.softmax_later_hi = cj.at("softmax_later_hi").get<double>();
+    }
     cal.attn_alpha = cj["attn_alpha"];
     cal.attn_norm_window = cj["attn_norm_window"];
     in_absmax = cj["in_absmax"];
@@ -1988,7 +2276,12 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
   cal.stream_scale = ride / std::max(in_absmax, resid_absmax);
-  WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window, 0.98, 1.02);
+  // The homogeneous baseline widens the norm fit for its [0.98,1.02] factor
+  // spread; the hetero population calib already covers the real cross-prompt
+  // spread, so it keeps gen512.py's window untouched.
+  if (!hetero) {
+    WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window, 0.98, 1.02);
+  }
   std::cout << "  calibration: attn_alpha " << cal.attn_alpha << " window "
             << cal.attn_norm_window << " span_raw " << cal.span_raw
             << " s_raw_max " << cal.s_raw_max << " m_eff " << cal.m_eff
@@ -2110,14 +2403,28 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   // calibration is a single-prompt fit; covering a real cross-prompt
   // population is a separate calibration item, not this test's job.
   auto factor = [&](int b) { return 0.98 + 0.04 * static_cast<double>(b) / B; };
+  // Hetero mode: lane b carries prompt b's OWN embedding (inputs512.f32), and
+  // its reference is prompt b's own post-attention residual (h512.f64).
+  if (hetero) {
+    ASSERT_TRUE(ReadF32(cdir + "/inputs512.f32",
+                        static_cast<size_t>(B) * kTokens * kH, x0_all))
+        << cdir << "/inputs512.f32 (need >= " << B << " prompts)";
+    ASSERT_TRUE(ReadF64(cdir + "/h512.f64",
+                        static_cast<size_t>(B) * kTokens * kH, h_all))
+        << cdir << "/h512.f64";
+  }
   HostTensor x{B, kTokens, kH, {}};
   x.v.resize(static_cast<size_t>(B) * kTokens * kH);
   for (int b = 0; b < B; b++) {
-    const double f = factor(b) * cal.stream_scale;
+    const double f = (hetero ? 1.0 : factor(b)) * cal.stream_scale;
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < kH; c++) {
-        x.At(b, t, c) =
-            f * static_cast<double>(x0[static_cast<size_t>(t) * kH + c]);
+        const size_t i = static_cast<size_t>(t) * kH + c;
+        const double xv = hetero
+                              ? static_cast<double>(
+                                    x0_all[static_cast<size_t>(b) * kTokens * kH + i])
+                              : static_cast<double>(x0[i]);
+        x.At(b, t, c) = f * xv;
       }
     }
   }
@@ -2390,7 +2697,11 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
     return;
   }
 
-  std::vector<int> bs = {0, B / 4, B / 2, B - 1};
+  // Hetero: a wide spread of DISTINCT prompts, each against its own reference.
+  std::vector<int> bs = hetero ? std::vector<int>{0, B / 8, B / 4, 3 * B / 8,
+                                                  B / 2, 5 * B / 8, 3 * B / 4,
+                                                  7 * B / 8, B - 1}
+                               : std::vector<int>{0, B / 4, B / 2, B - 1};
   std::vector<int> all_c(kH);
   for (int c = 0; c < kH; c++) all_c[c] = c;
   HostTensor got{B, kTokens, kH, {}};
@@ -2399,23 +2710,40 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   double worst = 0.0;
   for (int b : bs) {
     std::vector<double> want(static_cast<size_t>(kTokens) * kH),
-        o_got(want.size()), out_got(want.size());
+        o_ref_b(want.size()), o_got(want.size()), out_got(want.size());
     for (int t = 0; t < kTokens; t++) {
       for (int c = 0; c < kH; c++) {
         const size_t i = static_cast<size_t>(t) * kH + c;
-        const double xb = factor(b) * x0[i];
-        want[i] = xb + o_ref[i];
-        out_got[i] = got.At(b, t, c) / cal.stream_scale;
-        o_got[i] = out_got[i] - xb;
+        if (hetero) {
+          // want = prompt b's post-attention residual h512[b]; o_ref = h - x.
+          const size_t bi = static_cast<size_t>(b) * kTokens * kH + i;
+          const double xb = static_cast<double>(x0_all[bi]);
+          want[i] = h_all[bi];
+          o_ref_b[i] = h_all[bi] - xb;
+          out_got[i] = got.At(b, t, c) / cal.stream_scale;
+          o_got[i] = out_got[i] - xb;
+        } else {
+          const double xb = factor(b) * x0[i];
+          want[i] = xb + o_ref[i];
+          o_ref_b[i] = o_ref[i];
+          out_got[i] = got.At(b, t, c) / cal.stream_scale;
+          o_got[i] = out_got[i] - xb;
+        }
       }
     }
     const double e_layer = RmsRel(out_got, want, kTokens, kH, kSinkTokens);
-    const double e_o = RmsRel(o_got, o_ref, kTokens, kH, kSinkTokens);
-    std::cout << "  instance " << std::setw(3) << b << " (x" << std::fixed
-              << std::setprecision(3) << factor(b)
-              << "): post-attention residual 2^-" << std::setprecision(2)
-              << Bits(e_layer) << ", the attention output (after O) alone 2^-"
-              << Bits(e_o) << " over user tokens" << std::endl;
+    const double e_o = RmsRel(o_got, o_ref_b, kTokens, kH, kSinkTokens);
+    std::cout << "  instance " << std::setw(3) << b;
+    if (hetero) {
+      std::cout << " (prompt " << b << ")";
+    } else {
+      std::cout << " (x" << std::fixed << std::setprecision(3) << factor(b)
+                << ")";
+    }
+    std::cout << ": post-attention residual 2^-" << std::fixed
+              << std::setprecision(2) << Bits(e_layer)
+              << ", the attention output (after O) alone 2^-" << Bits(e_o)
+              << " over user tokens" << std::endl;
     worst = std::max(worst, e_layer);
   }
   EXPECT_LT(worst, std::ldexp(1.0, -6));
@@ -2450,10 +2778,20 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     return (e && e[0]) ? std::atof(e) : 0.35;
   }();
 
+  // CHEDDAR_CI_BATCH_PROMPTS: a directory of 512 GENUINELY DIFFERENT real
+  // prompts (gen512.py) -- inputs512.f32 [B,T,H], out512.f64 [B,T,H], and a
+  // POPULATION calib.json covering all of them. Each instance then carries its
+  // OWN prompt (no ride factor) and is checked against its own reference. The
+  // shared softmax calibration (row_shift=max, row_norm=mean over the 512) is
+  // the known-hard part for heterogeneous prompts; the norm/SiLU ranges are the
+  // population's, so this measures how far one shared calibration carries.
+  const char *prompts_env = std::getenv("CHEDDAR_CI_BATCH_PROMPTS");
+  const std::string prompts = prompts_env ? prompts_env : "";
   nlohmann::json calib_all;
   {
-    std::ifstream f(rd + "/calib.json");
-    ASSERT_TRUE(f.good()) << rd << "/calib.json";
+    const std::string cpath = (prompts.empty() ? rd : prompts) + "/calib.json";
+    std::ifstream f(cpath);
+    ASSERT_TRUE(f.good()) << cpath;
     calib_all = nlohmann::json::parse(f);
   }
   // One stream factor for the run: the largest residual any of its layers
@@ -2584,16 +2922,29 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   // (Doing 7.22): the layer-0 norm leaves a residual factor on scaled
   // instances that a single-prompt softmax calibration cannot cover.
   auto factor = [&](int b) { return 0.98 + 0.04 * static_cast<double>(b) / B; };
+  // In prompts mode, each instance is its OWN real prompt (no ride factor); its
+  // reference is the precomputed float64 layer-0 output.
+  std::vector<float> prompt_in;
+  std::vector<double> prompt_out;
+  if (!prompts.empty()) {
+    ASSERT_TRUE(ReadF32(prompts + "/inputs512.f32",
+                        static_cast<size_t>(B) * kTokens * kH, prompt_in));
+    ASSERT_TRUE(ReadF64(prompts + "/out512.f64",
+                        static_cast<size_t>(B) * kTokens * kH, prompt_out));
+  }
   std::vector<Ciphertext<word>> stream;
   {
     HostTensor x{B, kTokens, kH, {}};
     x.v.resize(static_cast<size_t>(B) * kTokens * kH);
     for (int b = 0; b < B; b++) {
-      const double f = factor(b) * stream_scale;
       for (int t = 0; t < kTokens; t++) {
         for (int c = 0; c < kH; c++) {
-          x.At(b, t, c) =
-              f * static_cast<double>(x0[static_cast<size_t>(t) * kH + c]);
+          const size_t i = (static_cast<size_t>(b) * kTokens + t) * kH + c;
+          const double v = prompts.empty()
+                               ? factor(b) * static_cast<double>(
+                                                 x0[static_cast<size_t>(t) * kH + c])
+                               : static_cast<double>(prompt_in[i]);
+          x.At(b, t, c) = stream_scale * v;
         }
       }
     }
@@ -2673,8 +3024,28 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
     }
     const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
     cal.cq = cal.ck = std::sqrt(cqk);
-    WidenForInstanceFactors(cal.alpha, cal.norm_window, 0.98, 1.02);
-    WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window, 0.98, 1.02);
+    if (!prompts.empty()) {
+      // Heterogeneous prompts serve the shared population through the full Cho
+      // iteration and its POPULATION invsqrt windows (gen512.py), exactly as
+      // TheAttentionHalfRuns reads them. Without this the calibration keeps
+      // softmax_niter=0 (single-pass, NOT Cho), which cannot serve a shared
+      // population. See [[quarot-heterogeneous-softmax]].
+      cal.softmax_niter = EnvInt("CHEDDAR_CI_BATCH_NITER",
+                                 cj.value("softmax_niter", 2));
+      cal.softmax_iter_inv_degree = EnvInt(
+          "CHEDDAR_CI_BATCH_ITER_INV_DEG", cj.value("softmax_iter_inv_degree", 31));
+      cal.softmax_last_inv_degree = EnvInt(
+          "CHEDDAR_CI_BATCH_LAST_INV_DEG", cj.value("softmax_last_inv_degree", 63));
+      cal.softmax_first_lo = cj.at("softmax_first_lo").get<double>();
+      cal.softmax_first_hi = cj.at("softmax_first_hi").get<double>();
+      cal.softmax_later_lo = cj.at("softmax_later_lo").get<double>();
+      cal.softmax_later_hi = cj.at("softmax_later_hi").get<double>();
+    } else {
+      // The factored ride widens the single-prompt norm calibration; in prompts
+      // mode the calibration is already the population's, so it is used as-is.
+      WidenForInstanceFactors(cal.alpha, cal.norm_window, 0.98, 1.02);
+      WidenForInstanceFactors(cal.attn_alpha, cal.attn_norm_window, 0.98, 1.02);
+    }
 
     bctx->ResetBootCounts();
     auto tl0 = Sync();
@@ -2695,29 +3066,60 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
               << " gate/up " << st.gate_up << " silu " << st.silu << " down "
               << st.down << " s; " << FreeMiB() << " MiB free" << std::endl;
 
-    // The reference instance against the exporter's residual after layer L.
-    std::vector<double> h_ref;
-    ASSERT_TRUE(ReadF64(rd + "/h_L" + (L < 10 ? "0" : "") + std::to_string(L) +
-                            ".f64",
-                        static_cast<size_t>(kTokens) * kH, h_ref));
     HostTensor got{B, kTokens, kH, {}};
     got.v.assign(static_cast<size_t>(B) * kTokens * kH, 0.0);
     std::vector<int> all_c(kH);
     for (int c = 0; c < kH; c++) all_c[c] = c;
     DecryptChannels(boot, layout, stream, all_c, got);
-    std::vector<double> out(static_cast<size_t>(kTokens) * kH);
-    for (int t = 0; t < kTokens; t++) {
-      for (int c = 0; c < kH; c++) {
-        out[static_cast<size_t>(t) * kH + c] = got.At(b_ref, t, c) / stream_scale;
+    if (prompts.empty()) {
+      // The reference instance against the exporter's residual after layer L.
+      std::vector<double> h_ref;
+      ASSERT_TRUE(ReadF64(rd + "/h_L" + (L < 10 ? "0" : "") + std::to_string(L) +
+                              ".f64",
+                          static_cast<size_t>(kTokens) * kH, h_ref));
+      std::vector<double> out(static_cast<size_t>(kTokens) * kH);
+      for (int t = 0; t < kTokens; t++)
+        for (int c = 0; c < kH; c++)
+          out[static_cast<size_t>(t) * kH + c] =
+              got.At(b_ref, t, c) / stream_scale;
+      const double e_user = RmsRel(out, h_ref, kTokens, kH, kSinkTokens);
+      const double e_all = RmsRel(out, h_ref, kTokens, kH, 0);
+      std::cout << "  layer " << L << " output, instance " << b_ref << " vs h_L"
+                << L << ".f64: 2^-" << std::setprecision(2) << Bits(e_user)
+                << " over user tokens (2^-" << Bits(e_all) << " over all)"
+                << std::endl;
+      EXPECT_LT(e_user, std::ldexp(1.0, -4)) << "layer " << L;
+    } else if (L == 0) {
+      // 512 DISTINCT real prompts: a spread of instances, each vs its OWN
+      // precomputed float64 layer-0 output.
+      const int nchk = EnvInt("CHEDDAR_CI_BATCH_CHECK", 16);
+      double worst = 0.0, sumbits = 0.0;
+      int cnt = 0;
+      for (int i = 0; i < nchk; i++) {
+        const int b = (i * B) / nchk;
+        std::vector<double> out(static_cast<size_t>(kTokens) * kH);
+        for (int t = 0; t < kTokens; t++)
+          for (int c = 0; c < kH; c++)
+            out[static_cast<size_t>(t) * kH + c] =
+                got.At(b, t, c) / stream_scale;
+        const double *rp =
+            &prompt_out[static_cast<size_t>(b) * kTokens * kH];
+        std::vector<double> ref(rp, rp + static_cast<size_t>(kTokens) * kH);
+        const double e = RmsRel(out, ref, kTokens, kH, kSinkTokens);
+        worst = std::max(worst, e);
+        sumbits += Bits(e);
+        cnt++;
+        if (cnt <= 8)
+          std::cout << "  prompt instance " << std::setw(3) << b << ": 2^-"
+                    << std::setprecision(2) << Bits(e) << " over user tokens"
+                    << std::endl;
       }
+      std::cout << "  512 REAL PROMPTS layer " << L << ": WORST 2^-"
+                << std::setprecision(2) << Bits(worst) << ", mean 2^-"
+                << (sumbits / cnt) << " over " << cnt << " instances"
+                << std::endl;
+      EXPECT_LT(worst, std::ldexp(1.0, -3)) << "512 real prompts worst instance";
     }
-    const double e_user = RmsRel(out, h_ref, kTokens, kH, kSinkTokens);
-    const double e_all = RmsRel(out, h_ref, kTokens, kH, 0);
-    std::cout << "  layer " << L << " output, instance " << b_ref
-              << " vs h_L" << L << ".f64: 2^-" << std::setprecision(2)
-              << Bits(e_user) << " over user tokens (2^-" << Bits(e_all)
-              << " over all)" << std::endl;
-    EXPECT_LT(e_user, std::ldexp(1.0, -4)) << "layer " << L;
   }
   std::cout << "  " << num_layers << " layer(s): " << total_s << " s = "
             << total_s / num_layers / B * 1000.0 << " ms per instance-layer"

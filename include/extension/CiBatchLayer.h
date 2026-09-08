@@ -166,6 +166,22 @@ class CiBatchLayer {
     double cq = 1.0, ck = 1.0;
     double span_raw = 1.0, s_raw_max = 0.0, m_eff = 8.0;
     std::vector<std::vector<double>> row_shift_raw, row_norm;
+
+    //! THE HETEROGENEOUS SOFTMAX (512 distinct prompts, one shared population
+    //! calibration). `softmax_niter > 0` selects the full Cho [25] iteration
+    //! (`CiBatchAttention::SoftMaxCho`) instead of the single-square shortcut:
+    //! the 2^k down-scale then `niter` normalise-and-square passes, the main
+    //! path booted between them, a degree-`iter`/`last` invsqrt over the FIRST
+    //! (population, wide) window and the data-independent LATER window
+    //! `[1/n, 1]` -- all DERIVED by `gen512.py`'s population host simulation
+    //! over ALL heads and prompts. niter = 0 leaves the same-prompt path
+    //! byte-identical. See [[quarot-heterogeneous-softmax]].
+    int softmax_niter = 0;
+    int softmax_iter_inv_degree = 31;  //!< crude FIRST/intermediate (deg-63 overspends)
+    int softmax_last_inv_degree = 63;  //!< accurate LAST; deg-31 misses 2^-6 at the
+                                       //!< widened window, deg-63 fits the budget
+    double softmax_first_lo = 0.0, softmax_first_hi = 0.0;
+    double softmax_later_lo = 0.0, softmax_later_hi = 0.0;
   };
 
   /** @brief The attention half's tensors on the device, `[in][out]` f32. */
@@ -182,9 +198,9 @@ class CiBatchLayer {
     const float *gate = nullptr;  //!< `[model][hidden]`
     const float *up = nullptr;    //!< `[model][hidden]`
     const float *down = nullptr;  //!< `[hidden][model]`
-    //! The two RMSNorm gains, `model` each; folded into the weights that
-    //! read the normalised stream.
-    std::vector<double> ffn_norm, attn_norm;
+    //! The FFN RMSNorm gain, `model`; folded into the weights that read the
+    //! normalised stream. (The attention norm lives on `AttnWeights`.)
+    std::vector<double> ffn_norm;
   };
 
   //! `boot` is not const: the layer prepares and drops its transform
