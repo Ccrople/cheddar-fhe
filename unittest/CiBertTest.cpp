@@ -1,24 +1,28 @@
-// BERT-Base layer 0's non-leg half on the real checkpoint: the O projection
-// with its bias, the residual, the post-attention LayerNorm, the whole GELU
-// feed-forward with its two biases, the second residual and the output
-// LayerNorm -- against `h_L00.f64`, the float64 reference.
+// BERT-Base layer 0 on the real checkpoint, against `h_L00.f64`.
 //
-// The attention leg is NOT run here. `ci_bert_leg_test` runs it at BERT's
-// shape against its own clear reference; what this test needs from it is its
-// OUTPUT, which `reference_forward_bert.py` writes as `av_L00.f64`, encrypted
-// straight into the layout the seam would have left it in. Splitting the two
-// is what makes a failure legible: everything measured here is the half this
-// file's class is responsible for.
+// TWO TESTS, and the split is deliberate.
 //
-// WHAT IS MEASURED, in order, each against the same float64 forward:
+//   TheTurnsRunOnTheRealWeights   the NON-LEG half alone: the O projection
+//                                 with its bias, the residual, the
+//                                 post-attention LayerNorm, the whole GELU
+//                                 feed-forward with its two biases, the second
+//                                 residual and the output LayerNorm. The
+//                                 attention output is the reference's own
+//                                 `av_L00.f64`, encrypted straight into the
+//                                 layout the seam leaves -- so a failure here
+//                                 is this half's.
+//   TheWholeLayerRunsOnTheRealWeights
+//                                 the two halves joined: Emit -> the twelve
+//                                 HalfBootModules -> the leg -> Boot ->
+//                                 the seam -> the two turns. One ring for the
+//                                 leg, one for the layer, and the three the
+//                                 chain needs.
 //
-//   stage 0   the stream, read back the way `ModDecomp` reads it
-//   stage 1   H = LayerNorm(X + O(av) + b_o)          -- AttentionTurn
-//   stage 2   Z = LayerNorm(H + W_out(GELU(W_int H + b_int)) + b_out)
-//                                                      -- FeedForward
+// `ci_bert_leg_test` measures the leg by itself at the same shape. Between
+// the three, every stage has a reference that does not depend on the others.
 //
-// Run it with BERT_ALL_DIR and BERT_REF_DIR pointing at `export_bert.py`'s
-// and `reference_forward_bert.py`'s output; it skips without them.
+// Run with BERT_ALL_DIR and BERT_REF_DIR pointing at `export_bert.py`'s and
+// `reference_forward_bert.py`'s output; both skip without them.
 
 #include <gtest/gtest.h>
 
@@ -33,11 +37,13 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/CiLift.h"
 #include "core/CiSwitchedCcmm.h"
 #include "core/EvkRequest.h"
 #include "core/MemoryPool.h"
 #include "extension/BootContext.h"
 #include "extension/CiBertLayer.h"
+#include "extension/CiSinCAttention.h"
 
 using word = uint32_t;
 using Ring = ringfixture::Ring<word>;
@@ -50,6 +56,16 @@ using cheddar::Plaintext;
 namespace {
 
 constexpr const char *kFfnParam = "ci16_35_land13c2e9.json";
+constexpr const char *kBootParam = "ci16_35.json";
+constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
+constexpr const char *kSmallParam = "ci12_35_boot.json";
+constexpr const char *kLiftedParam = "ringdegree13_35_boot.json";
+// The leg's TOWER ring (Doing.md 3.16): three CtS levels and K = 64, its SSE
+// secret sampled in the tower basis. Fused, `HalfBootTower` plus the lane
+// prefix IS the return, so there are no converters and no native tables on
+// the leg ring -- 15 GiB and 262 switching-ring rotation keys that the
+// converter route needs and this one does not.
+constexpr const char *kTowerParam = "ci16_35_land17c3e10.json";
 
 // BERT-Base, and the packing: T * rank is the slot count, 768 model channels
 // in two dense rank-512 ciphertexts and 3072 hidden ones in six.
@@ -124,8 +140,7 @@ bool ReadU8(const std::string &path, size_t n, std::vector<unsigned char> &out) 
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
   out.assign(n, 0);
-  f.read(reinterpret_cast<char *>(out.data()),
-         static_cast<std::streamsize>(n));
+  f.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(n));
   return static_cast<size_t>(f.gcount()) == n;
 }
 
@@ -158,10 +173,169 @@ void LayerNormHost(const std::vector<double> &x, const std::vector<double> &g,
   }
 }
 
-// One stage's report: relative error against the float64 forward, over the
-// live channels, with the message's own factor divided out.
-void Report(const char *what, const std::vector<double> &got,
-            const std::vector<double> &want) {
+/**
+ * @brief Layer 0's weights, and the float64 forward this file measures
+ * against. Both tests read the same thing; the whole-layer one uses more of
+ * it.
+ */
+struct Layer0 {
+  std::vector<double> x, av, href, gelu_dummy;
+  std::vector<double> wq, wk, wv, bq, bk, bv, wo, bo;
+  std::vector<double> wint, bint, wout, bout, ag, ab, fg, fb;
+  std::vector<unsigned char> gelu_group;
+  // The forward, stage by stage.
+  std::vector<double> q, k, v, av_host, h_pre, h, u, z_pre, z;
+  std::vector<double> attn_token_scale, ffn_token_scale;
+  // What the leg's calibration is read off.
+  std::vector<std::vector<double>> row_shift, row_norm;  // [head][row], RAW
+  double s_raw_min = 0.0, s_raw_max = 0.0, span_raw = 0.0, m_eff = 0.0;
+  double qmax = 0.0, kmax = 0.0, vmax = 0.0;
+  double resid_absmax = 0.0, u_absmax = 0.0;
+};
+
+bool LoadLayer0(const std::string &wdir, const std::string &rdir, Layer0 &L) {
+  const std::string ld = wdir + "/L00";
+  const size_t th = static_cast<size_t>(kT) * kH;
+  if (!ReadF32(wdir + "/input.f32", th, L.x)) return false;
+  if (!ReadF64(rdir + "/av_L00.f64", th, L.av)) return false;
+  if (!ReadF64(rdir + "/h_L00.f64", th, L.href)) return false;
+  if (!ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, L.wq)) return false;
+  if (!ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kH, L.wk)) return false;
+  if (!ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kH, L.wv)) return false;
+  if (!ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, L.wo)) return false;
+  if (!ReadF32(ld + "/bq.f32", kH, L.bq)) return false;
+  if (!ReadF32(ld + "/bk.f32", kH, L.bk)) return false;
+  if (!ReadF32(ld + "/bv.f32", kH, L.bv)) return false;
+  if (!ReadF32(ld + "/bo.f32", kH, L.bo)) return false;
+  if (!ReadF32(ld + "/wint.f32", static_cast<size_t>(kH) * kI, L.wint)) return false;
+  if (!ReadF32(ld + "/bint.f32", kI, L.bint)) return false;
+  if (!ReadF32(ld + "/wout.f32", static_cast<size_t>(kI) * kH, L.wout)) return false;
+  if (!ReadF32(ld + "/bout.f32", kH, L.bout)) return false;
+  if (!ReadF32(ld + "/attn_norm.f32", kH, L.ag)) return false;
+  if (!ReadF32(ld + "/attn_norm_bias.f32", kH, L.ab)) return false;
+  if (!ReadF32(ld + "/ffn_norm.f32", kH, L.fg)) return false;
+  if (!ReadF32(ld + "/ffn_norm_bias.f32", kH, L.fb)) return false;
+  if (!ReadU8(rdir + "/gelu_group_L00.u8", static_cast<size_t>(kT) * kI,
+              L.gelu_group)) {
+    return false;
+  }
+
+  // ---- the attention, from the raw stream (post-norm: no norm in front) ---
+  auto project = [&](const std::vector<double> &w, const std::vector<double> &b,
+                     std::vector<double> &out) {
+    out.assign(th, 0.0);
+    for (int t = 0; t < kT; t++) {
+      for (int o = 0; o < kH; o++) {
+        double acc = b[o];
+        for (int c = 0; c < kH; c++) {
+          acc += L.x[static_cast<size_t>(t) * kH + c] *
+                 w[static_cast<size_t>(c) * kH + o];
+        }
+        out[static_cast<size_t>(t) * kH + o] = acc;
+      }
+    }
+  };
+  project(L.wq, L.bq, L.q);
+  project(L.wk, L.bk, L.k);
+  project(L.wv, L.bv, L.v);
+  for (double a : L.q) L.qmax = std::max(L.qmax, std::abs(a));
+  for (double a : L.k) L.kmax = std::max(L.kmax, std::abs(a));
+  for (double a : L.v) L.vmax = std::max(L.vmax, std::abs(a));
+
+  L.s_raw_min = 1e300;
+  L.s_raw_max = -1e300;
+  L.row_shift.assign(kHeads, std::vector<double>(kT, -1e300));
+  L.row_norm.assign(kHeads, std::vector<double>(kT, 0.0));
+  std::vector<std::vector<std::vector<double>>> S(
+      kHeads, std::vector<std::vector<double>>(kT, std::vector<double>(kT)));
+  for (int hd = 0; hd < kHeads; hd++) {
+    for (int t = 0; t < kT; t++) {
+      for (int s = 0; s < kT; s++) {
+        double acc = 0.0;
+        for (int c = 0; c < kD; c++) {
+          acc += L.q[static_cast<size_t>(t) * kH + hd * kD + c] *
+                 L.k[static_cast<size_t>(s) * kH + hd * kD + c];
+        }
+        S[hd][t][s] = acc;
+        L.s_raw_min = std::min(L.s_raw_min, acc);
+        L.s_raw_max = std::max(L.s_raw_max, acc);
+        L.row_shift[hd][t] = std::max(L.row_shift[hd][t], acc);
+      }
+    }
+  }
+  L.span_raw = L.s_raw_max - L.s_raw_min;
+  L.m_eff = L.span_raw / std::sqrt(static_cast<double>(kD));
+  // The live-norm estimate the softmax folds into its mask; bidirectional, so
+  // the sum runs over the whole row.
+  L.av_host.assign(th, 0.0);
+  for (int hd = 0; hd < kHeads; hd++) {
+    for (int t = 0; t < kT; t++) {
+      double sum = 0.0;
+      std::vector<double> p(kT, 0.0);
+      for (int s = 0; s < kT; s++) {
+        p[s] = std::exp(L.m_eff * (S[hd][t][s] - L.row_shift[hd][t]) /
+                        L.span_raw);
+        sum += p[s];
+      }
+      L.row_norm[hd][t] = sum;
+      for (int s = 0; s < kT; s++) {
+        const double w = p[s] / sum;
+        for (int c = 0; c < kD; c++) {
+          L.av_host[static_cast<size_t>(t) * kH + hd * kD + c] +=
+              w * L.v[static_cast<size_t>(s) * kH + hd * kD + c];
+        }
+      }
+    }
+  }
+
+  // ---- the rest of the layer ---------------------------------------------
+  L.h_pre.assign(th, 0.0);
+  for (int t = 0; t < kT; t++) {
+    for (int c = 0; c < kH; c++) {
+      double acc = L.bo[c];
+      for (int j = 0; j < kH; j++) {
+        acc += L.av[static_cast<size_t>(t) * kH + j] *
+               L.wo[static_cast<size_t>(j) * kH + c];
+      }
+      L.h_pre[static_cast<size_t>(t) * kH + c] =
+          L.x[static_cast<size_t>(t) * kH + c] + acc;
+    }
+  }
+  LayerNormHost(L.h_pre, L.ag, L.ab, L.h, L.attn_token_scale);
+  L.u.assign(static_cast<size_t>(kT) * kI, 0.0);
+  for (int t = 0; t < kT; t++) {
+    for (int j = 0; j < kI; j++) {
+      double acc = L.bint[j];
+      for (int c = 0; c < kH; c++) {
+        acc += L.h[static_cast<size_t>(t) * kH + c] *
+               L.wint[static_cast<size_t>(c) * kI + j];
+      }
+      L.u[static_cast<size_t>(t) * kI + j] = acc;
+    }
+  }
+  L.z_pre.assign(th, 0.0);
+  for (int t = 0; t < kT; t++) {
+    for (int c = 0; c < kH; c++) {
+      double acc = L.bout[c];
+      for (int j = 0; j < kI; j++) {
+        acc += GeLuHost(L.u[static_cast<size_t>(t) * kI + j]) *
+               L.wout[static_cast<size_t>(j) * kH + c];
+      }
+      L.z_pre[static_cast<size_t>(t) * kH + c] =
+          L.h[static_cast<size_t>(t) * kH + c] + acc;
+    }
+  }
+  LayerNormHost(L.z_pre, L.fg, L.fb, L.z, L.ffn_token_scale);
+  for (double a : L.h_pre) L.resid_absmax = std::max(L.resid_absmax, std::abs(a));
+  for (double a : L.z_pre) L.resid_absmax = std::max(L.resid_absmax, std::abs(a));
+  for (double a : L.u) L.u_absmax = std::max(L.u_absmax, std::abs(a));
+  return true;
+}
+
+// One stage's report: relative error against the float64 forward, with the
+// message's own factor fitted out and printed.
+double Report(const char *what, const std::vector<double> &got,
+              const std::vector<double> &want) {
   double num = 0.0, den = 0.0, worst = 0.0, mx = 0.0, sq = 0.0;
   for (size_t i = 0; i < want.size(); i++) {
     num += got[i] * want[i];
@@ -175,8 +349,9 @@ void Report(const char *what, const std::vector<double> &got,
     sq += d * d;
   }
   std::cout << "  [" << what << "] relative " << (worst / mx) << " = 2^"
-            << std::log2(worst / mx) << ", rms 2^"
-            << 0.5 * std::log2(sq / den) << ", carried " << f << std::endl;
+            << std::log2(worst / mx) << ", rms 2^" << 0.5 * std::log2(sq / den)
+            << ", carried " << f << std::endl;
+  return f;
 }
 
 double RelBits(const std::vector<double> &got, const std::vector<double> &want) {
@@ -193,27 +368,84 @@ double RelBits(const std::vector<double> &got, const std::vector<double> &want) 
   return 0.5 * std::log2(sq / den);
 }
 
+// A model-channel image, read back through `Components`.
+void ReadStream(const Ring &ring, const std::vector<Ciphertext<word>> &cts,
+                std::vector<double> &got) {
+  got.assign(static_cast<size_t>(kT) * kH, 0.0);
+  for (size_t k = 0; k < cts.size(); k++) {
+    Plaintext<word> pt;
+    ring.ui->Decrypt(pt, cts[k]);
+    std::vector<double> co;
+    ring.context->encoder_.DecodeCoeff(co, pt);
+    const auto comp = Components(co);
+    for (int c = static_cast<int>(k) * kRank;
+         c < std::min<int>(kH, (static_cast<int>(k) + 1) * kRank); c++) {
+      for (int t = 0; t < kT; t++) {
+        got[static_cast<size_t>(t) * kH + c] =
+            comp[Rev(c - static_cast<int>(k) * kRank, 9)][t];
+      }
+    }
+  }
+}
+
+// The weights, declared. The model's own maps are identities on the module
+// basis (`ModelSlot(c) = c`, `HiddenSlot(j) = j`); what is not an identity is
+// the ATTENTION side, where the seam's layout decides which declared channel
+// carries which (head, channel).
+std::vector<double> DeclareSquare(const std::vector<double> &w, int in_live,
+                                  int in_declared, int out_live,
+                                  int out_declared) {
+  std::vector<double> out(static_cast<size_t>(in_declared) * out_declared, 0.0);
+  for (int i = 0; i < in_live; i++) {
+    for (int o = 0; o < out_live; o++) {
+      out[static_cast<size_t>(i) * out_declared + o] =
+          w[static_cast<size_t>(i) * out_live + o];
+    }
+  }
+  return out;
+}
+
+std::vector<double> Declare(const std::vector<double> &v, int declared) {
+  std::vector<double> out(declared, 0.0);
+  for (size_t i = 0; i < v.size(); i++) out[i] = v[i];
+  return out;
+}
+
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// 1. The non-leg half, on one ring.
+// ---------------------------------------------------------------------------
 TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   const char *wdir_env = std::getenv("BERT_ALL_DIR");
   const char *rdir_env = std::getenv("BERT_REF_DIR");
   if (wdir_env == nullptr || rdir_env == nullptr) {
     GTEST_SKIP() << "BERT_ALL_DIR / BERT_REF_DIR are not set";
   }
-  const std::string wdir(wdir_env), rdir(rdir_env), ld = wdir + "/L00";
+  Layer0 L;
+  ASSERT_TRUE(LoadLayer0(wdir_env, rdir_env, L))
+      << "could not read layer 0 -- run export_bert.py and "
+         "reference_forward_bert.py (REF_DUMP_U is not needed)";
+  {
+    double worst = 0.0, mx = 0.0;
+    for (size_t i = 0; i < L.z.size(); i++) {
+      worst = std::max(worst, std::abs(L.z[i] - L.href[i]));
+      mx = std::max(mx, std::abs(L.href[i]));
+    }
+    std::cout << "host forward vs h_L00.f64: " << (worst / mx) << std::endl;
+    ASSERT_LT(worst / mx, 1e-5)
+        << "this test's own float64 forward does not reproduce the reference";
+  }
 
   // `HalfBootModule` needs the SSE secret sparse in the MODULE basis
   // (Doing.md 3.6); set before any Ring samples one.
   setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
 
-  // ---- the ring ----------------------------------------------------------
-  //
-  // ONE ring, not the Llama model's four: without the leg there is no chain,
-  // no switching ring and no lifted ring, and the layer's own half runs
-  // entirely on the landing ladder the FFN uses there -- slack nine, because
-  // `SlotToCoeff` is compiled at `GetStCStartLevel()` and an operator eight
-  // levels deep cannot reach it without slack.
+  // ONE ring, not the whole-layer test's five: without the leg there is no
+  // chain, no switching ring and no lifted ring, and the layer's own half runs
+  // entirely on the landing ladder -- slack nine, because `SlotToCoeff` is
+  // compiled at `GetStCStartLevel()` and an operator eight levels deep cannot
+  // reach it without slack.
   const auto t_setup0 = std::chrono::steady_clock::now();
   Ring ring(kFfnParam, /*secret_coeffs=*/{}, /*boot_slack_levels=*/9,
             /*build_user_interface=*/true);
@@ -226,7 +458,9 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
 
   ui.PrepareModPackKeys(kT, kPcmmLevel, /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
-  for (int j = 0; j < kRank; j++) pack_keys.push_back(&ui.GetModPackKey(kRank, j));
+  for (int j = 0; j < kRank; j++) {
+    pack_keys.push_back(&ui.GetModPackKey(kRank, j));
+  }
   ctx->PrepareEvalMod();
   ctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal, nullptr);
   {
@@ -257,124 +491,39 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
     layer.AddRequiredRotations(req);
     ui.PrepareRotationKey(req);
   }
-  const auto t_setup1 = std::chrono::steady_clock::now();
-  std::cout << "setup " << std::chrono::duration<double>(t_setup1 - t_setup0).count()
+  std::cout << "setup "
+            << std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t_setup0).count()
             << " s" << std::endl;
-  cheddar::MemoryPool::Report("setup done");
-
-  // ---- the clear model ---------------------------------------------------
-  std::vector<double> x, av, href, wo, bo, wint, bint, wout, bout;
-  std::vector<double> ag, ab, fg, fb;
-  ASSERT_TRUE(ReadF32(wdir + "/input.f32", static_cast<size_t>(kT) * kH, x));
-  ASSERT_TRUE(ReadF64(rdir + "/av_L00.f64", static_cast<size_t>(kT) * kH, av));
-  ASSERT_TRUE(ReadF64(rdir + "/h_L00.f64", static_cast<size_t>(kT) * kH, href));
-  ASSERT_TRUE(ReadF32(ld + "/wo.f32", static_cast<size_t>(kH) * kH, wo));
-  ASSERT_TRUE(ReadF32(ld + "/bo.f32", kH, bo));
-  ASSERT_TRUE(ReadF32(ld + "/wint.f32", static_cast<size_t>(kH) * kI, wint));
-  ASSERT_TRUE(ReadF32(ld + "/bint.f32", kI, bint));
-  ASSERT_TRUE(ReadF32(ld + "/wout.f32", static_cast<size_t>(kI) * kH, wout));
-  ASSERT_TRUE(ReadF32(ld + "/bout.f32", kH, bout));
-  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, ag));
-  ASSERT_TRUE(ReadF32(ld + "/attn_norm_bias.f32", kH, ab));
-  ASSERT_TRUE(ReadF32(ld + "/ffn_norm.f32", kH, fg));
-  ASSERT_TRUE(ReadF32(ld + "/ffn_norm_bias.f32", kH, fb));
-  std::vector<unsigned char> gelu_group;
-  ASSERT_TRUE(ReadU8(rdir + "/gelu_group_L00.u8",
-                     static_cast<size_t>(kT) * kI, gelu_group))
-      << "run reference_forward_bert.py; it writes the GELU plan's groups";
-
-  // h_pre = x + av @ wo + b_o, then the norm; and the whole feed-forward.
-  std::vector<double> h_pre(static_cast<size_t>(kT) * kH, 0.0);
-  for (int t = 0; t < kT; t++) {
-    for (int c = 0; c < kH; c++) {
-      double acc = bo[c];
-      for (int j = 0; j < kH; j++) {
-        acc += av[static_cast<size_t>(t) * kH + j] *
-               wo[static_cast<size_t>(j) * kH + c];
-      }
-      h_pre[static_cast<size_t>(t) * kH + c] =
-          x[static_cast<size_t>(t) * kH + c] + acc;
-    }
-  }
-  std::vector<double> h, attn_token_scale;
-  LayerNormHost(h_pre, ag, ab, h, attn_token_scale);
-  std::vector<double> u(static_cast<size_t>(kT) * kI, 0.0);
-  for (int t = 0; t < kT; t++) {
-    for (int j = 0; j < kI; j++) {
-      double acc = bint[j];
-      for (int c = 0; c < kH; c++) {
-        acc += h[static_cast<size_t>(t) * kH + c] *
-               wint[static_cast<size_t>(c) * kI + j];
-      }
-      u[static_cast<size_t>(t) * kI + j] = acc;
-    }
-  }
-  std::vector<double> z_pre(static_cast<size_t>(kT) * kH, 0.0);
-  for (int t = 0; t < kT; t++) {
-    for (int c = 0; c < kH; c++) {
-      double acc = bout[c];
-      for (int j = 0; j < kI; j++) {
-        acc += GeLuHost(u[static_cast<size_t>(t) * kI + j]) *
-               wout[static_cast<size_t>(j) * kH + c];
-      }
-      z_pre[static_cast<size_t>(t) * kH + c] =
-          h[static_cast<size_t>(t) * kH + c] + acc;
-    }
-  }
-  std::vector<double> z, ffn_token_scale;
-  LayerNormHost(z_pre, fg, fb, z, ffn_token_scale);
-  {
-    // The host forward must be the file's, or nothing below means anything.
-    double worst = 0.0, mx = 0.0;
-    for (size_t i = 0; i < z.size(); i++) {
-      worst = std::max(worst, std::abs(z[i] - href[i]));
-      mx = std::max(mx, std::abs(href[i]));
-    }
-    std::cout << "host forward vs h_L00.f64: " << (worst / mx) << std::endl;
-    ASSERT_LT(worst / mx, 1e-5)
-        << "this test's own float64 forward does not reproduce the reference";
-  }
 
   // ---- the calibration ---------------------------------------------------
-  double resid_absmax = 0.0, u_absmax = 0.0;
-  for (double v : h_pre) resid_absmax = std::max(resid_absmax, std::abs(v));
-  for (double v : z_pre) resid_absmax = std::max(resid_absmax, std::abs(v));
-  for (double v : u) u_absmax = std::max(u_absmax, std::abs(v));
-  const double stream_scale = kRide / resid_absmax;
-  const double int_scale = kRide / (stream_scale * u_absmax);
+  const double stream_scale = kRide / L.resid_absmax;
+  const double int_scale = kRide / (stream_scale * L.u_absmax);
   typename cheddar::CiBertLayer<word>::Calibration cal;
   cal.stream_scale = stream_scale;
   // WITH THE PER-TOKEN RESCALE THE WINDOW IS ONE. LayerNorm is exactly scale
   // invariant, so `1/sqrt(var_t)` in front of it puts every token's argument
-  // at exactly one -- and the window then only has to cover what the
-  // calibration itself misses, which on this prompt is nothing. A served
-  // prompt whose variance moved would need the margin instead; that is the
-  // open item in `reference/docs/BERT_BASE_B1.md`.
+  // at exactly one, and the window then only has to cover what the
+  // calibration itself misses -- on this prompt, nothing. A served prompt
+  // whose variance moved would need the margin instead; that is the open item
+  // in `reference/docs/BERT_BASE_B1.md`.
   cal.attn_alpha = 1.0;
   cal.attn_window = 1.5;
   cal.ffn_alpha = 1.0;
   cal.ffn_window = 1.5;
-  cal.attn_scale = attn_token_scale;
-  cal.ffn_scale = ffn_token_scale;
-  cal.o_scale = stream_scale;   // the seam's images carry the model's own units
+  cal.attn_scale = L.attn_token_scale;
+  cal.ffn_scale = L.ffn_token_scale;
+  cal.o_scale = stream_scale;  // the images below carry the model's own units
   cal.int_scale = int_scale;
   cal.out_scale = stream_scale / layer.GetKappa();
   cal.gelu_range = 8.0;
   cal.gelu_degree = 31;
-  cal.gelu_group = gelu_group;
+  cal.gelu_group = L.gelu_group;
   std::cout << "stream_scale " << stream_scale << " (|resid| <= "
-            << resid_absmax << "), int_scale " << int_scale << " (|u| <= "
-            << u_absmax << "), kappa " << layer.GetKappa() << ", crossing "
-            << layer.GetCrossing() << std::endl;
+            << L.resid_absmax << "), int_scale " << int_scale << " (|u| <= "
+            << L.u_absmax << "), kappa " << layer.GetKappa() << std::endl;
 
-  // ---- the weights, declared -------------------------------------------
-  //
-  // The seam's map, which is `CiLlamaSeam`'s own: chain ciphertext `bi`,
-  // column `col` and lane `lane` land at declared channel
-  // `rev4(col) * 32 + rev5(lane)` of image `bi`, and carry the model's
-  // attention channel `rev5(lane) * head_dim + bi * rank + col`. Only the
-  // images with `bi * 16 < head_dim` carry anything, which for BERT's 64-wide
-  // head is four of the layout's eight.
+  // ---- the weights, declared --------------------------------------------
   const int num_images = kD / layout.rank;
   const int attn_declared = num_images * kRank;
   std::vector<int> attn_map(attn_declared, -1);
@@ -383,8 +532,8 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
       for (int lane = 0; lane < layout.lanes; lane++) {
         const int head = Rev(lane, 5);
         if (head >= kHeads) continue;
-        const int cc = Rev(col, 4) * 32 + Rev(lane, 5);
-        attn_map[bi * kRank + cc] = head * kD + bi * layout.rank + col;
+        attn_map[bi * kRank + Rev(col, 4) * 32 + Rev(lane, 5)] =
+            head * kD + bi * layout.rank + col;
       }
     }
   }
@@ -395,37 +544,20 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
     if (a < 0) continue;
     for (int c = 0; c < kH; c++) {
       wo_dec[static_cast<size_t>(in_d) * kDeclaredH + c] =
-          wo[static_cast<size_t>(a) * kH + c];
+          L.wo[static_cast<size_t>(a) * kH + c];
     }
   }
-  std::vector<double> wint_dec(static_cast<size_t>(kDeclaredH) * kDeclaredI,
-                               0.0);
-  for (int c = 0; c < kH; c++) {
-    for (int j = 0; j < kI; j++) {
-      wint_dec[static_cast<size_t>(c) * kDeclaredI + j] =
-          wint[static_cast<size_t>(c) * kI + j];
-    }
-  }
-  std::vector<double> wout_dec(static_cast<size_t>(kDeclaredI) * kDeclaredH,
-                               0.0);
-  for (int j = 0; j < kI; j++) {
-    for (int c = 0; c < kH; c++) {
-      wout_dec[static_cast<size_t>(j) * kDeclaredH + c] =
-          wout[static_cast<size_t>(j) * kH + c];
-    }
-  }
-  auto declare = [](const std::vector<double> &v, int declared) {
-    std::vector<double> out(declared, 0.0);
-    for (size_t i = 0; i < v.size(); i++) out[i] = v[i];
-    return out;
-  };
-  const std::vector<double> bo_dec = declare(bo, kDeclaredH);
-  const std::vector<double> bint_dec = declare(bint, kDeclaredI);
-  const std::vector<double> bout_dec = declare(bout, kDeclaredH);
-  const std::vector<double> ag_dec = declare(ag, kDeclaredH);
-  const std::vector<double> ab_dec = declare(ab, kDeclaredH);
-  const std::vector<double> fg_dec = declare(fg, kDeclaredH);
-  const std::vector<double> fb_dec = declare(fb, kDeclaredH);
+  const std::vector<double> wint_dec =
+      DeclareSquare(L.wint, kH, kDeclaredH, kI, kDeclaredI);
+  const std::vector<double> wout_dec =
+      DeclareSquare(L.wout, kI, kDeclaredI, kH, kDeclaredH);
+  const std::vector<double> bo_dec = Declare(L.bo, kDeclaredH);
+  const std::vector<double> bint_dec = Declare(L.bint, kDeclaredI);
+  const std::vector<double> bout_dec = Declare(L.bout, kDeclaredH);
+  const std::vector<double> ag_dec = Declare(L.ag, kDeclaredH);
+  const std::vector<double> ab_dec = Declare(L.ab, kDeclaredH);
+  const std::vector<double> fg_dec = Declare(L.fg, kDeclaredH);
+  const std::vector<double> fb_dec = Declare(L.fb, kDeclaredH);
 
   typename cheddar::CiBertLayer<word>::Weights w;
   w.o.host = &wo_dec;
@@ -440,7 +572,7 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   w.ffn_bias = &fb_dec;
   w.tag = "L00";
 
-  // ---- encrypt: the stream, and the attention output in the seam's layout -
+  // ---- encrypt the stream, and the attention output in the seam's layout --
   const int op_level = layer.GetStreamLevel();
   auto encrypt_image = [&](const std::vector<std::vector<double>> &comp,
                            int level) {
@@ -459,7 +591,7 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
     for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
       for (int t = 0; t < kT; t++) {
         comp[Rev(c - k * kRank, 9)][t] =
-            stream_scale * x[static_cast<size_t>(t) * kH + c];
+            stream_scale * L.x[static_cast<size_t>(t) * kH + c];
       }
     }
     stream[k] = encrypt_image(comp, op_level);
@@ -471,30 +603,16 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
       const int a = attn_map[bi * kRank + cc];
       if (a < 0) continue;
       for (int t = 0; t < kT; t++) {
-        comp[Rev(cc, 9)][t] = av[static_cast<size_t>(t) * kH + a];
+        comp[Rev(cc, 9)][t] = L.av[static_cast<size_t>(t) * kH + a];
       }
     }
     seamed[bi] = encrypt_image(comp, kPcmmLevel);
   }
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
-
-  // Stage 0: the stream, read back through `Components`.
   {
-    std::vector<double> got(static_cast<size_t>(kT) * kH, 0.0);
-    for (int k = 0; k < kDeclaredH / kRank; k++) {
-      Plaintext<word> pt;
-      ui.Decrypt(pt, stream[k]);
-      std::vector<double> co;
-      ring.context->encoder_.DecodeCoeff(co, pt);
-      const auto comp = Components(co);
-      for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
-        for (int t = 0; t < kT; t++) {
-          got[static_cast<size_t>(t) * kH + c] =
-              comp[Rev(c - k * kRank, 9)][t];
-        }
-      }
-    }
-    Report("stage 0: the stream", got, x);
+    std::vector<double> got;
+    ReadStream(ring, stream, got);
+    Report("stage 0: the stream", got, L.x);
   }
 
   // ---- stage 1: O, the residual and the post-attention LayerNorm ---------
@@ -504,24 +622,11 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const auto t1 = std::chrono::steady_clock::now();
-  ASSERT_EQ(static_cast<int>(h_ct.size()), kDeclaredH / kRank);
   {
-    std::vector<double> got(static_cast<size_t>(kT) * kH, 0.0);
-    for (int k = 0; k < kDeclaredH / kRank; k++) {
-      Plaintext<word> pt;
-      ui.Decrypt(pt, h_ct[k]);
-      std::vector<double> co;
-      ring.context->encoder_.DecodeCoeff(co, pt);
-      const auto comp = Components(co);
-      for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
-        for (int t = 0; t < kT; t++) {
-          got[static_cast<size_t>(t) * kH + c] =
-              comp[Rev(c - k * kRank, 9)][t];
-        }
-      }
-    }
-    Report("stage 1: H = LayerNorm(X + O + b_o)", got, h);
-    EXPECT_LT(RelBits(got, h), -8.0)
+    std::vector<double> got;
+    ReadStream(ring, h_ct, got);
+    Report("stage 1: H = LayerNorm(X + O + b_o)", got, L.h);
+    EXPECT_LT(RelBits(got, L.h), -8.0)
         << "the attention turn is worse than 2^-8 against the clear model";
   }
 
@@ -533,22 +638,10 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   const auto t3 = std::chrono::steady_clock::now();
   {
-    std::vector<double> got(static_cast<size_t>(kT) * kH, 0.0);
-    for (int k = 0; k < kDeclaredH / kRank; k++) {
-      Plaintext<word> pt;
-      ui.Decrypt(pt, z_ct[k]);
-      std::vector<double> co;
-      ring.context->encoder_.DecodeCoeff(co, pt);
-      const auto comp = Components(co);
-      for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
-        for (int t = 0; t < kT; t++) {
-          got[static_cast<size_t>(t) * kH + c] =
-              comp[Rev(c - k * kRank, 9)][t];
-        }
-      }
-    }
-    Report("stage 2: Z = LayerNorm(H + FFN(H))", got, z);
-    EXPECT_LT(RelBits(got, z), -7.0)
+    std::vector<double> got;
+    ReadStream(ring, z_ct, got);
+    Report("stage 2: Z = LayerNorm(H + FFN(H))", got, L.z);
+    EXPECT_LT(RelBits(got, L.z), -7.0)
         << "the layer's non-leg half is worse than 2^-7 against h_L00.f64";
   }
   auto secs = [](auto a, auto b) {
@@ -556,5 +649,493 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   };
   std::cout << "cost: AttentionTurn " << secs(t0, t1) << " s, FeedForward "
             << secs(t2, t3) << " s" << std::endl;
+  cheddar::MemoryPool::Report("done");
+}
+
+// ---------------------------------------------------------------------------
+// 2. The whole layer: the leg and the two turns, on five rings.
+// ---------------------------------------------------------------------------
+TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
+  const char *wdir_env = std::getenv("BERT_ALL_DIR");
+  const char *rdir_env = std::getenv("BERT_REF_DIR");
+  if (wdir_env == nullptr || rdir_env == nullptr) {
+    GTEST_SKIP() << "BERT_ALL_DIR / BERT_REF_DIR are not set";
+  }
+  Layer0 L;
+  ASSERT_TRUE(LoadLayer0(wdir_env, rdir_env, L));
+  {
+    // The attention this test's own forward computes must be the reference's,
+    // or the leg is being measured against the wrong thing.
+    double worst = 0.0, mx = 0.0;
+    for (size_t i = 0; i < L.av.size(); i++) {
+      worst = std::max(worst, std::abs(L.av_host[i] - L.av[i]));
+      mx = std::max(mx, std::abs(L.av[i]));
+    }
+    std::cout << "host attention vs av_L00.f64: " << (worst / mx) << std::endl;
+    ASSERT_LT(worst / mx, 1e-6);
+  }
+  setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
+
+  // ---- five rings, one secret -------------------------------------------
+  //
+  // The leg on `ci16_35` at slack ZERO (its softmax walk needs `GetEndLevel()`
+  // at 16), the layer on the K = 32 landing ladder at slack NINE, and the
+  // three the chain switches through. A ciphertext crosses between the first
+  // two only at a SHARED level, which is what `GetSeamInputLevel()` is for.
+  const auto t_setup0 = std::chrono::steady_clock::now();
+  Ring boot(kBootParam);
+  Ring swtch(kSwitchParam, boot.ui->GetSecretCoeffs());
+  Ring small(kSmallParam);
+  Ring lifted(kLiftedParam, cheddar::CiLiftHandler<word>::LiftSecret(
+                                small.ui->GetSecretCoeffs()));
+  Ring ffn(kFfnParam, boot.ui->GetSecretCoeffs(), /*boot_slack_levels=*/9,
+           /*build_user_interface=*/true);
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  auto fctx = std::dynamic_pointer_cast<BootContext<word>>(ffn.context);
+  ASSERT_NE(bctx, nullptr);
+  ASSERT_NE(fctx, nullptr);
+  cheddar::UserInterface<word> &fui = *ffn.ui;
+  const cheddar::EvkMap<word> &fevk = fui.GetEvkMap();
+  const cheddar::EvkMap<word> &bevk = boot.ui->GetEvkMap();
+  const int num_slots = boot.param->MaxNumSlots();
+  const int chain_level = 2;
+
+  // FUSED: ci16_35's native tables serve nothing. The scores and the
+  // attention output return through the TOWER ring, q/k/v and the stream
+  // cross through `HalfBootModule` (no native table), and the seam runs on
+  // the FFN ring -- so `PrepareEvalSpecialFFT` here would be ~6 GiB and a
+  // rotation-key set for nobody.
+  bctx->PrepareEvalMod();
+  fui.PrepareModPackKeys(kT, kPcmmLevel, /*num_aux=*/-1);
+  std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
+  for (int j = 0; j < kRank; j++) {
+    pack_keys.push_back(&fui.GetModPackKey(kRank, j));
+  }
+  fctx->PrepareEvalMod();
+  fctx->PrepareEvalSpecialFFT(num_slots, cheddar::BootVariant::kNormal, nullptr);
+  {
+    EvkRequest req;
+    fctx->AddRequiredRotations(req, num_slots, /*min_ks=*/false);
+    fui.PrepareRotationKey(req);
+  }
+  fctx->ReleaseCtS(num_slots);
+  // The two rings share their bottom primes, so they share the crossing
+  // constant; the leg's `restore` and the layer's own bookkeeping both rest
+  // on that.
+  ASSERT_NEAR(bctx->GetMessageRatio(), fctx->GetMessageRatio(),
+              1e-12 * std::abs(bctx->GetMessageRatio()));
+
+  typename cheddar::CiBertLayer<word>::Config cfg;
+  cfg.num_tokens = kT;
+  cfg.proj_rank = kRank;
+  cfg.model_declared = kDeclaredH;
+  cfg.model_live = kH;
+  cfg.hidden_declared = kDeclaredI;
+  cfg.hidden_live = kI;
+  cfg.num_heads = kHeads;
+  cfg.head_dim = kD;
+  cfg.eps = kEps;
+  cfg.product_level = kPcmmLevel;
+  cfg.verbose = true;
+  const cheddar::CiSwitchedCcmmLayout layout(boot.Degree(), small.Degree(), 32);
+  cheddar::CiBertLayer<word> layer(fctx, layout, pack_keys, cfg);
+  {
+    EvkRequest req;
+    layer.AddRequiredRotations(req);
+    fui.PrepareRotationKey(req);
+  }
+
+  // ---- the leg's tower ring ----------------------------------------------
+  //
+  // Its SSE secret is sampled in the TOWER basis, because the tower-centred
+  // ModRaise's wrap-around is bounded there and nowhere else (Doing.md 3.16:
+  // max 32 / std 5 at h = 16, against 780 / 270 for a native or module-sparse
+  // one). Every other ring keeps the module setting, so the environment is
+  // saved and put back around this one construction.
+  std::unique_ptr<Ring> tower;
+  {
+    const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    const std::string saved = prev ? prev : "";
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", /*overwrite=*/1);
+    tower = std::make_unique<Ring>(kTowerParam, boot.ui->GetSecretCoeffs(),
+                                   /*boot_slack_levels=*/0);
+    if (prev) {
+      setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
+    } else {
+      unsetenv("CHEDDAR_MODULE_SPARSE_SECRET");
+    }
+  }
+  auto lctx = std::dynamic_pointer_cast<BootContext<word>>(tower->context);
+  ASSERT_NE(lctx, nullptr);
+  lctx->PrepareEvalMod();  // and no native tables: the tower runs none
+  ASSERT_NEAR(lctx->GetMessageRatio(), bctx->GetMessageRatio(),
+              1e-9 * std::abs(bctx->GetMessageRatio()));
+
+  // ---- the leg ------------------------------------------------------------
+  typename cheddar::CiSinCAttention<word>::Config acfg;
+  acfg.dense_images = true;
+  acfg.num_heads = kHeads;
+  acfg.head_dim = kD;
+  acfg.rope = false;  // BERT's positions are learned and already in the input
+  acfg.restore = 1.0 / bctx->GetMessageRatio();
+  acfg.land_level = fctx->GetBootParameter().GetEvalModEndLevel();
+  acfg.landing_scale = fctx->GetStCInputScale();
+  // Fused: the forwards spend two levels, so the chain runs at 1 and the
+  // return is the tower's HalfBoot plus the prefix rather than an inverse
+  // converter.
+  acfg.fused = true;
+  acfg.chain_level = 1;
+  acfg.inverse_level = 0;
+  cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
+                                      lifted.context, acfg, lctx);
+  ASSERT_EQ(attn.GetNumImages(), kD / layout.rank);
+  swtch.ui->PrepareRingSwitchKey(small.Degree(), small.ui->GetSecretCoeffs(),
+                                 chain_level);
+  swtch.ui->PrepareInverseRingSwitchKey(small.Degree(),
+                                        small.ui->GetSecretCoeffs(),
+                                        chain_level);
+  for (int idx : attn.LiftedRotationIndices()) {
+    lifted.ui->PrepareRotationKey(idx, chain_level);
+  }
+  {
+    EvkRequest req;
+    attn.AddSwitchRotations(req);
+    swtch.ui->PrepareRotationKey(req);
+  }
+  {
+    EvkRequest req;
+    attn.AddRequiredRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  {
+    EvkRequest req;
+    attn.AddTowerRotations(req);
+    tower->ui->PrepareRotationKey(req);
+  }
+  typename cheddar::CiSinCAttention<word>::Keys keys;
+  keys.boot = &bevk;
+  keys.swtch = &swtch.ui->GetEvkMap();
+  keys.lifted = &lifted.ui->GetEvkMap();
+  keys.tower = &tower->ui->GetEvkMap();
+  keys.ring_switch = &swtch.ui->GetRingSwitchKey(layout.rank);
+  keys.inverse_ring_switch = &swtch.ui->GetInverseRingSwitchKey(layout.rank);
+  layer.Base().PrepareSeamHalf(0);
+  {
+    EvkRequest req;
+    layer.Base().AddSeamHalfRotations(req);
+    fui.PrepareRotationKey(req);
+  }
+  std::cout << "setup "
+            << std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t_setup0).count()
+            << " s" << std::endl;
+  cheddar::MemoryPool::Report("setup done");
+
+  // ---- the calibration ---------------------------------------------------
+  //
+  // The q/k/v sizing is the Llama model test's, on BERT's own maxima: the
+  // HalfBoot image bound first, then the cap on the chain-unit score message.
+  const double img_max = 0.45;
+  double cq = img_max / L.qmax, ck = img_max / L.kmax;
+  const double s_abs = std::max(std::abs(L.s_raw_max), std::abs(L.s_raw_min));
+  const double prod_cap = 0.36 / s_abs;
+  if (cq * ck > prod_cap) {
+    const double sh = std::sqrt(prod_cap / (cq * ck));
+    cq *= sh;
+    ck *= sh;
+  }
+  const double cv = std::min(1.0, img_max / L.vmax);
+  const double cqk = cq * ck;
+  const double stream_scale = kRide / L.resid_absmax;
+  const double int_scale = kRide / (stream_scale * L.u_absmax);
+  typename cheddar::CiBertLayer<word>::Calibration cal;
+  cal.stream_scale = stream_scale;
+  cal.attn_alpha = 1.0;
+  cal.attn_window = 1.5;
+  cal.ffn_alpha = 1.0;
+  cal.ffn_window = 1.5;
+  cal.attn_scale = L.attn_token_scale;
+  cal.ffn_scale = L.ffn_token_scale;
+  cal.q_scale = cq / stream_scale;
+  cal.k_scale = ck / stream_scale;
+  cal.v_scale = cv / stream_scale;
+  cal.int_scale = int_scale;
+  cal.out_scale = stream_scale / layer.GetKappa();
+  cal.gelu_range = 8.0;
+  cal.gelu_degree = 31;
+  cal.gelu_group = L.gelu_group;
+  std::cout << "cq " << cq << ", ck " << ck << ", cv " << cv
+            << ", stream_scale " << stream_scale << ", int_scale " << int_scale
+            << ", m_eff " << L.m_eff << std::endl;
+
+  // ---- the weights, declared --------------------------------------------
+  //
+  // The emission's rows, dense (Doing.md 3.12): one image per channel group,
+  // rows `hh * 16 + cp` over the model's heads -- which is the leg's doorstep
+  // after its merge. Module row `r` of group `g` is declared output
+  // `g * rank + rev(r)`, which is `Project`'s own contract.
+  const int qkv_groups = kD / layout.rank;
+  const int qkv_declared = qkv_groups * kRank;
+  auto qkv_entry = [&](int g, int hh, int cp, int &oc, int &o) {
+    const int row = hh * layout.rank + cp;
+    oc = g * kRank + Rev(row, 9);
+    o = hh * kD + g * layout.rank + cp;
+  };
+  auto declare_qkv = [&](const std::vector<double> &wsrc,
+                         std::vector<double> &out) {
+    out.assign(static_cast<size_t>(kDeclaredH) * qkv_declared, 0.0);
+    for (int g = 0; g < qkv_groups; g++) {
+      for (int hh = 0; hh < kHeads; hh++) {
+        for (int cp = 0; cp < layout.rank; cp++) {
+          int oc = 0, o = 0;
+          qkv_entry(g, hh, cp, oc, o);
+          for (int c = 0; c < kH; c++) {
+            out[static_cast<size_t>(c) * qkv_declared + oc] =
+                wsrc[static_cast<size_t>(c) * kH + o];
+          }
+        }
+      }
+    }
+  };
+  auto declare_qkv_bias = [&](const std::vector<double> &bsrc,
+                              std::vector<double> &out) {
+    out.assign(qkv_declared, 0.0);
+    for (int g = 0; g < qkv_groups; g++) {
+      for (int hh = 0; hh < kHeads; hh++) {
+        for (int cp = 0; cp < layout.rank; cp++) {
+          int oc = 0, o = 0;
+          qkv_entry(g, hh, cp, oc, o);
+          out[oc] = bsrc[o];
+        }
+      }
+    }
+  };
+  std::vector<double> wq_dec, wk_dec, wv_dec, bq_dec, bk_dec, bv_dec;
+  declare_qkv(L.wq, wq_dec);
+  declare_qkv(L.wk, wk_dec);
+  declare_qkv(L.wv, wv_dec);
+  declare_qkv_bias(L.bq, bq_dec);
+  declare_qkv_bias(L.bk, bk_dec);
+  declare_qkv_bias(L.bv, bv_dec);
+
+  const int num_images = kD / layout.rank;
+  const int attn_declared = num_images * kRank;
+  std::vector<int> attn_map(attn_declared, -1);
+  for (int bi = 0; bi < num_images; bi++) {
+    for (int col = 0; col < layout.rank; col++) {
+      for (int lane = 0; lane < layout.lanes; lane++) {
+        const int head = Rev(lane, 5);
+        if (head >= kHeads) continue;
+        attn_map[bi * kRank + Rev(col, 4) * 32 + Rev(lane, 5)] =
+            head * kD + bi * layout.rank + col;
+      }
+    }
+  }
+  std::vector<double> wo_dec(static_cast<size_t>(attn_declared) * kDeclaredH,
+                             0.0);
+  for (int in_d = 0; in_d < attn_declared; in_d++) {
+    const int a = attn_map[in_d];
+    if (a < 0) continue;
+    for (int c = 0; c < kH; c++) {
+      wo_dec[static_cast<size_t>(in_d) * kDeclaredH + c] =
+          L.wo[static_cast<size_t>(a) * kH + c];
+    }
+  }
+  const std::vector<double> wint_dec =
+      DeclareSquare(L.wint, kH, kDeclaredH, kI, kDeclaredI);
+  const std::vector<double> wout_dec =
+      DeclareSquare(L.wout, kI, kDeclaredI, kH, kDeclaredH);
+  const std::vector<double> bo_dec = Declare(L.bo, kDeclaredH);
+  const std::vector<double> bint_dec = Declare(L.bint, kDeclaredI);
+  const std::vector<double> bout_dec = Declare(L.bout, kDeclaredH);
+  const std::vector<double> ag_dec = Declare(L.ag, kDeclaredH);
+  const std::vector<double> ab_dec = Declare(L.ab, kDeclaredH);
+  const std::vector<double> fg_dec = Declare(L.fg, kDeclaredH);
+  const std::vector<double> fb_dec = Declare(L.fb, kDeclaredH);
+
+  typename cheddar::CiBertLayer<word>::Weights w;
+  w.q.host = &wq_dec;
+  w.k.host = &wk_dec;
+  w.v.host = &wv_dec;
+  w.o.host = &wo_dec;
+  w.inter.host = &wint_dec;
+  w.out.host = &wout_dec;
+  w.bq = &bq_dec;
+  w.bk = &bk_dec;
+  w.bv = &bv_dec;
+  w.bo = &bo_dec;
+  w.bint = &bint_dec;
+  w.bout = &bout_dec;
+  w.attn_gain = &ag_dec;
+  w.attn_bias = &ab_dec;
+  w.ffn_gain = &fg_dec;
+  w.ffn_bias = &fb_dec;
+  w.tag = "L00";
+
+  // ---- the stream --------------------------------------------------------
+  const int op_level = layer.GetStreamLevel();
+  std::vector<Ciphertext<word>> stream(kDeclaredH / kRank);
+  for (int k = 0; k < kDeclaredH / kRank; k++) {
+    std::vector<std::vector<double>> comp(kRank, std::vector<double>(kT, 0.0));
+    for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
+      for (int t = 0; t < kT; t++) {
+        comp[Rev(c - k * kRank, 9)][t] =
+            stream_scale * L.x[static_cast<size_t>(t) * kH + c];
+      }
+    }
+    const auto co = Recompose(comp);
+    Plaintext<word> pt;
+    ffn.context->encoder_.EncodeCoeff(pt, op_level,
+                                      ffn.param->GetScale(op_level), co);
+    boot.ui->Encrypt(stream[k], pt);
+    stream[k].SetNumSlots(num_slots);
+  }
+
+  // ---- Q, K and V, and their crossings -----------------------------------
+  const auto t_emit0 = std::chrono::steady_clock::now();
+  std::vector<std::vector<Ciphertext<word>>> qkv;
+  layer.Emit(qkv, stream, qkv_declared, w, cal);
+  std::vector<std::vector<Ciphertext<word>>> imgs(3);
+  for (int j = 0; j < 3; j++) {
+    imgs[j].resize(qkv_groups);
+    for (int g = 0; g < qkv_groups; g++) {
+      qkv[j][g].SetNumSlots(num_slots);
+      fctx->HalfBootModule(imgs[j][g], qkv[j][g], fevk,
+                           *layer.Base().GetModuleBasis());
+    }
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t_emit1 = std::chrono::steady_clock::now();
+
+  // ---- the softmax calibration, in chain units ---------------------------
+  typename cheddar::CiSinCAttention<word>::SoftMaxCalibration sc;
+  sc.m_eff = L.m_eff;
+  sc.span = cqk * L.span_raw;
+  sc.shift = cqk * L.s_raw_max;
+  sc.norm_lo = 0.9;
+  sc.norm_hi = 1.1;
+  sc.inv_degree = 7;
+  sc.causal = true;         // the per-row walk
+  sc.bidirectional = true;  // with every key live
+  // A DEAD LANE NEEDS A LIVE-LOOKING ROW. Its scores are zero, so shift zero
+  // and norm `dim` put its argument at exactly one; left at zero the inverse
+  // square root would be asked for 1/sqrt(0), outside every window.
+  sc.row_shift.assign(layout.lanes, std::vector<double>(kT, 0.0));
+  sc.row_norm.assign(layout.lanes,
+                     std::vector<double>(kT, static_cast<double>(layout.dim)));
+  for (int lane = 0; lane < layout.lanes; lane++) {
+    const int head = Rev(lane, 5);
+    if (head >= kHeads) continue;
+    for (int t = 0; t < kT; t++) {
+      sc.row_shift[lane][t] = cqk * L.row_shift[head][t];
+      sc.row_norm[lane][t] = L.row_norm[head][t];
+    }
+  }
+  attn.PrepareSoftMax(sc);
+
+  // ---- the leg -----------------------------------------------------------
+  const auto t_leg0 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> s0;
+  double carried = 0.0;
+  attn.Scores(s0, imgs[0], imgs[1], keys, &carried);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  ASSERT_LT(carried * cqk * s_abs, 0.95)
+      << "the q/k sizing missed EvalMod's range";
+  // FUSED: `Scores` hands back SLOTS at `GetTopLevel()`, carrying the chain's
+  // factor as a `Boot` would have -- the tower's HalfBoot and the lane prefix
+  // are the return, so there is no caller Boot here at all.
+  ASSERT_EQ(boot.param->NPToLevel(s0[0].GetNP()), attn.GetTopLevel());
+  std::vector<Ciphertext<word>> P;
+  attn.SoftMax(P, s0, carried, bevk);
+  std::vector<Ciphertext<word>> attn_out;
+  attn.Values(attn_out, P, imgs[2], keys);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t_leg1 = std::chrono::steady_clock::now();
+
+  // ---- the Boots and the seam -------------------------------------------
+  //
+  // Only the images the model fills: the chain writes `num_cts` column
+  // ciphertexts and BERT's 64-wide head lives in the first four of them.
+  const auto t_seam0 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> h_cts(num_images);
+  for (int bi = 0; bi < num_images; bi++) {
+    // Fused, `Values` already returned these booted, at the tower's landing
+    // less the prefix. They only have to meet the seam, whose level the two
+    // rings share.
+    Ciphertext<word> &booted = attn_out[bi];
+    const int seam_in = layer.Base().GetSeamInputLevel();
+    ASSERT_GE(boot.param->NPToLevel(booted.GetNP()), seam_in)
+        << "the leg's return landed below the seam's input level";
+    if (boot.param->NPToLevel(booted.GetNP()) > seam_in) {
+      Ciphertext<word> down;
+      bctx->LevelDown(down, booted, seam_in);
+      booted = std::move(down);
+    }
+    layer.Base().Seam(h_cts[bi], booted, fevk);
+  }
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t_seam1 = std::chrono::steady_clock::now();
+
+  // What the seam handed over, against the clear attention: this is where the
+  // leg's own factor is read, and `o_scale` is stated against it. In a run
+  // that does not decrypt, it is a calibration constant like any other.
+  double o_carried = 1.0;
+  {
+    std::vector<double> got(static_cast<size_t>(kT) * kH, 0.0);
+    for (int bi = 0; bi < num_images; bi++) {
+      Plaintext<word> pt;
+      ffn.ui->Decrypt(pt, h_cts[bi]);
+      std::vector<double> co;
+      ffn.context->encoder_.DecodeCoeff(co, pt);
+      const auto comp = Components(co);
+      for (int cc = 0; cc < kRank; cc++) {
+        const int a = attn_map[bi * kRank + cc];
+        if (a < 0) continue;
+        for (int t = 0; t < kT; t++) {
+          got[static_cast<size_t>(t) * kH + a] = comp[Rev(cc, 9)][t];
+        }
+      }
+    }
+    o_carried = Report("stage 1: the seam's attention output", got, L.av);
+    EXPECT_LT(RelBits(got, L.av), -7.0)
+        << "the leg and the seam did not deliver the attention output";
+  }
+  cal.o_scale = stream_scale / o_carried;
+
+  // ---- the two turns -----------------------------------------------------
+  const auto t_turn0 = std::chrono::steady_clock::now();
+  std::vector<Ciphertext<word>> h_ct;
+  layer.AttentionTurn(h_ct, h_cts, stream, w, cal, fevk);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  {
+    std::vector<double> got;
+    ReadStream(ffn, h_ct, got);
+    Report("stage 2: H = LayerNorm(X + O + b_o)", got, L.h);
+    EXPECT_LT(RelBits(got, L.h), -7.0);
+  }
+  std::vector<Ciphertext<word>> z_ct;
+  layer.FeedForward(z_ct, h_ct, w, cal, fevk);
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+  const auto t_turn1 = std::chrono::steady_clock::now();
+  {
+    std::vector<double> got;
+    ReadStream(ffn, z_ct, got);
+    Report("stage 3: THE LAYER, against h_L00.f64", got, L.href);
+    EXPECT_LT(RelBits(got, L.href), -6.0)
+        << "the whole layer is worse than 2^-6 against the float64 reference";
+  }
+  auto secs = [](auto a, auto b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+  std::cout << "cost: Emit + 12 HalfBootModules " << secs(t_emit0, t_emit1)
+            << " s, the leg " << secs(t_leg0, t_leg1) << " s, the seam "
+            << secs(t_seam0, t_seam1) << " s, the two turns "
+            << secs(t_turn0, t_turn1) << " s" << std::endl;
   cheddar::MemoryPool::Report("done");
 }
