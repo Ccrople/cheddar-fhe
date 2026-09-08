@@ -1038,6 +1038,21 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                    calib_.iter_inv_degree, cho_inv_in_, false));
     cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_,
                                    calib_.last_inv_degree, cho_inv_in_, true));
+    // The plain-causal 0/1 masks at exp_out_ are HEAD-INDEPENDENT, so encode the
+    // 128 of them ONCE here (SoftMaxCho, called once per head, read cho_masks_[l]
+    // instead of re-encoding 128 x NHEAD a layer). mask[l] is live at t >= l.
+    cho_masks_.clear();
+    cho_masks_.resize(T);
+    {
+      std::vector<double> m(T);
+      std::vector<Complex> msg;
+      for (int l = 0; l < T; l++) {
+        for (int t = 0; t < T; t++) m[t] = (t >= l) ? 1.0 : 0.0;
+        layout_.PackPerToken(msg, m);
+        boot_->gpu_encoder_.Encode(cho_masks_[l], exp_out_,
+                                   param.GetScale(exp_out_), msg);
+      }
+    }
     if (cfg_.verbose) {
       std::cout << "  [batch] softmax Cho: niter " << calib_.niter
                 << ", exp hb " << hb << " @" << exp_in_ << ".." << exp_out_
@@ -1286,19 +1301,11 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
              "CiBatchAttention::SoftMaxCho: call PrepareSoftMax with niter>0");
   const auto &mult_key = evk.GetMultiplicationKey();
 
-  // The plain causal 0/1 masks at exp_out_ (no est/gamma fold -- the iteration
-  // does the normalization). mask[l] is live (1) at query tokens t >= l.
-  std::vector<Pt> masks(T);
-  {
-    std::vector<double> m(T);
-    std::vector<Complex> msg;
-    for (int l = 0; l < T; l++) {
-      for (int t = 0; t < T; t++) m[t] = (t >= l) ? 1.0 : 0.0;
-      layout_.PackPerToken(msg, m);
-      boot_->gpu_encoder_.Encode(masks[l], exp_out_, param.GetScale(exp_out_),
-                                 msg);
-    }
-  }
+  // The plain causal 0/1 masks at exp_out_ are HEAD-INDEPENDENT (no est/gamma
+  // fold -- the iteration does the normalization), so they were encoded ONCE in
+  // PrepareSoftMax; read cho_masks_[l] here. mask[l] is live (1) at t >= l.
+  AssertTrue(static_cast<int>(cho_masks_.size()) == T,
+             "CiBatchAttention::SoftMaxCho: PrepareSoftMax must build cho_masks_");
 
   // y0 = exp((S - shift)/2^k) (.) causal.  u = a1 S + a0[row], exp, mask.
   const double a1 = 2.0 / (calib_.span * carried);
@@ -1318,10 +1325,9 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     boot_->Add(u, u, a0_[head]);
     Ct yf, t2;
     polys_[0]->Evaluate(boot_, yf, u, mult_key);   // exp -> exp_out_
-    boot_->Mult(t2, yf, masks[l]);
+    boot_->Mult(t2, yf, cho_masks_[l]);
     boot_->Rescale(y[l], t2);           // exp_out_ - 1
   }
-  masks.clear();
 
   // k normalize-and-square iterations. Boot the MAIN path to top each time
   // (so sq arrives at top-1 uniformly), norm via invsqrt, then y = (y r)^2.

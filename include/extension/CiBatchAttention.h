@@ -465,6 +465,12 @@ class CiBatchAttention {
   //! The FIRST iteration skips the main-path boot (y0 is fresh from exp), so its
   //! invsqrt reads sq at a LOWER level -- compiled separately here.
   int cho_first_in_ = 0;
+  //! niter>0 (SoftMaxCho): the 128 plain-causal 0/1 masks at exp_out_. They are
+  //! HEAD-INDEPENDENT (the Cho iteration does the normalization -- no est/gamma
+  //! fold, unlike BuildMasks), so they are encoded ONCE in PrepareSoftMax rather
+  //! than rebuilt per head call (128 x NHEAD -> 128 encodes a layer). mask[l] is
+  //! live (1) at query tokens t >= l.
+  std::vector<Pt> cho_masks_;
   //! `affine_in_prefix`: the `carried` the prefix plaintexts were encoded
   //! with (0 = the plain ctor encode, no affine folded). The chain's scale
   //! walk is deterministic, so after the first fold this never changes.
