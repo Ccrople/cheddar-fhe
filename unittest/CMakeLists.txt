@@ -586,4 +586,8 @@ if (ENABLE_EXTENSION)
   add_executable(pc_attention_test PcAttentionTest.cpp)
   target_link_libraries(pc_attention_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  add_executable(public_prefill_test PublicPrefillTest.cpp)
+  target_link_libraries(public_prefill_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
