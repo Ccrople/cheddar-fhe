@@ -2160,6 +2160,397 @@ TEST(CiBatch, TheHeterogeneousSoftMaxMatchesEachPrompt) {
 //    factor) has the SAME attention output, and the reference is av_L00.f64
 //    times Wo for all of them, plus each instance's own input.
 // ---------------------------------------------------------------------------
+// 7b. THE JOINT SOFTMAX OVER A PUBLIC CONTEXT: [SYLPH] 4.1's T = 4096 row.
+//
+//     3968 of the 4096 keys are PUBLIC -- their K and V are plaintext,
+//     computed in the clear -- and 128 are the user's encrypted query tokens.
+//     `CiPcAttention` contracts the public keys away into POWER SUMS and
+//     `SoftMaxCho` joins them into each iteration's denominator. This is that
+//     join, on the real layer-0 weights and a real 4096-token prompt.
+//
+//     Two things are under test and they fail differently.
+//
+//     THE ALGEBRA. Unrolled, `y^(j)_l = (y0_l)^(2^j) R_j` with `R_j` a per
+//     QUERY TOKEN scalar, so `sq^(j) = R_j^2 sum_l (y0_l)^(2^(j+1))` and the
+//     public keys need not survive an iteration. The host walks it BOTH ways
+//     -- over all 4096 keys directly, and split into 128 encrypted plus the
+//     power sums -- and they have to agree before the ciphertext is asked
+//     anything.
+//
+//     THE WINDOW, which is the one that bites. After the first normalise-and-
+//     square the row is a probability vector, so every later `sq` is a
+//     collision probability in `[1/live, 1]`: at 4096 keys its lower edge
+//     falls by the key ratio and the last invsqrt's fit collapses. It does
+//     not blow up -- it SATURATES, returning `r` short and silently scaling
+//     the attention output down, which is why this is measured and not
+//     assumed. `SoftMaxCalibration::cho_est` divides `sq` by a per-row
+//     estimate so the polynomial sees the RATIO. Both are run.
+// ---------------------------------------------------------------------------
+TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
+#ifndef USE_CUBLAS
+  GTEST_SKIP() << "built without cuBLAS";
+#else
+  const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
+  if (wdir_env == nullptr) GTEST_SKIP() << "LLAMA3_ALL_DIR is not set";
+  const std::string ld = std::string(wdir_env) + "/L00";
+  constexpr int kH = 4096, kKv = 1024, kD = 128, kNHead = 32, kNKv = 8;
+  const int T = kTokens;  // the encrypted block
+  const int ptok = EnvInt("PC4096_PTOK", 3968);
+  const int head = EnvInt("PC4096_HEAD", 3);  // the widest later window
+  const int niter = EnvInt("CHEDDAR_CI_BATCH_NITER", 2);
+  const int tokens = ptok + T;
+  ASSERT_GT(ptok, 0);
+  ASSERT_GT(niter, 0);
+  ASSERT_LE(tokens, 4096);
+
+  std::vector<float> wq, wk, an, x0;
+  ASSERT_TRUE(ReadF32(ld + "/wq.f32", size_t(kH) * kH, wq));
+  ASSERT_TRUE(ReadF32(ld + "/wk.f32", size_t(kH) * kKv, wk));
+  ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an));
+  const std::string in = std::string(wdir_env) + "/input_nosink_4096.f32";
+  if (!ReadF32(in, size_t(4096) * kH, x0)) {
+    GTEST_SKIP() << "no 4096-token input at " << in;
+  }
+
+  // ---- the host scores, RAW -----------------------------------------------
+  const double eps = 1e-5, rope_base = 500000.0;
+  const int kvh = head / (kNHead / kNKv);
+  const int half = kD / 2;
+  std::vector<double> qh(size_t(T) * kD, 0.0), kb(size_t(tokens) * kD, 0.0);
+  cheddar::ParallelFor(tokens, [&](int begin, int end) {
+    std::vector<double> y(kH);
+    for (int t = begin; t < end; t++) {
+      double ms = 0.0;
+      for (int c = 0; c < kH; c++) {
+        const double v = x0[size_t(t) * kH + c];
+        ms += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(ms / kH + eps);
+      for (int c = 0; c < kH; c++) {
+        y[c] = double(x0[size_t(t) * kH + c]) * inv * double(an[c]);
+      }
+      double *kd = &kb[size_t(t) * kD];
+      for (int c = 0; c < kH; c++) {
+        const double yc = y[c];
+        const float *row = &wk[size_t(c) * kKv + kvh * kD];
+        for (int d = 0; d < kD; d++) kd[d] += yc * double(row[d]);
+      }
+      for (int d = 0; d < half; d++) {
+        const double a = t * std::pow(rope_base, -2.0 * d / kD);
+        const double lo = kd[d], hi = kd[d + half];
+        kd[d] = lo * std::cos(a) - hi * std::sin(a);
+        kd[d + half] = hi * std::cos(a) + lo * std::sin(a);
+      }
+      if (t >= ptok) {
+        double *qd = &qh[size_t(t - ptok) * kD];
+        for (int c = 0; c < kH; c++) {
+          const double yc = y[c];
+          const float *row = &wq[size_t(c) * kH + head * kD];
+          for (int d = 0; d < kD; d++) qd[d] += yc * double(row[d]);
+        }
+        for (int d = 0; d < half; d++) {
+          const double a = t * std::pow(rope_base, -2.0 * d / kD);
+          const double lo = qd[d], hi = qd[d + half];
+          qd[d] = lo * std::cos(a) - hi * std::sin(a);
+          qd[d + half] = hi * std::cos(a) + lo * std::sin(a);
+        }
+      }
+    }
+  });
+
+  // S[t][l], causal: the encrypted row t sits at absolute `ptok + t`.
+  std::vector<double> S(size_t(T) * tokens, 0.0);
+  cheddar::ParallelFor(T, [&](int begin, int end) {
+    for (int t = begin; t < end; t++) {
+      for (int l = 0; l <= ptok + t; l++) {
+        double a = 0.0;
+        for (int d = 0; d < kD; d++) {
+          a += qh[size_t(t) * kD + d] * kb[size_t(l) * kD + d];
+        }
+        S[size_t(t) * tokens + l] = a;
+      }
+    }
+  });
+  const auto is_live = [&](int t, int l) { return l <= ptok + t; };
+  double s_min = 1e300, s_max = -1e300;
+  for (int t = 0; t < T; t++) {
+    for (int l = 0; l <= ptok + t; l++) {
+      s_min = std::min(s_min, S[size_t(t) * tokens + l]);
+      s_max = std::max(s_max, S[size_t(t) * tokens + l]);
+    }
+  }
+  const double span_raw = s_max - s_min;
+  const double m_eff = span_raw / std::sqrt(double(kD));
+  const double hb = m_eff / std::ldexp(1.0, niter + 1);
+
+  std::vector<double> shift(T);
+  for (int t = 0; t < T; t++) {
+    double mx = -1e300;
+    for (int l = 0; l <= ptok + t; l++) {
+      mx = std::max(mx, S[size_t(t) * tokens + l]);
+    }
+    shift[t] = mx;
+  }
+  const auto y0_of = [&](int t, int l) -> double {
+    if (!is_live(t, l)) return 0.0;
+    const double u =
+        1.0 - 2.0 * (shift[t] - S[size_t(t) * tokens + l]) / span_raw;
+    return std::exp(hb * (u - 1.0));
+  };
+
+  // ---- the host walk, BOTH ways -------------------------------------------
+  std::vector<double> yfull(size_t(T) * tokens);
+  for (int t = 0; t < T; t++) {
+    for (int l = 0; l < tokens; l++) yfull[size_t(t) * tokens + l] = y0_of(t, l);
+  }
+  std::vector<std::vector<double>> sq_host(niter, std::vector<double>(T, 0.0));
+  for (int j = 0; j < niter; j++) {
+    for (int t = 0; t < T; t++) {
+      double s = 0.0;
+      for (int l = 0; l < tokens; l++) {
+        const double v = yfull[size_t(t) * tokens + l];
+        s += v * v;
+      }
+      sq_host[j][t] = s;
+      const double r = 1.0 / std::sqrt(s);
+      for (int l = 0; l < tokens; l++) {
+        const double v = yfull[size_t(t) * tokens + l] * r;
+        yfull[size_t(t) * tokens + l] = v * v;
+      }
+    }
+  }
+
+  std::vector<std::vector<double>> pow_host(niter, std::vector<double>(T, 0.0));
+  for (int j = 0; j < niter; j++) {
+    const double e = std::ldexp(1.0, j + 1);  // 2^(j+1)
+    cheddar::ParallelFor(T, [&](int begin, int end) {
+      for (int t = begin; t < end; t++) {
+        double s = 0.0;
+        for (int l = 0; l < ptok; l++) s += std::pow(y0_of(t, l), e);
+        pow_host[j][t] = s;
+      }
+    });
+  }
+  std::vector<double> yenc(size_t(T) * T);
+  for (int t = 0; t < T; t++) {
+    for (int l = 0; l < T; l++) yenc[size_t(t) * T + l] = y0_of(t, ptok + l);
+  }
+  std::vector<double> R(T, 1.0);
+  double split_diff = 0.0;
+  for (int j = 0; j < niter; j++) {
+    for (int t = 0; t < T; t++) {
+      double se = 0.0;
+      for (int l = 0; l < T; l++) {
+        const double v = yenc[size_t(t) * T + l];
+        se += v * v;
+      }
+      const double s = se + R[t] * R[t] * pow_host[j][t];
+      split_diff =
+          std::max(split_diff, std::abs(s - sq_host[j][t]) / sq_host[j][t]);
+      const double r = 1.0 / std::sqrt(s);
+      for (int l = 0; l < T; l++) {
+        const double v = yenc[size_t(t) * T + l] * r;
+        yenc[size_t(t) * T + l] = v * v;
+      }
+      R[t] = R[t] * R[t] * r * r;
+    }
+  }
+  std::cout << "  [t4096] " << tokens << " keys = " << ptok << " public + " << T
+            << " encrypted, head " << head << ", niter " << niter << std::endl
+            << "  [t4096] split walk vs the whole row     : " << std::scientific
+            << std::setprecision(3) << split_diff
+            << "   (R_j has no key index, so it leaves the sum)" << std::endl;
+  ASSERT_LT(split_diff, 1e-12) << "the power-sum identity does not hold";
+  for (int j = 0; j < niter; j++) {
+    double lo = 1e300, hi = -1e300;
+    for (int t = 0; t < T; t++) {
+      lo = std::min(lo, sq_host[j][t]);
+      hi = std::max(hi, sq_host[j][t]);
+    }
+    std::cout << "  [t4096] iteration " << j << " sq window       : ["
+              << std::scientific << std::setprecision(3) << lo << ", " << hi
+              << "]  ratio " << std::fixed << std::setprecision(1) << (hi / lo)
+              << std::endl;
+  }
+
+  // ---- the rings ----------------------------------------------------------
+  cheddar::CiBatchAttention<word>::Config acfg;
+  acfg.verbose = true;
+  Ring boot(Param());
+  Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
+  Ring small("ci12_35_boot.json");
+  Ring lifted("ringdegree13_35_boot.json",
+              cheddar::CiLiftHandler<word>::LiftSecret(
+                  small.ui->GetSecretCoeffs()));
+  auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
+  ASSERT_NE(bctx, nullptr);
+  cheddar::CiBatchAttention<word> attn(bctx, swtch.context, small.context,
+                                       lifted.context, acfg);
+  // The layer's own rotations as well as the attention's: the score boots go
+  // through the layer ring's EvalSpecialFFT, whose keys `AddBootRotations`
+  // does not carry.
+  cheddar::CiBatchLayer<word>::Config lcfg;
+  lcfg.num_tokens = T;
+  lcfg.model = 32;
+  lcfg.hidden = 64;
+  lcfg.rows_per_tile = 32;
+  cheddar::CiBatchLayer<word> layer(bctx, lcfg);
+  bctx->PrepareEvalMod();
+  bctx->PrepareEvalSpecialFFT(attn.GetLayout().num_slots);
+  {
+    cheddar::EvkRequest req;
+    layer.AddRequiredRotations(req);
+    attn.AddBootRotations(req);
+    boot.ui->PrepareRotationKey(req);
+  }
+  const CiBatchLayout &layout = attn.GetLayout();
+
+  // The scores enter the ciphertext at the chain's factor, as the layer's do.
+  const double score_ride = 0.35;
+  const double cqk = score_ride / std::max(std::abs(s_min), std::abs(s_max));
+  const double carried = 1.8;
+
+  HostTensor senc{layout.num_instances, T, T, {}};
+  senc.v.assign(size_t(layout.num_instances) * T * T, 0.0);
+  for (int b = 0; b < layout.num_instances; b++) {
+    for (int t = 0; t < T; t++) {
+      for (int l = 0; l < T; l++) {
+        senc.At(b, t, l) = carried * cqk * S[size_t(t) * tokens + ptok + l];
+      }
+    }
+  }
+  // The power sums, one ciphertext an iteration. `CiPcAttention` produces
+  // these; here they are handed over directly so the join is what is measured
+  // and not the public branch, which `PcAttentionTest` covers on its own.
+  // NORMALISED, because the term crosses a bootstrap: `pow_scale` is the
+  // calibrated size of the sum and the ciphertext carries the ratio, which is
+  // O(1). Here the estimate is the sum itself, so the ratio is exactly 1; a
+  // shared calibration would be looser and the boot would still be fine.
+  const int kPowLevel = 5;
+  std::vector<std::vector<double>> pow_scale(niter, std::vector<double>(T, 1.0));
+  for (int j = 0; j < niter; j++) {
+    for (int t = 0; t < T; t++) pow_scale[j][t] = pow_host[j][t];
+  }
+  HostTensor pw{layout.num_instances, T, niter, {}};
+  pw.v.assign(size_t(layout.num_instances) * T * niter, 0.0);
+  for (int b = 0; b < layout.num_instances; b++) {
+    for (int t = 0; t < T; t++) {
+      for (int j = 0; j < niter; j++) {
+        pw.At(b, t, j) = pow_host[j][t] / pow_scale[j][t];
+      }
+    }
+  }
+
+  std::vector<int> bs = {0, layout.num_instances / 2,
+                         layout.num_instances - 1};
+  std::vector<int> all_l(T);
+  for (int l = 0; l < T; l++) all_l[l] = l;
+  HostTensor want{layout.num_instances, T, T, {}};
+  want.v.assign(size_t(layout.num_instances) * T * T, 0.0);
+  for (int b : bs) {
+    for (int t = 0; t < T; t++) {
+      for (int l = 0; l < T; l++) {
+        want.At(b, t, l) = yfull[size_t(t) * tokens + ptok + l];
+      }
+    }
+  }
+
+  // ---- run it twice: with the per-row fold and without --------------------
+  const auto run = [&](bool folded, double &rms_bits) {
+    typename cheddar::CiBatchAttention<word>::SoftMaxCalibration sc;
+    sc.m_eff = m_eff;
+    sc.span = cqk * span_raw;
+    sc.shift = cqk * s_max;
+    sc.causal = true;
+    sc.niter = niter;
+    sc.iter_inv_degree = EnvInt("CHEDDAR_CI_BATCH_ITER_INV_DEG", 31);
+    sc.last_inv_degree = EnvInt("CHEDDAR_CI_BATCH_LAST_INV_DEG", 63);
+    sc.row_shift.assign(kNHead, std::vector<double>(T, 0.0));
+    for (int h = 0; h < kNHead; h++) {
+      for (int t = 0; t < T; t++) sc.row_shift[h][t] = cqk * shift[t];
+    }
+    if (folded) {
+      // The estimate is the host's own `sq`, so the polynomial sees a ratio
+      // of one plus whatever the ciphertext's exp drifts by. A shared
+      // calibration would be looser; this measures the mechanism, and the
+      // window it needs is priced in `cho_window.py`.
+      sc.cho_est.assign(niter, std::vector<std::vector<double>>(
+                                   kNHead, std::vector<double>(T, 1.0)));
+      for (int j = 0; j < niter; j++) {
+        for (int h = 0; h < kNHead; h++) {
+          for (int t = 0; t < T; t++) sc.cho_est[j][h][t] = sq_host[j][t];
+        }
+      }
+      sc.first_lo = 0.75;
+      sc.first_hi = 1.35;
+      sc.norm_lo = 0.75;
+      sc.norm_hi = 1.35;
+    } else {
+      // The windows the data really spans, which is what the test harness
+      // derives today.
+      double flo = 1e300, fhi = -1e300, llo = 1e300, lhi = -1e300;
+      for (int t = 0; t < T; t++) {
+        flo = std::min(flo, sq_host[0][t]);
+        fhi = std::max(fhi, sq_host[0][t]);
+        for (int j = 1; j < niter; j++) {
+          llo = std::min(llo, sq_host[j][t]);
+          lhi = std::max(lhi, sq_host[j][t]);
+        }
+      }
+      sc.first_lo = std::max(flo * 0.5, 1e-3);
+      sc.first_hi = fhi * 1.6;
+      sc.norm_lo = (niter > 1) ? llo : sc.first_lo;
+      sc.norm_hi = (niter > 1) ? lhi : sc.first_hi;
+    }
+    attn.PrepareSoftMax(sc);
+
+    std::vector<Ciphertext<word>> cts;
+    EncryptChannels(boot, layout, senc, 1, cts);
+    for (auto &ct : cts) ct.SetScale(carried * boot.param->GetScale(1));
+    std::vector<Ciphertext<word>> booted(T);
+    for (int l = 0; l < T; l++) {
+      bctx->Boot(booted[l], cts[l], boot.ui->GetEvkMap());
+    }
+    cts.clear();
+    std::vector<Ciphertext<word>> pow_ct;
+    EncryptChannels(boot, layout, pw, kPowLevel, pow_ct);
+
+    typename cheddar::CiBatchAttention<word>::PublicHalf pub;
+    pub.pow = &pow_ct;
+    pub.pow_scale = pow_scale;
+    Ciphertext<word> pub_scale;
+    std::vector<Ciphertext<word>> P;
+    attn.SoftMax(P, booted, head, carried, boot.ui->GetEvkMap(), &pub,
+                 &pub_scale);
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+    HostTensor got{layout.num_instances, T, T, {}};
+    got.v.assign(want.v.size(), 0.0);
+    DecryptChannels(boot, layout, P, all_l, got);
+    const Err e = Compare(got, want, bs, all_l);
+    rms_bits = Bits(e.rms_rel);
+    std::cout << "  [t4096] " << (folded ? "WITH" : "without")
+              << " the per-row fold  : rms rel 2^-" << std::fixed
+              << std::setprecision(2) << rms_bits << "  (max abs "
+              << std::scientific << e.max_abs << ", ref rms " << e.rms_ref
+              << ")" << std::endl;
+  };
+
+  double bits_plain = 0.0, bits_folded = 0.0;
+  run(false, bits_plain);
+  run(true, bits_folded);
+
+  // The fold is the fix, so it is the one that has to pass. The unfolded
+  // number is printed beside it because it is the finding, and because a
+  // saturating invsqrt does not announce itself.
+  EXPECT_GT(bits_folded, 6.0)
+      << "the joint softmax is below the crypto floor even with the fold";
+  EXPECT_GT(bits_folded, bits_plain)
+      << "the per-row fold did not help, so the window was not the problem";
+#endif
+}
+
+// ---------------------------------------------------------------------------
 TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
   const char *wdir_env = std::getenv("LLAMA3_ALL_DIR");
   const char *rdir_env = std::getenv("LLAMA3_REF_DIR");

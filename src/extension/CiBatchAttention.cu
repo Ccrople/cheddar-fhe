@@ -1081,6 +1081,25 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     cho_first_in_ = exp_out_ - 3;
     AssertTrue(cho_first_in_ > 0,
                "CiBatchAttention::PrepareSoftMax: niter>0 needs exp_out above 3");
+    if (!calib_.cho_est.empty()) {
+      AssertTrue(static_cast<int>(calib_.cho_est.size()) == calib_.niter,
+                 "CiBatchAttention::PrepareSoftMax: cho_est is one estimate "
+                 "set an ITERATION");
+      for (const auto &per_head : calib_.cho_est) {
+        AssertTrue(!per_head.empty(),
+                   "CiBatchAttention::PrepareSoftMax: cho_est needs a head");
+        for (const auto &rows : per_head) {
+          AssertTrue(static_cast<int>(rows.size()) == T,
+                     "CiBatchAttention::PrepareSoftMax: cho_est is one "
+                     "estimate a ROW");
+          for (double e : rows) {
+            AssertTrue(e > 0.0,
+                       "CiBatchAttention::PrepareSoftMax: a cho_est entry is "
+                       "not positive, so its square root is not a fold");
+          }
+        }
+      }
+    }
     cho_first_lo_ = (calib_.first_lo > 0.0) ? calib_.first_lo : calib_.norm_lo;
     cho_first_hi_ = (calib_.first_hi > 0.0) ? calib_.first_hi : calib_.norm_hi;
     // The later window: start from the calibrated [norm_lo, norm_hi] ~ [1/n, 1],
@@ -1109,7 +1128,11 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                       param.GetScale(in_level), true)
                            .GetPolyDegree();
       const int out = in_level - Log2Ceil(used + 1);
-      const int floor = is_last ? cfg_.forward_level + 2 : 3;
+      // Taking a per-row estimate back out of `r` is one more plaintext
+      // multiply on the last iteration's output, so its floor rises by one.
+      const int floor =
+          is_last ? cfg_.forward_level + 2 + (calib_.cho_est.empty() ? 0 : 1)
+                  : 3;
       AssertTrue(out >= floor,
                  "CiBatchAttention::PrepareSoftMax: niter invsqrt overspends "
                  "its levels");
@@ -1512,6 +1535,14 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     AssertTrue(pub_scale != nullptr,
                "CiBatchAttention::SoftMaxCho: the public value accumulator "
                "needs R_k, so pub_scale must be given with pub");
+    AssertTrue(static_cast<int>(pub->pow_scale.size()) == k,
+               "CiBatchAttention::SoftMaxCho: pow_scale is one row of "
+               "constants an iteration");
+    for (const auto &row : pub->pow_scale) {
+      AssertTrue(static_cast<int>(row.size()) == T,
+                 "CiBatchAttention::SoftMaxCho: pow_scale is one constant a "
+                 "query token");
+    }
   }
 
   // k normalize-and-square iterations. Boot the MAIN path to top each time
@@ -1548,38 +1579,8 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     Ct sq;
     boot_->RelinearizeRescale(sq, sq_acc, mult_key);
     sq_acc = Ct();
-    // (2b) THE PUBLIC HALF OF THE SAME DENOMINATOR, for T = 4096:
-    //          sq^(j) += R_j^2 * sum_p (y0_p)^(2^(j+1)) .
-    // `R_j` is one number a query token, so it left the sum; the public keys
-    // are gone and only their power sum is here. The product is formed at the
-    // LOW level where both factors live and bootstrapped ONCE, rather than
-    // lifting each factor -- one boot an iteration a head, 64 a layer.
     Ct rsq;
     bool have_rsq = false;
-    if (pub != nullptr) {
-      const Ct &M = (*pub->pow)[j];
-      Ct term;
-      if (!have_R) {
-        boot_->Boot(term, M, evk);  // R_0 = 1
-      } else {
-        boot_->HMult(rsq, R, R, mult_key);  // R_j^2, reused by (3b)
-        have_rsq = true;
-        const int low = Min(param.NPToLevel(rsq.GetNP()),
-                            param.NPToLevel(M.GetNP()));
-        Ct a, b, prod;
-        boot_->LevelDown(a, rsq, low);
-        boot_->LevelDown(b, M, low);
-        boot_->HMult(prod, a, b, mult_key);
-        boot_->Boot(term, prod, evk);
-      }
-      const int sq_lvl0 = param.NPToLevel(sq.GetNP());
-      AssertTrue(param.NPToLevel(term.GetNP()) >= sq_lvl0,
-                 "CiBatchAttention::SoftMaxCho: the public term landed below "
-                 "the denominator it joins");
-      Ct down;
-      boot_->LevelDown(down, term, sq_lvl0);
-      boot_->Add(sq, sq, down);
-    }
     // (3) the window and its invsqrt: first iteration wide, later [norm_lo,hi];
     //     crude except the last.
     const bool first = (j == 0);
@@ -1590,19 +1591,122 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
         first ? cho_inv_[0].get() : (last ? cho_inv_[2].get() : cho_inv_[1].get());
     const double aff_a = 0.5 * (hi - lo);
     const double aff_b = 0.5 * (hi + lo);
-    Constant<word> inva;
     const int sq_lvl = param.NPToLevel(sq.GetNP());
-    boot_->encoder_.EncodeConstant(inva, sq_lvl, param.GetScale(sq_lvl),
-                                   1.0 / aff_a);
     Ct scaled, sqv;
-    boot_->Mult(scaled, sq, inva);
+    // The affine's multiply. With a per-row estimate it carries the estimate
+    // too -- `sq / est` instead of `sq` -- so the window the polynomial was
+    // fitted on is the RATIO and not the span of the rows' concentrations.
+    // Same multiply, same level; only taking the estimate back out of `r`
+    // below costs one. See `SoftMaxCalibration::cho_est`.
+    const bool folded = !calib_.cho_est.empty();
+    std::vector<double> row_g;   //!< 1 / sqrt(est), kept for `r`
+    if (folded) {
+      const auto &est = calib_.cho_est[j];
+      AssertTrue(head >= 0 && head < static_cast<int>(est.size()),
+                 "CiBatchAttention::SoftMaxCho: cho_est has no such head");
+      std::vector<double> row_a(T);
+      row_g.resize(T);
+      for (int t = 0; t < T; t++) {
+        row_a[t] = 1.0 / (est[head][t] * aff_a);
+        row_g[t] = 1.0 / std::sqrt(est[head][t]);
+      }
+      std::vector<Complex> msg;
+      Pt pa;
+      layout_.PackPerToken(msg, row_a);
+      boot_->gpu_encoder_.Encode(pa, sq_lvl, param.GetScale(sq_lvl), msg);
+      boot_->Mult(scaled, sq, pa);
+    } else {
+      Constant<word> inva;
+      boot_->encoder_.EncodeConstant(inva, sq_lvl, param.GetScale(sq_lvl),
+                                     1.0 / aff_a);
+      boot_->Mult(scaled, sq, inva);
+    }
     boot_->Rescale(sqv, scaled);        // cho_inv_in_ = top - 2
     Constant<word> shift;
     boot_->encoder_.EncodeConstant(shift, param.NPToLevel(sqv.GetNP()),
                                    sqv.GetScale(), -aff_b / aff_a);
     boot_->Add(sqv, sqv, shift);
+    // (2b) THE PUBLIC HALF OF THE SAME DENOMINATOR, for T = 4096:
+    //          sq^(j) += R_j^2 * sum_p (y0_p)^(2^(j+1)) .
+    // `R_j` is one number a query token, so it left the sum and the public
+    // keys are gone -- only their power sum is here.
+    //
+    // It joins AFTER the affine, and that is not cosmetic. The public term
+    // arrives from the public branch far below the walk and has to cross a
+    // bootstrap, which wants an O(1) message; the raw power sum over 3968
+    // keys runs to the hundreds and EvalMod's sine would be evaluated
+    // outside its range -- returning garbage, not an error. Every per-row
+    // constant (`pow_scale`, the row's `cho_est`, and `1 / aff_a`) is
+    // therefore folded in BEFORE the boot, so what crosses it is the public
+    // half of the invsqrt's ARGUMENT.
+    if (pub != nullptr) {
+      const Ct &M = (*pub->pow)[j];
+      // The constants ride M, which is the highest of the three: a plaintext
+      // multiply costs a level wherever it is taken, and `R_j^2` has the
+      // least to give (two squarings below the first invsqrt's landing).
+      std::vector<double> c(T);
+      for (int t = 0; t < T; t++) {
+        const double est = folded ? calib_.cho_est[j][head][t] : 1.0;
+        c[t] = pub->pow_scale[j][t] / (est * aff_a);
+      }
+      const int m_lvl = param.NPToLevel(M.GetNP());
+      AssertTrue(m_lvl >= 1,
+                 "CiBatchAttention::SoftMaxCho: the public power sum arrived "
+                 "with no level to fold its constants into");
+      std::vector<Complex> msg;
+      Pt pc;
+      layout_.PackPerToken(msg, c);
+      boot_->gpu_encoder_.Encode(pc, m_lvl, param.GetScale(m_lvl), msg);
+      Ct mc, t1;
+      boot_->Mult(t1, M, pc);
+      boot_->Rescale(mc, t1);
+
+      Ct pre;
+      if (!have_R) {
+        pre = std::move(mc);  // R_0 = 1
+      } else {
+        boot_->HMult(rsq, R, R, mult_key);  // R_j^2, reused by (3b)
+        have_rsq = true;
+        const int low = Min(param.NPToLevel(rsq.GetNP()),
+                            param.NPToLevel(mc.GetNP()));
+        AssertTrue(low >= 1,
+                   "CiBatchAttention::SoftMaxCho: R_j^2 and the public power "
+                   "sum have no level left to meet on");
+        Ct a2, b2;
+        boot_->LevelDown(a2, rsq, low);
+        boot_->LevelDown(b2, mc, low);
+        boot_->HMult(pre, a2, b2, mult_key);
+      }
+      // What crosses the bootstrap is the public half of the invsqrt's
+      // ARGUMENT, which is O(1) -- see `PublicHalf::pow_scale`.
+      Ct term;
+      boot_->Boot(term, pre, evk);
+      const int v_lvl = param.NPToLevel(sqv.GetNP());
+      AssertTrue(param.NPToLevel(term.GetNP()) >= v_lvl,
+                 "CiBatchAttention::SoftMaxCho: the public term landed below "
+                 "the argument it joins");
+      Ct down;
+      boot_->LevelDown(down, term, v_lvl);
+      boot_->Add(sqv, sqv, down);
+    }
     Ct r;
     inv->Evaluate(boot_, r, sqv, mult_key);
+    if (folded) {
+      // The polynomial was handed `sq / est`, so it returned
+      // `sqrt(est) * r_true`. One plaintext multiply on ONE ciphertext takes
+      // the estimate back out, and the walk has the level for it: at
+      // `cho_inv_in_` = top - 2 = 14 a degree-63 invsqrt lands `r` at 8
+      // against the compile-time floor `forward_level + 2 + 1` = 7.
+      const int r_lvl = param.NPToLevel(r.GetNP());
+      std::vector<Complex> msg;
+      Pt pg;
+      layout_.PackPerToken(msg, row_g);
+      boot_->gpu_encoder_.Encode(pg, r_lvl, param.GetScale(r_lvl), msg);
+      Ct t3, rf;
+      boot_->Mult(t3, r, pg);
+      boot_->Rescale(rf, t3);
+      r = std::move(rf);
+    }
     // (3b) R_{j+1} = R_j^2 (r^(j))^2 -- the next iteration's public factor,
     //      and after the last one the factor the public VALUE accumulator
     //      needs before it joins the output of `Values`.

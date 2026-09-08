@@ -345,6 +345,48 @@ class CiBatchAttention {
     //! on [0.9, 1.1] is 2^-13.
     int inv_degree = 7;
     bool causal = true;
+    /**
+     * @brief `niter > 0`: a per-ITERATION, per-HEAD, per-ROW estimate of
+     * `sq = sum_l y_l^2`, which the invsqrt's argument is divided by.
+     * `[iter][head][row]`; empty is 1 everywhere, i.e. today's behaviour.
+     *
+     * ## Why 4096 keys need it
+     *
+     * After the first normalise-and-square the row is a PROBABILITY VECTOR
+     * (`sum_l (y_l r)^2 = 1` by construction of `r`), so every later `sq` is
+     * that distribution's COLLISION PROBABILITY -- bounded below by
+     * `1 / live` and above by how concentrated the row is. The window a
+     * single affine has to cover therefore spans the rows' concentrations,
+     * and its lower edge falls with the key count.
+     *
+     * Measured on the real layer-0 weights and a real 4096-token prompt
+     * (`reference/scripts/cho_window.py`, 8 heads, niter 2):
+     *
+     *     later window   T = 128   [0.0131 .. 1.000]     deg-63  2^-19.4
+     *                    T = 4096  [0.00051 .. 0.1732]   deg-63  2^-5.4
+     *
+     * -- the lower edge drops by exactly the key ratio (1/128 -> 1/4096) and
+     * the fit collapses. It does NOT blow up, which is the dangerous part:
+     * the polynomial saturates, `r` comes back at 0.354x its true value, and
+     * the attention output is silently scaled down.
+     *
+     * Dividing `sq` by a per-row estimate collapses the window to the RATIO
+     * actual/estimate, which is what `row_norm` already does for the
+     * single-shot path. It is nearly free: the invsqrt's affine ALREADY
+     * multiplies `sq` by `1 / aff_a`, so the estimate rides that constant at
+     * no extra level, and only taking it back out of `r` costs one -- which
+     * the walk has (deg-63 lands `r` at 8 against a floor of
+     * `forward_level + 2`).
+     *
+     * And it buys accuracy back rather than spending it. On the same fit:
+     *
+     *     ratio window   [0.25, 4] = 16x   deg-31  6.1e-08   deg-63  2.0e-14
+     *                    [0.5, 2]  =  4x   deg-31  4.8e-15
+     *
+     * so a fold that lands inside 16x lets `last_inv_degree` come DOWN from
+     * 63 to 31 and gives a level back.
+     */
+    std::vector<std::vector<std::vector<double>>> cho_est;
 
     // --- Full Cho [25] normalize-and-square iteration (heterogeneous B=512) ---
     //! Extra squaring iterations `k`. 0 = the single-square shortcut above
@@ -448,8 +490,25 @@ class CiBatchAttention {
    * exactly those.
    */
   struct PublicHalf {
-    //! `pow[j] = sum_p (y0_p)^(2^(j+1))`, `niter` of them.
+    //! `pow[j] = sum_p (y0_p)^(2^(j+1))` DIVIDED by `pow_scale[j]`, `niter`
+    //! of them.
     const std::vector<Ct> *pow = nullptr;
+    /**
+     * @brief The per-ITERATION, per-ROW constant the caller divided `pow[j]`
+     * by. `[iter][row]`; required whenever `pow` is given.
+     *
+     * The public term has to be bootstrapped -- it arrives from the public
+     * branch far below the walk -- and a bootstrap wants an O(1) message
+     * (`GetMessageRatio`). The raw power sums are not: over 3968 keys
+     * `sum_p y0^2` runs to the hundreds, which puts EvalMod's sine outside
+     * its range and returns garbage rather than an error. So the caller
+     * hands over the sum already divided by a calibrated estimate of its own
+     * size, and this class multiplies the estimate back in BEFORE the boot,
+     * together with `1 / aff_a` and the row's `cho_est` -- one plaintext,
+     * and the thing that crosses the bootstrap is the public half of the
+     * invsqrt's ARGUMENT, which is O(1) by construction.
+     */
+    std::vector<std::vector<double>> pow_scale;
   };
 
   /**
