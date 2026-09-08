@@ -67,8 +67,9 @@ namespace cheddar {
  * `stream_scale` and `m` for a value in the model's own units:
  *
  *     stream (coefficients)        s * m           -- the norms' gain carries
- *                                  `s / kappa`, so `ToCoeff`'s own `kappa`
- *                                  leaves exactly this
+ *                                  `s_out / kappa`, so `ToCoeff`'s own
+ *                                  `kappa` leaves exactly what the next layer
+ *                                  will read as its own `s`
  *     q/k/v images, at the leg     q_scale * s * m -> q_scale = c_q / s
  *     O's output                   o_scale * (what the seam carried) * m,
  *                                  and it must be `s * m`
@@ -186,12 +187,43 @@ class CiBertLayer {
     //! for none. See the header: LayerNorm is exactly scale invariant, so
     //! these cancel and cost nothing.
     std::vector<double> attn_scale, ffn_scale;
-    //! What the residual stream carries. It rides the norms' gain and bias.
+    //! What the INPUT stream carries, per model unit: `Emit` reads it, the O
+    //! projection's output has to match it (it is added to the input), and
+    //! the post-attention crossing divides it out.
     double stream_scale = 1.0;
+    //! What this layer WRITES, per model unit -- both norms' output, and so
+    //! the next layer's `stream_scale`. Zero means the same as the input's.
+    //!
+    //! ONE FACTOR FOR A WHOLE CHAIN COSTS EVERY LAYER THE WORST LAYER'S
+    //! RESIDUAL. Measured over BERT-Base's twelve, the residual reaches
+    //! 1001.5 where layer 0's is 62.5; a single ride sized on the first put
+    //! layer 0 at rms 2^-6.73 against the 2^-10.68 it reaches on its own,
+    //! which is exactly the four bits a 16x colder crossing predicts. The
+    //! factor is free either way -- it rides the norms' gain and bias, which
+    //! are plaintexts -- so there is no reason to share it.
+    double stream_out = 0.0;
     //! The factors the six projections' weights carry (see the header for
     //! what each has to be).
     double q_scale = 1.0, k_scale = 1.0, v_scale = 1.0;
     double o_scale = 1.0, int_scale = 1.0, out_scale = 1.0;
+    //! THE FEED-FORWARD'S RESIDUAL ROWS, suppressed by a public per-token
+    //! factor. One entry per token, 1.0 for none, empty for no suppression.
+    //!
+    //! Measured on the real checkpoint, layer 10's `H + FFN(H)` reaches
+    //! 1001.5 at token 48 channel 180 -- thirteen slots past 100 in three
+    //! columns and five rows -- against a row-maximum median of 9.5. The
+    //! crossing is PEAK limited, so those five rows cost every other row a
+    //! hundredfold ride: layers 9 and 10 came back at rms 2^-7.08 and 2^-6.44
+    //! where their neighbours sit at 2^-8.5.
+    //!
+    //! It closes inside the layer. `H` carries the factor (the
+    //! post-attention norm's gain and bias are plaintexts, so it is free
+    //! there), the feed-forward's output carries it too (folded into GELU's
+    //! own masks and its output projection's bias), the GELU's argument has
+    //! it divided out at the crossing it is already being scaled by, and the
+    //! output LayerNorm -- exactly scale invariant per token -- removes it
+    //! from the answer. Nothing downstream needs to know.
+    std::vector<double> row_suppress;
     //! GELU's plan: the fitted half-interval, its degree, and the per-slot
     //! group assignment (0 bulk, 1 saturated positive, 2 saturated negative)
     //! indexed `[token * hidden_live + channel]`. `GeLu.h` carries the
@@ -275,14 +307,18 @@ class CiBertLayer {
                           double var) const;
 
  private:
-  //! One projection's bias, added on its own coefficient images.
+  //! One projection's bias, added on its own coefficient images. With
+  //! `per_token` non-empty the bias carries that factor as well, which is
+  //! what a suppressed residual needs (see `Calibration::row_suppress`).
   void AddBias(std::vector<Ct> &imgs, const std::vector<double> &bias_declared,
-               double scale) const;
+               double scale,
+               const std::vector<double> &per_token = {}) const;
   //! The crossing, the LayerNorm and the return to coefficients.
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain,
                 const std::vector<double> &bias, double alpha, double window,
-                const std::vector<double> &token_scale, const Calibration &c,
+                const std::vector<double> &token_scale, double in_scale,
+                double out_scale, const std::vector<double> &row_suppress,
                 const EvkMap<word> &evk);
   //! `x *= factor`, on the crossing's own constant multiply.
   void Canonicalise(Ct &ct, double factor) const;
@@ -306,6 +342,8 @@ class CiBertLayer {
   double kappa_ = 1.0;
   bool keep_norm_slots_ = false;
   std::vector<Ct> norm_slots_;
+  //! The GELU crossing's per-token plaintext, built once per feed-forward.
+  Pt gelu_pt_;
 };
 
 }  // namespace cheddar

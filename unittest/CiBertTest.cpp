@@ -193,12 +193,25 @@ struct Layer0 {
   double resid_absmax = 0.0, u_absmax = 0.0;
 };
 
-bool LoadLayer0(const std::string &wdir, const std::string &rdir, Layer0 &L) {
-  const std::string ld = wdir + "/L00";
+std::string Two(int n) {
+  return (n < 10 ? "0" : "") + std::to_string(n);
+}
+
+// Layer `n`'s weights and the float64 forward of that layer, from its own
+// CLEAR input -- which is the reference's `h_L{n-1}`, never the encrypted
+// stream. The calibration has to come from the clear model ([SYLPH] 3.1) and
+// this is where it does.
+bool LoadLayer(const std::string &wdir, const std::string &rdir, int n,
+               Layer0 &L) {
+  const std::string ld = wdir + "/L" + Two(n);
   const size_t th = static_cast<size_t>(kT) * kH;
-  if (!ReadF32(wdir + "/input.f32", th, L.x)) return false;
-  if (!ReadF64(rdir + "/av_L00.f64", th, L.av)) return false;
-  if (!ReadF64(rdir + "/h_L00.f64", th, L.href)) return false;
+  if (n == 0) {
+    if (!ReadF32(wdir + "/input.f32", th, L.x)) return false;
+  } else if (!ReadF64(rdir + "/h_L" + Two(n - 1) + ".f64", th, L.x)) {
+    return false;
+  }
+  if (!ReadF64(rdir + "/av_L" + Two(n) + ".f64", th, L.av)) return false;
+  if (!ReadF64(rdir + "/h_L" + Two(n) + ".f64", th, L.href)) return false;
   if (!ReadF32(ld + "/wq.f32", static_cast<size_t>(kH) * kH, L.wq)) return false;
   if (!ReadF32(ld + "/wk.f32", static_cast<size_t>(kH) * kH, L.wk)) return false;
   if (!ReadF32(ld + "/wv.f32", static_cast<size_t>(kH) * kH, L.wv)) return false;
@@ -215,8 +228,8 @@ bool LoadLayer0(const std::string &wdir, const std::string &rdir, Layer0 &L) {
   if (!ReadF32(ld + "/attn_norm_bias.f32", kH, L.ab)) return false;
   if (!ReadF32(ld + "/ffn_norm.f32", kH, L.fg)) return false;
   if (!ReadF32(ld + "/ffn_norm_bias.f32", kH, L.fb)) return false;
-  if (!ReadU8(rdir + "/gelu_group_L00.u8", static_cast<size_t>(kT) * kI,
-              L.gelu_group)) {
+  if (!ReadU8(rdir + "/gelu_group_L" + Two(n) + ".u8",
+              static_cast<size_t>(kT) * kI, L.gelu_group)) {
     return false;
   }
 
@@ -225,13 +238,12 @@ bool LoadLayer0(const std::string &wdir, const std::string &rdir, Layer0 &L) {
                      std::vector<double> &out) {
     out.assign(th, 0.0);
     for (int t = 0; t < kT; t++) {
-      for (int o = 0; o < kH; o++) {
-        double acc = b[o];
-        for (int c = 0; c < kH; c++) {
-          acc += L.x[static_cast<size_t>(t) * kH + c] *
-                 w[static_cast<size_t>(c) * kH + o];
-        }
-        out[static_cast<size_t>(t) * kH + o] = acc;
+      double *ot = &out[static_cast<size_t>(t) * kH];
+      for (int o = 0; o < kH; o++) ot[o] = b[o];
+      for (int c = 0; c < kH; c++) {
+        const double xv = L.x[static_cast<size_t>(t) * kH + c];
+        const double *wr = &w[static_cast<size_t>(c) * kH];
+        for (int o = 0; o < kH; o++) ot[o] += xv * wr[o];
       }
     }
   };
@@ -291,38 +303,45 @@ bool LoadLayer0(const std::string &wdir, const std::string &rdir, Layer0 &L) {
   // ---- the rest of the layer ---------------------------------------------
   L.h_pre.assign(th, 0.0);
   for (int t = 0; t < kT; t++) {
+    double *ht = &L.h_pre[static_cast<size_t>(t) * kH];
     for (int c = 0; c < kH; c++) {
-      double acc = L.bo[c];
-      for (int j = 0; j < kH; j++) {
-        acc += L.av[static_cast<size_t>(t) * kH + j] *
-               L.wo[static_cast<size_t>(j) * kH + c];
-      }
-      L.h_pre[static_cast<size_t>(t) * kH + c] =
-          L.x[static_cast<size_t>(t) * kH + c] + acc;
+      ht[c] = L.x[static_cast<size_t>(t) * kH + c] + L.bo[c];
+    }
+    for (int j = 0; j < kH; j++) {
+      const double av = L.av[static_cast<size_t>(t) * kH + j];
+      const double *wr = &L.wo[static_cast<size_t>(j) * kH];
+      for (int c = 0; c < kH; c++) ht[c] += av * wr[c];
     }
   }
   LayerNormHost(L.h_pre, L.ag, L.ab, L.h, L.attn_token_scale);
+  // The inner loop runs along the WEIGHT's own stride; the transposed order
+  // is a 30 s host forward a layer and this is a second of it.
   L.u.assign(static_cast<size_t>(kT) * kI, 0.0);
   for (int t = 0; t < kT; t++) {
-    for (int j = 0; j < kI; j++) {
-      double acc = L.bint[j];
-      for (int c = 0; c < kH; c++) {
-        acc += L.h[static_cast<size_t>(t) * kH + c] *
-               L.wint[static_cast<size_t>(c) * kI + j];
-      }
-      L.u[static_cast<size_t>(t) * kI + j] = acc;
+    double *ut = &L.u[static_cast<size_t>(t) * kI];
+    for (int j = 0; j < kI; j++) ut[j] = L.bint[j];
+    for (int c = 0; c < kH; c++) {
+      const double hv = L.h[static_cast<size_t>(t) * kH + c];
+      const double *wr = &L.wint[static_cast<size_t>(c) * kI];
+      for (int j = 0; j < kI; j++) ut[j] += hv * wr[j];
     }
   }
   L.z_pre.assign(th, 0.0);
-  for (int t = 0; t < kT; t++) {
-    for (int c = 0; c < kH; c++) {
-      double acc = L.bout[c];
-      for (int j = 0; j < kI; j++) {
-        acc += GeLuHost(L.u[static_cast<size_t>(t) * kI + j]) *
-               L.wout[static_cast<size_t>(j) * kH + c];
+  {
+    std::vector<double> g(kI);
+    for (int t = 0; t < kT; t++) {
+      double *zt = &L.z_pre[static_cast<size_t>(t) * kH];
+      for (int c = 0; c < kH; c++) {
+        zt[c] = L.h[static_cast<size_t>(t) * kH + c] + L.bout[c];
       }
-      L.z_pre[static_cast<size_t>(t) * kH + c] =
-          L.h[static_cast<size_t>(t) * kH + c] + acc;
+      for (int j = 0; j < kI; j++) {
+        g[j] = GeLuHost(L.u[static_cast<size_t>(t) * kI + j]);
+      }
+      for (int j = 0; j < kI; j++) {
+        const double gv = g[j];
+        const double *wr = &L.wout[static_cast<size_t>(j) * kH];
+        for (int c = 0; c < kH; c++) zt[c] += gv * wr[c];
+      }
     }
   }
   LayerNormHost(L.z_pre, L.fg, L.fb, L.z, L.ffn_token_scale);
@@ -423,7 +442,7 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
     GTEST_SKIP() << "BERT_ALL_DIR / BERT_REF_DIR are not set";
   }
   Layer0 L;
-  ASSERT_TRUE(LoadLayer0(wdir_env, rdir_env, L))
+  ASSERT_TRUE(LoadLayer(wdir_env, rdir_env, 0, L))
       << "could not read layer 0 -- run export_bert.py and "
          "reference_forward_bert.py (REF_DUMP_U is not needed)";
   {
@@ -661,19 +680,76 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   if (wdir_env == nullptr || rdir_env == nullptr) {
     GTEST_SKIP() << "BERT_ALL_DIR / BERT_REF_DIR are not set";
   }
-  Layer0 L;
-  ASSERT_TRUE(LoadLayer0(wdir_env, rdir_env, L));
-  {
-    // The attention this test's own forward computes must be the reference's,
-    // or the leg is being measured against the wrong thing.
-    double worst = 0.0, mx = 0.0;
-    for (size_t i = 0; i < L.av.size(); i++) {
-      worst = std::max(worst, std::abs(L.av_host[i] - L.av[i]));
-      mx = std::max(mx, std::abs(L.av[i]));
+  // `BERT_LAYERS` layers, chained: layer L reads L-1's ENCRYPTED output. One
+  // is the single-layer run; twelve is the model.
+  const char *nl = std::getenv("BERT_LAYERS");
+  const int num_layers = (nl != nullptr && *nl != 0) ? std::atoi(nl) : 1;
+  ASSERT_GE(num_layers, 1);
+  ASSERT_LE(num_layers, 12);
+
+  // THE STREAM'S FACTOR IS ONE NUMBER FOR THE WHOLE CHAIN. Each layer's norm
+  // puts it back on the way out, so a per-layer factor would have to be told
+  // to the NEXT layer as well; the Llama model test sizes it once off every
+  // layer's residual maximum and this does the same. The per-layer numbers
+  // come from the clear model, as everything else here does.
+  // PER LAYER, not one for the chain. Layer L's factor has to keep both
+  // crossings it is read by inside EvalMod's range: the residual L writes
+  // (`z_pre`) and the one L+1's attention writes on top of it (`h_pre`).
+  std::vector<double> attn_resid(num_layers, 0.0), ffn_resid(num_layers, 0.0);
+  std::vector<std::vector<double>> suppress(num_layers);
+  for (int n = 0; n < num_layers; n++) {
+    Layer0 probe;
+    ASSERT_TRUE(LoadLayer(wdir_env, rdir_env, n, probe))
+        << "could not read layer " << n;
+    for (double a : probe.h_pre) {
+      attn_resid[n] = std::max(attn_resid[n], std::abs(a));
     }
-    std::cout << "host attention vs av_L00.f64: " << (worst / mx) << std::endl;
-    ASSERT_LT(worst / mx, 1e-6);
+    // THE FEED-FORWARD'S RESIDUAL ROWS. A handful of them are a hundred times
+    // the rest -- layer 10 reaches 1001.5 at token 48 against a row-maximum
+    // median of 9.5 -- and the crossing is peak limited, so they cost every
+    // other row its ride. The public per-token factor brings each row to the
+    // median and the output LayerNorm takes it straight back out.
+    std::vector<double> row(kT, 0.0);
+    for (int t = 0; t < kT; t++) {
+      for (int c = 0; c < kH; c++) {
+        row[t] = std::max(row[t],
+                          std::abs(probe.z_pre[static_cast<size_t>(t) * kH + c]));
+      }
+    }
+    std::vector<double> sorted = row;
+    std::sort(sorted.begin(), sorted.end());
+    const double target = sorted[kT / 2];
+    suppress[n].assign(kT, 1.0);
+    for (int t = 0; t < kT; t++) {
+      if (row[t] > target) suppress[n][t] = target / row[t];
+      ffn_resid[n] = std::max(ffn_resid[n], row[t] * suppress[n][t]);
+    }
+    if (n == 0) {
+      // The attention this test's own forward computes must be the
+      // reference's, or the leg is being measured against the wrong thing.
+      double worst = 0.0, mx = 0.0;
+      for (size_t i = 0; i < probe.av.size(); i++) {
+        worst = std::max(worst, std::abs(probe.av_host[i] - probe.av[i]));
+        mx = std::max(mx, std::abs(probe.av[i]));
+      }
+      std::cout << "host attention vs av_L00.f64: " << (worst / mx)
+                << std::endl;
+      ASSERT_LT(worst / mx, 1e-6);
+    }
   }
+  std::vector<double> s_in(num_layers, 0.0), s_out(num_layers, 0.0);
+  for (int n = 0; n < num_layers; n++) {
+    double reach = ffn_resid[n];
+    if (n + 1 < num_layers) reach = std::max(reach, attn_resid[n + 1]);
+    s_out[n] = kRide / reach;
+  }
+  s_in[0] = kRide / attn_resid[0];
+  for (int n = 1; n < num_layers; n++) s_in[n] = s_out[n - 1];
+  std::cout << num_layers << " layer(s); residuals";
+  for (int n = 0; n < num_layers; n++) {
+    std::cout << " " << std::max(attn_resid[n], ffn_resid[n]);
+  }
+  std::cout << std::endl;
   setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
 
   // ---- five rings, one secret -------------------------------------------
@@ -831,6 +907,37 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
             << " s" << std::endl;
   cheddar::MemoryPool::Report("setup done");
 
+  // ---- the stream, encrypted once; every layer after the first reads the
+  //      one before it ------------------------------------------------------
+  const int op_level = layer.GetStreamLevel();
+  std::vector<Ciphertext<word>> stream(kDeclaredH / kRank);
+  {
+    Layer0 first;
+    ASSERT_TRUE(LoadLayer(wdir_env, rdir_env, 0, first));
+    for (int k = 0; k < kDeclaredH / kRank; k++) {
+      std::vector<std::vector<double>> comp(kRank,
+                                            std::vector<double>(kT, 0.0));
+      for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
+        for (int t = 0; t < kT; t++) {
+          comp[Rev(c - k * kRank, 9)][t] =
+              s_in[0] * first.x[static_cast<size_t>(t) * kH + c];
+        }
+      }
+      const auto co = Recompose(comp);
+      Plaintext<word> pt;
+      ffn.context->encoder_.EncodeCoeff(pt, op_level,
+                                        ffn.param->GetScale(op_level), co);
+      boot.ui->Encrypt(stream[k], pt);
+      stream[k].SetNumSlots(num_slots);
+    }
+  }
+
+  double worst_layer = -1e300;
+  for (int LAYER = 0; LAYER < num_layers; LAYER++) {
+  Layer0 L;
+  ASSERT_TRUE(LoadLayer(wdir_env, rdir_env, LAYER, L));
+  const std::string tag = "L" + Two(LAYER);
+  std::cout << "==== layer " << LAYER << " ====" << std::endl;
   // ---- the calibration ---------------------------------------------------
   //
   // The q/k/v sizing is the Llama model test's, on BERT's own maxima: the
@@ -846,27 +953,40 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   }
   const double cv = std::min(1.0, img_max / L.vmax);
   const double cqk = cq * ck;
-  const double stream_scale = kRide / L.resid_absmax;
-  const double int_scale = kRide / (stream_scale * L.u_absmax);
+  const double stream_scale = s_in[LAYER];
+  const double stream_out = s_out[LAYER];
+  // The intermediate crossing reads what the attention turn WROTE.
+  const double int_scale = kRide / (stream_out * L.u_absmax);
   typename cheddar::CiBertLayer<word>::Calibration cal;
   cal.stream_scale = stream_scale;
+  cal.stream_out = stream_out;
+  cal.row_suppress = suppress[LAYER];
   cal.attn_alpha = 1.0;
   cal.attn_window = 1.5;
   cal.ffn_alpha = 1.0;
   cal.ffn_window = 1.5;
   cal.attn_scale = L.attn_token_scale;
+  // THE SUPPRESSION IS PART OF THIS NORM'S ARGUMENT. Its input carries the
+  // per-token factor, so its variance carries the SQUARE of it, and the
+  // rescale that puts the invsqrt's argument at one has to carry the factor
+  // itself -- left out, a row suppressed by 1/100 arrives at 1e-4 where the
+  // window is [1/sqrt 1.5, sqrt 1.5] and the polynomial is evaluated where it
+  // was never fitted. Both are public per-token factors applied at the same
+  // multiply, so they simply multiply.
   cal.ffn_scale = L.ffn_token_scale;
+  for (int t = 0; t < kT; t++) cal.ffn_scale[t] /= suppress[LAYER][t];
   cal.q_scale = cq / stream_scale;
   cal.k_scale = ck / stream_scale;
   cal.v_scale = cv / stream_scale;
   cal.int_scale = int_scale;
-  cal.out_scale = stream_scale / layer.GetKappa();
+  cal.out_scale = stream_out / layer.GetKappa();
   cal.gelu_range = 8.0;
   cal.gelu_degree = 31;
   cal.gelu_group = L.gelu_group;
   std::cout << "cq " << cq << ", ck " << ck << ", cv " << cv
-            << ", stream_scale " << stream_scale << ", int_scale " << int_scale
-            << ", m_eff " << L.m_eff << std::endl;
+            << ", stream in " << stream_scale << " out " << stream_out
+            << ", int_scale " << int_scale << ", m_eff " << L.m_eff
+            << std::endl;
 
   // ---- the weights, declared --------------------------------------------
   //
@@ -970,26 +1090,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   w.attn_bias = &ab_dec;
   w.ffn_gain = &fg_dec;
   w.ffn_bias = &fb_dec;
-  w.tag = "L00";
-
-  // ---- the stream --------------------------------------------------------
-  const int op_level = layer.GetStreamLevel();
-  std::vector<Ciphertext<word>> stream(kDeclaredH / kRank);
-  for (int k = 0; k < kDeclaredH / kRank; k++) {
-    std::vector<std::vector<double>> comp(kRank, std::vector<double>(kT, 0.0));
-    for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
-      for (int t = 0; t < kT; t++) {
-        comp[Rev(c - k * kRank, 9)][t] =
-            stream_scale * L.x[static_cast<size_t>(t) * kH + c];
-      }
-    }
-    const auto co = Recompose(comp);
-    Plaintext<word> pt;
-    ffn.context->encoder_.EncodeCoeff(pt, op_level,
-                                      ffn.param->GetScale(op_level), co);
-    boot.ui->Encrypt(stream[k], pt);
-    stream[k].SetNumSlots(num_slots);
-  }
+  w.tag = tag;
 
   // ---- Q, K and V, and their crossings -----------------------------------
   const auto t_emit0 = std::chrono::steady_clock::now();
@@ -1100,7 +1201,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
         }
       }
     }
-    o_carried = Report("stage 1: the seam's attention output", got, L.av);
+      o_carried = Report("stage 1: the seam's attention output", got, L.av);
     EXPECT_LT(RelBits(got, L.av), -7.0)
         << "the leg and the seam did not deliver the attention output";
   }
@@ -1113,10 +1214,19 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   cudaDeviceSynchronize();
   ASSERT_EQ(cudaGetLastError(), cudaSuccess);
   {
+    // H CARRIES THE ROW SUPPRESSION, by design: the feed-forward's two halves
+    // both do and the output LayerNorm takes it back out. So the reference
+    // for this stage is the suppressed one; stage 3 below is the answer.
+    std::vector<double> want = L.h;
+    for (int t = 0; t < kT; t++) {
+      for (int c = 0; c < kH; c++) {
+        want[static_cast<size_t>(t) * kH + c] *= suppress[LAYER][t];
+      }
+    }
     std::vector<double> got;
     ReadStream(ffn, h_ct, got);
-    Report("stage 2: H = LayerNorm(X + O + b_o)", got, L.h);
-    EXPECT_LT(RelBits(got, L.h), -7.0);
+    Report("stage 2: H = LayerNorm(X + O + b_o), suppressed", got, want);
+    EXPECT_LT(RelBits(got, want), -7.0);
   }
   std::vector<Ciphertext<word>> z_ct;
   layer.FeedForward(z_ct, h_ct, w, cal, fevk);
@@ -1126,9 +1236,14 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   {
     std::vector<double> got;
     ReadStream(ffn, z_ct, got);
-    Report("stage 3: THE LAYER, against h_L00.f64", got, L.href);
-    EXPECT_LT(RelBits(got, L.href), -6.0)
-        << "the whole layer is worse than 2^-6 against the float64 reference";
+    const double bits =
+        RelBits(got, L.href);
+    Report(("stage 3: THE LAYER, against h_L" + Two(LAYER) + ".f64").c_str(),
+           got, L.href);
+    worst_layer = std::max(worst_layer, bits);
+    EXPECT_LT(bits, -6.0)
+        << "layer " << LAYER << " is worse than 2^-6 against the float64 "
+           "reference";
   }
   auto secs = [](auto a, auto b) {
     return std::chrono::duration<double>(b - a).count();
@@ -1136,6 +1251,15 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   std::cout << "cost: Emit + 12 HalfBootModules " << secs(t_emit0, t_emit1)
             << " s, the leg " << secs(t_leg0, t_leg1) << " s, the seam "
             << secs(t_seam0, t_seam1) << " s, the two turns "
-            << secs(t_turn0, t_turn1) << " s" << std::endl;
-  cheddar::MemoryPool::Report("done");
+            << secs(t_turn0, t_turn1) << " s, LAYER "
+            << secs(t_emit0, t_turn1) << " s" << std::endl;
+  cheddar::MemoryPool::Report(("layer " + Two(LAYER) + " done").c_str());
+  // THE CHAIN: the next layer reads this one's ENCRYPTED output. The weights'
+  // converted operands go with the layer -- the leg caches by tag, and
+  // twelve layers' worth would stand on the card at once otherwise.
+  stream = std::move(z_ct);
+  layer.Base().ReleaseWeights(tag);
+  }
+  std::cout << "the chain: " << num_layers << " layer(s), worst rms 2^"
+            << worst_layer << std::endl;
 }

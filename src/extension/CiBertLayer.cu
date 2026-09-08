@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -170,7 +171,8 @@ Plaintext<word> CiBertLayer<word>::TokenPlaintext(
 template <typename word>
 void CiBertLayer<word>::AddBias(std::vector<Ct> &imgs,
                                 const std::vector<double> &bias_declared,
-                                double scale) const {
+                                double scale,
+                                const std::vector<double> &per_token) const {
   NvtxScope _nv("bert: bias");
   const int rank = cfg_.proj_rank;
   const int log_rank = Log2Ceil(rank);
@@ -196,8 +198,14 @@ void CiBertLayer<word>::AddBias(std::vector<Ct> &imgs,
                  : bias_declared[static_cast<size_t>(g) * rank +
                                  Rev(rank - i, log_rank)];
       for (int t = 0; t < T; t++) {
+        // A suppressed row's bias is suppressed with it: the coefficient
+        // position IS the token (Doing.md 1.5du), so the factor is a
+        // per-position one and the partner deposit takes the NEXT token's.
+        const double ft = per_token.empty() ? 1.0 : per_token[t];
+        const double fn =
+            per_token.empty() ? 1.0 : per_token[std::min(t + 1, T - 1)];
         coeff[static_cast<size_t>(t) * rank + i] =
-            scale * (bi + (t + 1 < T ? partner : 0.0));
+            scale * (ft * bi + (t + 1 < T ? fn * partner : 0.0));
       }
     }
     Plaintext<word> pt;
@@ -248,7 +256,8 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
                                  const std::vector<double> &bias, double alpha,
                                  double window,
                                  const std::vector<double> &token_scale,
-                                 const Calibration &c,
+                                 double in_scale, double out_scale,
+                                 const std::vector<double> &row_suppress,
                                  const EvkMap<word> &evk) {
   NvtxScope _nv("bert: NormTurn");
   // THE OPERATOR'S INPUT RIDES AT ONE, AND THAT IS WHERE ITS PRECISION GOES.
@@ -272,7 +281,7 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
   // multiplied by `crossing`; what is left after this multiply is `beta`
   // times the model's own value, which is what the handler is calibrated for
   // -- and the per-token factor, which LayerNorm cancels identically.
-  const double factor = beta / (crossing_ * c.stream_scale);
+  const double factor = beta / (crossing_ * in_scale);
   Pt token_pt;
   if (!token_scale.empty()) {
     token_pt = TokenPlaintext(factor, token_scale, slots[0].GetScale());
@@ -324,12 +333,17 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
       // units, and `ToCoeff` below multiplies by `kappa` on the way out, so
       // the gain and the bias carry the quotient and the coefficient stream
       // carries exactly `stream_scale`.
-      const double g = live ? gain[declared] * c.stream_scale / kappa_ : 0.0;
-      const double b = live ? bias[declared] * c.stream_scale / kappa_ : 0.0;
+      const double g = live ? gain[declared] * out_scale / kappa_ : 0.0;
+      const double b = live ? bias[declared] * out_scale / kappa_ : 0.0;
       for (int t = 0; t < cfg_.num_tokens; t++) {
-        const size_t s = static_cast<size_t>(ch) * cfg_.num_tokens + t;
-        wts[k][s] = Complex(g, 0.0);
-        bs[k][s] = Complex(b, 0.0);
+        // In slots the address is `channel * num_tokens + rev(token)`; the
+        // gain and the bias are token-uniform except for the row
+        // suppression, which is exactly why it is free here.
+        const size_t s = static_cast<size_t>(ch) * cfg_.num_tokens +
+                         Rev(t, Log2Ceil(cfg_.num_tokens));
+        const double ft = row_suppress.empty() ? 1.0 : row_suppress[t];
+        wts[k][s] = Complex(g * ft, 0.0);
+        bs[k][s] = Complex(b * ft, 0.0);
         mask[k][s] = Complex(live ? 1.0 : 0.0, 0.0);
       }
     }
@@ -391,8 +405,13 @@ void CiBertLayer<word>::AttentionTurn(std::vector<Ct> &res,
     }
   }
   MemoryPool::Report("bert: after the O projection and the residual");
+  // What this layer writes, which is what the next one will read.
+  const double out_scale =
+      c.stream_out > 0.0 ? c.stream_out : c.stream_scale;
+  // The post-attention norm is where the row suppression goes ON: `H`
+  // carries it, and the OUTPUT norm below takes it back out.
   NormTurn(res, h, *w.attn_gain, *w.attn_bias, c.attn_alpha, c.attn_window,
-           c.attn_scale, c, evk);
+           c.attn_scale, c.stream_scale, out_scale, c.row_suppress, evk);
   MemoryPool::Report("bert: after the post-attention LayerNorm");
 }
 
@@ -408,6 +427,10 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
   AssertTrue(static_cast<int>(h.size()) == num_model_cts_,
              "CiBertLayer: the feed-forward's input is " +
                  std::to_string(num_model_cts_) + " ciphertexts");
+  // `h` is what `AttentionTurn` wrote, so everything here is stated in the
+  // OUTPUT's units, not the layer input's.
+  const double out_scale =
+      c.stream_out > 0.0 ? c.stream_out : c.stream_scale;
 
   // ---- the intermediate projection ---------------------------------------
   std::vector<Ct> u;
@@ -452,8 +475,22 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
       // The intermediate output carries `int_scale * stream_scale` per
       // model unit and `ToSlot` has just multiplied by `crossing`; what is
       // left after this multiply is `u / range`, which is what the fit takes.
-      Canonicalise(ups[i], 1.0 / (crossing_ * c.int_scale * c.stream_scale *
-                                  c.gelu_range));
+      // `H` carries the row suppression and GELU is not scale invariant, so
+      // the argument has it divided out here -- on the multiply the crossing
+      // is already paying for -- and the ANSWER gets it back through the
+      // masks below.
+      const double base =
+          1.0 / (crossing_ * c.int_scale * out_scale * c.gelu_range);
+      if (c.row_suppress.empty()) {
+        Canonicalise(ups[i], base);
+      } else {
+        std::vector<double> inv(cfg_.num_tokens);
+        for (int t = 0; t < cfg_.num_tokens; t++) {
+          inv[t] = 1.0 / c.row_suppress[t];
+        }
+        if (i == 0) gelu_pt_ = TokenPlaintext(base, inv, ups[i].GetScale());
+        Canonicalise(ups[i], gelu_pt_);
+      }
       if (w.bint != nullptr) {
         std::vector<Complex> bmsg(num_slots_, Complex(0.0, 0.0));
         for (int ch = 0; ch < rank; ch++) {
@@ -489,6 +526,28 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
       }
       gelu.Apply(act[i], ups[i], mask, evk);
       ups[i] = Ct{};
+      if (!c.row_suppress.empty()) {
+        // THE SUPPRESSION GOES ON THE ANSWER, and it cannot ride a mask: the
+        // fitted group's mask multiplies the INPUT (that is what stops a
+        // saturated slot from being evaluated at |v| = 16, `GeLu.h`), so a
+        // factor put there would scale the argument instead of the value --
+        // measured, that alone took the chain to 2^+24 by layer 1. It costs
+        // one of the two levels between the fit's landing and StC's.
+        std::vector<Complex> msg(num_slots_, Complex(0.0, 0.0));
+        const int log_t = Log2Ceil(cfg_.num_tokens);
+        for (int ch = 0; ch < rank; ch++) {
+          for (int t = 0; t < cfg_.num_tokens; t++) {
+            msg[static_cast<size_t>(ch) * cfg_.num_tokens + Rev(t, log_t)] =
+                Complex(c.row_suppress[t], 0.0);
+          }
+        }
+        const int lvl = boot_->param_.NPToLevel(act[i].GetNP());
+        Pt spt;
+        boot_->gpu_encoder_.Encode(spt, lvl, boot_->param_.GetScale(lvl), msg);
+        Ct scaled;
+        boot_->Mult(scaled, act[i], spt);
+        boot_->Rescale(act[i], scaled);
+      }
     }
   }
   MemoryPool::Report("bert: after GELU");
@@ -508,7 +567,9 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     AssertTrue(static_cast<int>(y.size()) == num_model_cts_,
                "CiBertLayer: the output projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");
-    if (w.bout != nullptr) AddBias(y, *w.bout, c.stream_scale);
+    if (w.bout != nullptr) {
+      AddBias(y, *w.bout, out_scale, c.row_suppress);
+    }
     std::vector<Ct> z(num_model_cts_);
     for (int k = 0; k < num_model_cts_; k++) {
       Ct down;
@@ -516,8 +577,10 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
       boot_->Add(z[k], down, y[k]);
     }
     MemoryPool::Report("bert: after the output projection and the residual");
+    // And OFF: LayerNorm is exactly scale invariant per token, so the
+    // factor both halves of `z` carry cancels identically here.
     NormTurn(res, z, *w.ffn_gain, *w.ffn_bias, c.ffn_alpha, c.ffn_window,
-             c.ffn_scale, c, evk);
+             c.ffn_scale, out_scale, out_scale, {}, evk);
   }
   MemoryPool::Report("bert: after the output LayerNorm");
 }
