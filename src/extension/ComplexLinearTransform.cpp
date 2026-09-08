@@ -72,8 +72,23 @@ void ComplexLinearTransform<word>::EvaluatePair(ConstContextPtr<word> context,
                                                 const EvkMap<word> &evk_map,
                                                 bool min_ks /*= false*/) const {
   std::map<int, Ct> bs_re, bs_im;
-  re_.EvaluateBabyStep(context, bs_re, in_re, evk_map, min_ks);
-  re_.EvaluateBabyStep(context, bs_im, in_im, evk_map, min_ks);
+  // ONE batched baby step, not two. The real and imaginary halves are
+  // rotated by the SAME distances with the SAME keys, so run serially they
+  // read every rotation key out of DRAM twice -- and the baby step is a
+  // bandwidth-bound key read (measured 79-85% of an A100's HBM peak, 13.1 ms
+  // and ~16 GB of a 58 ms `ci16_35` bootstrap). `EvaluateBabyStepBatch` puts
+  // the ciphertext index on the fast grid dimension with one shared key
+  // table, so the pair reads the keys once. It is word for word the loop
+  // (`CHEDDAR_HOIST_BS_SERIAL=1` is the loop), and min_ks has no batched form
+  // so it keeps the two calls.
+  if (min_ks) {
+    re_.EvaluateBabyStep(context, bs_re, in_re, evk_map, min_ks);
+    re_.EvaluateBabyStep(context, bs_im, in_im, evk_map, min_ks);
+  } else {
+    const std::vector<std::map<int, Ct> *> bs_out{&bs_re, &bs_im};
+    const std::vector<const Ct *> bs_in{&in_re, &in_im};
+    re_.EvaluateBabyStepBatch(context, bs_out, bs_in, evk_map);
+  }
 
   if (min_ks) {
     // min_ks derives one stride from the baby-step sequence and rotates
@@ -104,8 +119,23 @@ void ComplexLinearTransform<word>::EvaluateToReal(
     ConstContextPtr<word> context, Ct &res, const Ct &in_re, const Ct &in_im,
     const EvkMap<word> &evk_map, bool min_ks /*= false*/) const {
   std::map<int, Ct> bs_re, bs_im;
-  re_.EvaluateBabyStep(context, bs_re, in_re, evk_map, min_ks);
-  re_.EvaluateBabyStep(context, bs_im, in_im, evk_map, min_ks);
+  // ONE batched baby step, not two. The real and imaginary halves are
+  // rotated by the SAME distances with the SAME keys, so run serially they
+  // read every rotation key out of DRAM twice -- and the baby step is a
+  // bandwidth-bound key read (measured 79-85% of an A100's HBM peak, 13.1 ms
+  // and ~16 GB of a 58 ms `ci16_35` bootstrap). `EvaluateBabyStepBatch` puts
+  // the ciphertext index on the fast grid dimension with one shared key
+  // table, so the pair reads the keys once. It is word for word the loop
+  // (`CHEDDAR_HOIST_BS_SERIAL=1` is the loop), and min_ks has no batched form
+  // so it keeps the two calls.
+  if (min_ks) {
+    re_.EvaluateBabyStep(context, bs_re, in_re, evk_map, min_ks);
+    re_.EvaluateBabyStep(context, bs_im, in_im, evk_map, min_ks);
+  } else {
+    const std::vector<std::map<int, Ct> *> bs_out{&bs_re, &bs_im};
+    const std::vector<const Ct *> bs_in{&in_re, &in_im};
+    re_.EvaluateBabyStepBatch(context, bs_out, bs_in, evk_map);
+  }
 
   if (min_ks) {
     Ct rr, ri;

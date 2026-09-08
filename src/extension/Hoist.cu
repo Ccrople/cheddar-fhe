@@ -336,7 +336,8 @@ __global__ void GSFusedKernel(word **dst_bx, word **dst_ax, const word **bx,
 template <typename word, int num_bs_padded, bool has_im_in, bool has_im_out>
 __global__ void GSFusedComplexKernel(
     word **dst, const word **bs_re, const word **bs_im, const word **mx_re,
-    const word **mx_im, int num_bs, int num_gs, const word *primes,
+    const word **mx_im, int num_bs, int num_gs, int bs_begin, int mx_stride,
+    bool accumulate, const word *primes,
     const make_signed_t<word> *inv_primes, int log_degree) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int prime_index = (i >> log_degree);
@@ -353,11 +354,12 @@ __global__ void GSFusedComplexKernel(
   word im_a[has_im_in ? num_bs_padded : 1];
 #pragma unroll
   for (int j = 0; j < num_bs_padded; j++) {
-    re_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * j] + i) : 0;
-    re_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * j + 1] + i) : 0;
+    const int b = bs_begin + j;
+    re_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * b] + i) : 0;
+    re_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * b + 1] + i) : 0;
     if constexpr (has_im_in) {
-      im_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * j] + i) : 0;
-      im_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * j + 1] + i) : 0;
+      im_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * b] + i) : 0;
+      im_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * b + 1] + i) : 0;
     }
   }
 
@@ -367,7 +369,7 @@ __global__ void GSFusedComplexKernel(
 #pragma unroll
     for (int j = 0; j < num_bs_padded; j++) {
       if (j >= num_bs) break;
-      const word *re_pt = mx_re[j + k * num_bs];
+      const word *re_pt = mx_re[bs_begin + j + k * mx_stride];
       if (re_pt != nullptr) {
         word m = basic::StreamingLoad(re_pt + i);
         rr_b = basic::Add(rr_b, basic::MultMontgomery(re_b[j], m, prime,
@@ -381,7 +383,7 @@ __global__ void GSFusedComplexKernel(
                                                         montgomery), prime);
         }
       }
-      const word *im_pt = mx_im[j + k * num_bs];
+      const word *im_pt = mx_im[bs_begin + j + k * mx_stride];
       if (im_pt != nullptr) {
         word m = basic::StreamingLoad(im_pt + i);
         if constexpr (has_im_in) {
@@ -400,11 +402,27 @@ __global__ void GSFusedComplexKernel(
     }
     // dst interleaves outputs per giant step: (re bx, re ax[, im bx, im ax]).
     constexpr int out_stride = has_im_out ? 4 : 2;
-    dst[k * out_stride][i] = rr_b;
-    dst[k * out_stride + 1][i] = rr_a;
-    if constexpr (has_im_out) {
-      dst[k * out_stride + 2][i] = ri_b;
-      dst[k * out_stride + 3][i] = ri_a;
+    // A window past the first ADDS: the giant step's sum over baby steps is
+    // split into windows only so the register arrays stay small, and a sum
+    // does not care where it is cut.
+    if (accumulate) {
+      word *o0 = dst[k * out_stride];
+      word *o1 = dst[k * out_stride + 1];
+      o0[i] = basic::Add(o0[i], rr_b, prime);
+      o1[i] = basic::Add(o1[i], rr_a, prime);
+      if constexpr (has_im_out) {
+        word *o2 = dst[k * out_stride + 2];
+        word *o3 = dst[k * out_stride + 3];
+        o2[i] = basic::Add(o2[i], ri_b, prime);
+        o3[i] = basic::Add(o3[i], ri_a, prime);
+      }
+    } else {
+      dst[k * out_stride][i] = rr_b;
+      dst[k * out_stride + 1][i] = rr_a;
+      if constexpr (has_im_out) {
+        dst[k * out_stride + 2][i] = ri_b;
+        dst[k * out_stride + 3][i] = ri_a;
+      }
     }
   }
 }
@@ -2222,18 +2240,50 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
   dim3 grid_dim(np.GetNumTotal() * context->param_.degree_ /
                 kernel_block_dim_);
 
+  // The giant step's sum over baby steps, in WINDOWS.
+  //
+  // The kernel holds every baby step of the window in registers -- four
+  // arrays of the window width -- and at width 16 that is 96 registers, which
+  // caps an A100 at 682 threads an SM and the kernel at ~37% of achievable
+  // HBM bandwidth. At width 8 it is 40 registers and ~60%, and measured on
+  // `ci16_35`'s bootstrap the accumulation drops 18.9 ms to 11.9.
+  //
+  // Narrowing the SPLIT to get there does not pay: `CHEDDAR_CI_BSGS_BS_CAP=8`
+  // buys the same 7 ms in the accumulation and loses 15 in giant key switches,
+  // because halving the baby steps doubles the giant ones (58.07 -> 58.68 ms
+  // end to end). So the split stays at 16 and only the ACCUMULATION is cut:
+  // the sum is over baby steps, so cutting it into windows and adding is the
+  // same sum, the giant-step count is untouched, and the only new traffic is
+  // one read-modify-write of the outputs per window past the first --
+  // 8 polynomials against the window's ~800.
+  //
+  // `CHEDDAR_CI_GS_WINDOW` is the width; 0 or >= num_bs restores the single
+  // pass. The default is the measured 8.
+  static const int window_cap = [] {
+    const char *e = std::getenv("CHEDDAR_CI_GS_WINDOW");
+    if (e == nullptr || e[0] == 0) return 8;
+    const int v = std::atoi(e);
+    return (v < 1) ? 1 : ((v > 32) ? 32 : v);
+  }();
+  const int window = Min(window_cap, num_bs);
+
   auto launch = [&](auto in_flag, auto out_flag) {
     constexpr bool kImIn = decltype(in_flag)::value;
     constexpr bool kImOut = decltype(out_flag)::value;
-    constexpr_for<1, 6>([&](auto i) {
-      constexpr int num_bs_padded = 1 << i;
-      if (num_bs > num_bs_padded) return;
-      if (num_bs <= (1 << (i - 1))) return;
-      kernel::GSFusedComplexKernel<word, num_bs_padded, kImIn, kImOut>
-          <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d, mx_im_d,
-                                    num_bs, num_gs, primes, inv_primes,
-                                    context->param_.log_degree_);
-    });
+    for (int begin = 0; begin < num_bs; begin += window) {
+      const int width = Min(window, num_bs - begin);
+      const bool accumulate = (begin > 0);
+      constexpr_for<1, 6>([&](auto i) {
+        constexpr int num_bs_padded = 1 << i;
+        if (width > num_bs_padded) return;
+        if (width <= (1 << (i - 1))) return;
+        kernel::GSFusedComplexKernel<word, num_bs_padded, kImIn, kImOut>
+            <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d,
+                                      mx_im_d, width, num_gs, begin, num_bs,
+                                      accumulate, primes, inv_primes,
+                                      context->param_.log_degree_);
+      });
+    }
   };
   if (has_im_in && has_im_out) {
     launch(std::true_type{}, std::true_type{});
@@ -2442,6 +2492,13 @@ void HoistHandler<word>::EvaluateGiantStepComplex(
 
   // Rotate and fold each half exactly as EvaluateGiantStepOptimized does its
   // one -- shared with the batched group in GSComplexRotateFold.
+  //
+  // MEASURED AND REJECTED: routing the pair through
+  // `GSComplexRotateFoldGroup` -- the batched form, which shares the key
+  // tables the way the baby step's batch does -- costs 55.07 ms against
+  // 50.44 on `ci16_35`. At a group of two the gather and the wider buffers
+  // outweigh the sharing; the batch form earns its keep at the group sizes
+  // the batched layer calls it with, not here.
   GSComplexRotateFold(context, re_h, accum_re, res_re, evk_map,
                       input_num_slots, input_scale);
   if (res_im != nullptr) {

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -384,6 +385,15 @@ std::pair<int, int> EvalSpecialFFT<word>::BSGSSplit(int num_diag) const {
     gs = DivCeil(num_diag, bs);
     AssertTrue(gs >= 2, "BSGSSplit: a conjugate-invariant phase with a "
                         "single giant step is not supported");
+    // `CHEDDAR_BSGS_REPORT=1` prints the split every compiled phase gets. The
+    // transforms are 86% of a bootstrap and their cost is (diagonals x limbs)
+    // of plaintext plus (baby steps x beta x limbs) of key, so the plan is the
+    // cost model; without it the profile only says which kernel was slow.
+    static const bool report = std::getenv("CHEDDAR_BSGS_REPORT") != nullptr;
+    if (report) {
+      std::fprintf(stderr, "[bsgs] diag %4d -> bs %3d gs %3d\n", num_diag,
+                   bs, gs);
+    }
     return {bs, gs};
   }
 
