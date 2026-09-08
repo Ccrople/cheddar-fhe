@@ -135,6 +135,13 @@ class LayerNormHandler {
    * @param degree the Chebyshev degree for the inverse square root
    * @param channel_stride 1 on the module basis, 2 for a banded half-density
    *        image; see `RmsNorm.h`, the rule is identical and so is the reason
+   * @param invsqrt_coeffs the Chebyshev coefficients for `1/sqrt` on the
+   *        window, or empty to INTERPOLATE at `degree`. The same argument as
+   *        `GeLuHandler::Group::coeffs`: on a WIDE window an interpolant
+   *        spends its accuracy uniformly while the tokens are not uniform,
+   *        and a data-weighted fit is what makes a window of 2419 -- which is
+   *        what layer 9 has without a per-prompt per-token rescale -- cost
+   *        2.0e-03 at degree 127 instead of 4.9e-01 at degree 15.
    * @param live_channels the channels the MODEL has, when the declared width
    *        is larger (BERT's 768 in a declared 1024). The mean and the
    *        variance divide by this, not by the declared width; 0 means they
@@ -144,7 +151,8 @@ class LayerNormHandler {
                    int num_channels, double layer_constant, int input_level,
                    double eps = 1e-12, double window_ratio = 4.0,
                    int degree = 15, int channel_stride = 1,
-                   int live_channels = 0);
+                   int live_channels = 0,
+                   const std::vector<double> &invsqrt_coeffs = {});
 
   LayerNormHandler(const LayerNormHandler &) = delete;
   LayerNormHandler &operator=(const LayerNormHandler &) = delete;

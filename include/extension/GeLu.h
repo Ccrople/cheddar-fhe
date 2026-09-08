@@ -112,6 +112,20 @@ class GeLuHandler {
   /** @brief One slot group: how it is answered, and over what interval. */
   struct Group {
     Kind kind = Kind::kFit;
+    //! `kFit` only: the Chebyshev coefficients to use, or empty to
+    //! INTERPOLATE `GELU(range * v)` at `degree`.
+    //!
+    //! WHY A CALLER WOULD SUPPLY THEM. An interpolant is minimax-ish
+    //! UNIFORMLY over its interval, which is the wrong objective when
+    //! 99.9 % of the slots live in a hundredth of it. Fitted by least
+    //! squares WEIGHTED BY THE DATA (`reference/scripts/bert_gelu_search.py`)
+    //! the same degree is worth orders of magnitude: over +-156 at degree
+    //! 255, interpolation leaves the feed-forward at rms 6e-02 and the
+    //! weighted fit at **2.8e-03** -- which is what makes a GELU that needs
+    //! NO per-prompt calibration possible at all. A least-squares fit is
+    //! also BOUNDED inside its interval by construction, so the only safety
+    //! condition left is the one the range states.
+    std::vector<double> coeffs;
     //! `kFit` only: the fitted half-interval, in the units of `u`. The
     //! caller hands the input divided by THIS, so every group of kind
     //! `kFit` in one handler must state the same range (there is one

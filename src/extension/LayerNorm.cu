@@ -14,7 +14,8 @@ LayerNormHandler<word>::LayerNormHandler(ConstContextPtr<word> context,
                                          double layer_constant, int input_level,
                                          double eps, double window_ratio,
                                          int degree, int channel_stride,
-                                         int live_channels)
+                                         int live_channels,
+                                         const std::vector<double> &fitted)
     : context_{std::move(context)},
       num_tokens_{num_tokens},
       num_channels_{num_channels},
@@ -59,8 +60,12 @@ LayerNormHandler<word>::LayerNormHandler(ConstContextPtr<word> context,
 
   const double a = 0.5 * (window_hi_ - window_lo_);
   const double b = 0.5 * (window_hi_ + window_lo_);
-  auto coeffs = chebfit::Interpolate(
-      [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
+  auto coeffs =
+      fitted.empty()
+          ? chebfit::Interpolate(
+                [a, b](double v) { return 1.0 / std::sqrt(a * v + b); },
+                degree)
+          : fitted;
 
   // One level for the square, one for the affine map's multiplicative half.
   // Both scales stay canonical: the affine map by reinterpretation is free

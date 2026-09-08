@@ -66,7 +66,10 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
     have_fit = true;
     const double r = g.range;
     auto coeffs =
-        chebfit::Interpolate([r](double v) { return GeLu(r * v); }, g.degree);
+        g.coeffs.empty()
+            ? chebfit::Interpolate([r](double v) { return GeLu(r * v); },
+                                   g.degree)
+            : g.coeffs;
     const int degree_used =
         EvalPoly<word>(coeffs, fit_in_level, fit_scale, fit_scale, true)
             .GetPolyDegree();
@@ -82,8 +85,11 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
   for (size_t i = 0; i < groups_.size(); i++) {
     if (groups_[i].kind != Kind::kFit) continue;
     const double r = groups_[i].range;
-    auto coeffs = chebfit::Interpolate([r](double v) { return GeLu(r * v); },
-                                       groups_[i].degree);
+    auto coeffs =
+        groups_[i].coeffs.empty()
+            ? chebfit::Interpolate([r](double v) { return GeLu(r * v); },
+                                   groups_[i].degree)
+            : groups_[i].coeffs;
     // The target scale is the canonical scale of the level the tree LANDS on
     // -- EvalPoly stamps it on unchecked, and under grafting the two scales
     // differ enough to fail the next Add (see `SiLu.cu`).
