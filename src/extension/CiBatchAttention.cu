@@ -1196,14 +1196,18 @@ void CiBatchAttention<word>::BuildMasks(std::vector<Pt> &masks,
 template <typename word>
 void CiBatchAttention<word>::SoftMax(std::vector<Ct> &P,
                                      const std::vector<Ct> &scores, int head,
-                                     double carried,
-                                     const EvkMap<word> &evk) const {
+                                     double carried, const EvkMap<word> &evk,
+                                     const PublicHalf *pub,
+                                     Ct *pub_scale) const {
   NvtxScope _nv("batch attn: SoftMax");
   AssertTrue(softmax_ready_, "CiBatchAttention: call PrepareSoftMax first");
   if (calib_.niter > 0) {
-    SoftMaxCho(P, scores, head, carried, evk);
+    SoftMaxCho(P, scores, head, carried, evk, pub, pub_scale);
     return;
   }
+  AssertTrue(pub == nullptr,
+             "CiBatchAttention::SoftMax: the public half joins the Cho walk "
+             "(niter > 0); the single-shot softmax has no iteration to join");
   const Parameter<word> &param = boot_->param_;
   const int T = cfg_.num_tokens;
   const int top = GetTopLevel();
@@ -1440,7 +1444,9 @@ template <typename word>
 void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
                                         const std::vector<Ct> &scores, int head,
                                         double carried,
-                                        const EvkMap<word> &evk) const {
+                                        const EvkMap<word> &evk,
+                                        const PublicHalf *pub,
+                                        Ct *pub_scale) const {
   NvtxScope _nv("batch attn: SoftMaxCho");
   const Parameter<word> &param = boot_->param_;
   const int T = cfg_.num_tokens;
@@ -1494,6 +1500,20 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     return v >= 1 ? v : 8;
   }();
 
+  // The public half's running scalar. `R_0 = 1` is not a ciphertext, so it is
+  // a flag; from then on `R_{j+1} = R_j^2 (r^(j))^2`. It carries no key index,
+  // which is the whole reason the public keys need not survive an iteration.
+  Ct R;
+  bool have_R = false;
+  if (pub != nullptr) {
+    AssertTrue(pub->pow != nullptr && static_cast<int>(pub->pow->size()) == k,
+               "CiBatchAttention::SoftMaxCho: the public half owes one power "
+               "sum an iteration (CiPcAttention::GetNumPowers)");
+    AssertTrue(pub_scale != nullptr,
+               "CiBatchAttention::SoftMaxCho: the public value accumulator "
+               "needs R_k, so pub_scale must be given with pub");
+  }
+
   // k normalize-and-square iterations. Boot the MAIN path to top each time
   // (so sq arrives at top-1 uniformly), norm via invsqrt, then y = (y r)^2.
   for (int j = 0; j < k; j++) {
@@ -1528,6 +1548,38 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     Ct sq;
     boot_->RelinearizeRescale(sq, sq_acc, mult_key);
     sq_acc = Ct();
+    // (2b) THE PUBLIC HALF OF THE SAME DENOMINATOR, for T = 4096:
+    //          sq^(j) += R_j^2 * sum_p (y0_p)^(2^(j+1)) .
+    // `R_j` is one number a query token, so it left the sum; the public keys
+    // are gone and only their power sum is here. The product is formed at the
+    // LOW level where both factors live and bootstrapped ONCE, rather than
+    // lifting each factor -- one boot an iteration a head, 64 a layer.
+    Ct rsq;
+    bool have_rsq = false;
+    if (pub != nullptr) {
+      const Ct &M = (*pub->pow)[j];
+      Ct term;
+      if (!have_R) {
+        boot_->Boot(term, M, evk);  // R_0 = 1
+      } else {
+        boot_->HMult(rsq, R, R, mult_key);  // R_j^2, reused by (3b)
+        have_rsq = true;
+        const int low = Min(param.NPToLevel(rsq.GetNP()),
+                            param.NPToLevel(M.GetNP()));
+        Ct a, b, prod;
+        boot_->LevelDown(a, rsq, low);
+        boot_->LevelDown(b, M, low);
+        boot_->HMult(prod, a, b, mult_key);
+        boot_->Boot(term, prod, evk);
+      }
+      const int sq_lvl0 = param.NPToLevel(sq.GetNP());
+      AssertTrue(param.NPToLevel(term.GetNP()) >= sq_lvl0,
+                 "CiBatchAttention::SoftMaxCho: the public term landed below "
+                 "the denominator it joins");
+      Ct down;
+      boot_->LevelDown(down, term, sq_lvl0);
+      boot_->Add(sq, sq, down);
+    }
     // (3) the window and its invsqrt: first iteration wide, later [norm_lo,hi];
     //     crude except the last.
     const bool first = (j == 0);
@@ -1551,6 +1603,28 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     boot_->Add(sqv, sqv, shift);
     Ct r;
     inv->Evaluate(boot_, r, sqv, mult_key);
+    // (3b) R_{j+1} = R_j^2 (r^(j))^2 -- the next iteration's public factor,
+    //      and after the last one the factor the public VALUE accumulator
+    //      needs before it joins the output of `Values`.
+    if (pub != nullptr) {
+      Ct r2;
+      boot_->HMult(r2, r, r, mult_key);
+      if (!have_R) {
+        R = std::move(r2);  // R_1 = (r^(0))^2
+        have_R = true;
+      } else {
+        if (!have_rsq) {
+          boot_->HMult(rsq, R, R, mult_key);
+          have_rsq = true;
+        }
+        const int low = Min(param.NPToLevel(rsq.GetNP()),
+                            param.NPToLevel(r2.GetNP()));
+        Ct a, b;
+        boot_->LevelDown(a, rsq, low);
+        boot_->LevelDown(b, r2, low);
+        boot_->HMult(R, a, b, mult_key);
+      }
+    }
     // (4) y = (y r)^2  -- each y_l meets r, multiplies, squares; the result
     //     sums to 1 over live keys (r = 1/||y||).
     const int meet = param.NPToLevel(r.GetNP());
@@ -1561,6 +1635,13 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
       boot_->HMult(out, prod, prod, mult_key);
       y[l] = std::move(out);
     }
+  }
+
+  if (pub != nullptr) {
+    AssertTrue(have_R,
+               "CiBatchAttention::SoftMaxCho: the walk did not run, so there "
+               "is no R_k for the public accumulator");
+    *pub_scale = std::move(R);
   }
 
   // P = y_k, landed at forward_level.

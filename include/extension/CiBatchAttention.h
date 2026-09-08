@@ -429,8 +429,39 @@ class CiBatchAttention {
    * @param carried the scores' recorded-over-canonical factor before their
    *        Boot, divided out in the affine map
    */
+  /**
+   * @brief The PUBLIC half of a T = 4096 head, exactly as `CiPcAttention`
+   * leaves it. Absent (a null pointer) is the T = 128 layer, and then not one
+   * instruction below changes -- the whole join is inside
+   * `if (pub != nullptr)`.
+   *
+   * Unrolling `SoftMaxCho`'s walk gives
+   * `y^(j)_l = (y0_l)^(2^j) R_j` with `R_j = prod_{i<j} (r^(i))^(2^(j-i))`,
+   * and `R_j` carries no key index -- it is one number a QUERY token. So it
+   * comes out of the denominator,
+   *
+   *     sq^(j) = sum_l (y^(j)_l)^2 = R_j^2 sum_l (y0_l)^(2^(j+1)) ,
+   *
+   * and the public keys never have to survive an iteration. What they hand
+   * over instead is `pow[j] = sum_p (y0_p)^(2^(j+1))`, one a iteration, and
+   * one value accumulator at the top power. `CiPcAttention::Head` returns
+   * exactly those.
+   */
+  struct PublicHalf {
+    //! `pow[j] = sum_p (y0_p)^(2^(j+1))`, `niter` of them.
+    const std::vector<Ct> *pow = nullptr;
+  };
+
+  /**
+   * @param pub the public half of a T = 4096 head, or null for T = 128
+   * @param pub_scale out: `R_niter`, the per-query-token factor the public
+   *        VALUE accumulator has to be multiplied by before it joins the
+   *        output of `Values`. Written only when `pub` is given.
+   */
   void SoftMax(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
-               double carried, const EvkMap<word> &evk) const;
+               double carried, const EvkMap<word> &evk,
+               const PublicHalf *pub = nullptr,
+               Ct *pub_scale = nullptr) const;
 
   /**
    * @brief The FULL Cho [25] iteration (SoftMaxCalibration::niter > 0) for 512
@@ -446,7 +477,9 @@ class CiBatchAttention {
    * last (last_inv_degree). Plain causal path only (no fused/affine-prefix).
    */
   void SoftMaxCho(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
-                  double carried, const EvkMap<word> &evk) const;
+                  double carried, const EvkMap<word> &evk,
+                  const PublicHalf *pub = nullptr,
+                  Ct *pub_scale = nullptr) const;
 
   /**
    * @brief `res = P V` for one head: the 128 attention-output channel
