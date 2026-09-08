@@ -198,9 +198,9 @@ class CiBatchLayer {
     const float *gate = nullptr;  //!< `[model][hidden]`
     const float *up = nullptr;    //!< `[model][hidden]`
     const float *down = nullptr;  //!< `[hidden][model]`
-    //! The two RMSNorm gains, `model` each; folded into the weights that
-    //! read the normalised stream.
-    std::vector<double> ffn_norm, attn_norm;
+    //! The FFN RMSNorm gain, `model`; folded into the weights that read the
+    //! normalised stream. (The attention norm lives on `AttnWeights`.)
+    std::vector<double> ffn_norm;
   };
 
   //! `boot` is not const: the layer prepares and drops its transform
