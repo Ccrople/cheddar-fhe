@@ -67,8 +67,29 @@ CiSinCAttention<word>::CiSinCAttention(
   AssertTrue(layout.dim == 128 && layout.lanes == 32 && layout.num_cts == 8 &&
                  cfg_.sub_degree == 32,
              "CiSinCAttention: the transport (doorstep, premaps, exchange, "
-             "cross) is stated at the Llama alignment -- sub_degree 32, "
+             "cross) is stated at the Llama RING alignment -- sub_degree 32, "
              "dim 128, 32 lanes, 8 ciphertexts");
+  // The MODEL's shape, which is a different thing (see `Config::num_heads`):
+  // fewer heads leave lanes empty, a narrower head leaves channel groups
+  // empty, and both defaults are the layout's own numbers.
+  heads_ = cfg_.num_heads > 0 ? cfg_.num_heads : layout.lanes;
+  head_dim_ = cfg_.head_dim > 0 ? cfg_.head_dim : layout.dim;
+  AssertTrue(heads_ > 0 && heads_ <= layout.lanes,
+             "CiSinCAttention: the model has more heads than the layout has "
+             "lanes -- " + std::to_string(heads_) + " against " +
+                 std::to_string(layout.lanes));
+  AssertTrue(head_dim_ > 0 && head_dim_ <= layout.dim &&
+                 head_dim_ % layout.contraction == 0,
+             "CiSinCAttention: the head width must be a whole number of "
+             "chain calls -- " + std::to_string(head_dim_) +
+                 " against a contraction of " +
+                 std::to_string(layout.contraction));
+  groups_ = head_dim_ / layout.rank;
+  score_calls_ = head_dim_ / layout.contraction;
+  AssertTrue(cfg_.dense_images ||
+                 (heads_ == layout.lanes && head_dim_ == layout.dim),
+             "CiSinCAttention: the banded two-family route is stated at the "
+             "Llama alignment; a narrower model needs dense images");
   // The transport's height is a DIAL, not a fact: RoPE leaves the halves
   // at land_level - 1, but nothing between there and the descent needs
   // that height, and every key switch pays for the limbs it carries.
@@ -360,7 +381,10 @@ void CiSinCAttention<word>::BuildPremaps() {
 template <typename word>
 void CiSinCAttention<word>::BuildTransportPlaintexts() {
   const auto &layout = ccmm_.GetLayout();
-  const int half = layout.contraction;
+  // RoPE pairs channel m with m + head_dim/2, which is the layout's
+  // contraction only because Llama's head is exactly `dim` wide.
+  const int half = head_dim_ / 2;
+  const int pairs = half / layout.rank;
   // `landing_scale`: the images' declared scale on arrival against the one
   // this leg's constants were stated for (see Config). The ratio is a power
   // of two between two EvalMod ladders of this family (exactly 4 for the
@@ -378,18 +402,19 @@ void CiSinCAttention<word>::BuildTransportPlaintexts() {
   }
   std::vector<double> theta(half);
   for (int m = 0; m < half; m++) {
-    theta[m] = std::pow(cfg_.rope_base, -2.0 * m / layout.dim);
+    theta[m] = std::pow(cfg_.rope_base, -2.0 * m / head_dim_);
   }
   // RoPE + restore over the live doorstep addresses, shared by Q and K; the
   // masks also kill the half-density duplicates for free (1.5by). Encoding
   // only live addresses is the kill.
-  rope_cos_.resize(4);
-  rope_sin_.resize(4);
-  rope_neg_sin_.resize(4);
+  rope_cos_.resize(cfg_.rope ? pairs : 0);
+  rope_sin_.resize(cfg_.rope ? pairs : 0);
+  rope_neg_sin_.resize(cfg_.rope ? pairs : 0);
   // The heads a mask covers: the a family's 16 (the b family arrives by the
-  // merge), or all 32 of a dense image.
-  const int mask_heads = cfg_.dense_images ? layout.lanes : 16;
-  for (int lo = 0; lo < 4; lo++) {
+  // merge), or the model's own heads on a dense image -- so a model with
+  // fewer heads than lanes has its dead lanes killed here, for nothing.
+  const int mask_heads = cfg_.dense_images ? heads_ : 16;
+  for (int lo = 0; cfg_.rope && lo < pairs; lo++) {
     std::vector<Complex> cm(degree_, Complex(0.0, 0.0));
     std::vector<Complex> sm(degree_, Complex(0.0, 0.0));
     std::vector<Complex> nm(degree_, Complex(0.0, 0.0));
@@ -414,7 +439,7 @@ void CiSinCAttention<word>::BuildTransportPlaintexts() {
   {
     std::vector<Complex> km(degree_, Complex(0.0, 0.0));
     for (int t = 0; t < layout.dim; t++) {
-      for (int cp = 0; cp < 16; cp++) {
+      for (int cp = 0; cp < layout.rank; cp++) {
         for (int hh = 0; hh < mask_heads; hh++) {
           km[Door0(t, cp, hh)] = Complex(cfg_.restore, 0.0);
         }
@@ -504,11 +529,12 @@ void CiSinCAttention<word>::RopeAndKill(std::vector<Ct> &a_cts,
     }
     return;
   }
-  for (int lo = 0; lo < 4; lo++) {
+  const int pairs = head_dim_ / (2 * ccmm_.GetLayout().rank);
+  for (int lo = 0; lo < pairs; lo++) {
     for (int fam = 0; fam < 2; fam++) {
       std::vector<Ct> &cts = (fam == 0) ? a_cts : b_cts;
       Ct &lo_ct = cts[lo];
-      Ct &hi_ct = cts[lo + 4];
+      Ct &hi_ct = cts[lo + pairs];
       Ct aa, bb, dd;
       boot_->Mult(aa, lo_ct, rope_cos_[lo]);
       boot_->Mult(bb, hi_ct, rope_neg_sin_[lo]);
@@ -525,8 +551,10 @@ void CiSinCAttention<word>::RopeAndKill(std::vector<Ct> &a_cts,
 template <typename word>
 void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
   NvtxScope _nv("attn: Rope");
-  AssertTrue(cfg_.dense_images && static_cast<int>(cts.size()) == 8,
-             "CiSinCAttention::Rope: eight dense images");
+  AssertTrue(cfg_.dense_images && static_cast<int>(cts.size()) == groups_,
+             "CiSinCAttention::Rope: " + std::to_string(groups_) +
+                 " dense images, one per channel group");
+  const int pairs = head_dim_ / (2 * ccmm_.GetLayout().rank);
   if (!with_angles) {
     // V: the restore alone (the mask is `restore` at every doorstep slot).
     for (auto &ct : cts) {
@@ -535,9 +563,9 @@ void CiSinCAttention<word>::Rope(std::vector<Ct> &cts, bool with_angles) const {
       boot_->Rescale(ct, t);
     }
   } else {
-    for (int lo = 0; lo < 4; lo++) {
+    for (int lo = 0; lo < pairs; lo++) {
       Ct &lo_ct = cts[lo];
-      Ct &hi_ct = cts[lo + 4];
+      Ct &hi_ct = cts[lo + pairs];
       Ct aa, bb, dd;
       boot_->Mult(aa, lo_ct, rope_cos_[lo]);
       boot_->Mult(bb, hi_ct, rope_neg_sin_[lo]);
@@ -635,10 +663,13 @@ std::vector<Ciphertext<word>> CiSinCAttention<word>::Cross(
     const int v = BitRev(t_hi, 3);
     Ct acc;
     bool first = true;
-    for (int l = call * 4; l < call * 4 + 4; l++) {
+    const int per_call = layout.contraction / layout.rank;
+    for (int l = call * per_call; l < call * per_call + per_call; l++) {
+      AssertTrue(l < static_cast<int>(k_cts.size()),
+                 "CiSinCAttention::Cross: the call reaches past K's images");
       Ct piece;
       boot_->Mult(piece, k_cts[l], cross_sel_[v]);
-      const int rot = (v - l % 4) * 128;
+      const int rot = (v - l % per_call) * 128;
       if (rot != 0) {
         const int idx = (rot % degree_ + degree_) % degree_;
         Ct moved;
@@ -661,9 +692,12 @@ template <typename word>
 std::vector<Ciphertext<word>> CiSinCAttention<word>::VCall(
     const std::vector<Ct> &v_cts, int call, const EvkMap<word> &evk) const {
   NvtxScope _nv("attn: VCall");
-  const auto &layout = ccmm_.GetLayout();
-  std::vector<Ct> out(layout.num_cts);
-  for (int l = 0; l < layout.num_cts; l++) {
+  // One output per V IMAGE. The chain's rhs may be shorter than the layout's
+  // ciphertext count -- `DescendAndLift` fills the rest with exact zeros --
+  // and for a model whose head is narrower than `dim` it is: BERT's V is four
+  // images of the layout's eight columns' worth.
+  std::vector<Ct> out(v_cts.size());
+  for (size_t l = 0; l < v_cts.size(); l++) {
     Ct piece;
     boot_->Mult(piece, v_cts[l], call_sel_[call]);
     if (call == 1) {
@@ -742,8 +776,19 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
                                            double *carried) const {
   NvtxScope _nv("attn: chain (CC-MM) + return");
   const auto &layout = ccmm_.GetLayout();
+  // The scores contract over the head's CHANNELS and the values over the key
+  // TOKENS, and one call covers `contraction` of either. Llama's head is
+  // `dim` wide so both are two calls; BERT's is exactly one contraction wide,
+  // so its scores are ONE call and its values are still two.
+  const int calls = rhs_is_k ? score_calls_ : layout.dim / layout.contraction;
+  const int per_call = static_cast<int>(lhs_sinc.size()) / calls;
+  AssertTrue(per_call * calls == static_cast<int>(lhs_sinc.size()) &&
+                 per_call == layout.num_cts / 2,
+             "CiSinCAttention: the left operand does not split into " +
+                 std::to_string(calls) + " calls of " +
+                 std::to_string(layout.num_cts / 2));
   std::vector<Ct> acc;
-  for (int call = 0; call < 2; call++) {
+  for (int call = 0; call < calls; call++) {
     // The chain is the layer's most host-bound stretch (~30% busy, 192k
     // launches a layer): a window for the next layer's preparation.
     IdleWindow::Notify("chain");
@@ -752,8 +797,8 @@ void CiSinCAttention<word>::ChainAndReturn(std::vector<Ct> &res,
     // V rides Q's converter (1.5cb): same block function of (token, channel).
     Convert(rhs_is_k ? "k" : "q", rhs, *keys.swtch);
     std::vector<Ct> lhs;
-    for (int i = 0; i < layout.num_cts / 2; i++) {
-      lhs.push_back(std::move(lhs_sinc[call * layout.num_cts / 2 + i]));
+    for (int i = 0; i < per_call; i++) {
+      lhs.push_back(std::move(lhs_sinc[call * per_call + i]));
     }
     std::vector<Ct> part;
     ccmm_.Multiply(part, lhs, rhs, *keys.ring_switch,
@@ -805,8 +850,8 @@ void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q,
                                    std::vector<Ct> &k, const Keys &keys,
                                    double *carried) const {
   NvtxScope _nv("attn: Scores");
-  Rope(q, /*with_angles=*/true);
-  Rope(k, /*with_angles=*/true);
+  Rope(q, /*with_angles=*/cfg_.rope);
+  Rope(k, /*with_angles=*/cfg_.rope);
   ExchangeAll(q, *keys.boot);
   ExchangeAll(k, *keys.boot);
   Convert("q", q, *keys.swtch);
@@ -845,8 +890,8 @@ void CiSinCAttention<word>::Scores(std::vector<Ct> &res, std::vector<Ct> &q_a,
   AssertTrue(!cfg_.dense_images,
              "CiSinCAttention::Scores: this leg was built for dense images; "
              "call the 8-ciphertext form");
-  RopeAndKill(q_a, q_b, /*with_angles=*/true);
-  RopeAndKill(k_a, k_b, /*with_angles=*/true);
+  RopeAndKill(q_a, q_b, /*with_angles=*/cfg_.rope);
+  RopeAndKill(k_a, k_b, /*with_angles=*/cfg_.rope);
   Merge(q_a, q_b, *keys.boot);
   Merge(k_a, k_b, *keys.boot);
   ExchangeAll(q_a, *keys.boot);
@@ -997,7 +1042,10 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
           for (int lane = 0; lane < layout.lanes; lane++) {
             int ct_idx, slot, copy_slot;
             layout.LocateSlot(row, column, lane, ct_idx, slot, copy_slot);
-            const bool live = column <= row;
+            // Bidirectional (BERT): every key is live, and the per-row
+            // shift and norm still do their work. Causal (Llama): the
+            // lower triangle.
+            const bool live = calib_.bidirectional || column <= row;
             const double shift =
                 live ? calib_.row_shift[lane][row] : calib_.shift;
             a0_msg[slot] =

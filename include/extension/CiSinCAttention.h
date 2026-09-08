@@ -97,6 +97,36 @@ class CiSinCAttention {
     //! `Scores`/`Values` take 8 ciphertexts a tensor. Everything from the
     //! exchange on is unchanged.
     bool dense_images = false;
+    //! THE MODEL'S HEADS, when they are not the layout's.
+    //!
+    //! The transport's addresses are the RING's, not the model's: the
+    //! doorstep packs a 5-bit head field, a 4-bit column field and a 7-bit
+    //! token field into one slot because the layout has 32 lanes, rank 16 and
+    //! `dim` 128, and that is fixed by `sub_degree` and the two ring degrees.
+    //! A model with FEWER heads simply leaves lanes empty, and one with a
+    //! NARROWER head leaves channel groups empty -- so what these two change
+    //! is the LIVE set the masks cover, the number of ciphertexts a tensor
+    //! occupies (`head_dim / rank`), and the number of chain calls the
+    //! contraction needs (`head_dim / contraction`).
+    //!
+    //! BERT-Base is 12 heads of 64 against Llama's 32 of 128: it uses 12 of
+    //! the 32 lanes, four ciphertexts a tensor instead of eight, and ONE
+    //! chain call for the scores instead of two. Zero means the Llama
+    //! alignment (`lanes` heads of `dim` channels), which is what every test
+    //! on this branch states by not stating it.
+    //!
+    //! A DEAD LANE IS NOT HARMLESS DOWNSTREAM. Its scores are zero, and the
+    //! softmax walk's invsqrt would then be handed a row norm of zero, which
+    //! is outside any window and takes the ciphertext with it. The caller
+    //! must give the dead lanes a `row_shift` of zero and a `row_norm` of
+    //! `dim` in `SoftMaxCalibration`, which puts their argument at exactly 1.
+    int num_heads = 0;
+    int head_dim = 0;
+    //! RoPE. BERT adds learned absolute positions to the embeddings before
+    //! layer 0, so its leg carries the transport's restore multiply and no
+    //! angles at all -- which is the `with_angles = false` path V already
+    //! takes, one mask multiply per ciphertext instead of four.
+    bool rope = true;
     //! The declared scale the images ARRIVE at: 0 = this leg's own boot's
     //! `GetStCInputScale()` (a HalfBoot on the same ring). A crossing on
     //! another ring lands at ITS EvalMod's end scale -- 2^56 on the K = 32
@@ -184,7 +214,18 @@ class CiSinCAttention {
     double norm_hi = 2.0;
     int exp_degree = 0;   //!< 0 = derive it from `m_eff` (1.5ef)
     int inv_degree = 15;  //!< the walk has exactly four levels for it
+    //! Use the PER-ROW walk: a per-(lane, row) affine shift and, with
+    //! `row_norm`, a per-row norm estimate folded into the mask. The name is
+    //! historical -- what it selects is the per-row tables, not causality --
+    //! and `bidirectional` says which columns those tables call live.
     bool causal = false;
+    //! Every key is live (BERT), against a lower-triangular liveness
+    //! (Llama). The per-row shift and the `row_norm` fold are unchanged and
+    //! are still what closes the invsqrt interval to a ratio around one: a
+    //! bidirectional row's 128 live keys span a raw norm interval far wider
+    //! than a degree-15 invsqrt covers, and the fold is what removes it. Only
+    //! the 0/1 mask changes, to all ones.
+    bool bidirectional = false;
     //! Causal only: each (lane, row)'s calibrated live-key maximum, indexed
     //! [lane][row] with lane the LAYOUT lane (BitRev of the head). Masked
     //! slots fall back to `shift` so u stays inside the fit domain.
@@ -242,6 +283,11 @@ class CiSinCAttention {
   const CiSwitchedCcmmLayout &GetLayout() const { return ccmm_.GetLayout(); }
   /// Ciphertexts one operand occupies, and one result.
   int GetNumCiphertexts() const { return ccmm_.GetLayout().num_cts; }
+  /// The model's heads and head width, resolved (see `Config::num_heads`).
+  int GetNumHeads() const { return heads_; }
+  int GetHeadDim() const { return head_dim_; }
+  /// Ciphertexts one Q, K or V tensor occupies: `head_dim / rank`.
+  int GetNumImages() const { return groups_; }
   /// Where SoftMax expects its booted input: the leg ring's full-Boot
   /// landing, or in fused mode the tower's HalfBoot landing less the prefix
   /// (16 on both `ci16_35` and `ci16_35_land17c3e10`).
@@ -387,6 +433,10 @@ class CiSinCAttention {
   Config cfg_;
   int num_slots_ = 0;
   int degree_ = 0;
+  int heads_ = 0;        //!< the model's, <= layout.lanes
+  int head_dim_ = 0;     //!< the model's, a multiple of layout.contraction
+  int groups_ = 0;       //!< head_dim_ / layout.rank, ciphertexts a tensor
+  int score_calls_ = 0;  //!< head_dim_ / layout.contraction
   int window_ = 0;
   double gamma_ = 1.0;
 

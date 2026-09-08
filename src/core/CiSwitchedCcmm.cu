@@ -163,8 +163,16 @@ void CiSwitchedCcmmHandler<word>::Multiply(std::vector<Ct> &res,
   AssertTrue(static_cast<int>(lhs.size()) == layout_.num_cts / 2,
              "CiSwitchedCcmm: the lhs operand is num_cts / 2 big "
              "ciphertexts -- the contract's live columns and nothing else");
-  AssertTrue(static_cast<int>(rhs.size()) == layout_.num_cts,
-             "CiSwitchedCcmm: the rhs operand is num_cts big ciphertexts");
+  // AT MOST num_cts, not exactly. `DescendAndLift` already writes exact
+  // zeros past the ones it is given -- that is how the LHS carries only its
+  // live half -- and a model whose output is narrower than the layout uses
+  // the same door: BERT's values contract to 64 channels, which is four of
+  // the eight column ciphertexts, and the other four would be zeros the
+  // caller had to build.
+  AssertTrue(static_cast<int>(rhs.size()) > 0 &&
+                 static_cast<int>(rhs.size()) <= layout_.num_cts,
+             "CiSwitchedCcmm: the rhs operand is at most num_cts big "
+             "ciphertexts");
 
   NvtxScope *_d = new NvtxScope("ccmm: DescendAndLift (ring switch + lift)");
   std::vector<Ct> lifted_lhs, lifted_rhs;

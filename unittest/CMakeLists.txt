@@ -284,6 +284,12 @@ if (ENABLE_EXTENSION)
   # BERT's two operators Llama does not have: LayerNorm (RMSNorm's circuit plus
   # the centring, the masked mean and the bias) and GELU (one low-degree fit
   # plus the saturation masks). Host references throughout; no weight bundle.
+  # The attention leg at BERT's shape: 12 heads of 64, no RoPE, every key
+  # live. The sibling of CiBootSet.TheLibraryLegReproducesTheReference.
+  add_executable(ci_bert_leg_test CiBertLegTest.cpp)
+  target_link_libraries(ci_bert_leg_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(bert_ops_test BertOpsTest.cpp)
   target_link_libraries(bert_ops_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
