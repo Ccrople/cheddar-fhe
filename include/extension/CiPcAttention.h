@@ -161,6 +161,36 @@ class CiPcAttention {
     //! once at the end here. Empty = 1.
     std::vector<double> row_fold;
     int exp_degree = 0;  //!< 0 = derive from `m_eff`
+    /**
+     * @brief The encrypted branch's Cho [25] iteration count
+     * (`CiBatchAttention::SoftMaxCalibration::niter`). 0 is the single-shot
+     * softmax this class was first written against; `k > 0` is what the
+     * heterogeneous B = 512 layer actually runs, and it changes what the
+     * public half has to hand over.
+     *
+     * ## Why a joint softmax with the iteration is not "two adds"
+     *
+     * `SoftMaxCho` walks `y <- (y r)^2` k times, so every iteration's
+     * denominator is a sum over ALL 4096 keys and the public keys' `y` would
+     * have to survive between iterations -- 3968 ciphertexts. They do not
+     * have to. Unrolling the walk,
+     *
+     *     y^(j)_l = (y^(0)_l)^(2^j) R_j ,  R_j = prod_{i<j} (r^(i))^(2^(j-i))
+     *
+     * and `R_j` carries no key index -- it is one number a QUERY token. So it
+     * comes out of the sum:
+     *
+     *     sq^(j) = sum_l (y^(j)_l)^2 = R_j^2 sum_l (y^(0)_l)^(2^(j+1))
+     *
+     * and all the public half owes the iteration is the POWER SUMS
+     * `M_m = sum_p (y^(0)_p)^m` at `m = 2, 4, .., 2^k`, plus the value
+     * accumulator at the top power. Those are k exponentials of the same
+     * score, so they are computed in ONE streaming pass: the linear halves
+     * (`Scores`, the value product) are shared and only the exp repeats.
+     * `GetNumPowers()` is k, `Head` returns them in `pow`, and `acc` is
+     * against `pow`'s LAST weight.
+     */
+    int niter = 0;
   };
 
   /**
@@ -175,6 +205,10 @@ class CiPcAttention {
 
   //! The plain-map layout the queries and the results are packed in.
   const CiBatchLayout &GetLayout() const { return layout_; }
+  //! How many power sums `Head` returns: `max(niter, 1)`. `pow[j]` is
+  //! `sum_p (y0_p)^(2^(j+1))` and the value accumulator rides `pow`'s last
+  //! weight, `(y0_p)^(2^GetNumPowers())`.
+  int GetNumPowers() const { return calib_.niter > 0 ? calib_.niter : 1; }
   //! Where the exp lands: `q_level - 1 - ceil(log2(deg + 1))`.
   int GetWeightLevel() const { return exp_out_; }
   //! Where `Head` leaves `sq` and `acc`. The value product is one below the
@@ -222,7 +256,7 @@ class CiPcAttention {
    * `y = exp(m_eff (u - 1) / 4)` SQUARED, the quantity that accumulates.
    * `scores` is consumed.
    */
-  void Weights(std::vector<Ct> &w, std::vector<Ct> &scores,
+  void Weights(std::vector<std::vector<Ct>> &w, std::vector<Ct> &scores,
                const EvkMap<word> &evk) const;
 
   /**
@@ -230,14 +264,15 @@ class CiPcAttention {
    * `acc[c] += sum_p w[p] Vpub[p][c]`. `acc` and `sq` are grown on the first
    * call and read-modify-written after; `w` is consumed.
    */
-  void Accumulate(std::vector<Ct> &acc, Ct &sq, std::vector<Ct> &w,
+  void Accumulate(std::vector<Ct> &acc, std::vector<Ct> &pow,
+                  std::vector<std::vector<Ct>> &w,
                   const SubringWeights<word> &values) const;
 
   /**
    * @brief Close a head: the per-query-token fold onto `sq` and every
    * channel of `acc`, landing both at `GetOutputLevel()`.
    */
-  void Finish(std::vector<Ct> &acc, Ct &sq) const;
+  void Finish(std::vector<Ct> &acc, std::vector<Ct> &pow) const;
 
   /**
    * @brief Fill one chunk's key and value arrays for public tokens
@@ -256,6 +291,12 @@ class CiPcAttention {
    * residency does not move with the context length. That claim is the point
    * of the interface and PcAttentionTest measures it.
    */
+  void Head(std::vector<Ct> &acc, std::vector<Ct> &pow,
+            const std::vector<Ct> &q, int pub_tokens, const ChunkSource &src,
+            const EvkMap<word> &evk) const;
+
+  //! The single-power form, for a caller whose encrypted branch does not
+  //! iterate (`niter == 0`). Asserts that.
   void Head(std::vector<Ct> &acc, Ct &sq, const std::vector<Ct> &q,
             int pub_tokens, const ChunkSource &src,
             const EvkMap<word> &evk) const;
@@ -283,7 +324,7 @@ class CiPcAttention {
    * not change a word.
    */
   void HeadGroup(const std::vector<std::vector<Ct> *> &acc,
-                 const std::vector<Ct *> &sq,
+                 const std::vector<std::vector<Ct> *> &pow,
                  const std::vector<const std::vector<Ct> *> &q,
                  int pub_tokens, const ChunkSource &src,
                  const EvkMap<word> &evk) const;
@@ -298,7 +339,9 @@ class CiPcAttention {
   int exp_out_ = 0;
   //! The affine's multiply, folded into every key weight at encode time.
   double a1_ = 1.0;
-  std::unique_ptr<EvalPoly<word>> exp_;
+  //! One a power: `exps_[j]` is `exp(2^(j+1) hb (v - 1))`, `hb` the
+  //! encrypted branch's own `y0` exponent.
+  std::vector<std::unique_ptr<EvalPoly<word>>> exps_;
   //! The affine's per-query-token add, at `q_level - 1`.
   Pt a0_;
   //! The mask fold, per query token, at `GetWeightLevel() - 1`.

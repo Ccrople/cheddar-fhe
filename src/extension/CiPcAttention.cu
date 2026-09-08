@@ -91,26 +91,52 @@ void CiPcAttention<word>::Prepare(const Calibration &calib) {
 
   a1_ = 2.0 / (calib_.span * calib_.carried);
 
-  // w = y^2 = exp(m_eff (u - 1) / 2). The encrypted branch squares its y
-  // after the fact and pays a relinearization for it; here the square is a
-  // constant in the exponent and costs nothing.
-  const double hb = calib_.m_eff / 2.0;
-  const int degree =
-      (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(hb);
+  // `y0 = exp(hb (u - 1))` is what the encrypted branch's walk starts from:
+  // `m_eff / 2^(niter+1)` when it iterates (`CiBatchAttention`'s own rule at
+  // its `hb`), and this class's original `m_eff / 4` when it does not -- so
+  // that the FIRST power, m = 2, is exactly the `w = y^2` this class has
+  // always computed and a `niter == 0` caller sees no change at all.
+  const double hb0 = (calib_.niter > 0)
+                         ? calib_.m_eff / std::ldexp(1.0, calib_.niter + 1)
+                         : calib_.m_eff / 4.0;
+  const int steps = GetNumPowers();
   const int exp_in = cfg_.q_level - 1;
-  auto coeffs = chebfit::Interpolate(
-      [hb](double v) { return std::exp(hb * (v - 1.0)); }, degree);
-  const int used = EvalPoly<word>(coeffs, exp_in, param.GetScale(exp_in),
-                                  param.GetScale(exp_in), true)
-                       .GetPolyDegree();
-  exp_out_ = exp_in - Log2Ceil(used + 1);
-  AssertTrue(exp_out_ >= 2,
-             "CiPcAttention::Prepare: the exp exhausts the level budget "
-             "before the value product and the fold");
-  exp_ = std::make_unique<EvalPoly<word>>(coeffs, exp_in,
-                                          param.GetScale(exp_in),
-                                          param.GetScale(exp_out_), true);
-  exp_->Compile(boot_);
+
+  // Every power has to land on the SAME level or the sums cannot be added, so
+  // the degree is the widest one's -- the argument grows with the power, and
+  // so can the degree. The low powers pay a few coefficients for it and no
+  // levels; a single power (`niter == 0`) is unaffected.
+  int degree = 0;
+  for (int j = 0; j < steps; j++) {
+    const double hb = std::ldexp(hb0, j + 1);
+    degree = Max(degree, (calib_.exp_degree > 0) ? calib_.exp_degree
+                                                 : ExpDegree(hb));
+  }
+  int used = 0;
+  exps_.clear();
+  exps_.reserve(steps);
+  for (int j = 0; j < steps; j++) {
+    const double hb = std::ldexp(hb0, j + 1);
+    auto coeffs = chebfit::Interpolate(
+        [hb](double v) { return std::exp(hb * (v - 1.0)); }, degree);
+    const int u = EvalPoly<word>(coeffs, exp_in, param.GetScale(exp_in),
+                                 param.GetScale(exp_in), true)
+                      .GetPolyDegree();
+    AssertTrue(j == 0 || u == used,
+               "CiPcAttention::Prepare: the powers disagree on the used "
+               "degree, so they would not land together");
+    used = u;
+    if (j == 0) {
+      exp_out_ = exp_in - Log2Ceil(used + 1);
+      AssertTrue(exp_out_ >= 2,
+                 "CiPcAttention::Prepare: the exp exhausts the level budget "
+                 "before the value product and the fold");
+    }
+    exps_.push_back(std::make_unique<EvalPoly<word>>(
+        coeffs, exp_in, param.GetScale(exp_in), param.GetScale(exp_out_),
+        true));
+    exps_.back()->Compile(boot_);
+  }
 
   // The affine's ADD, per query token, at the level the scores land on. The
   // multiply is not here: it is a constant, so it rides the key weights'
@@ -137,7 +163,8 @@ void CiPcAttention<word>::Prepare(const Calibration &calib) {
   }
   ready_ = true;
   if (cfg_.verbose) {
-    std::cout << "  [pc] exp deg " << used << " @" << exp_in << ".."
+    std::cout << "  [pc] " << steps << " power" << (steps > 1 ? "s" : "")
+              << ", exp deg " << used << " @" << exp_in << ".."
               << exp_out_ << ", a1 " << a1_ << ", fold "
               << (has_fold_ ? "yes" : "no") << ", out @" << GetOutputLevel()
               << std::endl;
@@ -193,14 +220,18 @@ void CiPcAttention<word>::Scores(std::vector<Ct> &res,
 }
 
 template <typename word>
-void CiPcAttention<word>::Weights(std::vector<Ct> &w, std::vector<Ct> &scores,
+void CiPcAttention<word>::Weights(std::vector<std::vector<Ct>> &w,
+                                  std::vector<Ct> &scores,
                                   const EvkMap<word> &evk) const {
   AssertTrue(ready_, "CiPcAttention: call Prepare first");
   const auto &mult_key = evk.GetMultiplicationKey();
   const int exp_in = cfg_.q_level - 1;
+  const int steps = GetNumPowers();
   const double want = boot_->param_.GetScale(exp_in);
+  // `assign` would copy its value and a ciphertext is not copyable.
   w.clear();
-  w.resize(scores.size());
+  w.resize(steps);
+  for (int j = 0; j < steps; j++) w[j].resize(scores.size());
   for (size_t p = 0; p < scores.size(); p++) {
     AssertTrue(boot_->param_.NPToLevel(scores[p].GetNP()) == exp_in,
                "CiPcAttention::Weights: the score product did not land one "
@@ -208,41 +239,62 @@ void CiPcAttention<word>::Weights(std::vector<Ct> &w, std::vector<Ct> &scores,
     AssertTrue(std::abs(scores[p].GetScale() - want) <= 1e-9 * want,
                "CiPcAttention::Weights: the scores are off the canonical "
                "scale, so the affine's add would not line up");
+    // ONE affine, then every power reads the same `u`. The powers differ only
+    // in the exponent's constant, so this is where a Cho iteration's whole
+    // extra demand on the public half lives.
     boot_->Add(scores[p], scores[p], a0_);
-    exp_->Evaluate(boot_, w[p], scores[p], mult_key);
+    for (int j = 0; j < steps; j++) {
+      exps_[j]->Evaluate(boot_, w[j][p], scores[p], mult_key);
+    }
     scores[p] = Ct();
   }
   scores.clear();
 }
 
 template <typename word>
-void CiPcAttention<word>::Accumulate(std::vector<Ct> &acc, Ct &sq,
-                                     std::vector<Ct> &w,
+void CiPcAttention<word>::Accumulate(std::vector<Ct> &acc,
+                                     std::vector<Ct> &pow,
+                                     std::vector<std::vector<Ct>> &w,
                                      const SubringWeights<word> &values) const {
   AssertTrue(ready_, "CiPcAttention: call Prepare first");
-  AssertTrue(!w.empty(), "CiPcAttention::Accumulate: no weights");
-  AssertTrue(values.GetColsIn() == static_cast<int>(w.size()),
+  const int steps = GetNumPowers();
+  AssertTrue(static_cast<int>(w.size()) == steps,
+             "CiPcAttention::Accumulate: one weight set a power");
+  AssertTrue(!w[0].empty(), "CiPcAttention::Accumulate: no weights");
+  AssertTrue(values.GetColsIn() == static_cast<int>(w[0].size()),
              "CiPcAttention::Accumulate: the value weights do not contract "
              "this chunk");
   AssertTrue(values.GetColsOut() == cfg_.head_dim,
              "CiPcAttention::Accumulate: one output ciphertext a channel");
   const bool first = acc.empty();
 
-  // The denominator is a SUM OF CIPHERTEXTS -- no rotation, no key, no level
+  // Each denominator is a SUM OF CIPHERTEXTS -- no rotation, no key, no level
   // -- because the key axis is the ciphertext index. That is the batched
   // layout's own property and it is why the public branch never reduces.
-  // The weights are read, not consumed (the value product below reads them
-  // too), so the first term of the first chunk is a LevelDown to its own
-  // level: a copy, a ciphertext not being copyable.
-  size_t p = 0;
+  // The weights are read, not consumed (the value product below reads the
+  // last power too), so the first term of the first chunk is a LevelDown to
+  // its own level: a copy, a ciphertext not being copyable.
   if (first) {
-    boot_->LevelDown(sq, w[0], exp_out_);
-    p = 1;
+    pow.clear();
+    pow.resize(steps);
   }
-  for (; p < w.size(); p++) boot_->Add(sq, sq, w[p]);
+  AssertTrue(static_cast<int>(pow.size()) == steps,
+             "CiPcAttention::Accumulate: the chunks disagree on the power "
+             "count");
+  for (int j = 0; j < steps; j++) {
+    size_t p = 0;
+    if (first) {
+      boot_->LevelDown(pow[j], w[j][0], exp_out_);
+      p = 1;
+    }
+    for (; p < w[j].size(); p++) boot_->Add(pow[j], pow[j], w[j][p]);
+  }
 
+  // ONE value product, against the LAST power -- the encrypted branch's `P`
+  // after its final squaring is `(y0)^(2^k)` times a per-query-token scalar,
+  // so that is the only weight the output ever sees.
   std::vector<Ct> prod;
-  subring_.Multiply(boot_, prod, values, w);
+  subring_.Multiply(boot_, prod, values, w[steps - 1]);
   w.clear();
   if (first) {
     acc = std::move(prod);
@@ -257,18 +309,26 @@ void CiPcAttention<word>::Accumulate(std::vector<Ct> &acc, Ct &sq,
 }
 
 template <typename word>
-void CiPcAttention<word>::Finish(std::vector<Ct> &acc, Ct &sq) const {
+void CiPcAttention<word>::Finish(std::vector<Ct> &acc,
+                                 std::vector<Ct> &pow) const {
   AssertTrue(ready_, "CiPcAttention: call Prepare first");
   AssertTrue(!acc.empty(), "CiPcAttention::Finish: nothing was accumulated");
-  // `sq` is one level above `acc` (it never went through the value product),
-  // so it comes down to meet it before the fold and both land together.
-  Ct down;
-  boot_->LevelDown(down, sq, exp_out_ - 1);
-  sq = std::move(down);
+  AssertTrue(static_cast<int>(pow.size()) == GetNumPowers(),
+             "CiPcAttention::Finish: one power sum a power");
+  // The power sums are one level above `acc` (they never went through the
+  // value product), so they come down to meet it before the fold and all
+  // land together.
+  for (auto &m : pow) {
+    Ct down;
+    boot_->LevelDown(down, m, exp_out_ - 1);
+    m = std::move(down);
+  }
   if (!has_fold_) return;
-  Ct t;
-  boot_->Mult(t, sq, fold_);
-  boot_->Rescale(sq, t);
+  for (auto &m : pow) {
+    Ct t;
+    boot_->Mult(t, m, fold_);
+    boot_->Rescale(m, t);
+  }
   for (auto &c : acc) {
     Ct u;
     boot_->Mult(u, c, fold_);
@@ -278,7 +338,8 @@ void CiPcAttention<word>::Finish(std::vector<Ct> &acc, Ct &sq) const {
 
 template <typename word>
 void CiPcAttention<word>::HeadGroup(
-    const std::vector<std::vector<Ct> *> &acc, const std::vector<Ct *> &sq,
+    const std::vector<std::vector<Ct> *> &acc,
+    const std::vector<std::vector<Ct> *> &pow,
     const std::vector<const std::vector<Ct> *> &q, int pub_tokens,
     const ChunkSource &src, const EvkMap<word> &evk) const {
   AssertTrue(ready_, "CiPcAttention: call Prepare first");
@@ -287,13 +348,13 @@ void CiPcAttention<word>::HeadGroup(
   const int heads = static_cast<int>(q.size());
   AssertTrue(heads > 0, "CiPcAttention::HeadGroup: an empty group");
   AssertTrue(static_cast<int>(acc.size()) == heads &&
-                 static_cast<int>(sq.size()) == heads,
+                 static_cast<int>(pow.size()) == heads,
              "CiPcAttention::HeadGroup: one accumulator pair a query head");
   for (int h = 0; h < heads; h++) {
-    AssertTrue(q[h] != nullptr && acc[h] != nullptr && sq[h] != nullptr,
+    AssertTrue(q[h] != nullptr && acc[h] != nullptr && pow[h] != nullptr,
                "CiPcAttention::HeadGroup: a null member");
     acc[h]->clear();
-    *sq[h] = Ct();
+    pow[h]->clear();
   }
 
   const size_t lanes = static_cast<size_t>(cfg_.num_instances);
@@ -313,14 +374,22 @@ void CiPcAttention<word>::HeadGroup(
     for (int h = 0; h < heads; h++) {
       std::vector<Ct> s;
       Scores(s, *q[h], kw);
-      std::vector<Ct> w;
+      std::vector<std::vector<Ct>> w;
       Weights(w, s, evk);
-      Accumulate(*acc[h], *sq[h], w, vw);
+      Accumulate(*acc[h], *pow[h], w, vw);
     }
     kw = SubringWeights<word>();
     vw = SubringWeights<word>();
   }
-  for (int h = 0; h < heads; h++) Finish(*acc[h], *sq[h]);
+  for (int h = 0; h < heads; h++) Finish(*acc[h], *pow[h]);
+}
+
+template <typename word>
+void CiPcAttention<word>::Head(std::vector<Ct> &acc, std::vector<Ct> &pow,
+                               const std::vector<Ct> &q, int pub_tokens,
+                               const ChunkSource &src,
+                               const EvkMap<word> &evk) const {
+  HeadGroup({&acc}, {&pow}, {&q}, pub_tokens, src, evk);
 }
 
 template <typename word>
@@ -328,7 +397,12 @@ void CiPcAttention<word>::Head(std::vector<Ct> &acc, Ct &sq,
                                const std::vector<Ct> &q, int pub_tokens,
                                const ChunkSource &src,
                                const EvkMap<word> &evk) const {
-  HeadGroup({&acc}, {&sq}, {&q}, pub_tokens, src, evk);
+  AssertTrue(GetNumPowers() == 1,
+             "CiPcAttention::Head: the single-power form is for an encrypted "
+             "branch that does not iterate (Calibration::niter == 0)");
+  std::vector<Ct> pow;
+  Head(acc, pow, q, pub_tokens, src, evk);
+  sq = std::move(pow[0]);
 }
 
 template class CiPcAttention<uint32_t>;

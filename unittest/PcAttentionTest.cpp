@@ -599,17 +599,19 @@ TEST(PcAttention, TheGroupShareIsTheSeparateHeadsWordForWord) {
   };
 
   std::vector<std::vector<Ciphertext<word>>> acc_s(kGroup), acc_g(kGroup);
-  std::vector<Ciphertext<word>> sq_s(kGroup), sq_g(kGroup);
+  // The separate calls take the single-power form (this calibration does not
+  // iterate); the group returns `pow`, whose one entry is the same sum.
+  std::vector<Ciphertext<word>> sq_s(kGroup);
+  std::vector<std::vector<Ciphertext<word>>> pow_g(kGroup);
   for (int h = 0; h < kGroup; h++) {
     att->Head(acc_s[h], sq_s[h], q[h].ct, kPtok, src, ring.ui->GetEvkMap());
   }
 
-  std::vector<std::vector<Ciphertext<word>> *> ap(kGroup);
-  std::vector<Ciphertext<word> *> sp(kGroup);
+  std::vector<std::vector<Ciphertext<word>> *> ap(kGroup), sp(kGroup);
   std::vector<const std::vector<Ciphertext<word>> *> qp(kGroup);
   for (int h = 0; h < kGroup; h++) {
     ap[h] = &acc_g[h];
-    sp[h] = &sq_g[h];
+    sp[h] = &pow_g[h];
     qp[h] = &q[h].ct;
   }
   att->HeadGroup(ap, sp, qp, kPtok, src, ring.ui->GetEvkMap());
@@ -634,7 +636,8 @@ TEST(PcAttention, TheGroupShareIsTheSeparateHeadsWordForWord) {
   for (int h = 0; h < kGroup; h++) {
     ASSERT_EQ(acc_g[h].size(), acc_s[h].size());
     ASSERT_FALSE(acc_g[h].empty());
-    compare(sq_g[h], sq_s[h]);
+    ASSERT_EQ(pow_g[h].size(), 1u) << "this calibration has one power";
+    compare(pow_g[h][0], sq_s[h]);
     for (size_t c = 0; c < acc_g[h].size(); c++) {
       compare(acc_g[h][c], acc_s[h][c]);
     }
@@ -743,8 +746,7 @@ TEST(PcAttention, TheContextPriceSplitsByHeadCount) {
     att->Prepare(MakeCalibration(false));
 
     // What survives the whole context: one accumulator set a query head.
-    std::vector<std::vector<Ciphertext<word>>> acc(group);
-    std::vector<Ciphertext<word>> sq(group);
+    std::vector<std::vector<Ciphertext<word>>> acc(group), pow(group);
     std::vector<double> kbuf, vbuf;
     SubringWeights<word> kw, vw;
     double t_enc = 0.0, t_prod = 0.0;
@@ -769,9 +771,9 @@ TEST(PcAttention, TheContextPriceSplitsByHeadCount) {
       for (int h = 0; h < group; h++) {
         std::vector<Ciphertext<word>> s;
         att->Scores(s, q.ct, kw);
-        std::vector<Ciphertext<word>> w;
+        std::vector<std::vector<Ciphertext<word>>> w;
         att->Weights(w, s, ring.ui->GetEvkMap());
-        att->Accumulate(acc[h], sq[h], w, vw);
+        att->Accumulate(acc[h], pow[h], w, vw);
       }
       cudaDeviceSynchronize();
       const auto t2 = std::chrono::steady_clock::now();
@@ -783,7 +785,7 @@ TEST(PcAttention, TheContextPriceSplitsByHeadCount) {
       kw = SubringWeights<word>();
       vw = SubringWeights<word>();
     }
-    for (int h = 0; h < group; h++) att->Finish(acc[h], sq[h]);
+    for (int h = 0; h < group; h++) att->Finish(acc[h], pow[h]);
 
     const double enc_ms = 1000.0 * t_enc / ptok;
     const double prod_ms = 1000.0 * t_prod / (static_cast<double>(ptok) * group);
