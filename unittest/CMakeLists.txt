@@ -286,6 +286,12 @@ if (ENABLE_EXTENSION)
   # plus the saturation masks). Host references throughout; no weight bundle.
   # The attention leg at BERT's shape: 12 heads of 64, no RoPE, every key
   # live. The sibling of CiBootSet.TheLibraryLegReproducesTheReference.
+  # BERT-Base layer 0's non-leg half on the real checkpoint, against the
+  # float64 reference: both LayerNorms, both residuals, the biases and GELU.
+  add_executable(ci_bert_test CiBertTest.cpp)
+  target_link_libraries(ci_bert_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(ci_bert_leg_test CiBertLegTest.cpp)
   target_link_libraries(ci_bert_leg_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)

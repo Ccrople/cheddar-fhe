@@ -95,6 +95,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiSinCAttention.cu
     src/extension/CiLlamaSeam.cu
     src/extension/CiLlamaLayer.cu
+    src/extension/CiBertLayer.cu
     src/extension/CiLayerPrefetch.cu
     src/extension/CiBatch.cu
     src/extension/CiBatchLayer.cu
