@@ -112,9 +112,15 @@ void CiPcAttention<word>::Prepare(const Calibration &calib) {
     degree = Max(degree, (calib_.exp_degree > 0) ? calib_.exp_degree
                                                  : ExpDegree(hb));
   }
+  // Each power lands where its OWN used degree puts it: a smaller argument
+  // has genuinely smaller high coefficients and `EvalPoly` trims the ones
+  // that vanish, so the low powers can come out a level higher. They are
+  // brought down to the deepest one's landing in `Weights` -- a LevelDown a
+  // weight, which is what makes the sums addable.
   int used = 0;
   exps_.clear();
   exps_.reserve(steps);
+  exp_level_.assign(steps, 0);
   for (int j = 0; j < steps; j++) {
     const double hb = std::ldexp(hb0, j + 1);
     auto coeffs = chebfit::Interpolate(
@@ -122,21 +128,18 @@ void CiPcAttention<word>::Prepare(const Calibration &calib) {
     const int u = EvalPoly<word>(coeffs, exp_in, param.GetScale(exp_in),
                                  param.GetScale(exp_in), true)
                       .GetPolyDegree();
-    AssertTrue(j == 0 || u == used,
-               "CiPcAttention::Prepare: the powers disagree on the used "
-               "degree, so they would not land together");
-    used = u;
-    if (j == 0) {
-      exp_out_ = exp_in - Log2Ceil(used + 1);
-      AssertTrue(exp_out_ >= 2,
-                 "CiPcAttention::Prepare: the exp exhausts the level budget "
-                 "before the value product and the fold");
-    }
+    used = Max(used, u);
+    exp_level_[j] = exp_in - Log2Ceil(u + 1);
     exps_.push_back(std::make_unique<EvalPoly<word>>(
-        coeffs, exp_in, param.GetScale(exp_in), param.GetScale(exp_out_),
-        true));
+        coeffs, exp_in, param.GetScale(exp_in),
+        param.GetScale(exp_level_[j]), true));
     exps_.back()->Compile(boot_);
   }
+  exp_out_ = exp_level_[0];
+  for (int j = 1; j < steps; j++) exp_out_ = Min(exp_out_, exp_level_[j]);
+  AssertTrue(exp_out_ >= 2,
+             "CiPcAttention::Prepare: the exp exhausts the level budget "
+             "before the value product and the fold");
 
   // The affine's ADD, per query token, at the level the scores land on. The
   // multiply is not here: it is a constant, so it rides the key weights'
@@ -245,6 +248,11 @@ void CiPcAttention<word>::Weights(std::vector<std::vector<Ct>> &w,
     boot_->Add(scores[p], scores[p], a0_);
     for (int j = 0; j < steps; j++) {
       exps_[j]->Evaluate(boot_, w[j][p], scores[p], mult_key);
+      if (exp_level_[j] > exp_out_) {
+        Ct down;
+        boot_->LevelDown(down, w[j][p], exp_out_);
+        w[j][p] = std::move(down);
+      }
     }
     scores[p] = Ct();
   }
@@ -334,6 +342,47 @@ void CiPcAttention<word>::Finish(std::vector<Ct> &acc,
     boot_->Mult(u, c, fold_);
     boot_->Rescale(c, u);
   }
+}
+
+template <typename word>
+void CiPcAttention<word>::JoinOutput(std::vector<Ct> &res,
+                                     std::vector<Ct> &acc, const Ct &scale,
+                                     const EvkMap<word> &evk) const {
+  AssertTrue(ready_, "CiPcAttention: call Prepare first");
+  AssertTrue(!acc.empty(), "CiPcAttention::JoinOutput: nothing accumulated");
+  AssertTrue(res.empty() || res.size() == acc.size(),
+             "CiPcAttention::JoinOutput: the two halves disagree on the "
+             "channel count");
+  const Parameter<word> &param = boot_->param_;
+  const auto &mult_key = evk.GetMultiplicationKey();
+  const bool first = res.empty();
+  if (first) res.resize(acc.size());
+  for (size_t c = 0; c < acc.size(); c++) {
+    // `R_k` and the accumulator meet at whichever is lower; the product
+    // lands one below that.
+    const int meet = Min(param.NPToLevel(scale.GetNP()),
+                         param.NPToLevel(acc[c].GetNP()));
+    Ct a, b, prod;
+    boot_->LevelDown(a, acc[c], meet);
+    acc[c] = Ct();
+    boot_->LevelDown(b, scale, meet);
+    boot_->HMult(prod, a, b, mult_key);
+    if (first) {
+      res[c] = std::move(prod);
+      continue;
+    }
+    AssertTrue(std::abs(res[c].GetScale() - prod.GetScale()) <=
+                   1e-9 * prod.GetScale(),
+               "CiPcAttention::JoinOutput: the two halves are on different "
+               "scales, so the add would not mean anything");
+    const int lo = Min(param.NPToLevel(res[c].GetNP()),
+                       param.NPToLevel(prod.GetNP()));
+    Ct ra, rb;
+    boot_->LevelDown(ra, res[c], lo);
+    boot_->LevelDown(rb, prod, lo);
+    boot_->Add(res[c], ra, rb);
+  }
+  acc.clear();
 }
 
 template <typename word>

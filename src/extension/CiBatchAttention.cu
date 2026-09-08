@@ -1723,11 +1723,21 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
         }
         const int low = Min(param.NPToLevel(rsq.GetNP()),
                             param.NPToLevel(r2.GetNP()));
-        Ct a, b;
+        Ct a, b, prod;
         boot_->LevelDown(a, rsq, low);
         boot_->LevelDown(b, r2, low);
-        boot_->HMult(R, a, b, mult_key);
+        boot_->HMult(prod, a, b, mult_key);
+        R = std::move(prod);
       }
+      // `R` costs levels every iteration (a square and a multiply) and it has
+      // to survive all of them AND the multiply onto the public value
+      // accumulator afterwards, so it rides back up here. It is O(1) by
+      // construction -- `R_j` is a product of inverse square roots of sums
+      // that are themselves normalised -- so the bootstrap is well posed.
+      // One boot an iteration a head, 64 a layer.
+      Ct up;
+      boot_->Boot(up, R, evk);
+      R = std::move(up);
     }
     // (4) y = (y r)^2  -- each y_l meets r, multiplies, squares; the result
     //     sums to 1 over live keys (r = 1/||y||).

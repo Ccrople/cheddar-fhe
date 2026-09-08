@@ -275,6 +275,28 @@ class CiPcAttention {
   void Finish(std::vector<Ct> &acc, std::vector<Ct> &pow) const;
 
   /**
+   * @brief The public half of the OUTPUT: `res[c] += scale * acc[c]`.
+   *
+   * `Values` gives the encrypted half `sum_l P_l Venc[l]` with `P = y_k`
+   * already carrying the walk's per-query-token factor. The public half was
+   * accumulated against the LAST power alone, `sum_p (y0_p)^(2^k) Vpub[p]`,
+   * so what it still owes is `R_k` -- and that is exactly what
+   * `CiBatchAttention::SoftMaxCho` hands back through `pub_scale`.
+   *
+   * One ciphertext multiply a CHANNEL (128 a head, 4096 a layer), which is
+   * the whole cost of joining the two outputs; the denominators joined
+   * earlier, inside the walk.
+   *
+   * `acc` is consumed. `res` is grown on the first call and read-modify-
+   * written after, so a caller can hand it `Values`' own output. The scales
+   * must already agree -- the encrypted output carries the chain's factor in
+   * its RECORDED scale, so a caller that wants to add to it declares the
+   * public value weights at the same ratio when it encodes them.
+   */
+  void JoinOutput(std::vector<Ct> &res, std::vector<Ct> &acc,
+                  const Ct &scale, const EvkMap<word> &evk) const;
+
+  /**
    * @brief Fill one chunk's key and value arrays for public tokens
    * `[start, start + width)`, in the layouts `EncodeKeys` / `EncodeValues`
    * document. Both vectors arrive already sized.
@@ -342,6 +364,11 @@ class CiPcAttention {
   //! One a power: `exps_[j]` is `exp(2^(j+1) hb (v - 1))`, `hb` the
   //! encrypted branch's own `y0` exponent.
   std::vector<std::unique_ptr<EvalPoly<word>>> exps_;
+  //! Where each power's polynomial actually lands. A smaller argument has
+  //! smaller high coefficients, `EvalPoly` trims the ones that vanish, and
+  //! the low powers can therefore come out a level higher; `Weights` brings
+  //! them down to `exp_out_`, the deepest.
+  std::vector<int> exp_level_;
   //! The affine's per-query-token add, at `q_level - 1`.
   Pt a0_;
   //! The mask fold, per query token, at `GetWeightLevel() - 1`.
