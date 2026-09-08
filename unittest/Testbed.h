@@ -231,7 +231,7 @@ class Testbed : public testing::TestWithParam<const char *> {
               : 0;
       context_ = BootContext<word>::Create(
           *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
-                                 num_stc_levels_, 5, BootSlackLevels(),
+                                 BootStcLevels(), 5, BootSlackLevels(),
                                  num_double_angle));
     } else {
       context_ = Context<word>::Create(*param_);
@@ -258,6 +258,12 @@ class Testbed : public testing::TestWithParam<const char *> {
   // EvalMod is wider (CHEDDAR_BOOT_DOUBLE_ANGLE), moves it so that EvalMod
   // still ends on default_encryption_level, which BootContext asserts.
   virtual int BootCtsLevels() const { return num_cts_levels_; }
+
+  // Levels SlotToCoeff spends, the mirror of `BootCtsLevels`. The preset's
+  // count reproduces every shipped bootstrap; a bench that wants the
+  // level-against-time curve of the two transforms moves it, and the landing
+  // level moves with it.
+  virtual int BootStcLevels() const { return num_stc_levels_; }
 
   // Whether SetUp builds a BootContext when the preset asks for one. A test
   // that needs the extension's transforms but not the bootstrap -- the real

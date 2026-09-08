@@ -228,6 +228,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(boot_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # One ciphertext's bootstrap latency, synced on both sides of every
+  # repetition -- the number `boot_test`'s Bootstrap prints is a slice of a
+  # pipelined queue, which is not what a single bootstrap costs.
+  add_executable(boot_bench BootBench.cpp)
+  target_link_libraries(boot_bench
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # CoeffToSlot and SlotToCoeff on the real subring, against the encoder rather
   # than against another run of the transform. Compiles the transforms
   # standalone, since BootContext still refuses the conjugate-invariant flag,
