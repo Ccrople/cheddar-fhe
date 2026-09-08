@@ -1331,11 +1331,12 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
 
   // The main-path boots batch across the T key-token ciphertexts, exactly the
   // score boots' CHEDDAR_CI_BATCH_BOOT_GROUP (BootBatch is word-for-word equal
-  // to the loop; group 1 = the serial path, the A100 baseline).
+  // to the loop; default 8, matching CiBatchLayer::BootGroupSize; group 1 = the
+  // serial A/B baseline).
   static const int boot_group = [] {
     const char *e = std::getenv("CHEDDAR_CI_BATCH_BOOT_GROUP");
     const int v = (e != nullptr) ? std::atoi(e) : 0;
-    return v >= 1 ? v : 1;
+    return v >= 1 ? v : 8;
   }();
 
   // k normalize-and-square iterations. Boot the MAIN path to top each time

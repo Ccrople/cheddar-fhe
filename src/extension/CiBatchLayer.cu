@@ -104,15 +104,17 @@ void CiBatchLayer<word>::AddRequiredRotations(EvkRequest &req) const {
 }
 
 namespace {
-// How many full Boots stand together in one `BootBatch` group. 1 is the
-// serial loop, exactly the A100 configuration (the default, so a baseline
-// A/B needs no env); the Phase-2 lever raises it with
-// `CHEDDAR_EVALMOD_BATCH` sizing the reduction's chunks inside.
+// How many full Boots stand together in one `BootBatch` group. 8 is the
+// default: on a B200 whole layer (512 prompts, niter=2) it cuts the boot stage
+// ~19% and the layer -14.7% (898->766 s), exact (BootBatch is word-for-word
+// equal to the serial loop) and matched to `CHEDDAR_EVALMOD_BATCH`'s own 8-wide
+// reduction chunks. `CHEDDAR_CI_BATCH_BOOT_GROUP=1` is the serial A/B baseline
+// (the original A100 configuration).
 int BootGroupSize() {
   static const int group = [] {
     const char *env = std::getenv("CHEDDAR_CI_BATCH_BOOT_GROUP");
     const int value = (env != nullptr) ? std::atoi(env) : 0;
-    return value >= 1 ? value : 1;
+    return value >= 1 ? value : 8;
   }();
   return group;
 }
