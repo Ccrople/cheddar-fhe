@@ -112,6 +112,26 @@ void HoistHandler<word>::SetEvaluateSerial(bool serial) {
   eval_serial_ = serial;
 }
 
+// The width of a giant-step accumulation WINDOW, shared by the serial and the
+// batched fused kernels. See `GSFusedComplexPAccum` for what it buys and why
+// narrowing the BSGS split instead does not.
+inline int GSWindowCap() {
+  static const int cap = [] {
+    const char *e = std::getenv("CHEDDAR_CI_GS_WINDOW");
+    // A single pass. Windowing the baby-step range was what kept the OLD
+    // kernel (baby steps in registers) off the spill -- 53.39 / 50.81 / 50.91
+    // / 56.14 ms a `ci16_35` bootstrap at 2 / 4 / 8 / 16 -- and it cost one
+    // read-modify-write of the outputs per window past the first, 30-37% of
+    // the accumulation's traffic. With the accumulators resident instead
+    // there is nothing to spill, so the whole range goes in one pass and that
+    // traffic is gone.
+    if (e == nullptr || e[0] == 0) return 32;
+    const int v = std::atoi(e);
+    return (v < 1) ? 1 : ((v > 32) ? 32 : v);
+  }();
+  return cap;
+}
+
 namespace kernel {
 
 // Fused kernel for KeyMult, MAC, and Aut in the baby step.
@@ -333,7 +353,33 @@ __global__ void GSFusedKernel(word **dst_bx, word **dst_ax, const word **bx,
 // whose input is one real ciphertext. `has_im_out` off drops the res_im
 // accumulation: the last phase, where the imaginary half of the answer is
 // redundant and never formed. Both flags off is meaningless and unused.
-template <typename word, int num_bs_padded, bool has_im_in, bool has_im_out>
+// The giant step's plaintext accumulation, with the ACCUMULATORS in registers
+// rather than the baby steps.
+//
+// Both orders read the same bytes once -- every baby step and every plaintext
+// -- but they differ in what has to stay live. Summing over baby steps for one
+// giant step at a time needs all `num_bs` rotated ciphertexts resident (four
+// words each: the real and imaginary b and a), which at 16 baby steps is 64
+// words and 96 registers, and an A100 then runs the kernel at 682 threads an
+// SM and ~37% of its achievable HBM bandwidth. Running the baby steps on the
+// OUTSIDE needs only the current one plus one accumulator per giant step and
+// output half -- 4 + 4 * num_gs words, 12 at CoeffToSlot's num_gs = 2 and 20
+// at SlotToCoeff's 4 -- so the same arithmetic in the same order fits in ~32
+// registers with nothing spilled and nothing re-read.
+//
+// The accumulator bound must be a COMPILE-TIME one (the template parameter,
+// with the runtime `num_gs` as a break) for the same reason the baby-step
+// array did: a runtime bound leaves the indexing dynamic and ptxas puts the
+// array in local memory. `num_bs` needs no such treatment any more -- it is a
+// plain loop over scalars now, which is why it is no longer a template
+// parameter.
+//
+// `bs_begin` / `mx_stride` / `accumulate` window the baby-step range and add
+// into the destination instead of storing. With the accumulators in registers
+// a window is no longer needed to keep the kernel off the spill, and the
+// default is a single pass; they stay because a phase with a very large
+// num_gs would want them.
+template <typename word, int num_gs_padded, bool has_im_in, bool has_im_out>
 __global__ void GSFusedComplexKernel(
     word **dst, const word **bs_re, const word **bs_im, const word **mx_re,
     const word **mx_im, int num_bs, int num_gs, int bs_begin, int mx_stride,
@@ -345,83 +391,96 @@ __global__ void GSFusedComplexKernel(
   const word prime = primes[prime_index];
   const make_signed_t<word> montgomery = inv_primes[prime_index];
 
-  // bs_re holds the (bx, ax) pointer pairs of the real baby steps
-  // interleaved: bs_re[2j] = bx of step j, bs_re[2j + 1] = ax. Interleaving
-  // keeps one pointer array per input instead of four parameters.
-  word re_b[num_bs_padded];
-  word re_a[num_bs_padded];
-  word im_b[has_im_in ? num_bs_padded : 1];
-  word im_a[has_im_in ? num_bs_padded : 1];
+  word rr_b[num_gs_padded];
+  word rr_a[num_gs_padded];
+  word ri_b[has_im_out ? num_gs_padded : 1];
+  word ri_a[has_im_out ? num_gs_padded : 1];
 #pragma unroll
-  for (int j = 0; j < num_bs_padded; j++) {
-    const int b = bs_begin + j;
-    re_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * b] + i) : 0;
-    re_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_re[2 * b + 1] + i) : 0;
-    if constexpr (has_im_in) {
-      im_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * b] + i) : 0;
-      im_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_im[2 * b + 1] + i) : 0;
+  for (int k = 0; k < num_gs_padded; k++) {
+    rr_b[k] = 0;
+    rr_a[k] = 0;
+    if constexpr (has_im_out) {
+      ri_b[k] = 0;
+      ri_a[k] = 0;
     }
   }
 
-  for (int k = 0; k < num_gs; k++) {
-    word rr_b = 0, rr_a = 0;
-    word ri_b = 0, ri_a = 0;
+  // bs_re holds the (bx, ax) pointer pairs of the real baby steps
+  // interleaved: bs_re[2j] = bx of step j, bs_re[2j + 1] = ax. Interleaving
+  // keeps one pointer array per input instead of four parameters.
+  for (int j = 0; j < num_bs; j++) {
+    const int b = bs_begin + j;
+    const word re_b = basic::StreamingLoad(bs_re[2 * b] + i);
+    const word re_a = basic::StreamingLoad(bs_re[2 * b + 1] + i);
+    word im_b = 0, im_a = 0;
+    if constexpr (has_im_in) {
+      im_b = basic::StreamingLoad(bs_im[2 * b] + i);
+      im_a = basic::StreamingLoad(bs_im[2 * b + 1] + i);
+    }
 #pragma unroll
-    for (int j = 0; j < num_bs_padded; j++) {
-      if (j >= num_bs) break;
-      const word *re_pt = mx_re[bs_begin + j + k * mx_stride];
+    for (int k = 0; k < num_gs_padded; k++) {
+      if (k >= num_gs) break;
+      const word *re_pt = mx_re[b + k * mx_stride];
       if (re_pt != nullptr) {
         word m = basic::StreamingLoad(re_pt + i);
-        rr_b = basic::Add(rr_b, basic::MultMontgomery(re_b[j], m, prime,
-                                                      montgomery), prime);
-        rr_a = basic::Add(rr_a, basic::MultMontgomery(re_a[j], m, prime,
-                                                      montgomery), prime);
+        rr_b[k] = basic::Add(
+            rr_b[k], basic::MultMontgomery(re_b, m, prime, montgomery), prime);
+        rr_a[k] = basic::Add(
+            rr_a[k], basic::MultMontgomery(re_a, m, prime, montgomery), prime);
         if constexpr (has_im_in && has_im_out) {
-          ri_b = basic::Add(ri_b, basic::MultMontgomery(im_b[j], m, prime,
-                                                        montgomery), prime);
-          ri_a = basic::Add(ri_a, basic::MultMontgomery(im_a[j], m, prime,
-                                                        montgomery), prime);
+          ri_b[k] = basic::Add(
+              ri_b[k], basic::MultMontgomery(im_b, m, prime, montgomery),
+              prime);
+          ri_a[k] = basic::Add(
+              ri_a[k], basic::MultMontgomery(im_a, m, prime, montgomery),
+              prime);
         }
       }
-      const word *im_pt = mx_im[bs_begin + j + k * mx_stride];
+      const word *im_pt = mx_im[b + k * mx_stride];
       if (im_pt != nullptr) {
         word m = basic::StreamingLoad(im_pt + i);
         if constexpr (has_im_in) {
-          rr_b = basic::Sub(rr_b, basic::MultMontgomery(im_b[j], m, prime,
-                                                        montgomery), prime);
-          rr_a = basic::Sub(rr_a, basic::MultMontgomery(im_a[j], m, prime,
-                                                        montgomery), prime);
+          rr_b[k] = basic::Sub(
+              rr_b[k], basic::MultMontgomery(im_b, m, prime, montgomery),
+              prime);
+          rr_a[k] = basic::Sub(
+              rr_a[k], basic::MultMontgomery(im_a, m, prime, montgomery),
+              prime);
         }
         if constexpr (has_im_out) {
-          ri_b = basic::Add(ri_b, basic::MultMontgomery(re_b[j], m, prime,
-                                                        montgomery), prime);
-          ri_a = basic::Add(ri_a, basic::MultMontgomery(re_a[j], m, prime,
-                                                        montgomery), prime);
+          ri_b[k] = basic::Add(
+              ri_b[k], basic::MultMontgomery(re_b, m, prime, montgomery),
+              prime);
+          ri_a[k] = basic::Add(
+              ri_a[k], basic::MultMontgomery(re_a, m, prime, montgomery),
+              prime);
         }
       }
     }
-    // dst interleaves outputs per giant step: (re bx, re ax[, im bx, im ax]).
-    constexpr int out_stride = has_im_out ? 4 : 2;
-    // A window past the first ADDS: the giant step's sum over baby steps is
-    // split into windows only so the register arrays stay small, and a sum
-    // does not care where it is cut.
+  }
+
+  // dst interleaves outputs per giant step: (re bx, re ax[, im bx, im ax]).
+  constexpr int out_stride = has_im_out ? 4 : 2;
+#pragma unroll
+  for (int k = 0; k < num_gs_padded; k++) {
+    if (k >= num_gs) break;
     if (accumulate) {
       word *o0 = dst[k * out_stride];
       word *o1 = dst[k * out_stride + 1];
-      o0[i] = basic::Add(o0[i], rr_b, prime);
-      o1[i] = basic::Add(o1[i], rr_a, prime);
+      o0[i] = basic::Add(o0[i], rr_b[k], prime);
+      o1[i] = basic::Add(o1[i], rr_a[k], prime);
       if constexpr (has_im_out) {
         word *o2 = dst[k * out_stride + 2];
         word *o3 = dst[k * out_stride + 3];
-        o2[i] = basic::Add(o2[i], ri_b, prime);
-        o3[i] = basic::Add(o3[i], ri_a, prime);
+        o2[i] = basic::Add(o2[i], ri_b[k], prime);
+        o3[i] = basic::Add(o3[i], ri_a[k], prime);
       }
     } else {
-      dst[k * out_stride][i] = rr_b;
-      dst[k * out_stride + 1][i] = rr_a;
+      dst[k * out_stride][i] = rr_b[k];
+      dst[k * out_stride + 1][i] = rr_a[k];
       if constexpr (has_im_out) {
-        dst[k * out_stride + 2][i] = ri_b;
-        dst[k * out_stride + 3][i] = ri_a;
+        dst[k * out_stride + 2][i] = ri_b[k];
+        dst[k * out_stride + 3][i] = ri_a[k];
       }
     }
   }
@@ -436,12 +495,12 @@ __global__ void GSFusedComplexKernel(
 // kernel streams because it reads each line exactly once. The baby-step and
 // output tables carry one slice per ciphertext; the arithmetic per
 // ciphertext, and its order, are exactly the serial kernel's.
-template <typename word, int num_bs_padded, bool has_im_in, bool has_im_out>
+template <typename word, int num_gs_padded, bool has_im_in, bool has_im_out>
 __global__ void GSFusedComplexKernelBatch(
     word **dst, const word **bs_re, const word **bs_im, const word **mx_re,
-    const word **mx_im, int num_bs, int num_gs, int num_cts,
-    const word *primes, const make_signed_t<word> *inv_primes,
-    int log_degree) {
+    const word **mx_im, int num_bs, int num_gs, int num_cts, int bs_begin,
+    int mx_stride, bool accumulate, const word *primes,
+    const make_signed_t<word> *inv_primes, int log_degree) {
   const int ct = blockIdx.x % num_cts;
   const int xblk = blockIdx.x / num_cts;
   int i = xblk * blockDim.x + threadIdx.x;
@@ -451,67 +510,98 @@ __global__ void GSFusedComplexKernelBatch(
   const make_signed_t<word> montgomery = inv_primes[prime_index];
 
   constexpr int out_stride = has_im_out ? 4 : 2;
-  const word **bs_re_ct = bs_re + ct * 2 * num_bs;
-  const word **bs_im_ct = has_im_in ? bs_im + ct * 2 * num_bs : bs_im;
+  // The baby-step tables carry the FULL width per ciphertext; a window only
+  // moves where this launch reads inside that slice.
+  const word **bs_re_ct = bs_re + ct * 2 * mx_stride;
+  const word **bs_im_ct = has_im_in ? bs_im + ct * 2 * mx_stride : bs_im;
   word **dst_ct = dst + ct * num_gs * out_stride;
 
-  word re_b[num_bs_padded];
-  word re_a[num_bs_padded];
-  word im_b[has_im_in ? num_bs_padded : 1];
-  word im_a[has_im_in ? num_bs_padded : 1];
+  word rr_b[num_gs_padded];
+  word rr_a[num_gs_padded];
+  word ri_b[has_im_out ? num_gs_padded : 1];
+  word ri_a[has_im_out ? num_gs_padded : 1];
 #pragma unroll
-  for (int j = 0; j < num_bs_padded; j++) {
-    re_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_re_ct[2 * j] + i) : 0;
-    re_a[j] = (j < num_bs) ? basic::StreamingLoad(bs_re_ct[2 * j + 1] + i) : 0;
-    if constexpr (has_im_in) {
-      im_b[j] = (j < num_bs) ? basic::StreamingLoad(bs_im_ct[2 * j] + i) : 0;
-      im_a[j] =
-          (j < num_bs) ? basic::StreamingLoad(bs_im_ct[2 * j + 1] + i) : 0;
+  for (int k = 0; k < num_gs_padded; k++) {
+    rr_b[k] = 0;
+    rr_a[k] = 0;
+    if constexpr (has_im_out) {
+      ri_b[k] = 0;
+      ri_a[k] = 0;
     }
   }
 
-  for (int k = 0; k < num_gs; k++) {
-    word rr_b = 0, rr_a = 0;
-    word ri_b = 0, ri_a = 0;
+  for (int j = 0; j < num_bs; j++) {
+    const int b = bs_begin + j;
+    const word re_b = basic::StreamingLoad(bs_re_ct[2 * b] + i);
+    const word re_a = basic::StreamingLoad(bs_re_ct[2 * b + 1] + i);
+    word im_b = 0, im_a = 0;
+    if constexpr (has_im_in) {
+      im_b = basic::StreamingLoad(bs_im_ct[2 * b] + i);
+      im_a = basic::StreamingLoad(bs_im_ct[2 * b + 1] + i);
+    }
 #pragma unroll
-    for (int j = 0; j < num_bs_padded; j++) {
-      if (j >= num_bs) break;
-      const word *re_pt = mx_re[j + k * num_bs];
+    for (int k = 0; k < num_gs_padded; k++) {
+      if (k >= num_gs) break;
+      const word *re_pt = mx_re[b + k * mx_stride];
       if (re_pt != nullptr) {
         word m = re_pt[i];
-        rr_b = basic::Add(rr_b, basic::MultMontgomery(re_b[j], m, prime,
-                                                      montgomery), prime);
-        rr_a = basic::Add(rr_a, basic::MultMontgomery(re_a[j], m, prime,
-                                                      montgomery), prime);
+        rr_b[k] = basic::Add(
+            rr_b[k], basic::MultMontgomery(re_b, m, prime, montgomery), prime);
+        rr_a[k] = basic::Add(
+            rr_a[k], basic::MultMontgomery(re_a, m, prime, montgomery), prime);
         if constexpr (has_im_in && has_im_out) {
-          ri_b = basic::Add(ri_b, basic::MultMontgomery(im_b[j], m, prime,
-                                                        montgomery), prime);
-          ri_a = basic::Add(ri_a, basic::MultMontgomery(im_a[j], m, prime,
-                                                        montgomery), prime);
+          ri_b[k] = basic::Add(
+              ri_b[k], basic::MultMontgomery(im_b, m, prime, montgomery),
+              prime);
+          ri_a[k] = basic::Add(
+              ri_a[k], basic::MultMontgomery(im_a, m, prime, montgomery),
+              prime);
         }
       }
-      const word *im_pt = mx_im[j + k * num_bs];
+      const word *im_pt = mx_im[b + k * mx_stride];
       if (im_pt != nullptr) {
         word m = im_pt[i];
         if constexpr (has_im_in) {
-          rr_b = basic::Sub(rr_b, basic::MultMontgomery(im_b[j], m, prime,
-                                                        montgomery), prime);
-          rr_a = basic::Sub(rr_a, basic::MultMontgomery(im_a[j], m, prime,
-                                                        montgomery), prime);
+          rr_b[k] = basic::Sub(
+              rr_b[k], basic::MultMontgomery(im_b, m, prime, montgomery),
+              prime);
+          rr_a[k] = basic::Sub(
+              rr_a[k], basic::MultMontgomery(im_a, m, prime, montgomery),
+              prime);
         }
         if constexpr (has_im_out) {
-          ri_b = basic::Add(ri_b, basic::MultMontgomery(re_b[j], m, prime,
-                                                        montgomery), prime);
-          ri_a = basic::Add(ri_a, basic::MultMontgomery(re_a[j], m, prime,
-                                                        montgomery), prime);
+          ri_b[k] = basic::Add(
+              ri_b[k], basic::MultMontgomery(re_b, m, prime, montgomery),
+              prime);
+          ri_a[k] = basic::Add(
+              ri_a[k], basic::MultMontgomery(re_a, m, prime, montgomery),
+              prime);
         }
       }
     }
-    dst_ct[k * out_stride][i] = rr_b;
-    dst_ct[k * out_stride + 1][i] = rr_a;
-    if constexpr (has_im_out) {
-      dst_ct[k * out_stride + 2][i] = ri_b;
-      dst_ct[k * out_stride + 3][i] = ri_a;
+  }
+
+#pragma unroll
+  for (int k = 0; k < num_gs_padded; k++) {
+    if (k >= num_gs) break;
+    if (accumulate) {
+      word *o0 = dst_ct[k * out_stride];
+      word *o1 = dst_ct[k * out_stride + 1];
+      o0[i] = basic::Add(o0[i], rr_b[k], prime);
+      o1[i] = basic::Add(o1[i], rr_a[k], prime);
+      if constexpr (has_im_out) {
+        word *o2 = dst_ct[k * out_stride + 2];
+        word *o3 = dst_ct[k * out_stride + 3];
+        o2[i] = basic::Add(o2[i], ri_b[k], prime);
+        o3[i] = basic::Add(o3[i], ri_a[k], prime);
+      }
+    } else {
+      dst_ct[k * out_stride][i] = rr_b[k];
+      dst_ct[k * out_stride + 1][i] = rr_a[k];
+      if constexpr (has_im_out) {
+        dst_ct[k * out_stride + 2][i] = ri_b[k];
+        dst_ct[k * out_stride + 3][i] = ri_a[k];
+      }
     }
   }
 }
@@ -2259,13 +2349,7 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
   //
   // `CHEDDAR_CI_GS_WINDOW` is the width; 0 or >= num_bs restores the single
   // pass. The default is the measured 8.
-  static const int window_cap = [] {
-    const char *e = std::getenv("CHEDDAR_CI_GS_WINDOW");
-    if (e == nullptr || e[0] == 0) return 8;
-    const int v = std::atoi(e);
-    return (v < 1) ? 1 : ((v > 32) ? 32 : v);
-  }();
-  const int window = Min(window_cap, num_bs);
+  const int window = Min(GSWindowCap(), num_bs);
 
   auto launch = [&](auto in_flag, auto out_flag) {
     constexpr bool kImIn = decltype(in_flag)::value;
@@ -2273,11 +2357,13 @@ void HoistHandler<word>::GSFusedComplexPAccum(ConstContextPtr<word> context,
     for (int begin = 0; begin < num_bs; begin += window) {
       const int width = Min(window, num_bs - begin);
       const bool accumulate = (begin > 0);
+      // The dispatch is on the GIANT-step count now: that is what lives in
+      // registers. `num_bs` is a runtime loop bound over scalars.
       constexpr_for<1, 6>([&](auto i) {
-        constexpr int num_bs_padded = 1 << i;
-        if (width > num_bs_padded) return;
-        if (width <= (1 << (i - 1))) return;
-        kernel::GSFusedComplexKernel<word, num_bs_padded, kImIn, kImOut>
+        constexpr int num_gs_padded = 1 << i;
+        if (num_gs > num_gs_padded) return;
+        if (num_gs <= (1 << (i - 1))) return;
+        kernel::GSFusedComplexKernel<word, num_gs_padded, kImIn, kImOut>
             <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d,
                                       mx_im_d, width, num_gs, begin, num_bs,
                                       accumulate, primes, inv_primes,
@@ -2436,18 +2522,27 @@ void HoistHandler<word>::GSFusedComplexPAccumBatch(
   dim3 grid_dim(static_cast<unsigned>(num_cts) * np.GetNumTotal() *
                 context->param_.degree_ / kernel_block_dim_);
 
+  // The same windowing as the serial kernel, and for the same reason: the
+  // group only widens the grid, it does not shrink the four register arrays,
+  // so a 16-wide accumulation spills here too.
+  const int window = Min(GSWindowCap(), num_bs);
   auto launch = [&](auto in_flag, auto out_flag) {
     constexpr bool kImIn = decltype(in_flag)::value;
     constexpr bool kImOut = decltype(out_flag)::value;
-    constexpr_for<1, 6>([&](auto i) {
-      constexpr int num_bs_padded = 1 << i;
-      if (num_bs > num_bs_padded) return;
-      if (num_bs <= (1 << (i - 1))) return;
-      kernel::GSFusedComplexKernelBatch<word, num_bs_padded, kImIn, kImOut>
-          <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d, mx_im_d,
-                                    num_bs, num_gs, num_cts, primes,
-                                    inv_primes, context->param_.log_degree_);
-    });
+    for (int begin = 0; begin < num_bs; begin += window) {
+      const int width = Min(window, num_bs - begin);
+      const bool accumulate = (begin > 0);
+      constexpr_for<1, 6>([&](auto i) {
+        constexpr int num_gs_padded = 1 << i;
+        if (num_gs > num_gs_padded) return;
+        if (num_gs <= (1 << (i - 1))) return;
+        kernel::GSFusedComplexKernelBatch<word, num_gs_padded, kImIn, kImOut>
+            <<<grid_dim, block_dim>>>(dst_d, bs_re_d, bs_im_d, mx_re_d,
+                                      mx_im_d, width, num_gs, num_cts, begin,
+                                      num_bs, accumulate, primes, inv_primes,
+                                      context->param_.log_degree_);
+      });
+    }
   };
   if (has_im_in && has_im_out) {
     launch(std::true_type{}, std::true_type{});
