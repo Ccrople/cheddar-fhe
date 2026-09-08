@@ -2613,6 +2613,17 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
     sc.last_inv_degree = EnvInt(
         "CHEDDAR_CI_BATCH_LAST_INV_DEG",
         have_pop ? pop["last_inv_degree"].get<int>() : 63);
+    // The INTERMEDIATE gets its own degree knob because its window can be the
+    // PROVEN one. `sq_j` for j >= 1 is a collision probability, so
+    // [1/(margin live), 1] is a theorem and nothing -- a corpus row or a
+    // crafted query alike -- can leave it, where the measured 36x window is a
+    // statistic whose polynomial is 7.7e+13 off just outside. The swap is
+    // free: the intermediate is compiled at `cho_inv_in_` against a floor of
+    // 3, so deg-255 lands at 6, and its own accuracy does not matter (the
+    // relative error is cancelled exactly by the next normalisation) -- only
+    // the domain it hands on, which at deg-255 widens by [0.998, 1.002].
+    sc.mid_inv_degree = EnvInt("CHEDDAR_CI_BATCH_MID_INV_DEG",
+                               have_pop ? pop.value("mid_inv_degree", 0) : 0);
     sc.row_shift.assign(kNHead, std::vector<double>(T, 0.0));
     for (int h = 0; h < kNHead; h++) {
       for (int t = 0; t < T; t++) sc.row_shift[h][t] = cqk * shift[t];
