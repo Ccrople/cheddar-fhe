@@ -2844,7 +2844,7 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
   cfg.hidden = kI;
   cfg.rows_per_tile = EnvInt("CHEDDAR_CI_BATCH_TILE", 512);
   cfg.norm_apply_level = EnvInt("CHEDDAR_CI_BATCH_HOLD", 8);
-  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
   // The B200 residency switches; every default is the A100 configuration.
   cfg.hold_channels_ffn = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS_FFN", 1) != 0;
   cfg.release_boot_tables = EnvInt("CHEDDAR_CI_BATCH_RELEASE_TABLES", 1) != 0;
@@ -5744,7 +5744,7 @@ TEST(CiBatch, TheNormTurnMatchesTheHost) {
   cfg.model = model;
   cfg.hidden = 512;
   cfg.rows_per_tile = 32;
-  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 0) != 0;
+  cfg.hold_channels = EnvInt("CHEDDAR_CI_BATCH_HOLD_CHANNELS", 1) != 0;
   cfg.verbose = true;
   cheddar::CiBatchLayer<word> layer(bctx, cfg);
   bctx->PrepareEvalMod();
