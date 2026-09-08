@@ -424,6 +424,68 @@ class CiBatchAttention {
     //! spread not yet compressed). 0 = fall back to [norm_lo,norm_hi]. Later
     //! iterations use the data-independent [norm_lo,norm_hi] ~ [1/n,1].
     double first_lo = 0.0, first_hi = 0.0;
+    /**
+     * @brief The INTERMEDIATE normalizations' window (0 < j < k-1), and the
+     * degree fitted on it. 0 = fall back to [norm_lo, norm_hi] and
+     * `iter_inv_degree`, which is what k = 2 wants (there IS no intermediate)
+     * and what k >= 3 must not have.
+     *
+     * ## Why an intermediate needs its own window
+     *
+     * `y_j` for j >= 1 is the tempered distribution NORMALIZED TO SUM ONE, so
+     * `sq_j` is its collision probability and the LAST iteration -- always at
+     * temperature 2, whatever k is -- spans `[1/live, 1]`: 2069x at T = 4096
+     * against 350x at T = 128 (`reference/scripts/cho_ideal512.py`). The
+     * intermediates are at temperature 4, 8, 16 ... and span 25x, 5x, 18x.
+     * Compiling them on the LAST one's window is therefore a hole that only
+     * opens at k >= 3, and it opened: with `iter_inv_degree` 31 over a 5900x
+     * window the intermediate `r` is ~38% out, `y = (y r)^2` carries that to
+     * the fourth power, and `sq_{k-1}` leaves the window the last invsqrt was
+     * fitted on -- whose unclamped Chebyshev then grows like cosh. Measured on
+     * a T = 4096 population calibration: softmax 2^-3.7, and with the served
+     * context's own (tighter) last window 2.3e+49.
+     *
+     * It cannot be fixed by raising `iter_inv_degree`, because that degree is
+     * also the FIRST invsqrt's and the first is compiled at `exp_out_ - 3`
+     * with five levels to spend ("overspends its levels" at 63).
+     */
+    double mid_lo = 0.0, mid_hi = 0.0;
+    int mid_inv_degree = 0;  //!< 0 = `iter_inv_degree`
+    /**
+     * @brief `[iter][head][row]`: a per-row estimate of the public half's
+     * running scalar `R_{j+1}`, so the ciphertext that is BOOTSTRAPPED carries
+     * `R / est` instead of `R`. Empty is 1 everywhere -- today's behaviour.
+     *
+     * ## Why `R` is not O(1)
+     *
+     * `SoftMaxCho` carries `R_j` because the public keys leave the sum: with
+     * `y^(j)_l = (y0_l)^(2^j) R_j`, `R_j` has no key index, so the public half
+     * owes only power sums. But `sum_l y^(j)_l = 1`, so
+     *
+     *     R_j  =  1 / sum_l (y0_l)^(2^j)
+     *
+     * -- it IS the softmax's normaliser, and that spans orders of magnitude
+     * with the data. At T = 128 with a per-prompt calibration it happens to sit
+     * near 1 (measured 0.974) and the bootstrap at the end of each iteration is
+     * well posed. At T = 4096 with a POPULATION calibration the same quantity
+     * reaches 42 (host), the boot's message leaves EvalMod's range, and the
+     * result is 2.2e+49 -- silently, because a bootstrap out of range does not
+     * raise.
+     *
+     * With an estimate the boot sees `R / est ~ 1`. It costs no level of its
+     * own: the factor rides `r^2`, which is already formed for the recursion
+     * and is followed immediately by the boot, and the estimate comes back out
+     * where `R` is CONSUMED -- `est^2` folds into the per-row constant the
+     * public power sum already carries. The one thing the caller must do is
+     * take `est` back out of `pub_scale`, which comes back as
+     * `R_k / pub_r_est[niter-1][head][row]`; fold it into the public value
+     * accumulator, which carries a per-row constant of its own.
+     *
+     * The estimate itself is offline: `R_j = 1 / sum_l (y0_l)^(2^j)` is a
+     * function of the scores, so a calibration split gives it
+     * (reference/scripts/gen_t4096_pop.py).
+     */
+    std::vector<std::vector<std::vector<double>>> pub_r_est;
   };
 
   /**
@@ -590,6 +652,14 @@ class CiBatchAttention {
   //! last invsqrt cannot blow for any prompt. Used by both PrepareSoftMax (the
   //! compiled poly) and SoftMaxCho (the runtime affine) -- they must agree.
   double cho_later_lo_ = 0.0, cho_later_hi_ = 0.0;
+  //! The INTERMEDIATE window (0 < j < k-1) and its degree. Separate from the
+  //! later one because the intermediates are at temperature 4, 8, 16 ... and
+  //! span tens, while the last is always at temperature 2 and spans `live`.
+  //! Its upper end carries the FIRST invsqrt's overshoot, and the LAST one's
+  //! carries this one's -- the chain, not one step. See
+  //! `SoftMaxCalibration::mid_lo`.
+  double cho_mid_lo_ = 0.0, cho_mid_hi_ = 0.0;
+  int cho_mid_deg_ = 0;
   int cho_inv_in_ = 0;   //!< the level the later invsqrts read sq at (booted)
   //! The FIRST iteration skips the main-path boot (y0 is fresh from exp), so its
   //! invsqrt reads sq at a LOWER level -- compiled separately here.

@@ -1111,9 +1111,34 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     // fit (accuracy is set by the LOW end, host robust_windows.py: negligible)
     // and costs no level or bootstrap. See [[quarot-heterogeneous-softmax]].
     cho_later_lo_ = calib_.norm_lo;
-    const double worst_later =
+    // The overshoot is a CHAIN, not one step: each normalization's crude `r`
+    // inflates the NEXT iteration's `sq`, so the window that has to cover it is
+    // the next one's. With k = 2 the last iteration follows the first directly
+    // and this is the original bound; with k >= 3 the intermediate sits between
+    // them and owes its own.
+    const double worst_first =
         WorstCaseChoLaterSq(cho_first_lo_, cho_first_hi_, calib_.iter_inv_degree);
-    cho_later_hi_ = std::max(calib_.norm_hi, 1.10 * worst_later);
+    cho_mid_deg_ = (calib_.mid_inv_degree > 0) ? calib_.mid_inv_degree
+                                               : calib_.iter_inv_degree;
+    // A SUPPLIED intermediate window is taken as given, and must already carry
+    // the first invsqrt's error (the generator walks the calibration split with
+    // the crude `r_0` in place). It is not widened by `worst_first`, because
+    // that bound uses `sum y^4 <= (sum y^2)^2` -- attained only by a row
+    // concentrated on ONE key. At the LAST iteration's temperature the data
+    // really does reach it, which is why the original bound costs nothing
+    // there; at an intermediate temperature the collision probability is two
+    // orders below it (measured 7.0e-3 against the bound's 1.0), and applying
+    // it turns a 36x window into a 5700x one -- the very thing this window
+    // exists to avoid.
+    const bool have_mid = calib_.mid_hi > 0.0;
+    cho_mid_lo_ = have_mid ? calib_.mid_lo : calib_.norm_lo;
+    cho_mid_hi_ = have_mid ? calib_.mid_hi
+                           : std::max(calib_.norm_hi, 1.10 * worst_first);
+    const double worst_mid =
+        (calib_.niter >= 3)
+            ? WorstCaseChoLaterSq(cho_mid_lo_, cho_mid_hi_, cho_mid_deg_)
+            : worst_first;
+    cho_later_hi_ = std::max(calib_.norm_hi, 1.10 * worst_mid);
     // `is_last` lands P at forward_level (its apply is the final square);
     // the first/intermediate invsqrts' output is booted, so they only need
     // their apply to stay above 0.
@@ -1144,8 +1169,8 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     };
     cho_inv_.push_back(compile_inv(cho_first_lo_, cho_first_hi_,
                                    calib_.iter_inv_degree, cho_first_in_, false));
-    cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_,
-                                   calib_.iter_inv_degree, cho_inv_in_, false));
+    cho_inv_.push_back(
+        compile_inv(cho_mid_lo_, cho_mid_hi_, cho_mid_deg_, cho_inv_in_, false));
     cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_,
                                    calib_.last_inv_degree, cho_inv_in_, true));
     // The plain-causal 0/1 masks at exp_out_ are HEAD-INDEPENDENT, so encode the
@@ -1168,10 +1193,10 @@ void CiBatchAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                 << ", exp hb " << hb << " @" << exp_in_ << ".." << exp_out_
                 << ", invsqrt @" << cho_inv_in_ << " first[" << cho_first_lo_
                 << "," << cho_first_hi_ << "] deg " << calib_.iter_inv_degree
-                << ", later[" << cho_later_lo_ << "," << cho_later_hi_
-                << "] (calib_hi " << calib_.norm_hi << ", worst "
-                << WorstCaseChoLaterSq(cho_first_lo_, cho_first_hi_,
-                                       calib_.iter_inv_degree)
+                << ", mid[" << cho_mid_lo_ << "," << cho_mid_hi_ << "] deg "
+                << cho_mid_deg_ << ", later[" << cho_later_lo_ << ","
+                << cho_later_hi_ << "] (calib_hi " << calib_.norm_hi
+                << ", worst " << worst_first << "/" << worst_mid
                 << "), last deg " << calib_.last_inv_degree << std::endl;
     }
   }
@@ -1543,7 +1568,32 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
                  "CiBatchAttention::SoftMaxCho: pow_scale is one constant a "
                  "query token");
     }
+    if (!calib_.pub_r_est.empty()) {
+      AssertTrue(static_cast<int>(calib_.pub_r_est.size()) == k,
+                 "CiBatchAttention::SoftMaxCho: pub_r_est is one estimate set "
+                 "an ITERATION");
+      for (const auto &per_head : calib_.pub_r_est) {
+        AssertTrue(head < static_cast<int>(per_head.size()),
+                   "CiBatchAttention::SoftMaxCho: pub_r_est has no such head");
+        AssertTrue(static_cast<int>(per_head[head].size()) == T,
+                   "CiBatchAttention::SoftMaxCho: pub_r_est is one estimate a "
+                   "query token");
+        for (double e : per_head[head]) {
+          AssertTrue(e > 0.0,
+                     "CiBatchAttention::SoftMaxCho: a pub_r_est entry is not "
+                     "positive, so it is not a normaliser");
+        }
+      }
+    }
   }
+  // `R` is carried NORMALISED (`R / G_j`) so the bootstrap at the end of each
+  // iteration sees an O(1) message -- see `SoftMaxCalibration::pub_r_est`.
+  // `G_0 = 1`; `G_{j+1} = pub_r_est[j][head]`.
+  const bool r_normed = (pub != nullptr) && !calib_.pub_r_est.empty();
+  const std::vector<double> ones(T, 1.0);
+  auto g_at = [&](int j) -> const std::vector<double> & {
+    return (!r_normed || j == 0) ? ones : calib_.pub_r_est[j - 1][head];
+  };
 
   // k normalize-and-square iterations. Boot the MAIN path to top each time
   // (so sq arrives at top-1 uniformly), norm via invsqrt, then y = (y r)^2.
@@ -1585,8 +1635,10 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     //     crude except the last.
     const bool first = (j == 0);
     const bool last = (j == k - 1);
-    const double lo = first ? cho_first_lo_ : cho_later_lo_;
-    const double hi = first ? cho_first_hi_ : cho_later_hi_;
+    const double lo =
+        first ? cho_first_lo_ : (last ? cho_later_lo_ : cho_mid_lo_);
+    const double hi =
+        first ? cho_first_hi_ : (last ? cho_later_hi_ : cho_mid_hi_);
     EvalPoly<word> *inv =
         first ? cho_inv_[0].get() : (last ? cho_inv_[2].get() : cho_inv_[1].get());
     const double aff_a = 0.5 * (hi - lo);
@@ -1644,10 +1696,14 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
       // The constants ride M, which is the highest of the three: a plaintext
       // multiply costs a level wherever it is taken, and `R_j^2` has the
       // least to give (two squarings below the first invsqrt's landing).
+      // `R_j^2 = (R_j / G_j)^2 G_j^2`, and the carried ciphertext is the
+      // normalised one, so `G_j^2` comes back out here -- on a per-row
+      // constant this term already carries, at no level.
+      const std::vector<double> &gj = g_at(j);
       std::vector<double> c(T);
       for (int t = 0; t < T; t++) {
         const double est = folded ? calib_.cho_est[j][head][t] : 1.0;
-        c[t] = pub->pow_scale[j][t] / (est * aff_a);
+        c[t] = pub->pow_scale[j][t] * gj[t] * gj[t] / (est * aff_a);
       }
       const int m_lvl = param.NPToLevel(M.GetNP());
       AssertTrue(m_lvl >= 1,
@@ -1713,6 +1769,27 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     if (pub != nullptr) {
       Ct r2;
       boot_->HMult(r2, r, r, mult_key);
+      if (r_normed) {
+        // R~_{j+1} = R~_j^2 r_j^2 (G_j^2 / G_{j+1}). The factor rides `r^2`,
+        // which exists only for this recursion and is booted immediately
+        // after, so the level it costs is one the boot gives back.
+        const std::vector<double> &gj = g_at(j);
+        const std::vector<double> &gn = g_at(j + 1);
+        std::vector<double> f(T);
+        for (int t = 0; t < T; t++) f[t] = gj[t] * gj[t] / gn[t];
+        const int lvl = param.NPToLevel(r2.GetNP());
+        AssertTrue(lvl >= 1,
+                   "CiBatchAttention::SoftMaxCho: no level left to normalise "
+                   "the public scalar's recursion");
+        std::vector<Complex> msg;
+        Pt pf;
+        layout_.PackPerToken(msg, f);
+        boot_->gpu_encoder_.Encode(pf, lvl, param.GetScale(lvl), msg);
+        Ct t4, rn;
+        boot_->Mult(t4, r2, pf);
+        boot_->Rescale(rn, t4);
+        r2 = std::move(rn);
+      }
       if (!have_R) {
         R = std::move(r2);  // R_1 = (r^(0))^2
         have_R = true;

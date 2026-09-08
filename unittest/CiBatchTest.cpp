@@ -2198,7 +2198,25 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
   const int T = kTokens;  // the encrypted block
   const int ptok = EnvInt("PC4096_PTOK", 3968);
   const int head = EnvInt("PC4096_HEAD", 3);  // the widest later window
-  const int niter = EnvInt("CHEDDAR_CI_BATCH_NITER", 2);
+  // PC4096_POP: a POPULATION calibration and a HELD-OUT context to serve with
+  // it (reference/scripts/gen_t4096_pop.py). Without it the test calibrates on
+  // the prompt it then runs -- the row shift is the row's own maximum and
+  // `cho_est` is the row's own `sq` -- which measures the MECHANISM but not
+  // the service model. With it the shift, the span and both windows come from
+  // 128 contexts the served one is not among, which is what [SYLPH]'s server
+  // really has.
+  const char *pop_env = std::getenv("PC4096_POP");
+  nlohmann::json pop;
+  const bool have_pop = (pop_env != nullptr);
+  if (have_pop) {
+    std::ifstream f(std::string(pop_env) + "/calib.json");
+    if (!f.good()) GTEST_SKIP() << "no calib.json under " << pop_env;
+    f >> pop;
+    ASSERT_EQ(pop["tokens"].get<int>(), 4096);
+    ASSERT_EQ(pop["ptok"].get<int>(), ptok);
+  }
+  const int niter =
+      EnvInt("CHEDDAR_CI_BATCH_NITER", have_pop ? pop["niter"].get<int>() : 2);
   const int tokens = ptok + T;
   ASSERT_GT(ptok, 0);
   ASSERT_GT(niter, 0);
@@ -2210,7 +2228,10 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
   ASSERT_TRUE(ReadF32(ld + "/attn_norm.f32", kH, an));
   std::vector<float> wv;
   ASSERT_TRUE(ReadF32(ld + "/wv.f32", size_t(kH) * kKv, wv));
-  const std::string in = std::string(wdir_env) + "/input_nosink_4096.f32";
+  const std::string in =
+      have_pop ? std::string(pop_env) + "/served_" +
+                     std::to_string(EnvInt("PC4096_SERVE", 0)) + ".f32"
+               : std::string(wdir_env) + "/input_nosink_4096.f32";
   if (!ReadF32(in, size_t(4096) * kH, x0)) {
     GTEST_SKIP() << "no 4096-token input at " << in;
   }
@@ -2282,10 +2303,7 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
       s_max = std::max(s_max, S[size_t(t) * tokens + l]);
     }
   }
-  const double span_raw = s_max - s_min;
-  const double m_eff = span_raw / std::sqrt(double(kD));
-  const double hb = m_eff / std::ldexp(1.0, niter + 1);
-
+  double span_raw = s_max - s_min;
   std::vector<double> shift(T);
   for (int t = 0; t < T; t++) {
     double mx = -1e300;
@@ -2294,6 +2312,19 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
     }
     shift[t] = mx;
   }
+  if (have_pop) {
+    // The served context's own span and row maxima are what the fold made
+    // exact; the population's are what a server actually holds. Every row of
+    // this one then sits BELOW its shift, which is the underflow the Cho
+    // down-scale exists to compress.
+    span_raw = pop["span_raw"].get<double>();
+    s_max = pop["s_raw_max"].get<double>();
+    const auto &rs = pop["row_shift_raw"];
+    ASSERT_EQ(int(rs.size()), kNHead);
+    for (int t = 0; t < T; t++) shift[t] = rs[head][t].get<double>();
+  }
+  const double m_eff = span_raw / std::sqrt(double(kD));
+  const double hb = m_eff / std::ldexp(1.0, niter + 1);
   const auto y0_of = [&](int t, int l) -> double {
     if (!is_live(t, l)) return 0.0;
     const double u =
@@ -2339,6 +2370,7 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
     for (int l = 0; l < T; l++) yenc[size_t(t) * T + l] = y0_of(t, ptok + l);
   }
   std::vector<double> R(T, 1.0);
+  std::vector<std::vector<double>> Rj(niter, std::vector<double>(T, 1.0));
   double split_diff = 0.0;
   for (int j = 0; j < niter; j++) {
     for (int t = 0; t < T; t++) {
@@ -2356,11 +2388,55 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
         yenc[size_t(t) * T + l] = v * v;
       }
       R[t] = R[t] * R[t] * r * r;
+      Rj[j][t] = R[t];
     }
   }
   // R_k, the factor the public VALUE accumulator needs before it joins the
   // output of `Values`. `SoftMaxCho` hands it back through `pub_scale`.
   const std::vector<double> Rk = R;
+  // The normaliser the CARRIED `R` rides, so its per-iteration bootstrap sees
+  // an O(1) message. Without a population file it is this context's own `R`,
+  // which is exact; with one it is the calibration split's geometric mean, and
+  // the point of the mechanism is that an estimate is enough.
+  std::vector<double> Gk(T, 1.0);
+  std::vector<std::vector<std::vector<double>>> r_est;
+  {
+    r_est.assign(niter, std::vector<std::vector<double>>(
+                            kNHead, std::vector<double>(T, 1.0)));
+    for (int j = 0; j < niter; j++) {
+      for (int h = 0; h < kNHead; h++) {
+        for (int t = 0; t < T; t++) {
+          r_est[j][h][t] =
+              have_pop ? pop["r_est"][j][head][t].get<double>() : Rj[j][t];
+        }
+      }
+    }
+    // A deliberate over-estimate puts the whole of `R / est` BELOW one, which
+    // is the side of the bootstrap's range to be on: too large leaves EvalMod
+    // (silently), too small only costs relative precision against an absolute
+    // noise floor. The estimate cannot shrink the spread -- the served row's
+    // own `R` deviates from the population's by whatever it deviates by -- so
+    // the knob is where that spread is placed.
+    // Measured on two held-out contexts (softmax, rms relative):
+    //     x1   R~ 6.5..9.5   2^-5.69 / 2^-5.17
+    //     x4   R~ 1.6..2.4   2^-7.58 / 2^-7.60
+    //     x16  R~ 0.40..0.59 2^-7.71 / 2^-7.53
+    //     x64  R~ 0.10..0.15 2^-5.62 / 2^-5.99
+    // -- a two-sided curve with an interior optimum, which is what the two
+    // failure modes predict. 8 is its centre.
+    const double rscale = [] {
+      const char *e = std::getenv("PC4096_RSCALE");
+      return (e && e[0]) ? std::atof(e) : 8.0;
+    }();
+    if (rscale != 1.0) {
+      for (auto &per_head : r_est) {
+        for (auto &row : per_head) {
+          for (double &v : row) v *= rscale;
+        }
+      }
+    }
+    for (int t = 0; t < T; t++) Gk[t] = r_est[niter - 1][head][t];
+  }
   std::cout << "  [t4096] " << tokens << " keys = " << ptok << " public + " << T
             << " encrypted, head " << head << ", niter " << niter << std::endl
             << "  [t4096] split walk vs the whole row     : " << std::scientific
@@ -2531,12 +2607,17 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
     sc.shift = cqk * s_max;
     sc.causal = true;
     sc.niter = niter;
-    sc.iter_inv_degree = EnvInt("CHEDDAR_CI_BATCH_ITER_INV_DEG", 31);
-    sc.last_inv_degree = EnvInt("CHEDDAR_CI_BATCH_LAST_INV_DEG", 63);
+    sc.iter_inv_degree = EnvInt(
+        "CHEDDAR_CI_BATCH_ITER_INV_DEG",
+        have_pop ? pop["iter_inv_degree"].get<int>() : 31);
+    sc.last_inv_degree = EnvInt(
+        "CHEDDAR_CI_BATCH_LAST_INV_DEG",
+        have_pop ? pop["last_inv_degree"].get<int>() : 63);
     sc.row_shift.assign(kNHead, std::vector<double>(T, 0.0));
     for (int h = 0; h < kNHead; h++) {
       for (int t = 0; t < T; t++) sc.row_shift[h][t] = cqk * shift[t];
     }
+    sc.pub_r_est = r_est;
     if (folded) {
       // The estimate is the host's own `sq`, so the polynomial sees a ratio
       // of one plus whatever the ciphertext's exp drifts by. A shared
@@ -2553,22 +2634,47 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
       sc.first_hi = 1.35;
       sc.norm_lo = 0.75;
       sc.norm_hi = 1.35;
+    } else if (have_pop) {
+      // The POPULATION's windows, and no fold at all. The fold is not the
+      // lever a shared calibration has: after the first normalise-and-square
+      // the row is a probability vector, so every later `sq` is its COLLISION
+      // PROBABILITY, which lives in [1 / live, 1] whatever the calibration
+      // does -- and measured over 512 held-out contexts the spread is WITHIN
+      // one row across contexts (median 9x, worst 1336x), not across rows, so
+      // no per-row plaintext shrinks it (`cho_window512.py` / `cho_ideal512.py`).
+      // What does is the DEGREE: at a ~5900x window deg-63 is 1.8e-1 and
+      // deg-255 is 7.2e-4, which is where T = 128 already sits. Dropping the
+      // fold is what pays for it -- the estimate costs the last invsqrt one
+      // level on the way out, and deg-255 needs exactly that level.
+      sc.first_lo = pop["first_lo"].get<double>();
+      sc.first_hi = pop["first_hi"].get<double>();
+      sc.mid_lo = pop.value("mid_lo", 0.0);
+      sc.mid_hi = pop.value("mid_hi", 0.0);
+      sc.norm_lo = pop["norm_lo"].get<double>();
+      sc.norm_hi = pop["norm_hi"].get<double>();
     } else {
       // The windows the data really spans, which is what the test harness
       // derives today.
       double flo = 1e300, fhi = -1e300, llo = 1e300, lhi = -1e300;
+      double mlo = 1e300, mhi = -1e300;
       for (int t = 0; t < T; t++) {
         flo = std::min(flo, sq_host[0][t]);
         fhi = std::max(fhi, sq_host[0][t]);
-        for (int j = 1; j < niter; j++) {
-          llo = std::min(llo, sq_host[j][t]);
-          lhi = std::max(lhi, sq_host[j][t]);
+        llo = std::min(llo, sq_host[niter - 1][t]);
+        lhi = std::max(lhi, sq_host[niter - 1][t]);
+        for (int j = 1; j < niter - 1; j++) {
+          mlo = std::min(mlo, sq_host[j][t]);
+          mhi = std::max(mhi, sq_host[j][t]);
         }
       }
       sc.first_lo = std::max(flo * 0.5, 1e-3);
       sc.first_hi = fhi * 1.6;
       sc.norm_lo = (niter > 1) ? llo : sc.first_lo;
       sc.norm_hi = (niter > 1) ? lhi : sc.first_hi;
+      if (niter > 2) {
+        sc.mid_lo = mlo * 0.5;
+        sc.mid_hi = mhi * 1.6;
+      }
     }
     attn.PrepareSoftMax(sc);
 
@@ -2615,7 +2721,10 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
       for (int b = 0; b < layout.num_instances; b++) {
         for (int t = 0; t < T; t++) {
           for (size_t i = 0; i < vc.size(); i++) {
-            ha.At(b, t, int(i)) = accpub[size_t(t) * vc.size() + i];
+            // `pub_scale` comes back as `R_k / G_k`, so `G_k` rides the
+            // accumulator -- the per-row constant the public value half
+            // already carries (`CiPcAttention::EncodeValues`).
+            ha.At(b, t, int(i)) = accpub[size_t(t) * vc.size() + i] * Gk[t];
           }
         }
       }
@@ -2669,8 +2778,8 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
       double worst = 0.0, mag = 0.0;
       for (int b : bs) {
         for (int t = 0; t < T; t++) {
-          worst = std::max(worst, std::abs(gs.At(b, t, 0) - Rk[t]));
-          mag = std::max(mag, std::abs(Rk[t]));
+          worst = std::max(worst, std::abs(gs.At(b, t, 0) - Rk[t] / Gk[t]));
+          mag = std::max(mag, std::abs(Rk[t] / Gk[t]));
         }
       }
       std::cout << "  [t4096] " << (folded ? "WITH" : "without")
@@ -2679,7 +2788,12 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
                 << "   (relative 2^" << std::fixed << std::setprecision(2)
                 << std::log2(worst / mag) << ")" << std::endl;
       EXPECT_GT(mag, 1e-12) << "the reference R_k is ~zero";
-      if (folded) EXPECT_LT(worst, 0.02 * mag);
+      // `R` is now carried NORMALISED (`SoftMaxCalibration::pub_r_est`), so
+      // this is not the same circuit the 2% was measured on -- there is one
+      // more plaintext multiply on `r^2` an iteration. Measured 2^-5.6..-6.1
+      // across runs on a randomised draw; 2% is 2^-5.64, which makes the
+      // assertion a coin flip. 3% is the floor with its spread allowed for.
+      if (folded) EXPECT_LT(worst, 0.03 * mag);
     }
 
     HostTensor got{layout.num_instances, T, T, {}};
@@ -2696,6 +2810,29 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
 
   double bits_plain = 0.0, bits_folded = 0.0;
   run(false, bits_plain);
+  if (have_pop) {
+    // There is nothing to fold against: the estimate a shared calibration can
+    // offer is not the served row's own `sq`, and the measurement says a
+    // per-row one makes the last window WIDER, not narrower. So the population
+    // run is the unfolded one, and it is the one that has to pass.
+    std::cout << "  [t4096] POPULATION calibration from " << pop_env
+              << ": " << pop["ncal"].get<int>() << " contexts, serving a "
+              << "held-out one; niter " << niter << ", invsqrt deg "
+              << pop["iter_inv_degree"].get<int>() << "/"
+              << pop["last_inv_degree"].get<int>() << ", later window ["
+              << std::scientific << std::setprecision(3)
+              << pop["norm_lo"].get<double>() << ", "
+              << pop["norm_hi"].get<double>() << "]" << std::endl;
+    // Measured 2^-7.5..-7.7 over four held-out contexts, against 2^-6.37 for
+    // the served context's OWN calibration -- so the population path is not
+    // merely tolerable, it is better, because niter 3 with an intermediate
+    // window of its own and a normalised `R` beats niter 2 with a saturating
+    // last invsqrt. The threshold is the measurement less the run-to-run
+    // spread this tree records (~0.4 bits), not an aspiration.
+    EXPECT_GT(bits_plain, 6.5)
+        << "one shared calibration does not carry a context it never saw";
+    return;
+  }
   run(true, bits_folded);
 
   // The fold is the fix, so it is the one that has to pass. The unfolded
