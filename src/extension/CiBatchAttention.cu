@@ -1329,16 +1329,34 @@ void CiBatchAttention<word>::SoftMaxCho(std::vector<Ct> &P,
     boot_->Rescale(y[l], t2);           // exp_out_ - 1
   }
 
+  // The main-path boots batch across the T key-token ciphertexts, exactly the
+  // score boots' CHEDDAR_CI_BATCH_BOOT_GROUP (BootBatch is word-for-word equal
+  // to the loop; group 1 = the serial path, the A100 baseline).
+  static const int boot_group = [] {
+    const char *e = std::getenv("CHEDDAR_CI_BATCH_BOOT_GROUP");
+    const int v = (e != nullptr) ? std::atoi(e) : 0;
+    return v >= 1 ? v : 1;
+  }();
+
   // k normalize-and-square iterations. Boot the MAIN path to top each time
   // (so sq arrives at top-1 uniformly), norm via invsqrt, then y = (y r)^2.
   for (int j = 0; j < k; j++) {
     // (1) main-path bootstrap to top -- SKIPPED on iteration 0 (y0 is fresh
     //     from exp, still high), so the first invsqrt reads at cho_first_in_.
     if (j > 0) {
-      for (int l = 0; l < T; l++) {
-        Ct up;
-        boot_->Boot(up, y[l], evk);
-        y[l] = std::move(up);
+      for (int l0 = 0; l0 < T; l0 += boot_group) {
+        const int g = Min(T - l0, boot_group);
+        if (g == 1) {
+          Ct up;
+          boot_->Boot(up, y[l0], evk);
+          y[l0] = std::move(up);
+          continue;
+        }
+        std::vector<const Ct *> in(g);
+        for (int j2 = 0; j2 < g; j2++) in[j2] = &y[l0 + j2];
+        std::vector<Ct> out_g;
+        boot_->BootBatch(out_g, in, evk);
+        for (int j2 = 0; j2 < g; j2++) y[l0 + j2] = std::move(out_g[j2]);
       }
     }
     // (2) sq = sum_l y_l^2  (one relinearization), landing at top-1.
