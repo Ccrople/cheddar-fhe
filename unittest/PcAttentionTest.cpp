@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "RingFixture.h"
+#include "core/DeviceVector.h"
 #include "core/MemoryPool.h"
 #include "extension/CiPcAttention.h"
 
@@ -41,6 +42,9 @@ using cheddar::CiPcAttention;
 using cheddar::Ciphertext;
 using cheddar::Complex;
 using cheddar::Plaintext;
+using cheddar::CopyDeviceToHost;
+using cheddar::DeviceVector;
+using cheddar::HostVector;
 using cheddar::SubringWeights;
 
 namespace {
@@ -557,7 +561,93 @@ TEST(PcAttention, TheResidencyDoesNotMoveWithTheContextLength) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. WHAT THE CONTEXT COSTS, and the lever the interface leaves on the table.
+// 4. THE GQA SHARE IS THE SEPARATE HEADS. `HeadGroup` encodes one chunk of
+//    the public keys and values ONCE and drives the group's query heads
+//    against it, where `Head` -- one query head a call -- encodes the same
+//    numbers again for every one of them. The encode is a plaintext
+//    operation on numbers that do not depend on the query, so sharing it
+//    cannot change an output word, and this says it does not: the library's
+//    standing rule for every batched path (`CHEDDAR_CMT_SERIAL` and the
+//    rest) is that the shared form stays word for word equal to the loop.
+//
+//    `Head` is `HeadGroup` with a group of one, so what is really under test
+//    is that a group of three is three groups of one.
+// ---------------------------------------------------------------------------
+TEST(PcAttention, TheGroupShareIsTheSeparateHeadsWordForWord) {
+  Ring ring("ci16_35.json");
+  constexpr int kChunk = 8;
+  constexpr int kPtok = 24;   // three chunks
+  constexpr int kGroup = 3;
+
+  auto bctx = std::dynamic_pointer_cast<cheddar::BootContext<word>>(
+      ring.context);
+  ASSERT_NE(bctx, nullptr);
+  auto att = std::make_unique<CiPcAttention<word>>(bctx, MakeConfig(kChunk));
+  att->Prepare(MakeCalibration(true));
+
+  // Different queries a head: a group that shared its queries would pass
+  // even if `HeadGroup` read the wrong one.
+  std::vector<Queries> q(kGroup);
+  for (int h = 0; h < kGroup; h++) {
+    q[h].Build(ring, att->GetLayout(), 0.2, 0x51A7C0DEULL + h);
+  }
+  PublicContext pc;
+  pc.Fill(kPtok, 0.2, 0xC0FFEE11ULL);
+  const auto src = [&](int start, int width, std::vector<double> &kb,
+                       std::vector<double> &vb) {
+    pc.Chunk(start, width, kb, vb);
+  };
+
+  std::vector<std::vector<Ciphertext<word>>> acc_s(kGroup), acc_g(kGroup);
+  std::vector<Ciphertext<word>> sq_s(kGroup), sq_g(kGroup);
+  for (int h = 0; h < kGroup; h++) {
+    att->Head(acc_s[h], sq_s[h], q[h].ct, kPtok, src, ring.ui->GetEvkMap());
+  }
+
+  std::vector<std::vector<Ciphertext<word>> *> ap(kGroup);
+  std::vector<Ciphertext<word> *> sp(kGroup);
+  std::vector<const std::vector<Ciphertext<word>> *> qp(kGroup);
+  for (int h = 0; h < kGroup; h++) {
+    ap[h] = &acc_g[h];
+    sp[h] = &sq_g[h];
+    qp[h] = &q[h].ct;
+  }
+  att->HeadGroup(ap, sp, qp, kPtok, src, ring.ui->GetEvkMap());
+
+  size_t differ = 0, total = 0;
+  const auto compare = [&](const Ciphertext<word> &got,
+                           const Ciphertext<word> &want) {
+    const DeviceVector<word> *g[2] = {&got.bx_, &got.ax_};
+    const DeviceVector<word> *w[2] = {&want.bx_, &want.ax_};
+    for (int p = 0; p < 2; p++) {
+      HostVector<word> a, b;
+      CopyDeviceToHost(a, *g[p]);
+      CopyDeviceToHost(b, *w[p]);
+      ASSERT_EQ(a.size(), b.size());
+      for (size_t i = 0; i < a.size(); i++) differ += (a[i] != b[i]);
+      total += a.size();
+    }
+    ASSERT_EQ(got.GetScale(), want.GetScale());
+    ASSERT_EQ(got.GetNumSlots(), want.GetNumSlots());
+  };
+
+  for (int h = 0; h < kGroup; h++) {
+    ASSERT_EQ(acc_g[h].size(), acc_s[h].size());
+    ASSERT_FALSE(acc_g[h].empty());
+    compare(sq_g[h], sq_s[h]);
+    for (size_t c = 0; c < acc_g[h].size(); c++) {
+      compare(acc_g[h][c], acc_s[h][c]);
+    }
+  }
+  std::cout << "  group of " << kGroup << " vs " << kGroup
+            << " separate heads   : " << differ << " of " << total
+            << " words differ" << std::endl;
+  ASSERT_EQ(differ, 0u);
+  ASSERT_GT(total, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// 5. WHAT THE CONTEXT COSTS, and the lever the interface leaves on the table.
 //
 //    Test 3 prices a public token at one chunk size. This one prices it
 //    across chunk sizes AND splits the price in two, because the halves do

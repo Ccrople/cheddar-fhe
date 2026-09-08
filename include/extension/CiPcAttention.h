@@ -260,6 +260,34 @@ class CiPcAttention {
             int pub_tokens, const ChunkSource &src,
             const EvkMap<word> &evk) const;
 
+  /**
+   * @brief A GQA GROUP against the whole public context: the group's query
+   * heads share ONE encode of the public keys and values.
+   *
+   * `Kpub` and `Vpub` are per KV head and Llama-3-8B is GQA 32/8, so one
+   * encoded pair serves FOUR query heads while the two products are per
+   * query head. `Head` encodes inside its own chunk loop, so calling it four
+   * times encodes the same numbers four times -- and the encode is half of
+   * what a public token costs (B200, `ci16_35`, B = 512, chunk 128: 3.578 ms
+   * a token to encode, 3.286 ms a token a head to multiply). Over Sylph's
+   * 3968 public tokens that is 871.5 s a layer against 530.8, measured by
+   * `PcAttention.TheContextPriceSplitsByHeadCount`.
+   *
+   * The trade is that the two stores now outlive the exp -- `Head` could
+   * drop the key store before it, because one head has no second use for it.
+   * Live demand at chunk 128 is 6.5 GiB, which is nothing on a card with 183.
+   *
+   * `acc` and `sq` are one a query head in `q`'s order and are cleared here.
+   * `Head` is this with a group of one, so the two paths are the same code
+   * and `TheGroupShareIsTheSeparateHeadsWordForWord` says the sharing did
+   * not change a word.
+   */
+  void HeadGroup(const std::vector<std::vector<Ct> *> &acc,
+                 const std::vector<Ct *> &sq,
+                 const std::vector<const std::vector<Ct> *> &q,
+                 int pub_tokens, const ChunkSource &src,
+                 const EvkMap<word> &evk) const;
+
  private:
   std::shared_ptr<const BootContext<word>> boot_;
   Config cfg_;

@@ -277,14 +277,24 @@ void CiPcAttention<word>::Finish(std::vector<Ct> &acc, Ct &sq) const {
 }
 
 template <typename word>
-void CiPcAttention<word>::Head(std::vector<Ct> &acc, Ct &sq,
-                               const std::vector<Ct> &q, int pub_tokens,
-                               const ChunkSource &src,
-                               const EvkMap<word> &evk) const {
+void CiPcAttention<word>::HeadGroup(
+    const std::vector<std::vector<Ct> *> &acc, const std::vector<Ct *> &sq,
+    const std::vector<const std::vector<Ct> *> &q, int pub_tokens,
+    const ChunkSource &src, const EvkMap<word> &evk) const {
   AssertTrue(ready_, "CiPcAttention: call Prepare first");
-  AssertTrue(pub_tokens > 0, "CiPcAttention::Head: an empty public context");
-  acc.clear();
-  sq = Ct();
+  AssertTrue(pub_tokens > 0,
+             "CiPcAttention::HeadGroup: an empty public context");
+  const int heads = static_cast<int>(q.size());
+  AssertTrue(heads > 0, "CiPcAttention::HeadGroup: an empty group");
+  AssertTrue(static_cast<int>(acc.size()) == heads &&
+                 static_cast<int>(sq.size()) == heads,
+             "CiPcAttention::HeadGroup: one accumulator pair a query head");
+  for (int h = 0; h < heads; h++) {
+    AssertTrue(q[h] != nullptr && acc[h] != nullptr && sq[h] != nullptr,
+               "CiPcAttention::HeadGroup: a null member");
+    acc[h]->clear();
+    *sq[h] = Ct();
+  }
 
   const size_t lanes = static_cast<size_t>(cfg_.num_instances);
   std::vector<double> kbuf, vbuf;
@@ -295,20 +305,30 @@ void CiPcAttention<word>::Head(std::vector<Ct> &acc, Ct &sq,
     vbuf.assign(static_cast<size_t>(width) * cfg_.head_dim * lanes, 0.0);
     src(start, width, kbuf, vbuf);
 
+    // ONE encode of the chunk for the whole group -- the reason this form
+    // exists. Both stores stay alive across the group's exps; that is the
+    // trade, and at chunk 128 it is 6.5 GiB.
     EncodeKeys(kw, kbuf, width);
-    std::vector<Ct> s;
-    Scores(s, q, kw);
-    // The key store is the biggest thing alive and the exp does not need it.
-    kw = SubringWeights<word>();
-
-    std::vector<Ct> w;
-    Weights(w, s, evk);
-
     EncodeValues(vw, vbuf, width);
-    Accumulate(acc, sq, w, vw);
+    for (int h = 0; h < heads; h++) {
+      std::vector<Ct> s;
+      Scores(s, *q[h], kw);
+      std::vector<Ct> w;
+      Weights(w, s, evk);
+      Accumulate(*acc[h], *sq[h], w, vw);
+    }
+    kw = SubringWeights<word>();
     vw = SubringWeights<word>();
   }
-  Finish(acc, sq);
+  for (int h = 0; h < heads; h++) Finish(*acc[h], *sq[h]);
+}
+
+template <typename word>
+void CiPcAttention<word>::Head(std::vector<Ct> &acc, Ct &sq,
+                               const std::vector<Ct> &q, int pub_tokens,
+                               const ChunkSource &src,
+                               const EvkMap<word> &evk) const {
+  HeadGroup({&acc}, {&sq}, {&q}, pub_tokens, src, evk);
 }
 
 template class CiPcAttention<uint32_t>;
