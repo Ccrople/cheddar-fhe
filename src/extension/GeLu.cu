@@ -25,21 +25,33 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
                                int input_level)
     : context_{std::move(context)}, groups_{groups}, input_level_{input_level} {
   AssertTrue(!groups_.empty(), "GeLu: at least one group");
-  const double in_scale = context_->param_.GetScale(input_level_);
   polys_.resize(groups_.size());
   // The fitted groups' polynomials live on [-1, 1] and are fitted to
   // `GELU(range * v)`, so their output is already GELU(u) with nothing to
   // undo; what they need is `u / range`, which `Apply` takes as given (see
   // `SiLu.h` for why the division is not done here). The saturated groups
   // have no polynomial at all -- that is the whole point of the class.
+  // THE MASK GOES IN FRONT OF THE POLYNOMIAL, NOT BEHIND IT. A saturated
+  // slot's input is `u / R` with |u| far past `R` -- that is what makes it
+  // saturated -- and a Chebyshev polynomial evaluated there grows like
+  // cosh(d arccosh(v)): at |v| = 16 and degree 31 that is 1e46, which
+  // overflows the modulus and destroys EVERY slot of the ciphertext, the
+  // masked-out ones included. Measured before the fix, with the masks on the
+  // output: the bulk slots came back at 6.3e+16. So the fitted group's mask
+  // multiplies the INPUT -- the saturated slots become zero, where the fit
+  // returns GELU(0) = 0, which is also the right answer for the negative
+  // saturated group -- and the masks cost the same one level either way.
+  multi_ = groups_.size() > 1;
+  const int fit_in_level = multi_ ? input_level_ - 1 : input_level_;
+  const double fit_scale = context_->param_.GetScale(fit_in_level);
   std::vector<int> levels;
   double fit_range = 0.0;
   bool have_fit = false;
   for (size_t i = 0; i < groups_.size(); i++) {
     const auto &g = groups_[i];
     if (g.kind != Kind::kFit) {
-      // `u` itself costs no level: it arrives at the input level and is only
-      // levelled down to meet the fitted group.
+      // `u` itself needs one level for its own mask multiply, and it takes it
+      // wherever the fitted group lands.
       levels.push_back(input_level_);
       continue;
     }
@@ -54,9 +66,9 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
     auto coeffs =
         chebfit::Interpolate([r](double v) { return GeLu(r * v); }, g.degree);
     const int degree_used =
-        EvalPoly<word>(coeffs, input_level_, in_scale, in_scale, true)
+        EvalPoly<word>(coeffs, fit_in_level, fit_scale, fit_scale, true)
             .GetPolyDegree();
-    levels.push_back(input_level_ - Log2Ceil(degree_used + 1));
+    levels.push_back(fit_in_level - Log2Ceil(degree_used + 1));
   }
   AssertTrue(have_fit, "GeLu: at least one fitted group");
   // The groups are SUMMED, so they meet at the deepest of them; a group that
@@ -74,13 +86,17 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
     // -- EvalPoly stamps it on unchecked, and under grafting the two scales
     // differ enough to fail the next Add (see `SiLu.cu`).
     polys_[i] = std::make_unique<EvalPoly<word>>(
-        coeffs, input_level_, in_scale, context_->param_.GetScale(levels[i]),
+        coeffs, fit_in_level, fit_scale, context_->param_.GetScale(levels[i]),
         /*chebyshev=*/true);
     polys_[i]->Compile(context_);
   }
-  // One group needs no mask and no multiply; more than one costs the rescale
-  // that the group sum's doubled scale asks for.
-  out_level_ = groups_.size() == 1 ? poly_out_level_ : poly_out_level_ - 1;
+  // One group needs no mask and no multiply at all. More than one costs
+  // exactly one level -- the input mask's rescale, already inside
+  // `fit_in_level`; the saturated groups' own multiplies rescale onto the
+  // level the fit lands on and cost nothing further.
+  out_level_ = poly_out_level_;
+  AssertTrue(!multi_ || poly_out_level_ + 1 <= fit_in_level,
+             "GeLu: the saturated groups have no level to be multiplied at");
 }
 
 template <typename word>
@@ -108,29 +124,33 @@ void GeLuHandler<word>::Prepare(
     const std::vector<std::vector<Complex>> &mask) const {
   if (groups_.size() == 1) return;
   AssertTrue(mask.size() == groups_.size(), "GeLu: one mask per group");
-  if (cached_mask_level_ == poly_out_level_ && cached_mask_ == mask) return;
+  if (cached_mask_level_ == input_level_ && cached_mask_ == mask) return;
   mask_pt_.clear();
   mask_pt_.resize(mask.size());
-  const double scale = context_->param_.GetScale(poly_out_level_);
   std::vector<Complex> scaled;
   for (size_t i = 0; i < mask.size(); i++) {
     if (groups_[i].kind == Kind::kZero) continue;
     if (groups_[i].kind == Kind::kIdentity) {
       // The input arrives as `u / range`, so the identity group's answer is
       // `range * v` -- and the factor rides the mask's own plaintext, for
-      // nothing.
+      // nothing. It meets the fit one level above where the fit lands, so
+      // that its own rescale puts it exactly there.
+      const int lvl = poly_out_level_ + 1;
       scaled.assign(mask[i].size(), Complex(0.0, 0.0));
       for (size_t s = 0; s < mask[i].size(); s++) {
         scaled[s] = mask[i][s] * GetRange();
       }
-      context_->gpu_encoder_.Encode(mask_pt_[i], poly_out_level_, scale,
-                                    scaled);
+      context_->gpu_encoder_.Encode(mask_pt_[i], lvl,
+                                    context_->param_.GetScale(lvl), scaled);
       continue;
     }
-    context_->gpu_encoder_.Encode(mask_pt_[i], poly_out_level_, scale, mask[i]);
+    // The fitted group's mask multiplies the INPUT, at the input level.
+    context_->gpu_encoder_.Encode(mask_pt_[i], input_level_,
+                                  context_->param_.GetScale(input_level_),
+                                  mask[i]);
   }
   cached_mask_ = mask;
-  cached_mask_level_ = poly_out_level_;
+  cached_mask_level_ = input_level_;
 }
 
 template <typename word>
@@ -158,30 +178,32 @@ void GeLuHandler<word>::Apply(Ct &res, const Ct &normalised_u,
     return;
   }
   Prepare(mask);
-  Ct piece, levelled, term, acc;
+  Ct product, clamped, levelled, term;
   bool first = true;
   for (size_t i = 0; i < groups_.size(); i++) {
     // A `kZero` group contributes nothing, which is exactly why it is free:
     // GELU below the transition is zero to within 1.3e-04, and those slots
-    // are most of the outliers (measured: 3835 of 3907 at layer 0).
+    // are most of the outliers (measured: 3835 of 3907 at layer 0). The
+    // fitted group's input mask has already set them to zero, and the fit
+    // returns GELU(0) = 0 there, so nothing has to put them back.
     if (groups_[i].kind == Kind::kZero) continue;
-    if (groups_[i].kind == Kind::kIdentity) {
-      context_->LevelDown(levelled, normalised_u, poly_out_level_);
+    if (groups_[i].kind == Kind::kFit) {
+      // Clamp first, evaluate second. See the constructor.
+      context_->Mult(product, normalised_u, mask_pt_[i]);
+      context_->Rescale(clamped, product);
+      polys_[i]->Evaluate(context_, term, clamped, mult_key);
     } else {
-      polys_[i]->Evaluate(context_, piece, normalised_u, mult_key);
-      context_->LevelDown(levelled, piece, poly_out_level_);
+      context_->LevelDown(levelled, normalised_u, poly_out_level_ + 1);
+      context_->Mult(product, levelled, mask_pt_[i]);
+      context_->Rescale(term, product);
     }
-    context_->Mult(term, levelled, mask_pt_[i]);
     if (first) {
-      context_->Copy(acc, term);
+      context_->Copy(res, term);
       first = false;
     } else {
-      context_->Add(acc, acc, term);
+      context_->Add(res, res, term);
     }
   }
-  // `Mult(Ct, Pt)` does not rescale; this is the level the header charges the
-  // masks, and it is the one Llama's gate multiply spends.
-  context_->Rescale(res, acc);
 }
 
 template class GeLuHandler<uint32_t>;

@@ -72,13 +72,25 @@ namespace cheddar {
  * high not being the safe side, and about the argument's scale being part of
  * the argument holds here word for word, and is not repeated.
  *
- * ## The masks cost one level, and BERT has it
+ * ## THE MASK GOES IN FRONT OF THE POLYNOMIAL
  *
- * `Mult(Ct, Pt)` does not rescale, so the group sum lands at twice the scale
- * and the rescale that follows is one level. Llama's feed-forward spends that
- * level on the gate multiply `SiLU(g) * u`; BERT's has no gate, so the level
- * the masks take is the one SwiGLU was using. With a single group there is no
- * mask and no multiply at all.
+ * Not behind it. A saturated slot's input is `u / R` with |u| far past `R` --
+ * that is what makes it saturated -- and a Chebyshev polynomial evaluated
+ * there grows like cosh(d arccosh(v)): at |v| = 16 and degree 31 that is
+ * 1e46, which overflows the modulus and destroys EVERY slot of the
+ * ciphertext, the masked-out ones included. Measured, with the masks on the
+ * output instead: the BULK slots came back at 6.3e+16.
+ *
+ * So the fitted group's mask multiplies the INPUT. The saturated slots become
+ * zero, where the fit returns `GELU(0) = 0` -- which is also the right answer
+ * for the negative saturated group, so it needs no term of its own -- and the
+ * positive group is added back afterwards, its own multiply rescaling onto
+ * the level the fit lands on.
+ *
+ * It costs one level. Llama's feed-forward spends that level on the gate
+ * multiply `SiLU(g) * u`; BERT's has no gate, so the level the masks take is
+ * the one SwiGLU was using. With a single group there is no mask and no
+ * multiply at all.
  *
  * @tparam word uint32_t or uint64_t
  */
@@ -166,6 +178,7 @@ class GeLuHandler {
   mutable std::vector<std::vector<Complex>> cached_mask_;
   mutable std::vector<Pt> mask_pt_;
   mutable int cached_mask_level_ = -1;
+  bool multi_ = false;
 };
 
 }  // namespace cheddar

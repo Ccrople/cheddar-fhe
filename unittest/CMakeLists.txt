@@ -281,6 +281,13 @@ if (ENABLE_EXTENSION)
 
   # Llama RMSNorm on the real layer-2 residual stream. Needs ENABLE_EXTENSION
   # for EvalPoly, and LLAMA3_REAL_DIR for the weight bundle.
+  # BERT's two operators Llama does not have: LayerNorm (RMSNorm's circuit plus
+  # the centring, the masked mean and the bias) and GELU (one low-degree fit
+  # plus the saturation masks). Host references throughout; no weight bundle.
+  add_executable(bert_ops_test BertOpsTest.cpp)
+  target_link_libraries(bert_ops_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   add_executable(rms_norm_test RmsNormTest.cpp)
   target_link_libraries(rms_norm_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
