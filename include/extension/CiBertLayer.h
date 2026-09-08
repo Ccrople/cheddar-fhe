@@ -230,6 +230,11 @@ class CiBertLayer {
     //! measurements; `reference_forward_bert.py` writes the plan.
     double gelu_range = 8.0;
     int gelu_degree = 31;
+    //! The WIDE fitted group, for the slots a corpus says reach past
+    //! `gelu_range` with no stable sign -- 30 of 393,216 at layers 9 and 10,
+    //! none elsewhere. Zero for none; group 3 in `gelu_group`.
+    double gelu_wide_range = 0.0;
+    int gelu_wide_degree = 63;
     std::vector<unsigned char> gelu_group;
   };
 

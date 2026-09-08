@@ -52,6 +52,7 @@ using cheddar::Ciphertext;
 using cheddar::Complex;
 using cheddar::EvkRequest;
 using cheddar::Plaintext;
+using json = nlohmann::json;
 
 namespace {
 
@@ -983,6 +984,33 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   cal.gelu_range = 8.0;
   cal.gelu_degree = 31;
   cal.gelu_group = L.gelu_group;
+  // `BERT_CALIB_DIR`: the GELU plan from a CORPUS rather than from the served
+  // prompt. `bert_corpus.py` writes it -- a slot is bulk only if its whole
+  // corpus range fits the fitted interval, anything past it is answered by
+  // `u` or by nothing where its sign is stable, and by a wide fit where it is
+  // not. Without this the plan is the served prompt's own, which is not a
+  // calibration at all.
+  if (const char *cdir = std::getenv("BERT_CALIB_DIR")) {
+    std::ifstream cf(std::string(cdir) + "/corpus.json");
+    ASSERT_TRUE(cf.good()) << "no corpus.json in BERT_CALIB_DIR";
+    json cj = json::parse(cf);
+    const auto &cl = cj["layers"][LAYER];
+    cal.gelu_range = cl["gelu_range"].get<double>();
+    cal.gelu_degree = static_cast<int>(cl["gelu_degree"].get<double>());
+    cal.gelu_wide_range = cl["gelu_wide_range"].get<double>();
+    cal.gelu_wide_degree =
+        static_cast<int>(cl["gelu_wide_degree"].get<double>());
+    ASSERT_TRUE(ReadU8(std::string(cdir) + "/gelu_group_L" + Two(LAYER) +
+                           ".u8",
+                       static_cast<size_t>(kT) * kI, cal.gelu_group))
+        << "no corpus GELU groups for layer " << LAYER;
+    std::cout << "corpus GELU plan: bulk +-" << cal.gelu_range << " deg "
+              << cal.gelu_degree << ", wide +-" << cal.gelu_wide_range
+              << " deg " << cal.gelu_wide_degree << ", "
+              << static_cast<int>(cl["gelu_wide_channels"].get<double>())
+              << " wide channels"
+              << std::endl;
+  }
   std::cout << "cq " << cq << ", ck " << ck << ", cv " << cv
             << ", stream in " << stream_scale << " out " << stream_out
             << ", int_scale " << int_scale << ", m_eff " << L.m_eff

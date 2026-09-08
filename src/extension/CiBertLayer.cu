@@ -460,14 +460,25 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     // The GELU's groups, per SLOT: the outliers are two hidden channels of
     // 3072 (`GeLu.h`), so the assignment is per (token, channel) and not per
     // token. In slots the address is `channel * num_tokens + rev(token)`.
+    // Four groups at most: the bulk fit, the two saturated ones, and -- when
+    // the calibration says a handful of slots reach past the bulk range with
+    // no stable sign -- a WIDE fit for them. Measured over a corpus, that is
+    // 30 slots of 393,216 at layers 9 and 10 and none anywhere else, and
+    // without it those slots would be a Chebyshev evaluated outside its
+    // interval, which is unbounded.
     std::vector<typename GeLuHandler<word>::Group> groups = {
         {GeLuHandler<word>::Kind::kFit, c.gelu_range, c.gelu_degree},
         {GeLuHandler<word>::Kind::kIdentity, c.gelu_range, 0},
         {GeLuHandler<word>::Kind::kZero, c.gelu_range, 0}};
+    const int num_groups = c.gelu_wide_range > 0.0 ? 4 : 3;
+    if (num_groups == 4) {
+      groups.push_back({GeLuHandler<word>::Kind::kFit, c.gelu_wide_range,
+                        c.gelu_wide_degree});
+    }
     GeLuHandler<word> gelu(boot_, groups, op_level_);
     const int log_t = Log2Ceil(cfg_.num_tokens);
     const int rank = cfg_.proj_rank;
-    std::vector<std::vector<Complex>> mask(3);
+    std::vector<std::vector<Complex>> mask(num_groups);
     for (int i = 0; i < num_hidden_cts_; i++) {
       // `1/range` and the crossing's own constants ride the same multiply;
       // the bias is a plaintext add at the level that leaves, in the same
@@ -508,7 +519,7 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
                                    boot_->param_.GetScale(op_level_), bmsg);
         boot_->Add(ups[i], ups[i], bpt);
       }
-      for (int gsel = 0; gsel < 3; gsel++) {
+      for (int gsel = 0; gsel < num_groups; gsel++) {
         mask[gsel].assign(num_slots_, Complex(0.0, 0.0));
       }
       for (int ch = 0; ch < rank; ch++) {
@@ -520,6 +531,7 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
           if (declared < cfg_.hidden_live && !c.gelu_group.empty()) {
             which = c.gelu_group[static_cast<size_t>(t) * cfg_.hidden_live +
                                  declared];
+            if (which >= num_groups) which = 0;
           }
           mask[which][s] = Complex(1.0, 0.0);
         }

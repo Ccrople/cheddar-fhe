@@ -57,10 +57,12 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
     }
     AssertTrue(g.range > 0.0, "GeLu: range must be positive");
     AssertTrue(g.degree > 0, "GeLu: degree must be positive");
-    AssertTrue(!have_fit || g.range == fit_range,
-               "GeLu: every fitted group must state the same range -- there "
-               "is one ciphertext and one division");
-    fit_range = g.range;
+    // The FIRST fitted group's range is the one the caller divided by; a
+    // second one states its own and its input mask carries the ratio, which
+    // is free (the mask is already a multiply). That is what lets a handful
+    // of slots reaching 135 be answered at all while the other 393,000 keep
+    // a range of 24 and its degree -- see `Calibration::gelu_group`.
+    if (!have_fit) fit_range = g.range;
     have_fit = true;
     const double r = g.range;
     auto coeffs =
@@ -144,10 +146,17 @@ void GeLuHandler<word>::Prepare(
                                     context_->param_.GetScale(lvl), scaled);
       continue;
     }
-    // The fitted group's mask multiplies the INPUT, at the input level.
+    // The fitted group's mask multiplies the INPUT, at the input level, and
+    // carries `caller's range / this group's range` so that every group sees
+    // its own argument in [-1, 1] off ONE division.
+    const double ratio = GetRange() / groups_[i].range;
+    scaled.assign(mask[i].size(), Complex(0.0, 0.0));
+    for (size_t sx = 0; sx < mask[i].size(); sx++) {
+      scaled[sx] = mask[i][sx] * ratio;
+    }
     context_->gpu_encoder_.Encode(mask_pt_[i], input_level_,
                                   context_->param_.GetScale(input_level_),
-                                  mask[i]);
+                                  scaled);
   }
   cached_mask_ = mask;
   cached_mask_level_ = input_level_;
