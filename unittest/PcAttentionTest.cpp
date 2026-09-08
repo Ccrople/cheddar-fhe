@@ -23,9 +23,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "RingFixture.h"
@@ -39,6 +41,7 @@ using cheddar::CiPcAttention;
 using cheddar::Ciphertext;
 using cheddar::Complex;
 using cheddar::Plaintext;
+using cheddar::SubringWeights;
 
 namespace {
 
@@ -551,4 +554,168 @@ TEST(PcAttention, TheResidencyDoesNotMoveWithTheContextLength) {
   }
   EXPECT_GT(lng.seconds, shrt.seconds)
       << "the longer context did no more work, so nothing was measured";
+}
+
+// ---------------------------------------------------------------------------
+// 4. WHAT THE CONTEXT COSTS, and the lever the interface leaves on the table.
+//
+//    Test 3 prices a public token at one chunk size. This one prices it
+//    across chunk sizes AND splits the price in two, because the halves do
+//    not scale with the same head count:
+//
+//      ENCODE   `EncodeKeys` + `EncodeValues`. Kpub and Vpub are per KV
+//               head, and Llama-3-8B is GQA 32/8 -- the same pair serves
+//               FOUR query heads. `Head` encodes inside its own chunk loop
+//               (CiPcAttention.cu), so four calls encode the same numbers
+//               four times.
+//      PRODUCT  `Scores` + `Weights` + `Accumulate`, per QUERY head, 32.
+//
+//    A layer is therefore `8 * encode + 32 * product` if a group shares its
+//    encode and `32 * (encode + product)` if it does not. Which of those two
+//    is the real figure decides whether the public context is affordable, so
+//    it is measured rather than argued, and driven step by step rather than
+//    through `Head` for exactly that reason.
+//
+//    A bench, not a check: skipped unless PC_SWEEP is set. PC_SWEEP_TOKENS
+//    is the context it walks (default 256 -- long enough to average the
+//    chunks, short enough to run in a minute), PC_SWEEP_CHUNKS the sizes,
+//    PC_SWEEP_GROUP the query heads a KV head serves.
+// ---------------------------------------------------------------------------
+namespace {
+
+int EnvInt(const char *name, int fallback) {
+  const char *e = std::getenv(name);
+  if (e == nullptr || e[0] == 0) return fallback;
+  const int v = std::atoi(e);
+  return v > 0 ? v : fallback;
+}
+
+std::vector<int> EnvChunks(const char *name, std::vector<int> fallback) {
+  const char *e = std::getenv(name);
+  if (e == nullptr || e[0] == 0) return fallback;
+  std::vector<int> out;
+  std::string s(e), tok;
+  for (size_t i = 0; i <= s.size(); i++) {
+    if (i == s.size() || s[i] == ',') {
+      if (!tok.empty()) {
+        const int v = std::atoi(tok.c_str());
+        if (v > 0) out.push_back(v);
+        tok.clear();
+      }
+    } else {
+      tok.push_back(s[i]);
+    }
+  }
+  return out.empty() ? fallback : out;
+}
+
+}  // namespace
+
+TEST(PcAttention, TheContextPriceSplitsByHeadCount) {
+  if (std::getenv("PC_SWEEP") == nullptr) {
+    GTEST_SKIP() << "a bench, not a check -- set PC_SWEEP=1 to run it";
+  }
+  const bool ledger = cheddar::MemoryPool::SetStatisticsEnabled(true) ||
+                      cheddar::MemoryPool::StatisticsEnabled();
+
+  Ring ring("ci16_35.json");
+  auto bctx = std::dynamic_pointer_cast<cheddar::BootContext<word>>(
+      ring.context);
+  ASSERT_NE(bctx, nullptr);
+
+  const int ptok = EnvInt("PC_SWEEP_TOKENS", 256);
+  const int group = EnvInt("PC_SWEEP_GROUP", 4);
+  const std::vector<int> chunks =
+      EnvChunks("PC_SWEEP_CHUNKS", {8, 16, 32, 64, 128});
+  // Sylph's split of a 4096-token context, and Llama-3-8B's head counts.
+  constexpr double kSylphPublic = 3968.0;
+  constexpr int kQueryHeads = 32, kKvHeads = 8;
+
+  // The layout does not depend on the chunk, so the queries are built once.
+  const auto probe =
+      std::make_unique<CiPcAttention<word>>(bctx, MakeConfig(chunks[0]));
+  Queries q;
+  q.Build(ring, probe->GetLayout(), 0.2, 0x1234ABCDULL);
+  PublicContext pc;
+  pc.Fill(ptok, 0.2, 0xFEEDFACEULL);
+
+  std::cout << std::endl
+            << "  " << ptok << " public tokens, " << group
+            << " query heads a KV head, " << kHeadDim << " channels"
+            << std::endl
+            << "  chunk   encode/tok   product/tok/head   live      "
+               "layer shared   layer per head"
+            << std::endl;
+
+  double best_shared = 0.0;
+  for (int chunk : chunks) {
+    auto att = std::make_unique<CiPcAttention<word>>(bctx, MakeConfig(chunk));
+    att->Prepare(MakeCalibration(false));
+
+    // What survives the whole context: one accumulator set a query head.
+    std::vector<std::vector<Ciphertext<word>>> acc(group);
+    std::vector<Ciphertext<word>> sq(group);
+    std::vector<double> kbuf, vbuf;
+    SubringWeights<word> kw, vw;
+    double t_enc = 0.0, t_prod = 0.0;
+    int64_t live = 0;
+    const size_t lanes = static_cast<size_t>(kInstances);
+
+    cudaDeviceSynchronize();
+    for (int start = 0; start < ptok; start += chunk) {
+      const int width = std::min(chunk, ptok - start);
+      kbuf.assign(static_cast<size_t>(kHeadDim) * width * lanes, 0.0);
+      vbuf.assign(static_cast<size_t>(width) * kHeadDim * lanes, 0.0);
+      pc.Chunk(start, width, kbuf, vbuf);
+
+      const auto t0 = std::chrono::steady_clock::now();
+      att->EncodeKeys(kw, kbuf, width);
+      att->EncodeValues(vw, vbuf, width);
+      cudaDeviceSynchronize();
+      const auto t1 = std::chrono::steady_clock::now();
+      // The group's query heads read the SAME encoded chunk. That sharing is
+      // the whole point of the split, so the bench does it here and `Head`
+      // (one query head a call) cannot.
+      for (int h = 0; h < group; h++) {
+        std::vector<Ciphertext<word>> s;
+        att->Scores(s, q.ct, kw);
+        std::vector<Ciphertext<word>> w;
+        att->Weights(w, s, ring.ui->GetEvkMap());
+        att->Accumulate(acc[h], sq[h], w, vw);
+      }
+      cudaDeviceSynchronize();
+      const auto t2 = std::chrono::steady_clock::now();
+      t_enc += Seconds(t0, t1);
+      t_prod += Seconds(t1, t2);
+      if (ledger) {
+        live = std::max(live, cheddar::MemoryPool::GetUsage().current_bytes);
+      }
+      kw = SubringWeights<word>();
+      vw = SubringWeights<word>();
+    }
+    for (int h = 0; h < group; h++) att->Finish(acc[h], sq[h]);
+
+    const double enc_ms = 1000.0 * t_enc / ptok;
+    const double prod_ms = 1000.0 * t_prod / (static_cast<double>(ptok) * group);
+    const double shared =
+        kSylphPublic * (kKvHeads * enc_ms + kQueryHeads * prod_ms) / 1000.0;
+    const double per_head =
+        kSylphPublic * kQueryHeads * (enc_ms + prod_ms) / 1000.0;
+    best_shared = (best_shared == 0.0) ? shared : std::min(best_shared, shared);
+
+    std::cout << std::fixed << std::setprecision(3) << "  " << std::setw(5)
+              << chunk << "   " << std::setw(10) << enc_ms << "   "
+              << std::setw(16) << prod_ms << "   " << std::setw(7)
+              << std::setprecision(0) << (live / 1048576.0) << " MiB"
+              << std::setprecision(1) << std::setw(12) << shared << " s"
+              << std::setw(14) << per_head << " s" << std::endl;
+
+    EXPECT_GT(t_prod, 0.0) << "the product half was not measured";
+    EXPECT_GT(t_enc, 0.0) << "the encode half was not measured";
+  }
+  std::cout << "  (layer = " << static_cast<int>(kSylphPublic)
+            << " public tokens; shared = " << kKvHeads
+            << " encodes + " << kQueryHeads
+            << " products, per head = what `Head` does today)" << std::endl;
+  EXPECT_GT(best_shared, 0.0);
 }
