@@ -183,6 +183,26 @@ class CiBertLayer {
     double attn_window = 2.0;
     double ffn_alpha = 1.0;
     double ffn_window = 2.0;
+    //! Each norm's invsqrt degree, 0 to derive it from the window as
+    //! `Config::norm_degree` does. It is PER NORM because the two norms of
+    //! one layer do not want the same degree: the Chebyshev rate for
+    //! `x^-1/2` on `[eps, 1]` is `1 + 2 sqrt(eps)`, so the degree a window
+    //! needs is `~ ln(1/delta) sqrt(window) / 2` and BERT's windows differ by
+    //! two orders of magnitude between the attention norm (17 to 366 over the
+    //! twelve layers, with a safety margin already in) and the feed-forward
+    //! norm at layers 9 and 10 (12,000). Nothing else moves that degree --
+    //! composition, repeated squaring and a Newton refine all leave the rate
+    //! alone (`reference/docs/BERT_BASE_B1.md` 11.3).
+    int attn_degree = 0;
+    int ffn_degree = 0;
+    //! Fitted Chebyshev coefficients for each norm's `1/sqrt`, empty to
+    //! interpolate. Fit them for the RELATIVE error (the weight divided by
+    //! the function): the norm multiplies the centred row by this, so a
+    //! relative error passes straight through, while `1/sqrt` itself varies
+    //! by 54x over a wide window and an absolute-error objective therefore
+    //! spends its accuracy in the wrong place -- worth about a level, and at
+    //! degree 31 the absolute objective took the chain to 9e+08.
+    std::vector<double> attn_invsqrt, ffn_invsqrt;
     //! The public per-token rescale at each norm, one entry per token, empty
     //! for none. See the header: LayerNorm is exactly scale invariant, so
     //! these cancel and cost nothing.
@@ -236,6 +256,33 @@ class CiBertLayer {
     double gelu_wide_range = 0.0;
     int gelu_wide_degree = 63;
     std::vector<unsigned char> gelu_group;
+    //! One band of the CERTIFIED plan (`reference/scripts/bert_plan.py`).
+    struct GeLuBand {
+      double range = 0.0;
+      int degree = 63;
+      std::vector<double> coeffs;
+    };
+    //! The certified band plan. When it is non-empty it REPLACES the four
+    //! groups above: every band is a `kFit` -- there is no identity and no
+    //! zero group, so no slot is ever answered by `u` or by nothing -- and
+    //! the band a channel is in comes from the WEIGHTS, not from a prompt.
+    //!
+    //! WHY THAT IS SAFE WITHOUT A CORPUS. A LayerNorm output lies exactly on
+    //! the sphere of radius `sqrt(768)`, so with `a_j = gain * W[:,j]` and
+    //! `c_j = bias . W[:,j] + b_j`,
+    //!
+    //!     |u_j - c_j| <= sqrt(768) ||a_j - mean(a_j)||
+    //!
+    //! for EVERY input -- another prompt, an adversarial one, a random
+    //! ciphertext. A band's range is that ceiling maximised over its
+    //! channels, so no slot can leave its own interval and the unbounded
+    //! failure mode (a Chebyshev evaluated outside, `GeLu.h`) is gone rather
+    //! than made unlikely. The corpus is read for the fit's WEIGHTING only,
+    //! which can cost accuracy and cannot cost safety. Measured over 28
+    //! prompts, 17 of them hostile: the ceiling is 1.5x-3.5x the corpus
+    //! maximum per layer and the corpus reaches 0.95 of it at layers 3-7,
+    //! so it is not a loose bound (`reference/docs/BERT_BASE_B1.md` 11.1).
+    std::vector<GeLuBand> gelu_bands;
   };
 
   CiBertLayer(std::shared_ptr<const BootContext<word>> boot,
@@ -322,6 +369,7 @@ class CiBertLayer {
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain,
                 const std::vector<double> &bias, double alpha, double window,
+                int degree, const std::vector<double> &invsqrt,
                 const std::vector<double> &token_scale, double in_scale,
                 double out_scale, const std::vector<double> &row_suppress,
                 const EvkMap<word> &evk);

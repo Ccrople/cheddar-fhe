@@ -254,7 +254,8 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
                                  const std::vector<Ct> &stream,
                                  const std::vector<double> &gain,
                                  const std::vector<double> &bias, double alpha,
-                                 double window,
+                                 double window, int degree_in,
+                                 const std::vector<double> &invsqrt,
                                  const std::vector<double> &token_scale,
                                  double in_scale, double out_scale,
                                  const std::vector<double> &row_suppress,
@@ -297,11 +298,11 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
   // The handler sees `beta * x`, so its own layer constant is one and its
   // epsilon carries `beta^2`; the gain then carries no `sqrt(alpha)` at all,
   // only the model's gain and the stream factor the output has to leave with.
-  const int degree = NormDegree(window);
+  const int degree = degree_in > 0 ? degree_in : NormDegree(window);
   LayerNormHandler<word> ln(boot_, cfg_.num_tokens, cfg_.model_declared,
                             /*layer_constant=*/1.0, op_level_,
                             beta * beta * cfg_.eps, window, degree,
-                            /*channel_stride=*/1, cfg_.model_live);
+                            /*channel_stride=*/1, cfg_.model_live, invsqrt);
   AssertTrue(ln.GetNumCiphertexts() == num_model_cts_,
              "CiBertLayer: LayerNormHandler disagrees about the width");
   AssertTrue(ln.GetOutputLevel() >= sched_.GetStCLevel(),
@@ -411,7 +412,8 @@ void CiBertLayer<word>::AttentionTurn(std::vector<Ct> &res,
   // The post-attention norm is where the row suppression goes ON: `H`
   // carries it, and the OUTPUT norm below takes it back out.
   NormTurn(res, h, *w.attn_gain, *w.attn_bias, c.attn_alpha, c.attn_window,
-           c.attn_scale, c.stream_scale, out_scale, c.row_suppress, evk);
+           c.attn_degree, c.attn_invsqrt, c.attn_scale, c.stream_scale,
+           out_scale, c.row_suppress, evk);
   MemoryPool::Report("bert: after the post-attention LayerNorm");
 }
 
@@ -466,16 +468,30 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     // 30 slots of 393,216 at layers 9 and 10 and none anywhere else, and
     // without it those slots would be a Chebyshev evaluated outside its
     // interval, which is unbounded.
-    std::vector<typename GeLuHandler<word>::Group> groups = {
-        {GeLuHandler<word>::Kind::kFit, c.gelu_range, c.gelu_degree},
-        {GeLuHandler<word>::Kind::kIdentity, c.gelu_range, 0},
-        {GeLuHandler<word>::Kind::kZero, c.gelu_range, 0}};
-    const int num_groups = c.gelu_wide_range > 0.0 ? 4 : 3;
-    if (num_groups == 4) {
-      groups.push_back({GeLuHandler<word>::Kind::kFit, c.gelu_wide_range,
-                        c.gelu_wide_degree});
+    std::vector<typename GeLuHandler<word>::Group> groups;
+    if (!c.gelu_bands.empty()) {
+      // The CERTIFIED plan: every band a fit over an interval `u` cannot
+      // leave. No identity and no zero group, because those two are the
+      // only ones whose failure is a wrong answer rather than a bounded
+      // one, and their assignment was the per-prompt part.
+      for (const auto &b : c.gelu_bands) {
+        groups.push_back({GeLuHandler<word>::Kind::kFit, b.range, b.degree,
+                          b.coeffs});
+      }
+    } else {
+      groups = {{GeLuHandler<word>::Kind::kFit, c.gelu_range, c.gelu_degree},
+                {GeLuHandler<word>::Kind::kIdentity, c.gelu_range, 0},
+                {GeLuHandler<word>::Kind::kZero, c.gelu_range, 0}};
+      if (c.gelu_wide_range > 0.0) {
+        groups.push_back({GeLuHandler<word>::Kind::kFit, c.gelu_wide_range,
+                          c.gelu_wide_degree});
+      }
     }
+    const int num_groups = static_cast<int>(groups.size());
     GeLuHandler<word> gelu(boot_, groups, op_level_);
+    // The caller divides by the handler's OWN range; a band whose range
+    // differs recovers it through its mask (`GeLu.h`).
+    const double gelu_range = gelu.GetRange();
     const int log_t = Log2Ceil(cfg_.num_tokens);
     const int rank = cfg_.proj_rank;
     std::vector<std::vector<Complex>> mask(num_groups);
@@ -491,7 +507,7 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
       // is already paying for -- and the ANSWER gets it back through the
       // masks below.
       const double base =
-          1.0 / (crossing_ * c.int_scale * out_scale * c.gelu_range);
+          1.0 / (crossing_ * c.int_scale * out_scale * gelu_range);
       if (c.row_suppress.empty()) {
         Canonicalise(ups[i], base);
       } else {
@@ -507,7 +523,7 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
         for (int ch = 0; ch < rank; ch++) {
           const int declared = i * rank + ch;
           const double b = declared < cfg_.hidden_live
-                               ? (*w.bint)[declared] / c.gelu_range
+                               ? (*w.bint)[declared] / gelu_range
                                : 0.0;
           for (int t = 0; t < cfg_.num_tokens; t++) {
             bmsg[static_cast<size_t>(ch) * cfg_.num_tokens + t] =
@@ -592,7 +608,8 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     // And OFF: LayerNorm is exactly scale invariant per token, so the
     // factor both halves of `z` carry cancels identically here.
     NormTurn(res, z, *w.ffn_gain, *w.ffn_bias, c.ffn_alpha, c.ffn_window,
-             c.ffn_scale, out_scale, out_scale, {}, evk);
+             c.ffn_degree, c.ffn_invsqrt, c.ffn_scale, out_scale, out_scale,
+             {}, evk);
   }
   MemoryPool::Report("bert: after the output LayerNorm");
 }

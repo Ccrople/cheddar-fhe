@@ -112,6 +112,16 @@ class GeLuHandler {
   /** @brief One slot group: how it is answered, and over what interval. */
   struct Group {
     Kind kind = Kind::kFit;
+    //! `kFit` only: the fitted half-interval, in the units of `u`. The
+    //! caller hands the input divided by `GetRange()` -- ONE division for
+    //! one ciphertext -- and a group whose own range differs recovers the
+    //! difference through its mask, which carries `GetRange() / range`. So
+    //! fitted groups MAY state different ranges, and a certified band plan
+    //! is exactly that: one band per interval, no identity or zero group,
+    //! and the band a channel is in is a property of the WEIGHTS
+    //! (`reference/scripts/bert_plan.py`).
+    double range = 1.0;
+    int degree = 31;
     //! `kFit` only: the Chebyshev coefficients to use, or empty to
     //! INTERPOLATE `GELU(range * v)` at `degree`.
     //!
@@ -126,12 +136,6 @@ class GeLuHandler {
     //! also BOUNDED inside its interval by construction, so the only safety
     //! condition left is the one the range states.
     std::vector<double> coeffs;
-    //! `kFit` only: the fitted half-interval, in the units of `u`. The
-    //! caller hands the input divided by THIS, so every group of kind
-    //! `kFit` in one handler must state the same range (there is one
-    //! ciphertext and one division).
-    double range = 1.0;
-    int degree = 31;
   };
 
   /**
