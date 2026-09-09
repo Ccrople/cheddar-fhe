@@ -2235,6 +2235,47 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
   if (!ReadF32(in, size_t(4096) * kH, x0)) {
     GTEST_SKIP() << "no 4096-token input at " << in;
   }
+  // PC4096_USER: the SERVICE shape. A T = 4096 heterogeneous prefill is one
+  // PUBLIC document and a user's own encrypted query, so what varies between
+  // users is the last `T` tokens and not the 3968 in front of them. This
+  // replaces them with user block `PC4096_USER` of
+  // `users_<PC4096_SERVE>.f32` (gen_t4096_pop.py NUSERS), whose text is taken
+  // from a stretch of the corpus the calibration never saw. RMSNorm is
+  // per-token, so every public key is bit-identical across users and only `q`
+  // moves -- which is exactly what the shared calibration is claiming to
+  // cover, since `row_shift`, `r_est` and `pow_scale` are one number a
+  // (head, row) FOR EVERY USER.
+  //
+  // Serving the users one at a time is not a weaker measurement than packing
+  // 512 of them into the batch: CKKS slots are independent here -- the
+  // rotations run along the key axis and `sq` sums over ciphertexts, so lane
+  // b's arithmetic never touches lane b'. A real batch adds only the shared
+  // DECLARED SCALE, a second-order coupling. So the spread over users is the
+  // answer, and it is read off runs, not off lanes.
+  const int user = EnvInt("PC4096_USER", -1);
+  if (user >= 0) {
+    ASSERT_TRUE(have_pop) << "PC4096_USER needs a PC4096_POP directory";
+    const std::string upath = std::string(pop_env) + "/users_" +
+                              std::to_string(EnvInt("PC4096_SERVE", 0)) +
+                              ".f32";
+    std::ifstream uf(upath, std::ios::binary);
+    if (!uf.good()) GTEST_SKIP() << "no user blocks at " << upath;
+    const size_t block = size_t(T) * kH;
+    uf.seekg(0, std::ios::end);
+    const size_t have = size_t(uf.tellg()) / sizeof(float);
+    ASSERT_GE(have, block * (size_t(user) + 1))
+        << upath << " holds " << (have / block) << " user blocks";
+    std::vector<float> ub(block);
+    uf.seekg(std::streamoff(sizeof(float) * block * size_t(user)),
+             std::ios::beg);
+    uf.read(reinterpret_cast<char *>(ub.data()),
+            std::streamsize(sizeof(float) * block));
+    ASSERT_TRUE(uf.good()) << "short read on " << upath;
+    for (size_t i = 0; i < block; i++) x0[size_t(ptok) * kH + i] = ub[i];
+    std::cout << "  [t4096] USER " << user << " of " << (have / block)
+              << " from " << upath << " (the public prefix is unchanged)"
+              << std::endl;
+  }
 
   // ---- the host scores, RAW -----------------------------------------------
   const double eps = 1e-5, rope_base = 500000.0;
@@ -2520,6 +2561,18 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
   // ---- the rings ----------------------------------------------------------
   cheddar::CiBatchAttention<word>::Config acfg;
   acfg.verbose = true;
+  // The REAL public branch needs the two halves to share an addressing.
+  // `CiPcAttention`'s operand is a subring element -- its layout is the flat
+  // `{tokens x instances, tokens}`, which is the PLAIN map -- while this
+  // class's default layout is the chain's nested one (rank 16, lanes 32).
+  // `Config::plain_map` is exactly the switch that moves the block relabelling
+  // into the two converters, at no cost, so that everything outside the chain
+  // is plain-native. Without it `Head`'s queries are read in one packing and
+  // written in another, which is what the first attempt measured.
+  // PC4096_PLAIN turns it on WITHOUT the real branch, which is the control:
+  // the plain map changes this test's whole addressing, so the real branch's
+  // number is only comparable against a host-supplied run in the same map.
+  acfg.plain_map = EnvInt("PC4096_PLAIN", EnvInt("PC4096_REAL_PUB", 0)) != 0;
   Ring boot(Param());
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   Ring small("ci12_35_boot.json");
@@ -2596,6 +2649,217 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
       for (int l = 0; l < T; l++) {
         want.At(b, t, l) = yfull[size_t(t) * tokens + ptok + l];
       }
+    }
+  }
+
+  // ---- the PUBLIC BRANCH, actually computed (PC4096_REAL_PUB) -------------
+  // Everything above hands the public half's power sums and value accumulator
+  // over as HOST numbers encrypted directly, so what the join test measures is
+  // the JOIN. A service does not have that: the public keys are plaintext but
+  // the query is not, so `sum_p (y0_p)^m` is a CIPHERTEXT `CiPcAttention` has
+  // to build, and its own error is in none of the numbers above. This runs it.
+  //
+  // Two constants make it drop in exactly where the host values were:
+  //   * `G_k` rides `Calibration::row_fold`, which `Finish` applies once to
+  //     the accumulator AND to every power sum -- the accumulator is what
+  //     owes it (`pub_scale` comes back as `R_k / G_k`), and the powers are
+  //     compensated by
+  //   * `pow_scale[j][t] = 1 / G_k[t]`, since `SoftMaxCho` multiplies
+  //     `pow_scale[j][t] g_j(t)^2 / (est aff_a)` back in BEFORE the boot. The
+  //     product is then the raw power sum times the same constants the host
+  //     path carried, so the two are the same circuit.
+  // `pow_scale` is a bookkeeping convention, not a numerical one: the boot
+  // sees the product, never the bare sum.
+  //
+  // Run ONCE, outside `run`: the public branch does not depend on the fold,
+  // and its encode alone is ~14 ms a public token a head.
+  const bool real_pub = EnvInt("PC4096_REAL_PUB", 0) != 0;
+  std::unique_ptr<cheddar::CiPcAttention<word>> pcp;
+  std::vector<Ciphertext<word>> pow_real, acc_real;
+  std::vector<std::vector<double>> pow_scale_real(
+      niter, std::vector<double>(T, 1.0));
+  if (real_pub) {
+    ASSERT_TRUE(have_pop)
+        << "PC4096_REAL_PUB wants a population calibration (PC4096_POP)";
+    cheddar::CiPcAttention<word>::Config pcfg;
+    pcfg.num_tokens = T;
+    pcfg.num_instances = layout.num_instances;
+    pcfg.head_dim = kD;
+    pcfg.chunk = EnvInt("PC4096_CHUNK", 64);
+    // The LAYER will have to boot Q to reach this (it projects at
+    // `rope_level` 5 and the widest power's deg-31 exp needs `q_level - 6 >=
+    // 2`); a test can simply encrypt there.
+    pcfg.q_level = EnvInt("PC4096_QLEVEL", 16);
+    pcp = std::make_unique<cheddar::CiPcAttention<word>>(bctx, pcfg);
+    typename cheddar::CiPcAttention<word>::Calibration pcal;
+    pcal.m_eff = m_eff;
+    pcal.span = cqk * span_raw;
+    pcal.shift = cqk * s_max;
+    pcal.carried = carried;
+    pcal.niter = niter;
+    pcal.row_shift.assign(T, 0.0);
+    for (int t = 0; t < T; t++) pcal.row_shift[t] = cqk * shift[t];
+    pcal.row_fold.assign(T, 0.0);
+    for (int t = 0; t < T; t++) pcal.row_fold[t] = Gk[t];
+    pcp->Prepare(pcal);
+    for (int j = 0; j < niter; j++) {
+      for (int t = 0; t < T; t++) pow_scale_real[j][t] = 1.0 / Gk[t];
+    }
+
+    // The query, at `q_level`, carrying `carried * cq * ck` exactly as the
+    // encrypted branch's scores do -- the class divides `carried` out in the
+    // affine and the keys go in raw, so the product is the chain-unit score.
+    HostTensor qt{layout.num_instances, T, kD, {}};
+    qt.v.assign(size_t(layout.num_instances) * T * kD, 0.0);
+    for (int b = 0; b < layout.num_instances; b++) {
+      for (int t = 0; t < T; t++) {
+        for (int c = 0; c < kD; c++) {
+          qt.At(b, t, c) = carried * cqk * qh[size_t(t) * kD + c];
+        }
+      }
+    }
+    std::vector<Ciphertext<word>> q_ct;
+    EncryptChannels(boot, layout, qt, pcfg.q_level, q_ct);
+
+    // The public VALUES, all `head_dim` channels (the four in `vc` are only
+    // what the comparison reads). RoPE does not enter here, and the keys keep
+    // the test's ABSOLUTE rotation on both sides, so no `p - ptok` shift is
+    // needed -- that is a LAYER concern, where `BuildRope` puts the encrypted
+    // block at position 0.
+    std::vector<double> vfull(size_t(ptok) * kD, 0.0);
+    cheddar::ParallelFor(ptok, [&](int begin, int end) {
+      std::vector<double> y(kH);
+      for (int p = begin; p < end; p++) {
+        double ms = 0.0;
+        for (int c = 0; c < kH; c++) {
+          const double v = x0[size_t(p) * kH + c];
+          ms += v * v;
+        }
+        const double inv = 1.0 / std::sqrt(ms / kH + eps);
+        for (int c = 0; c < kH; c++) {
+          y[c] = double(x0[size_t(p) * kH + c]) * inv * double(an[c]);
+        }
+        for (int d = 0; d < kD; d++) {
+          double a = 0.0;
+          for (int c = 0; c < kH; c++) {
+            a += y[c] * double(wv[size_t(c) * kKv + kvh * kD + d]);
+          }
+          vfull[size_t(p) * kD + d] = a;
+        }
+      }
+    });
+
+    const int B = layout.num_instances;
+    const auto src = [&](int start, int width, std::vector<double> &kbuf,
+                         std::vector<double> &vbuf) {
+      // k[(c * width + p) * B + b] = Kpub[b][start + p][c]
+      // v[(p * head_dim + c) * B + b] = Vpub[b][start + p][c]
+      // Every instance sees the SAME public context, so the inner `b` runs
+      // over a constant.
+      for (int c = 0; c < kD; c++) {
+        for (int p = 0; p < width; p++) {
+          const double kv = kb[size_t(start + p) * kD + c];
+          double *dst = &kbuf[(size_t(c) * width + p) * B];
+          for (int b = 0; b < B; b++) dst[b] = kv;
+        }
+      }
+      for (int p = 0; p < width; p++) {
+        for (int c = 0; c < kD; c++) {
+          const double vv = vfull[size_t(start + p) * kD + c];
+          double *dst = &vbuf[(size_t(p) * kD + c) * B];
+          for (int b = 0; b < B; b++) dst[b] = vv;
+        }
+      }
+    };
+
+    // PC4096_PUBN cuts the public context short. The whole branch is 60 s a
+    // head, so a wrong constant costs a minute to see; 64 public tokens is a
+    // second and the host expectation below is over the same range, which
+    // makes this the debugging shape rather than the measuring one.
+    const int pubn = std::min(ptok, EnvInt("PC4096_PUBN", ptok));
+    auto tp0 = std::chrono::steady_clock::now();
+    pcp->Head(acc_real, pow_real, q_ct, pubn, src, boot.ui->GetEvkMap());
+    ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    const double tp =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0)
+            .count();
+    ASSERT_EQ(int(pow_real.size()), niter);
+    ASSERT_EQ(int(acc_real.size()), kD);
+    std::cout << "  [t4096] REAL public branch: " << ptok << " public tokens, "
+              << "q@" << pcfg.q_level << ", chunk " << pcfg.chunk << " -> "
+              << std::fixed << std::setprecision(1) << tp << " s a head"
+              << std::endl;
+
+    // What the branch OWES, before the join is asked to be right: `Finish`
+    // multiplies every power sum by `row_fold`, so the k-th should decrypt to
+    // `pow_host[j][t] * G_k[t]`. Checking that first separates a wrong public
+    // branch from a wrong join -- they fail the same way downstream.
+    {
+      HostTensor gp{layout.num_instances, T, niter, {}};
+      gp.v.assign(size_t(layout.num_instances) * T * niter, 0.0);
+      std::vector<int> wp(niter);
+      for (int j = 0; j < niter; j++) wp[j] = j;
+      DecryptChannels(boot, layout, pow_real, wp, gp);
+      for (int j = 0; j < niter; j++) {
+        const double e = std::ldexp(1.0, j + 1);
+        double d = 0.0, m = 0.0, worst_rel = 0.0;
+        int worst_t = 0;
+        for (int t = 0; t < T; t++) {
+          double s = 0.0;
+          for (int p = 0; p < pubn; p++) s += std::pow(y0_of(t, p), e);
+          const double want_j = s * Gk[t];
+          const double got_j = gp.At(0, t, j);
+          d = std::max(d, std::abs(got_j - want_j));
+          m = std::max(m, std::abs(want_j));
+          const double rel = std::abs(got_j / want_j - 1.0);
+          if (rel > worst_rel) {
+            worst_rel = rel;
+            worst_t = t;
+          }
+        }
+        std::cout << "  [t4096]   pow[" << j << "] vs host*G_k : "
+                  << std::scientific << std::setprecision(3) << d << " of "
+                  << m << "  worst RELATIVE " << worst_rel << " at row "
+                  << worst_t << " (got " << gp.At(0, worst_t, j) << ")"
+                  << std::endl;
+        if (j == 0) {
+          // Is what is missing a per-row constant, and is it `G_k`? Three
+          // rows with very different `G_k` settle it in one line each.
+          for (int t : {3, 64, 127}) {
+            double s2 = 0.0;
+            for (int p = 0; p < pubn; p++) s2 += std::pow(y0_of(t, p), e);
+            std::cout << "  [t4096]     row " << t << ": got "
+                      << gp.At(0, t, j) << "  raw " << s2 << "  raw*G_k "
+                      << (s2 * Gk[t]) << "  G_k " << Gk[t] << "  got/raw "
+                      << (gp.At(0, t, j) / s2) << std::endl;
+          }
+        }
+      }
+      // `DecryptChannels` writes at the CHANNEL index, not at the position in
+      // `which`, so a tensor narrower than `max(which) + 1` is a heap
+      // overwrite -- which is what the first run's `munmap_chunk` was.
+      HostTensor ga{layout.num_instances, T, kD, {}};
+      ga.v.assign(size_t(layout.num_instances) * T * kD, 0.0);
+      std::vector<int> wa(vc.size());
+      for (size_t i = 0; i < vc.size(); i++) wa[i] = vc[i];
+      DecryptChannels(boot, layout, acc_real, wa, ga);
+      double d = 0.0, m = 0.0;
+      for (int t = 0; t < T; t++) {
+        for (size_t i = 0; i < vc.size(); i++) {
+          double a = 0.0;
+          for (int p = 0; p < pubn; p++) {
+            a += std::pow(y0_of(t, p), top_pow) *
+                 vpub[size_t(p) * vc.size() + i];
+          }
+          const double want_a = a * Gk[t];
+          d = std::max(d, std::abs(ga.At(0, t, vc[i]) - want_a));
+          m = std::max(m, std::abs(want_a));
+        }
+      }
+      std::cout << "  [t4096]   acc     vs host*G_k : " << std::scientific
+                << std::setprecision(3) << d << " of " << m << "  (2^"
+                << std::fixed << std::setprecision(2)
+                << std::log2(std::max(d / m, 1e-300)) << ")" << std::endl;
     }
   }
 
@@ -2698,11 +2962,11 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
     }
     cts.clear();
     std::vector<Ciphertext<word>> pow_ct;
-    EncryptChannels(boot, layout, pw, kPowLevel, pow_ct);
+    if (!real_pub) EncryptChannels(boot, layout, pw, kPowLevel, pow_ct);
 
     typename cheddar::CiBatchAttention<word>::PublicHalf pub;
-    pub.pow = &pow_ct;
-    pub.pow_scale = pow_scale;
+    pub.pow = real_pub ? &pow_real : &pow_ct;
+    pub.pow_scale = real_pub ? pow_scale_real : pow_scale;
     Ciphertext<word> pub_scale;
     std::vector<Ciphertext<word>> P;
     attn.SoftMax(P, booted, head, carried, boot.ui->GetEvkMap(), &pub,
@@ -2740,22 +3004,38 @@ TEST(CiBatch, TheJointSoftMaxOverAPublicContextMatchesTheHost) {
         }
       }
       std::vector<Ciphertext<word>> acc_ct;
-      EncryptChannels(boot, layout, ha, 5, acc_ct);
       std::vector<Ciphertext<word>> outp;
-      pc.JoinOutput(outp, acc_ct, pub_scale, boot.ui->GetEvkMap());
+      if (real_pub) {
+        // `JoinOutput` consumes `acc`, and with a real public branch there is
+        // only one of it; POP mode runs the unfolded arm alone, so that is
+        // exactly enough.
+        ASSERT_FALSE(acc_real.empty())
+            << "the real public accumulator was already consumed -- "
+               "PC4096_REAL_PUB serves one arm";
+        pcp->JoinOutput(outp, acc_real, pub_scale, boot.ui->GetEvkMap());
+        acc_real.clear();
+      } else {
+        EncryptChannels(boot, layout, ha, 5, acc_ct);
+        pc.JoinOutput(outp, acc_ct, pub_scale, boot.ui->GetEvkMap());
+      }
       ASSERT_EQ(cudaGetLastError(), cudaSuccess);
 
-      HostTensor go{layout.num_instances, T, int(vc.size()), {}};
-      go.v.assign(ha.v.size(), 0.0);
+      const int ochan = real_pub ? kD : int(vc.size());
+      HostTensor go{layout.num_instances, T, ochan, {}};
+      go.v.assign(size_t(layout.num_instances) * T * ochan, 0.0);
+      // The real branch carries every head_dim channel; the host one carries
+      // only the four the comparison reads.
       std::vector<int> which(vc.size());
-      for (size_t i = 0; i < vc.size(); i++) which[i] = int(i);
+      for (size_t i = 0; i < vc.size(); i++) {
+        which[i] = real_pub ? vc[i] : int(i);
+      }
       DecryptChannels(boot, layout, outp, which, go);
-      HostTensor wo{layout.num_instances, T, int(vc.size()), {}};
-      wo.v.assign(ha.v.size(), 0.0);
+      HostTensor wo{layout.num_instances, T, ochan, {}};
+      wo.v.assign(size_t(layout.num_instances) * T * ochan, 0.0);
       for (int b : bs) {
         for (int t = 0; t < T; t++) {
           for (size_t i = 0; i < vc.size(); i++) {
-            wo.At(b, t, int(i)) = outpub[size_t(t) * vc.size() + i];
+            wo.At(b, t, which[i]) = outpub[size_t(t) * vc.size() + i];
           }
         }
       }
