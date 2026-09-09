@@ -710,6 +710,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // alone and both norms state a window with a margin. Everything the served
   // prompt would otherwise contribute is switched off together, here.
   const bool certified = std::getenv("BERT_CALIB_DIR") != nullptr;
+  const bool gelu_only_env = std::getenv("BERT_CERT_GELU_ONLY") != nullptr;
   std::vector<double> attn_resid(num_layers, 0.0), ffn_resid(num_layers, 0.0);
   std::vector<std::vector<double>> suppress(num_layers);
   for (int n = 0; n < num_layers; n++) {
@@ -742,7 +743,9 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
       // 9.5) instead of the median, and the bits that costs the stream are
       // exactly the price of prompt independence. It is the one number the
       // host study could not predict, so it is printed below.
-      if (!certified && row[t] > target) suppress[n][t] = target / row[t];
+      if ((!certified || gelu_only_env) && row[t] > target) {
+        suppress[n][t] = target / row[t];
+      }
       ffn_resid[n] = std::max(ffn_resid[n], row[t] * suppress[n][t]);
     }
     if (n == 0) {
@@ -1064,9 +1067,29 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
       // AND EVERYTHING PER TOKEN GOES. The plan's windows are stated for the
       // RAW variance, so a per-token rescale left on would move the invsqrt's
       // argument off the window it was fitted for.
-      cal.attn_scale.clear();
-      cal.ffn_scale.clear();
-      cal.row_suppress.clear();
+      //
+      // `BERT_CERT_GELU_ONLY=1` keeps the norms as they were -- their
+      // per-token rescale, their window of 1.5, their degree 7 -- and
+      // certifies the GELU alone. That half FITS today's landing (a
+      // degree-63 band tree is `levels(63) + 1 = 7`, exactly the budget)
+      // where the norms' half does not (degree 31 is 9 against 7, and no
+      // landing that affords it fits an 80 GB card: 12.5). So it is the
+      // only way to measure the certified GELU on the real crypto today.
+      const bool gelu_only = std::getenv("BERT_CERT_GELU_ONLY") != nullptr;
+      if (!gelu_only) {
+        cal.attn_scale.clear();
+        cal.ffn_scale.clear();
+        cal.row_suppress.clear();
+      } else {
+        cal.attn_alpha = 1.0;
+        cal.attn_window = 1.5;
+        cal.attn_degree = 0;
+        cal.attn_invsqrt.clear();
+        cal.ffn_alpha = 1.0;
+        cal.ffn_window = 1.5;
+        cal.ffn_degree = 0;
+        cal.ffn_invsqrt.clear();
+      }
       std::cout << "CERTIFIED plan: " << cal.gelu_bands.size()
                 << " GELU bands, ranges";
       for (const auto &b : cal.gelu_bands) std::cout << " " << b.range;
@@ -1074,7 +1097,10 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
                 << "; attn window " << cal.attn_window << " deg "
                 << cal.attn_degree << ", ffn window " << cal.ffn_window
                 << " deg " << cal.ffn_degree
-                << "; nothing per token" << std::endl;
+                << (gelu_only ? "; GELU ONLY (the norms keep their "
+                                "per-prompt per-token rescale)"
+                              : "; nothing per token")
+                << std::endl;
     } else {
       std::cout << "corpus GELU plan: bulk +-" << cal.gelu_range << " deg "
                 << cal.gelu_degree << ", wide +-" << cal.gelu_wide_range
