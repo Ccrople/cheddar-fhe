@@ -283,6 +283,27 @@ class CiBertLayer {
     //! maximum per layer and the corpus reaches 0.95 of it at layers 3-7,
     //! so it is not a loose bound (`reference/docs/BERT_BASE_B1.md` 11.1).
     std::vector<GeLuBand> gelu_bands;
+    //! One MODE of a per-channel plan (`GeLu.h`'s `Mode`): a polynomial and
+    //! the per-CHANNEL weight its answer is taken with, `hidden_live` long.
+    struct GeLuMode {
+      std::vector<double> coeffs;
+      std::vector<double> weight;
+    };
+    //! The per-channel plan, as modes. When it is non-empty it replaces the
+    //! bands AND the four-group plan: the GELU becomes
+    //! `sum_r beta_r * P_r(v)` with `v_j = (u_j - c_j) / rad_j` -- the
+    //! channel's OWN certified interval, which is what a band plan cannot
+    //! give it. Both halves of that affine are public and free: `1/rad_j`
+    //! rides the crossing's own per-slot multiply and `-c_j/rad_j` rides the
+    //! intermediate bias, which is already added in slots.
+    //!
+    //! Measured at degree 127 on layer 0: eight bands leave the feed-forward
+    //! at 1.5e-02, the full per-channel fit at 4.3e-04, and TWELVE modes
+    //! reproduce the per-channel answer (the coefficient matrix is a smooth
+    //! two-parameter family and is numerically low rank).
+    std::vector<GeLuMode> gelu_modes;
+    //! `rad_j` and `c_j` per DECLARED hidden channel, for the affine above.
+    std::vector<double> gelu_rad, gelu_centre;
   };
 
   CiBertLayer(std::shared_ptr<const BootContext<word>> boot,

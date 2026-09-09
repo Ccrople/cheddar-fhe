@@ -468,6 +468,26 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     // 30 slots of 393,216 at layers 9 and 10 and none anywhere else, and
     // without it those slots would be a Chebyshev evaluated outside its
     // interval, which is unbounded.
+    // ---- a MODE plan replaces the groups entirely ------------------------
+    //
+    // `v_j = (u_j - c_j) / rad_j` is the channel's OWN certified interval,
+    // and both halves of that affine are public and free: `1/rad_j` rides
+    // the crossing's per-slot multiply below (which is already happening)
+    // and `-c_j/rad_j` rides the intermediate bias, which is already a slot
+    // add. So a mode plan costs one evaluation a MODE and no mask at all.
+    const bool use_modes = !c.gelu_modes.empty();
+    std::unique_ptr<GeLuHandler<word>> mode_gelu;
+    if (use_modes) {
+      AssertTrue(static_cast<int>(c.gelu_rad.size()) >= cfg_.hidden_live &&
+                     static_cast<int>(c.gelu_centre.size()) >=
+                         cfg_.hidden_live,
+                 "CiBertLayer: a mode plan needs gelu_rad and gelu_centre");
+      std::vector<typename GeLuHandler<word>::Mode> ms(c.gelu_modes.size());
+      for (size_t r = 0; r < c.gelu_modes.size(); r++) {
+        ms[r].coeffs = c.gelu_modes[r].coeffs;
+      }
+      mode_gelu = std::make_unique<GeLuHandler<word>>(boot_, ms, op_level_);
+    }
     std::vector<typename GeLuHandler<word>::Group> groups;
     if (!c.gelu_bands.empty()) {
       // The CERTIFIED plan: every band a fit over an interval `u` cannot
@@ -490,8 +510,9 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     const int num_groups = static_cast<int>(groups.size());
     GeLuHandler<word> gelu(boot_, groups, op_level_);
     // The caller divides by the handler's OWN range; a band whose range
-    // differs recovers it through its mask (`GeLu.h`).
-    const double gelu_range = gelu.GetRange();
+    // differs recovers it through its mask (`GeLu.h`). A mode plan divides
+    // per CHANNEL instead, so its "range" is one.
+    const double gelu_range = use_modes ? 1.0 : gelu.GetRange();
     const int log_t = Log2Ceil(cfg_.num_tokens);
     const int rank = cfg_.proj_rank;
     std::vector<std::vector<Complex>> mask(num_groups);
@@ -508,7 +529,36 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
       // masks below.
       const double base =
           1.0 / (crossing_ * c.int_scale * out_scale * gelu_range);
-      if (c.row_suppress.empty()) {
+      if (use_modes) {
+        // The per-CHANNEL divide, on the multiply the crossing is already
+        // paying for. The row suppression, when there is one, simply
+        // multiplies it -- both are public and both are per slot.
+        std::vector<Complex> msg(num_slots_, Complex(0.0, 0.0));
+        for (int ch = 0; ch < rank; ch++) {
+          const int declared = i * rank + ch;
+          const double r = declared < cfg_.hidden_live
+                               ? base / c.gelu_rad[declared]
+                               : 0.0;
+          for (int t = 0; t < cfg_.num_tokens; t++) {
+            const double sup =
+                c.row_suppress.empty() ? 1.0 : 1.0 / c.row_suppress[t];
+            msg[static_cast<size_t>(ch) * cfg_.num_tokens + Rev(t, log_t)] =
+                Complex(r * sup, 0.0);
+          }
+        }
+        // The scale is `TokenPlaintext`'s: the multiply and the rescale
+        // together have to land the stream back on `op_level_`'s canonical
+        // scale, so the plaintext carries
+        // `GetScale(op) * RescalePrimeProd(slot) / ct.GetScale()`.
+        Pt pt;
+        boot_->gpu_encoder_.Encode(
+            pt, slot_level_,
+            boot_->param_.GetScale(op_level_) *
+                boot_->param_.GetRescalePrimeProd(slot_level_) /
+                ups[i].GetScale(),
+            msg);
+        Canonicalise(ups[i], pt);
+      } else if (c.row_suppress.empty()) {
         Canonicalise(ups[i], base);
       } else {
         std::vector<double> inv(cfg_.num_tokens);
@@ -522,9 +572,12 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
         std::vector<Complex> bmsg(num_slots_, Complex(0.0, 0.0));
         for (int ch = 0; ch < rank; ch++) {
           const int declared = i * rank + ch;
-          const double b = declared < cfg_.hidden_live
-                               ? (*w.bint)[declared] / gelu_range
-                               : 0.0;
+          const double b =
+              declared >= cfg_.hidden_live
+                  ? 0.0
+                  : (use_modes ? ((*w.bint)[declared] - c.gelu_centre[declared]) /
+                                     c.gelu_rad[declared]
+                               : (*w.bint)[declared] / gelu_range);
           for (int t = 0; t < cfg_.num_tokens; t++) {
             bmsg[static_cast<size_t>(ch) * cfg_.num_tokens + t] =
                 Complex(b, 0.0);
@@ -535,24 +588,44 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
                                    boot_->param_.GetScale(op_level_), bmsg);
         boot_->Add(ups[i], ups[i], bpt);
       }
-      for (int gsel = 0; gsel < num_groups; gsel++) {
-        mask[gsel].assign(num_slots_, Complex(0.0, 0.0));
-      }
-      for (int ch = 0; ch < rank; ch++) {
-        const int declared = i * rank + ch;
-        for (int t = 0; t < cfg_.num_tokens; t++) {
-          const size_t s =
-              static_cast<size_t>(ch) * cfg_.num_tokens + Rev(t, log_t);
-          int which = 0;
-          if (declared < cfg_.hidden_live && !c.gelu_group.empty()) {
-            which = c.gelu_group[static_cast<size_t>(t) * cfg_.hidden_live +
-                                 declared];
-            if (which >= num_groups) which = 0;
+      if (use_modes) {
+        // One weight vector a mode, for THIS ciphertext's channels. The
+        // weights are per channel and constant along the token axis --
+        // there is nothing per prompt anywhere in a mode plan.
+        std::vector<std::vector<Complex>> wt(c.gelu_modes.size());
+        for (size_t r = 0; r < c.gelu_modes.size(); r++) {
+          wt[r].assign(num_slots_, Complex(0.0, 0.0));
+          for (int ch = 0; ch < rank; ch++) {
+            const int declared = i * rank + ch;
+            if (declared >= cfg_.hidden_live) continue;
+            const double b = c.gelu_modes[r].weight[declared];
+            for (int t = 0; t < cfg_.num_tokens; t++) {
+              wt[r][static_cast<size_t>(ch) * cfg_.num_tokens + Rev(t, log_t)] =
+                  Complex(b, 0.0);
+            }
           }
-          mask[which][s] = Complex(1.0, 0.0);
         }
+        mode_gelu->ApplyModes(act[i], ups[i], wt, evk);
+      } else {
+        for (int gsel = 0; gsel < num_groups; gsel++) {
+          mask[gsel].assign(num_slots_, Complex(0.0, 0.0));
+        }
+        for (int ch = 0; ch < rank; ch++) {
+          const int declared = i * rank + ch;
+          for (int t = 0; t < cfg_.num_tokens; t++) {
+            const size_t s =
+                static_cast<size_t>(ch) * cfg_.num_tokens + Rev(t, log_t);
+            int which = 0;
+            if (declared < cfg_.hidden_live && !c.gelu_group.empty()) {
+              which = c.gelu_group[static_cast<size_t>(t) * cfg_.hidden_live +
+                                   declared];
+              if (which >= num_groups) which = 0;
+            }
+            mask[which][s] = Complex(1.0, 0.0);
+          }
+        }
+        gelu.Apply(act[i], ups[i], mask, evk);
       }
-      gelu.Apply(act[i], ups[i], mask, evk);
       ups[i] = Ct{};
       if (!c.row_suppress.empty()) {
         // THE SUPPRESSION GOES ON THE ANSWER, and it cannot ride a mask: the

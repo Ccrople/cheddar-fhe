@@ -1058,6 +1058,39 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
                                       "range; the mask divides by it";
         cal.gelu_bands.push_back(band);
       }
+      // ---- the MODE plan, when the file carries one ---------------------
+      //
+      // A band gives every channel in it the band's WIDEST interval; a mode
+      // plan gives each channel its OWN, at R evaluations rather than 3072,
+      // because the per-channel coefficient matrix is numerically low rank.
+      // Measured at degree 127 on layer 0: bands 1.5e-02, per channel
+      // 4.3e-04 (`reference/docs/BERT_BASE_B1.md` 12.6).
+      if (cl.contains("gelu_modes") && !cl["gelu_modes"].empty()) {
+        // The modes come out of an SVD, so the FIRST R of them are the best
+        // rank-R plan there is: `BERT_GELU_MODES` sweeps the cost/accuracy
+        // trade without regenerating anything.
+        size_t keep = cl["gelu_modes"].size();
+        if (const char *k = std::getenv("BERT_GELU_MODES")) {
+          keep = std::min<size_t>(keep, std::max(1, std::atoi(k)));
+        }
+        cal.gelu_modes.clear();
+        for (const auto &mj : cl["gelu_modes"]) {
+          if (cal.gelu_modes.size() >= keep) break;
+          typename cheddar::CiBertLayer<word>::Calibration::GeLuMode m;
+          m.coeffs = mj["coeffs"].get<std::vector<double>>();
+          m.weight = mj["weight"].get<std::vector<double>>();
+          ASSERT_EQ(static_cast<int>(m.weight.size()), kI)
+              << "a mode's weight must cover every hidden channel";
+          cal.gelu_modes.push_back(m);
+        }
+        cal.gelu_rad = cl["gelu_rad"].get<std::vector<double>>();
+        cal.gelu_centre = cl["gelu_centre"].get<std::vector<double>>();
+        cal.gelu_bands.clear();
+        std::cout << "MODE plan: " << cal.gelu_modes.size()
+                  << " modes of degree " << (cal.gelu_modes[0].coeffs.size() - 1)
+                  << ", each channel on its OWN certified interval"
+                  << std::endl;
+      }
       // The two norms: a window with a MARGIN (the variance has no certified
       // interval), the degree the Chebyshev rate for `x^-1/2` asks of that
       // window, and a vector fitted for RELATIVE error.

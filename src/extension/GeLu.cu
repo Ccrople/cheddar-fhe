@@ -124,6 +124,87 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
 }
 
 template <typename word>
+GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
+                               const std::vector<Mode> &modes, int input_level)
+    : context_{std::move(context)}, modes_{modes}, input_level_{input_level} {
+  AssertTrue(!modes_.empty(), "GeLu: at least one mode");
+  // A MODE PLAN HAS NO MASK ON THE INPUT. Every mode is evaluated on `v` as
+  // it stands -- the caller has already divided by each channel's own radius
+  // through the projection's weights and the crossing's plaintext -- so no
+  // slot is ever handed a zero argument and nothing collects a `p(0)`. The
+  // per-slot plaintext multiplies the ANSWER, and it costs the one level the
+  // band plan spent on its input mask.
+  const double scale = context_->param_.GetScale(input_level_);
+  polys_.resize(modes_.size());
+  // TWO PASSES, for the reason `SiLu.cu` records: `EvalPoly` stamps the
+  // target scale on unchecked, so it has to be the canonical scale of the
+  // level the tree LANDS on -- which is not known until the degrees are.
+  std::vector<int> levels;
+  for (size_t i = 0; i < modes_.size(); i++) {
+    AssertTrue(!modes_[i].coeffs.empty(), "GeLu: a mode with no polynomial");
+    const int degree_used =
+        EvalPoly<word>(modes_[i].coeffs, input_level_, scale, scale, true)
+            .GetPolyDegree();
+    levels.push_back(input_level_ - Log2Ceil(degree_used + 1));
+  }
+  poly_out_level_ = *std::min_element(levels.begin(), levels.end());
+  for (size_t i = 0; i < modes_.size(); i++) {
+    polys_[i] = std::make_unique<EvalPoly<word>>(
+        modes_[i].coeffs, input_level_, scale,
+        context_->param_.GetScale(levels[i]), /*chebyshev=*/true);
+    polys_[i]->Compile(context_);
+  }
+  for (size_t i = 0; i < modes_.size(); i++) {
+    AssertTrue(levels[i] == poly_out_level_,
+               "GeLu: mode " + std::to_string(i) + " lands at level " +
+                   std::to_string(levels[i]) + " but another lands at " +
+                   std::to_string(poly_out_level_) +
+                   " -- every mode must have the same TREE DEPTH");
+  }
+  AssertTrue(poly_out_level_ >= 1,
+             "GeLu: the modes and their weights do not fit below the input "
+             "level");
+  out_level_ = poly_out_level_ - 1;
+}
+
+template <typename word>
+void GeLuHandler<word>::ApplyModes(
+    Ct &res, const Ct &v, const std::vector<std::vector<Complex>> &weight,
+    const EvkMap<word> &evk_map) const {
+  NvtxScope _nv("gelu: ApplyModes");
+  AssertTrue(!modes_.empty(), "GeLu: ApplyModes on a group plan");
+  AssertTrue(weight.size() == modes_.size(),
+             "GeLu: one weight vector per mode");
+  const auto &mult_key = evk_map.GetMultiplicationKey();
+  if (cached_mode_level_ != poly_out_level_ || cached_mode_weight_ != weight) {
+    mode_pt_.clear();
+    mode_pt_.resize(modes_.size());
+    const double scale = context_->param_.GetScale(poly_out_level_);
+    for (size_t i = 0; i < modes_.size(); i++) {
+      context_->gpu_encoder_.Encode(mode_pt_[i], poly_out_level_, scale,
+                                    weight[i]);
+    }
+    cached_mode_weight_ = weight;
+    cached_mode_level_ = poly_out_level_;
+  }
+  Ct term, product, accum;
+  for (size_t i = 0; i < modes_.size(); i++) {
+    polys_[i]->Evaluate(context_, term, v, mult_key);
+    context_->Mult(product, term, mode_pt_[i]);
+    if (i == 0) {
+      context_->Copy(accum, product);
+    } else {
+      context_->Add(accum, accum, product);
+    }
+  }
+  // ONE rescale for the whole sum: the modes all land on the same level and
+  // their plaintexts are encoded at that level's scale, so the products are
+  // at the same scale and add BEFORE the rescale rather than after it --
+  // which is also why a mode plan costs one level and not R of them.
+  context_->Rescale(res, accum);
+}
+
+template <typename word>
 double GeLuHandler<word>::GetRange() const {
   for (const auto &g : groups_) {
     if (g.kind == Kind::kFit) return g.range;

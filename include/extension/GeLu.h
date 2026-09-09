@@ -109,6 +109,37 @@ class GeLuHandler {
     kZero,      //!< nothing: exact where `u` is below it
   };
 
+  /**
+   * @brief One MODE of a per-channel plan: a polynomial every slot is given,
+   * and the per-slot weight its answer is taken with.
+   *
+   * WHY A MODE PLAN EXISTS. A band plan gives every channel in a band the
+   * SAME interval -- its widest member's -- and that interval, not the
+   * degree, is what it loses on: at degree 127 eight bands leave the
+   * feed-forward at 1.5e-02 where a fit over each channel's OWN certified
+   * radius leaves it at 4.3e-04. But a per-channel plan is a coefficient
+   * VECTOR per channel, and 3072 polynomials cannot be evaluated.
+   *
+   * They do not have to be. The matrix `C[channel][k]` of per-channel
+   * Chebyshev coefficients is a smooth two-parameter family (the channel's
+   * centre and radius) and is numerically LOW RANK: measured on BERT at
+   * degree 127, twelve modes reproduce the full per-channel answer and
+   * sixteen are indistinguishable from it. So
+   *
+   *     p_j(v) = sum_r beta_r[j] * P_r(v)
+   *
+   * with `P_r` ordinary constant-coefficient polynomials -- R evaluations of
+   * the UNMASKED input, each output multiplied by a per-slot plaintext and
+   * summed. There is no mask on the input, so no slot is ever handed a zero
+   * argument and there is no `p(0)` to collect (`Apply` below).
+   */
+  struct Mode {
+    //! `P_r`'s Chebyshev coefficients on [-1, 1]. The weights are NOT here:
+    //! they are per CIPHERTEXT, so `ApplyModes` takes them the way `Apply`
+    //! takes its masks, and the compiled polynomials are shared.
+    std::vector<double> coeffs;
+  };
+
   /** @brief One slot group: how it is answered, and over what interval. */
   struct Group {
     Kind kind = Kind::kFit;
@@ -153,6 +184,26 @@ class GeLuHandler {
   double GetRange(int g) const { return groups_[g].range; }
   //! The range the caller must divide by: the one fitted group's.
   double GetRange() const;
+  /**
+   * @brief The MODE constructor: `sum_r beta_r * P_r(v)`, one evaluation a
+   * mode on the input as it stands. The caller has already divided by each
+   * channel's own radius (that folds into the projection's weights and the
+   * crossing's plaintext, both public), so there is no range and no mask.
+   */
+  GeLuHandler(ConstContextPtr<word> context, const std::vector<Mode> &modes,
+              int input_level);
+
+  /**
+   * @brief `sum_r weight[r] * P_r(v)` for ONE ciphertext.
+   * @param weight one vector a mode, in the caller's slot order.
+   */
+  void ApplyModes(Ct &res, const Ct &v,
+                  const std::vector<std::vector<Complex>> &weight,
+                  const EvkMap<word> &evk_map) const;
+
+  //! Whether this handler was built from modes.
+  bool IsModes() const { return !modes_.empty(); }
+
   //! The level `Apply` leaves its output at.
   int GetOutputLevel() const { return out_level_; }
 
@@ -188,6 +239,11 @@ class GeLuHandler {
  private:
   ConstContextPtr<word> context_;
   std::vector<Group> groups_;
+  std::vector<Mode> modes_;
+  mutable std::vector<Pt> mode_pt_;
+  mutable std::vector<std::vector<Complex>> cached_mode_weight_;
+  mutable int cached_mode_level_ = -1;
+
   int input_level_;
   int poly_out_level_ = 0;
   int out_level_ = 0;
