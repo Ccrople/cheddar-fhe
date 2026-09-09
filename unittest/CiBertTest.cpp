@@ -56,7 +56,16 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char *kFfnParam = "ci16_35_land13c2e9.json";
+constexpr const char *kFfnParamDefault = "ci16_35_land13c2e9.json";
+// The layer half's ring, overridable: a CERTIFIED calibration has no
+// per-token rescale, so its invsqrt windows are the raw variance's (17 to
+// 12,000 across the twenty-four norms) and the degree the Chebyshev rate
+// asks of those does not fit the landing at 13. `gen_landing.py ci16_35.json
+// 17 parameters/ci16_35_land17c2e9.json 2 9` builds the deeper one.
+inline const char *FfnParam() {
+  const char *e = std::getenv("BERT_FFN_PARAM");
+  return (e && *e) ? e : kFfnParamDefault;
+}
 constexpr const char *kBootParam = "ci16_35.json";
 constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
 constexpr const char *kSmallParam = "ci12_35_boot.json";
@@ -467,7 +476,7 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   // compiled at `GetStCStartLevel()` and an operator eight levels deep cannot
   // reach it without slack.
   const auto t_setup0 = std::chrono::steady_clock::now();
-  Ring ring(kFfnParam, /*secret_coeffs=*/{}, /*boot_slack_levels=*/9,
+  Ring ring(FfnParam(), /*secret_coeffs=*/{}, /*boot_slack_levels=*/9,
             /*build_user_interface=*/true);
   auto ctx = std::dynamic_pointer_cast<BootContext<word>>(ring.context);
   ASSERT_NE(ctx, nullptr);
@@ -696,6 +705,11 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // PER LAYER, not one for the chain. Layer L's factor has to keep both
   // crossings it is read by inside EvalMod's range: the residual L writes
   // (`z_pre`) and the one L+1's attention writes on top of it (`h_pre`).
+  // A certified plan (`reference/scripts/bert_plan.py`) has NOTHING per token
+  // and nothing per prompt in it: the GELU's bands come from the weights
+  // alone and both norms state a window with a margin. Everything the served
+  // prompt would otherwise contribute is switched off together, here.
+  const bool certified = std::getenv("BERT_CALIB_DIR") != nullptr;
   std::vector<double> attn_resid(num_layers, 0.0), ffn_resid(num_layers, 0.0);
   std::vector<std::vector<double>> suppress(num_layers);
   for (int n = 0; n < num_layers; n++) {
@@ -722,7 +736,13 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     const double target = sorted[kT / 2];
     suppress[n].assign(kT, 1.0);
     for (int t = 0; t < kT; t++) {
-      if (row[t] > target) suppress[n][t] = target / row[t];
+      // THE SUPPRESSION IS PER PROMPT -- it is read off THIS prompt's
+      // `z_pre` -- so a CERTIFIED plan cannot use it. Without it the ride is
+      // set by the true row maximum (1001.5 at layer 10 against a median of
+      // 9.5) instead of the median, and the bits that costs the stream are
+      // exactly the price of prompt independence. It is the one number the
+      // host study could not predict, so it is printed below.
+      if (!certified && row[t] > target) suppress[n][t] = target / row[t];
       ffn_resid[n] = std::max(ffn_resid[n], row[t] * suppress[n][t]);
     }
     if (n == 0) {
@@ -765,7 +785,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   Ring small(kSmallParam);
   Ring lifted(kLiftedParam, cheddar::CiLiftHandler<word>::LiftSecret(
                                 small.ui->GetSecretCoeffs()));
-  Ring ffn(kFfnParam, boot.ui->GetSecretCoeffs(), /*boot_slack_levels=*/9,
+  Ring ffn(FfnParam(), boot.ui->GetSecretCoeffs(), /*boot_slack_levels=*/9,
            /*build_user_interface=*/true);
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(ffn.context);
@@ -1004,12 +1024,65 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
                            ".u8",
                        static_cast<size_t>(kT) * kI, cal.gelu_group))
         << "no corpus GELU groups for layer " << LAYER;
-    std::cout << "corpus GELU plan: bulk +-" << cal.gelu_range << " deg "
-              << cal.gelu_degree << ", wide +-" << cal.gelu_wide_range
-              << " deg " << cal.gelu_wide_degree << ", "
-              << static_cast<int>(cl["gelu_wide_channels"].get<double>())
-              << " wide channels"
-              << std::endl;
+    if (cl.contains("gelu_bands")) {
+      // ---- THE CERTIFIED PLAN ---------------------------------------------
+      //
+      // Every band is a fit over an interval `u` cannot leave: with
+      // `a_j = gain * W[:,j]` and `c_j = bias . W[:,j] + b_j`, a LayerNorm
+      // output lies exactly on the sphere of radius sqrt(768), so
+      // `|u_j - c_j| <= sqrt(768) ||a_j - mean(a_j)||` for EVERY input.
+      // Checked over 28 prompts x 128 tokens x 3072 channels x 12 layers:
+      // never violated, maximum occupancy 0.9527. So there is no identity
+      // group and no zero group -- those two were the per-prompt part, and
+      // the only ones whose failure is a wrong answer rather than a bounded
+      // one (`reference/docs/BERT_BASE_B1.md` 11.1).
+      cal.gelu_bands.clear();
+      for (const auto &bj : cl["gelu_bands"]) {
+        typename cheddar::CiBertLayer<word>::Calibration::GeLuBand band;
+        band.range = bj["range"].get<double>();
+        band.degree = static_cast<int>(bj["degree"].get<double>());
+        band.coeffs = bj["coeffs"].get<std::vector<double>>();
+        ASSERT_GT(band.range, 0.0) << "band " << cal.gelu_bands.size()
+                                   << " of layer " << LAYER << " states no "
+                                      "range; the mask divides by it";
+        cal.gelu_bands.push_back(band);
+      }
+      // The two norms: a window with a MARGIN (the variance has no certified
+      // interval), the degree the Chebyshev rate for `x^-1/2` asks of that
+      // window, and a vector fitted for RELATIVE error.
+      cal.attn_alpha = cl["attn_norm"]["alpha"].get<double>();
+      cal.attn_window = cl["attn_norm"]["window"].get<double>();
+      cal.attn_degree =
+          static_cast<int>(cl["attn_norm"]["degree"].get<double>());
+      cal.attn_invsqrt =
+          cl["attn_norm"]["coeffs"].get<std::vector<double>>();
+      cal.ffn_alpha = cl["ffn_norm"]["alpha"].get<double>();
+      cal.ffn_window = cl["ffn_norm"]["window"].get<double>();
+      cal.ffn_degree =
+          static_cast<int>(cl["ffn_norm"]["degree"].get<double>());
+      cal.ffn_invsqrt = cl["ffn_norm"]["coeffs"].get<std::vector<double>>();
+      // AND EVERYTHING PER TOKEN GOES. The plan's windows are stated for the
+      // RAW variance, so a per-token rescale left on would move the invsqrt's
+      // argument off the window it was fitted for.
+      cal.attn_scale.clear();
+      cal.ffn_scale.clear();
+      cal.row_suppress.clear();
+      std::cout << "CERTIFIED plan: " << cal.gelu_bands.size()
+                << " GELU bands, ranges";
+      for (const auto &b : cal.gelu_bands) std::cout << " " << b.range;
+      std::cout << " deg " << cal.gelu_bands[0].degree
+                << "; attn window " << cal.attn_window << " deg "
+                << cal.attn_degree << ", ffn window " << cal.ffn_window
+                << " deg " << cal.ffn_degree
+                << "; nothing per token" << std::endl;
+    } else {
+      std::cout << "corpus GELU plan: bulk +-" << cal.gelu_range << " deg "
+                << cal.gelu_degree << ", wide +-" << cal.gelu_wide_range
+                << " deg " << cal.gelu_wide_degree << ", "
+                << static_cast<int>(cl["gelu_wide_channels"].get<double>())
+                << " wide channels"
+                << std::endl;
+    }
   }
   std::cout << "cq " << cq << ", ck " << ck << ", cv " << cv
             << ", stream in " << stream_scale << " out " << stream_out

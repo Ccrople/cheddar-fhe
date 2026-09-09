@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
@@ -105,6 +106,21 @@ GeLuHandler<word>::GeLuHandler(ConstContextPtr<word> context,
   out_level_ = poly_out_level_;
   AssertTrue(!multi_ || poly_out_level_ + 1 <= fit_in_level,
              "GeLu: the saturated groups have no level to be multiplied at");
+  // EVERY FITTED GROUP MUST LAND ON THE SAME LEVEL. `Apply` sums the groups
+  // and `Context::Add` requires the same NP and the same scale, so two fits
+  // whose trees differ in DEPTH -- not in degree: 31 and 25 both cost five
+  // levels, 31 and 63 do not -- would abort inside the addition with a
+  // message about neither GELU nor its groups. A band plan is exactly the
+  // caller that can do this by accident, so say it here.
+  for (size_t i = 0; i < groups_.size(); i++) {
+    if (groups_[i].kind != Kind::kFit) continue;
+    AssertTrue(levels[i] == poly_out_level_,
+               "GeLu: fitted group " + std::to_string(i) + " lands at level " +
+                   std::to_string(levels[i]) + " but another lands at " +
+                   std::to_string(poly_out_level_) +
+                   " -- every fitted group must have the same TREE DEPTH "
+                   "(ceil(log2(degree + 1))), or the groups cannot be summed");
+  }
 }
 
 template <typename word>
