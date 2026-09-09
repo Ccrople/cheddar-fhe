@@ -194,6 +194,25 @@ class CiBatchLayer {
                                        //!< widened window, deg-63 fits the budget
     double softmax_first_lo = 0.0, softmax_first_hi = 0.0;
     double softmax_later_lo = 0.0, softmax_later_hi = 0.0;
+    //! The per-(iteration, head, row) estimate the FIRST invsqrt's argument is
+    //! divided by, so its polynomial sees a RATIO near one instead of the
+    //! population's raw `sq_0`. Empty = no fold (the shipped behaviour).
+    //!
+    //! It is not a statistic about the prompt. The causal mask makes the live
+    //! key count `live = t + 1` PUBLIC and `sq_0` scales with it, so the
+    //! per-row constant folds out something the server already knows; what is
+    //! left is the diffuse-vs-concentrated spread of the row, which is what
+    //! the window then has to cover. Measured over 2560 contexts at T = 128
+    //! (`reference/docs/ROBUST_CALIBRATION.md` 3.3): the first window goes
+    //! 10000x -> 271x and the LAST invsqrt's worst case 2.9e-01 -> 4.0e-05.
+    //! It costs the last invsqrt one level of floor, and at T = 128 there are
+    //! two spare. At T = 4096 there are not, and the fold is not the lever
+    //! there anyway -- see `gen_t4096_pop.py` and 3.2.
+    //!
+    //! `[niter][heads][tokens]`, handed to `SoftMaxCalibration::cho_est`
+    //! unchanged; `gen512.py` writes the first iteration and the reader fills
+    //! the rest with ones, which is a fold that does nothing.
+    std::vector<std::vector<std::vector<double>>> softmax_cho_est;
   };
 
   /** @brief The attention half's tensors on the device, `[in][out]` f32. */

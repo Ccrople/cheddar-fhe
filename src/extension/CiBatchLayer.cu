@@ -681,6 +681,10 @@ void CiBatchLayer<word>::Attention(
       sc.first_hi = c.softmax_first_hi;
       sc.norm_lo = c.softmax_later_lo;
       sc.norm_hi = c.softmax_later_hi;
+      // The first iteration's fold, if the calibration supplies one. Handed
+      // over unchanged: `PrepareSoftMax` validates the shape and raises the
+      // last invsqrt's floor by the level it costs.
+      sc.cho_est = c.softmax_cho_est;
     }
     AssertTrue(static_cast<int>(c.row_shift_raw.size()) == heads,
                "CiBatchLayer::Attention: row_shift_raw is [heads][tokens]");

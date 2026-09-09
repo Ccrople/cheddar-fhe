@@ -101,6 +101,42 @@ double EnvDouble(const char *name, double fallback) {
 }
 constexpr int kTokens = 128;
 
+// `softmax_cho_est`: the per-(head, row) estimate the FIRST invsqrt's argument
+// is divided by (`reference/docs/ROBUST_CALIBRATION.md` 3.3, written by
+// gen512.py as the population's geometric mean of `sq_0`). The JSON carries
+// the FIRST iteration only, `[heads][tokens]`, because that is the one whose
+// window is the population's -- every later `sq` is a collision probability on
+// the data-independent `[1/live, 1]` and has nothing per-row to fold out. The
+// remaining iterations are therefore filled with ones, a fold that does
+// nothing, so the shape `PrepareSoftMax` validates is the full one.
+//
+// Absent from the JSON the result is empty and the crypto is byte-identical to
+// the shipped path -- the fold is opt-in, and it is opt-in per calibration
+// rather than by environment because it costs the last invsqrt a level and the
+// window it hands on is only a theorem WITH it.
+std::vector<std::vector<std::vector<double>>> ReadChoEst(
+    const nlohmann::json &cj, int niter, int heads, int tokens) {
+  std::vector<std::vector<std::vector<double>>> est;
+  if (!cj.contains("softmax_cho_est") || niter <= 0) return est;
+  const auto &first = cj.at("softmax_cho_est");
+  EXPECT_EQ(static_cast<int>(first.size()), heads)
+      << "softmax_cho_est is [heads][tokens]";
+  est.assign(niter, std::vector<std::vector<double>>(
+                        heads, std::vector<double>(tokens, 1.0)));
+  for (int h = 0; h < heads; h++) {
+    const auto &row = first.at(h);
+    EXPECT_EQ(static_cast<int>(row.size()), tokens)
+        << "softmax_cho_est head " << h << " is one estimate a token";
+    for (int t = 0; t < tokens; t++) {
+      const double v = row.at(t).get<double>();
+      EXPECT_GT(v, 0.0) << "softmax_cho_est[" << h << "][" << t
+                        << "] must be positive -- it is divided by";
+      est[0][h][t] = v;
+    }
+  }
+  return est;
+}
+
 // The norm's channel-boot ring (Doing.md 7.38): CHEDDAR_CI_BATCH_CHAN_PARAM
 // names a gen_landing sub-ladder of the layer preset (ci16_35_land11c4e8s2,
 // landing 9) on the SAME secret; NormTurn then sums the squares before any
@@ -3216,6 +3252,8 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       cal.softmax_first_hi = cj.at("softmax_first_hi").get<double>();
       cal.softmax_later_lo = cj.at("softmax_later_lo").get<double>();
       cal.softmax_later_hi = cj.at("softmax_later_hi").get<double>();
+      cal.softmax_cho_est =
+          ReadChoEst(cj, cal.softmax_niter, kHeads, kTokens);
     }
     cal.attn_alpha = cj["attn_alpha"];
     cal.attn_norm_window = cj["attn_norm_window"];
@@ -4021,6 +4059,8 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
       cal.softmax_first_hi = cj.at("softmax_first_hi").get<double>();
       cal.softmax_later_lo = cj.at("softmax_later_lo").get<double>();
       cal.softmax_later_hi = cj.at("softmax_later_hi").get<double>();
+      cal.softmax_cho_est =
+          ReadChoEst(cj, cal.softmax_niter, kHeads, kTokens);
     } else {
       // The factored ride widens the single-prompt norm calibration; in prompts
       // mode the calibration is already the population's, so it is used as-is.
