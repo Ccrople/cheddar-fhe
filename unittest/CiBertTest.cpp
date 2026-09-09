@@ -66,6 +66,14 @@ inline const char *FfnParam() {
   const char *e = std::getenv("BERT_FFN_PARAM");
   return (e && *e) ? e : kFfnParamDefault;
 }
+// The layer half's boot SLACK, overridable. Only StC depends on it
+// (`BootContext.h`): more slack puts StC lower, which is one more level for
+// the norm and the GELU between the landing and `ToCoeff` -- and, measured
+// there, LESS StC memory, not more. Nine is what the Llama FFN uses.
+inline int FfnSlack() {
+  const char *e = std::getenv("BERT_FFN_SLACK");
+  return (e && *e) ? std::atoi(e) : 9;
+}
 constexpr const char *kBootParam = "ci16_35.json";
 constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
 constexpr const char *kSmallParam = "ci12_35_boot.json";
@@ -476,7 +484,7 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
   // compiled at `GetStCStartLevel()` and an operator eight levels deep cannot
   // reach it without slack.
   const auto t_setup0 = std::chrono::steady_clock::now();
-  Ring ring(FfnParam(), /*secret_coeffs=*/{}, /*boot_slack_levels=*/9,
+  Ring ring(FfnParam(), /*secret_coeffs=*/{}, /*boot_slack_levels=*/FfnSlack(),
             /*build_user_interface=*/true);
   auto ctx = std::dynamic_pointer_cast<BootContext<word>>(ring.context);
   ASSERT_NE(ctx, nullptr);
@@ -788,7 +796,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   Ring small(kSmallParam);
   Ring lifted(kLiftedParam, cheddar::CiLiftHandler<word>::LiftSecret(
                                 small.ui->GetSecretCoeffs()));
-  Ring ffn(FfnParam(), boot.ui->GetSecretCoeffs(), /*boot_slack_levels=*/9,
+  Ring ffn(FfnParam(), boot.ui->GetSecretCoeffs(), /*boot_slack_levels=*/FfnSlack(),
            /*build_user_interface=*/true);
   auto bctx = std::dynamic_pointer_cast<BootContext<word>>(boot.context);
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(ffn.context);
