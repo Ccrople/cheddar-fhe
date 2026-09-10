@@ -1211,11 +1211,35 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                  "reduction tree does not already hold");
     }
     slim_block_ = stride;
+    // APPENDIX D'S FOLD, which is the difference between slim costing a level
+    // and costing nothing. It needs `j == k`, and `j == k` is also where the
+    // appendix D search keeps `m` near 1, so the two constraints agree.
+    const bool fold = (calib_.slim_j == plan.k);
+    const int slim_levels = fold ? plan.k : plan.k + 1;
     slim_inv_ = std::make_unique<SlimPolyHandler<word>>(
         boot_, std::move(plan), stride, cho_inv_in_,
         boot_->param_.GetScale(cho_inv_in_),
-        boot_->param_.GetScale(cho_inv_in_ - (Log2Ceil(slim_deg) + 1)));
+        boot_->param_.GetScale(cho_inv_in_ - slim_levels), fold);
     slim_inv_->Compile();
+    slim_fold_ = fold;
+    if (fold) {
+      // The affine map onto the fit domain is `x = (sq - aff_b) / aff_a`, and
+      // it is already a multiply followed by an add. Folding `v^(1)` in turns
+      // its two SCALARS into PLAINTEXTS -- the same level, the same two
+      // operations -- and that is the whole cost of appendix D's fold.
+      const std::vector<Complex> &v1 = slim_inv_->GetLeadingMessage();
+      AssertTrue(!v1.empty(), "CiSinCAttention: the fold produced no v^(1)");
+      std::vector<Complex> a_msg(v1.size()), b_msg(v1.size());
+      for (size_t s = 0; s < v1.size(); s++) {
+        a_msg[s] = Complex(v1[s].real() / aff_a, 0.0);
+        b_msg[s] = Complex(-v1[s].real() * aff_b / aff_a, 0.0);
+      }
+      boot_->gpu_encoder_.Encode(slim_affine_a_, cho_inv_in_ + 1,
+                                 boot_->param_.GetScale(cho_inv_in_ + 1),
+                                 a_msg);
+      boot_->gpu_encoder_.Encode(slim_affine_b_, cho_inv_in_,
+                                 boot_->param_.GetScale(cho_inv_in_), b_msg);
+    }
     // The same floor `compile_inv` enforces for the Paterson-Stockmeyer path:
     // `(y r)^2` is P itself on the last pass, so `r` must leave two levels.
     // Slim at degree 64 lands ONE lower than PS at 63, and this is where that
@@ -1359,7 +1383,17 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
       hi = cho_later_hi_;
       inv = cho_inv_[1].get();
     }
-    {
+    const bool use_slim = (last && !first && slim_inv_ != nullptr);
+    if (use_slim && slim_fold_) {
+      // APPENDIX D'S FOLD. The affine is the same multiply and the same add;
+      // its two operands are PLAINTEXTS carrying `v^(1)` instead of scalars,
+      // so `sq` leaves here as `v^(1) . x` and Algorithm 1's leaf is a
+      // plaintext ADD. Same level as the scalar form, one level less overall.
+      Ct scaled;
+      boot_->Mult(scaled, sq, slim_affine_a_);
+      boot_->Rescale(sq, scaled);
+      boot_->Add(sq, sq, slim_affine_b_);
+    } else {
       // The levels are READ, not assumed: pass 0's `sq` is at `sq_level_`
       // and every later pass's at `top - 1`.
       const double aff_a = 0.5 * (hi - lo);
@@ -1379,7 +1413,7 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
       boot_->Add(sq, sq, shift);
     }
     Ct r;
-    if (last && !first && slim_inv_ != nullptr) {
+    if (use_slim) {
       // [SYLPH] Algorithm 1. `sq` is periodic in the slot index after the
       // reduction, so every block evaluates a different leaf of the eq. (3)
       // tree and the fold puts `P` back in every block -- which is what the

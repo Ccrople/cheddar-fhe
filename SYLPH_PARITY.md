@@ -199,14 +199,18 @@ doing it rather than describing it:
   `block * 2^(l-1)` for `l = 1..j`, and the reduction tree already asks for
   exactly that set for every `j <= 4` — which is every `j` the period admits.
   There is an assert saying so.
-- **It costs a level at equal accuracy.** Degree 63 becomes 64 and lands one
-  level lower, and on this window 63 is 2^-14.3 against 32's 2^-5.7. There is
-  an explicit assert at the same floor `compile_inv` uses, so switching the
-  knob on either works or names the reason. **Appendix D's
-  leading-coefficient fold is what makes it free** (`k` levels for degree
-  `2^k`), and the hook it needs — a plaintext multiply immediately before the
-  evaluation — already exists as the affine map onto the fit domain. That is
-  the next step and it is not implemented.
+- **Appendix D's fold is implemented, and it is what makes the trade even.**
+  Without it degree 63 becomes 64 and lands one level lower. With it —
+  automatic when `slim_j == k`, which is also where the appendix D search keeps
+  `m` near 1, so the two constraints agree — Algorithm 1 costs `k` levels for
+  degree `2^k`, exactly what Paterson-Stockmeyer costs for `2^k - 1`. The fold
+  needs the input pre-multiplied by `v^(1)`, and the hook is the affine map
+  onto the fit domain: its two SCALARS become plaintexts, the same level and
+  the same two operations, and slim's leaf is then a plaintext ADD. So at
+  equal levels the degrees are equal and slim wins on multiplications
+  outright, 6 against 23 at degree 64. There is still an explicit assert at
+  the same floor `compile_inv` uses, so a `slim_j < k` (no fold) says why it
+  does not fit rather than landing wrong.
 
 **Eq. (5) is not wired.** `SylphPcmm` is built and host-tested, and so is the
 `tau^2` it needs (`TauPermutation`, one `SlotPermute` at one level and 64

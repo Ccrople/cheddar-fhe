@@ -12,13 +12,14 @@ template <typename word>
 SlimPolyHandler<word>::SlimPolyHandler(ConstContextPtr<word> context,
                                        slim::SlimPlan plan, int block_slots,
                                        int input_level, double input_scale,
-                                       double output_scale)
+                                       double output_scale, bool fold_leading)
     : context_{std::move(context)},
       plan_{std::move(plan)},
       block_slots_{block_slots},
       input_level_{input_level},
       input_scale_{input_scale},
-      output_scale_{output_scale} {
+      output_scale_{output_scale},
+      fold_leading_{fold_leading} {
   AssertTrue(plan_.ok, "SlimPoly: the plan is not usable: " + plan_.why);
   AssertTrue(block_slots_ > 0 && (block_slots_ & (block_slots_ - 1)) == 0,
   // MaxNumSlots, not `degree_`: the CI ring has `degree_` real slots and an
@@ -34,11 +35,24 @@ SlimPolyHandler<word>::SlimPolyHandler(ConstContextPtr<word> context,
   // the leaf's plaintext multiply, and `j` for the fold. Theorem 1's `k + 1`.
   const int leaf_degree = 1 << (plan_.k - plan_.j);
   const int basis_levels = plan_.k - plan_.j;
-  output_level_ = input_level_ - basis_levels - 1 - plan_.j;
+  if (fold_leading_) {
+    // Appendix D. The leaf must be degree ONE, because that is the only case
+    // where folding the leading coefficient leaves nothing but a plaintext
+    // ADD -- at leaf degree 2 or more the remaining coefficients still need a
+    // multiply and the level comes back.
+    AssertTrue(plan_.j == plan_.k,
+               "SlimPoly: appendix D's fold needs j == k, where the leaf is "
+               "degree one and the leading coefficient is the whole of it");
+    output_level_ = input_level_ - plan_.j;
+  } else {
+    output_level_ = input_level_ - basis_levels - 1 - plan_.j;
+  }
   AssertTrue(output_level_ >= 0,
              "SlimPoly: Algorithm 1 needs " +
-                 std::to_string(plan_.NumLevels()) + " levels below " +
-                 std::to_string(input_level_) + ", and there are not that many");
+                 std::to_string(plan_.NumLevels(fold_leading_)) +
+                 " levels below " +
+                 std::to_string(input_level_) +
+                 ", and there are not that many");
   AssertTrue(leaf_degree >= 1, "SlimPoly: the leaf degree collapsed");
 }
 
@@ -84,6 +98,30 @@ void SlimPolyHandler<word>::Compile() {
     }
   }
 
+  if (fold_leading_) {
+    // v^(1) goes OUT to the caller, who multiplies it into the input upstream;
+    // v^(0) is added here, and an addition spends no level. That is the whole
+    // of appendix D's leaf.
+    leading_msg_.assign(slots, Complex(0.0, 0.0));
+    for (int s = 0; s < slots; s++) {
+      const std::vector<double> &c = plan_.leaf[(s / block_slots_) % blocks];
+      leading_msg_[s] = Complex(c.size() > 1 ? c[1] : 0.0, 0.0);
+    }
+    leaf_pt_.clear();
+    leaf_pt_.resize(1);
+    context_->encoder_.Encode(leaf_pt_[0], input_level_, input_scale_,
+                              leaf_msg_[0]);
+    m_pt_.clear();
+    m_pt_.resize(plan_.j);
+    for (int l = plan_.j; l >= 1; l--) {
+      const int lvl = input_level_ - (plan_.j - l + 1);
+      context_->encoder_.Encode(m_pt_[l - 1], lvl,
+                                context_->param_.GetScale(lvl), m_msg_[l - 1]);
+    }
+    compiled_ = true;
+    return;
+  }
+
   // --- encode -----------------------------------------------------------
   // The leaf's plaintexts sit at the level the Chebyshev basis lands on, with
   // the scale divided out per degree exactly as `EvalPolyNode::Compile` does
@@ -112,7 +150,8 @@ void SlimPolyHandler<word>::Compile() {
   leaf_pt_.resize(leaf_degree + 1);
   for (int delta = 0; delta <= leaf_degree; delta++) {
     const double scale =
-        (delta == 0) ? leaf_work_scale : (leaf_work_scale / basis_scale_[delta]);
+        (delta == 0) ? leaf_work_scale
+                     : (leaf_work_scale / basis_scale_[delta]);
     context_->encoder_.Encode(leaf_pt_[delta], leaf_work_level, scale,
                               leaf_msg_[delta]);
   }
@@ -157,52 +196,61 @@ void SlimPolyHandler<word>::Evaluate(Ct &res, const Ct &input,
   // Paterson-Stockmeyer is the refinement for small `j`, and it is `EvalPoly`'s
   // tree with `PAccum` in place of `CAccum` -- the same change the BERT
   // branch's mode plan wants.
-  Ct accum;
-  {
-    std::map<int, MultiLevelCiphertext<word>> basis;
-    Ct input_tmp;
-    context_->Copy(input_tmp, input);
-    basis.try_emplace(1, context_->param_, std::move(input_tmp));
-    if (leaf_degree >= 2) {
-      BasisMap<word> basis_map(input_level_, input_scale_,
-                               EvalPolyType::kNormal, true);
-      for (int delta = 2; delta <= leaf_degree; delta++) {
-        basis_map.AddBase(context_, delta);
+  if (fold_leading_) {
+    // The input already carries `v^(1)_i x` -- the caller folded it into the
+    // plaintext multiply that precedes this -- so the leaf is `x' + v^(0)`,
+    // an addition, and Algorithm 1 spends `k` levels rather than `k + 1`.
+    context_->Add(res, input, leaf_pt_[0]);
+  } else {
+    Ct accum;
+    {
+      std::map<int, MultiLevelCiphertext<word>> basis;
+      Ct input_tmp;
+      context_->Copy(input_tmp, input);
+      basis.try_emplace(1, context_->param_, std::move(input_tmp));
+      if (leaf_degree >= 2) {
+        BasisMap<word> basis_map(input_level_, input_scale_,
+                                 EvalPolyType::kNormal, true);
+        for (int delta = 2; delta <= leaf_degree; delta++) {
+          basis_map.AddBase(context_, delta);
+        }
+        basis_map.Evaluate(context_, basis, mult_key);
       }
-      basis_map.Evaluate(context_, basis, mult_key);
-    }
 
-    NPInfo np = context_->param_.LevelToNP(leaf_work_level);
-    std::vector<std::vector<DvConstView<word>>> ct_srcs;
-    std::vector<DvConstView<word>> pt_srcs;
-    double scale = 0.0;
-    int num_slots = 0;
-    for (int delta = 1; delta <= leaf_degree; delta++) {
-      MultiLevelCiphertext<word> &ml = basis.at(delta);
-      int lvl = ml.GetMaxLevel();
-      while (!context_->IsMultUnsafeCompatible(lvl, leaf_work_level)) lvl -= 1;
-      context_->AddLowerLevelsUntil(ml, lvl);
-      const Ct &ct = ml.AtLevel(lvl);
-      const int ter_diff = ct.GetNP().num_ter_ - np.num_ter_;
-      AssertTrue(ter_diff >= 0, "SlimPoly: leaf level mismatch");
-      ct_srcs.push_back(ct.ConstViewVector(ter_diff));
-      pt_srcs.push_back(leaf_pt_[delta].ConstView());
-      num_slots = Max(num_slots, ct.GetNumSlots());
-      const double s = ct.GetScale() * leaf_pt_[delta].GetScale();
-      if (scale == 0.0) {
-        scale = s;
-      } else {
-        context_->AssertSameScale(scale, s);
+      NPInfo np = context_->param_.LevelToNP(leaf_work_level);
+      std::vector<std::vector<DvConstView<word>>> ct_srcs;
+      std::vector<DvConstView<word>> pt_srcs;
+      double scale = 0.0;
+      int num_slots = 0;
+      for (int delta = 1; delta <= leaf_degree; delta++) {
+        MultiLevelCiphertext<word> &ml = basis.at(delta);
+        int lvl = ml.GetMaxLevel();
+        while (!context_->IsMultUnsafeCompatible(lvl, leaf_work_level)) {
+          lvl -= 1;
+        }
+        context_->AddLowerLevelsUntil(ml, lvl);
+        const Ct &ct = ml.AtLevel(lvl);
+        const int ter_diff = ct.GetNP().num_ter_ - np.num_ter_;
+        AssertTrue(ter_diff >= 0, "SlimPoly: leaf level mismatch");
+        ct_srcs.push_back(ct.ConstViewVector(ter_diff));
+        pt_srcs.push_back(leaf_pt_[delta].ConstView());
+        num_slots = Max(num_slots, ct.GetNumSlots());
+        const double s = ct.GetScale() * leaf_pt_[delta].GetScale();
+        if (scale == 0.0) {
+          scale = s;
+        } else {
+          context_->AssertSameScale(scale, s);
+        }
       }
+      accum.RemoveRx();
+      accum.ModifyNP(np);
+      accum.SetScale(scale);
+      accum.SetNumSlots(num_slots);
+      std::vector<DvView<word>> dst = accum.ViewVector(0, true);
+      context_->elem_handler_.PAccum(dst, np, ct_srcs, pt_srcs);
+      context_->Add(accum, accum, leaf_pt_[0]);
+      context_->Rescale(res, accum);
     }
-    accum.RemoveRx();
-    accum.ModifyNP(np);
-    accum.SetScale(scale);
-    accum.SetNumSlots(num_slots);
-    std::vector<DvView<word>> dst = accum.ViewVector(0, true);
-    context_->elem_handler_.PAccum(dst, np, ct_srcs, pt_srcs);
-    context_->Add(accum, accum, leaf_pt_[0]);
-    context_->Rescale(res, accum);
   }
 
   // --- lines 2-5: the fold ------------------------------------------------

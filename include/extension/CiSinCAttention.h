@@ -263,12 +263,20 @@ class CiSinCAttention {
     //! multiplications: `O(2^((k-j)/2)) + j` against `O(2^(k/2))`, which at
     //! degree 64 and `j = 6` is 6 against 23.
     //!
-    //! The trade only becomes free with appendix D's leading-coefficient
-    //! fold, which makes it `k` levels for degree `2^k` -- and the hook that
-    //! fold needs, a plaintext multiply immediately before the evaluation,
-    //! already exists here as the affine map onto the fit domain. That is the
-    //! next step and it is NOT implemented, so today this knob costs either a
-    //! level or eight bits and is off.
+    //! **Appendix D's fold is implemented and switches on automatically when
+    //! `slim_j == k`**, which is also the depth where appendix D's search
+    //! keeps `m` near 1 -- the two constraints agree. The affine map onto the
+    //! fit domain is already a plaintext multiply followed by an add; folding
+    //! `v^(1)` in turns its two SCALARS into plaintexts, which costs the same
+    //! level, and Algorithm 1's leaf then becomes a plaintext ADD. Degree
+    //! `2^k` in `k` levels is exactly what Paterson-Stockmeyer spends on
+    //! `2^k - 1`, so at `slim_j == k` the degrees are equal and slim wins on
+    //! multiplications outright: 6 against 23 at degree 64.
+    //!
+    //! At `slim_j < k` there is no fold and the level comes back, which is
+    //! what the landing assert in `PrepareSoftMax` reports.
+    //!
+    //! Default 0 (off) because none of this has met a GPU yet.
     int slim_j = 0;
   };
 
@@ -488,6 +496,12 @@ class CiSinCAttention {
   //! The degree the LAST invsqrt actually used, which slim rounds up to a
   //! power of two.
   int last_deg_used_ = 0;
+  //! Appendix D's fold, as the affine map's two operands. The walk's affine
+  //! onto the fit domain is `x = (sq - b) / a` with `a`, `b` scalars; folding
+  //! `v^(1)` in makes them the PLAINTEXTS `v^(1)/a` and `-v^(1) b/a`, which
+  //! costs the same level and leaves slim's leaf a plaintext ADD.
+  Pt slim_affine_a_, slim_affine_b_;
+  bool slim_fold_ = false;
   SoftMaxCalibration calib_;
   bool softmax_ready_ = false;
   int exp_in_ = 0, exp_out_ = 0, sq_level_ = 0, poly_in_ = 0;
