@@ -219,6 +219,9 @@ void SlimPolyHandler<word>::Evaluate(Ct &res, const Ct &input,
 
   AssertTrue(context_->param_.NPToLevel(res.GetNP()) == output_level_,
              "SlimPoly: Algorithm 1 did not land where Compile said it would");
+  // As `EvalPoly::Evaluate` does: check the scale rather than assert it into
+  // being, then set it exactly so accumulated double error cannot drift.
+  context_->AssertSameScale(res, output_scale_);
   res.SetScale(output_scale_);
   if (plan_.negated) {
     // Lemma 1 was applied to -P; the caller was told, but say it again here

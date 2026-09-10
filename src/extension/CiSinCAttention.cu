@@ -1073,6 +1073,7 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                    cho_inv_in_, cfg_.forward_level + 2,
                                    "later", &inv_used));
     inv_out = cho_inv_in_ - Log2Ceil(inv_used + 1);
+    last_deg_used_ = inv_used;
   }
 
   causal_a0_.clear();
@@ -1139,6 +1140,93 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                  boot_->param_.GetScale(exp_out_), mask_msg);
     }
   }
+  // --- [SYLPH] 3.4: the slim evaluator for the LAST inverse square root ----
+  //
+  // The auxiliary track is exactly what section 3.4 is for. After the
+  // rotate-and-add every slot of a row holds that row's whole norm, so the
+  // message is PERIODIC and the spare slots are copies. The period is
+  // `num_slots / rank`: the reduction tree rotates by `stride << t` for
+  // t = 0..3 with `stride = num_slots / rank`, so slot `s` ends up holding the
+  // cyclic sum over `{s + m * stride}` and slot `s + stride` holds the same
+  // set. It is DERIVED here rather than assumed, and a `j` the period cannot
+  // hold is refused rather than truncated.
+  slim_inv_.reset();
+  slim_block_ = 0;
+  if (calib_.slim_j > 0) {
+    AssertTrue(calib_.niter > 0,
+               "CiSinCAttention: slim_j is for the Cho iteration's last "
+               "invsqrt; the single-pass walk has no separate one");
+    const int stride = num_slots_ / layout.rank;
+    const int blocks = 1 << calib_.slim_j;
+    AssertTrue(stride > 0 && stride * blocks <= num_slots_,
+               "CiSinCAttention: [SYLPH] 3.4 needs 2^(t+j) <= N and the "
+               "auxiliary track's period is num_slots / rank");
+    // Slim needs a degree that is exactly a power of two. The shipped 63
+    // becomes 64, which is ONE MORE level than Paterson-Stockmeyer spends on
+    // 63 -- theorem 1 is `k + 1` for `2^k` and PS is `k + 1` for `2^(k+1) - 1`
+    // -- so this either overspends (and `compile_inv`'s assert says so) or the
+    // caller has dropped a degree to pay for it. The knob's documentation
+    // carries the arithmetic; this is where it is enforced.
+    int slim_deg = 1;
+    while (slim_deg < last_deg_used_) slim_deg <<= 1;
+    const double aff_a = 0.5 * (cho_later_hi_ - cho_later_lo_);
+    const double aff_b = 0.5 * (cho_later_hi_ + cho_later_lo_);
+    auto coeffs = chebfit::Interpolate(
+        [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+        slim_deg);
+    slim::DecomposeOptions opt;
+    opt.lo = -1.0;
+    opt.hi = 1.0;
+    // Appendix D's search, BOTH halves. Without the lookahead `m` reaches
+    // 8.8e5 on this very window at degree 64 -- 16 bits of dynamic range spent
+    // on a cancellation -- and with it stays near 1.
+    opt.lookahead = true;
+    slim::SlimPlan plan = slim::BuildPlan(coeffs, calib_.slim_j, opt);
+    AssertTrue(plan.ok, "CiSinCAttention: the slim plan failed: " + plan.why);
+    AssertFalse(plan.negated,
+                "CiSinCAttention: the invsqrt fit came back with a negative "
+                "leading coefficient, which lemma 1 cannot decompose; the "
+                "caller would have to negate and nothing here does");
+    AssertTrue(plan.range_bits < 1.0,
+               "CiSinCAttention: the slim decomposition spends " +
+                   std::to_string(plan.range_bits) +
+                   " bits of dynamic range on U^2 + V^2 - m, which is more "
+                   "than the fit is worth");
+    // NO NEW ROTATION KEYS. Algorithm 1's fold rotates by
+    // `block * 2^(l-1)` for l = 1..j, and the reduction tree above already
+    // asks for `stride << t` at t = 0..3 -- the same set for every j <= 4,
+    // which is every j the period can hold. So the slim path adds levels or
+    // accuracy but never a key, and `AddRequiredRotations` needs no change.
+    for (int l = 1; l <= calib_.slim_j; l++) {
+      const int dist = stride * (1 << (l - 1));
+      AssertTrue(std::find(reduce_dist_.begin(), reduce_dist_.end(), dist) !=
+                     reduce_dist_.end(),
+                 "CiSinCAttention: [SYLPH] 3.4's fold wants a rotation the "
+                 "reduction tree does not already hold");
+    }
+    slim_block_ = stride;
+    slim_inv_ = std::make_unique<SlimPolyHandler<word>>(
+        boot_, std::move(plan), stride, cho_inv_in_,
+        boot_->param_.GetScale(cho_inv_in_),
+        boot_->param_.GetScale(cho_inv_in_ - (Log2Ceil(slim_deg) + 1)));
+    slim_inv_->Compile();
+    // The same floor `compile_inv` enforces for the Paterson-Stockmeyer path:
+    // `(y r)^2` is P itself on the last pass, so `r` must leave two levels.
+    // Slim at degree 64 lands ONE lower than PS at 63, and this is where that
+    // shows up as a refusal rather than as a wrong level downstream.
+    AssertTrue(slim_inv_->GetOutputLevel() >= cfg_.forward_level + 2,
+               "CiSinCAttention: [SYLPH] 3.4's Algorithm 1 spends k + 1 levels "
+               "for degree 2^k where Paterson-Stockmeyer spends k + 1 for "
+               "2^(k+1) - 1, so the slim last invsqrt overspends its budget "
+               "here; appendix D's leading-coefficient fold is what makes it "
+               "k levels, and it is not implemented");
+    if (cfg_.verbose) {
+      std::cout << "CiSinCAttention: [SYLPH] 3.4 slim last invsqrt, degree "
+                << slim_deg << ", j " << calib_.slim_j << ", block " << stride
+                << ", landing " << slim_inv_->GetOutputLevel() << std::endl;
+    }
+  }
+
   softmax_ready_ = true;
   if (cfg_.verbose) {
     std::cout << "CiSinCAttention::PrepareSoftMax: niter " << k << ", exp deg "
@@ -1285,7 +1373,15 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
       boot_->Add(sq, sq, shift);
     }
     Ct r;
-    inv->Evaluate(boot_, r, sq, mult_key);
+    if (last && slim_inv_ != nullptr) {
+      // [SYLPH] Algorithm 1. `sq` is periodic in the slot index after the
+      // reduction, so every block evaluates a different leaf of the eq. (3)
+      // tree and the fold puts `P` back in every block -- which is what the
+      // multiply below needs, and why no mask is required here.
+      slim_inv_->Evaluate(r, sq, evk);
+    } else {
+      inv->Evaluate(boot_, r, sq, mult_key);
+    }
     const int meet = boot_->param_.NPToLevel(r.GetNP());
     // `y <- (y r)^2`. On the LAST pass that product is P itself, which is why
     // the two are the same three operations.

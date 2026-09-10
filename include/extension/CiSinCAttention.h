@@ -12,6 +12,7 @@
 #include "extension/BootContext.h"
 #include "extension/CiSinCBasis.h"
 #include "extension/EvalPoly.h"
+#include "extension/SlimPoly.h"
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
 
@@ -240,6 +241,32 @@ class CiSinCAttention {
     //! The largest live key count a row can have, for the later window's
     //! theorem `sq_j >= 1 / live`. 0 = the layout's `dim`.
     int live_max = 0;
+    //! [SYLPH] 3.4's SLIM evaluation for the LAST inverse square root, at
+    //! recursion depth `j`. 0 = the shipped Paterson-Stockmeyer path.
+    //!
+    //! This is the auxiliary track section 3.4 was written for: after the
+    //! rotate-and-add the norm is one value per row broadcast over every slot
+    //! of that row, so the message is periodic and the spare slots can carry
+    //! the decomposition tree instead of copies. `PrepareSoftMax` DERIVES the
+    //! period from the layout (`num_slots / rank`) rather than assuming it,
+    //! and refuses a `j` the period cannot hold.
+    //!
+    //! **It is not free, and the arithmetic is stated here so nobody has to
+    //! rediscover it.** Theorem 1 spends `k + 1` levels for degree `2^k`,
+    //! where Paterson-Stockmeyer spends the same `k + 1` for degree
+    //! `2^(k+1) - 1`. So at a fixed budget slim buys HALF the degree, and on
+    //! this window degree 63 is 2^-14.3 against degree 32's 2^-5.7 -- it
+    //! would be paid for in accuracy, not in levels. What it buys back is
+    //! multiplications: `O(2^((k-j)/2)) + j` against `O(2^(k/2))`, which at
+    //! degree 64 and `j = 6` is 6 against 23.
+    //!
+    //! The trade only becomes free with appendix D's leading-coefficient
+    //! fold, which makes it `k` levels for degree `2^k` -- and the hook that
+    //! fold needs, a plaintext multiply immediately before the evaluation,
+    //! already exists here as the affine map onto the fit domain. That is the
+    //! next step and it is NOT implemented, so today this knob costs either a
+    //! level or eight bits and is off.
+    int slim_j = 0;
   };
 
   /** @brief The keys one call needs, on three rings. */
@@ -451,6 +478,13 @@ class CiSinCAttention {
   std::vector<Pt> cross_sel_, call_sel_;
 
   // The compiled softmax walk.
+  //! [SYLPH] 3.4's slim evaluator for the last invsqrt, when `slim_j > 0`.
+  std::unique_ptr<SlimPolyHandler<word>> slim_inv_;
+  //! The slim block, DERIVED from the layout in PrepareSoftMax.
+  int slim_block_ = 0;
+  //! The degree the LAST invsqrt actually used, which slim rounds up to a
+  //! power of two.
+  int last_deg_used_ = 0;
   SoftMaxCalibration calib_;
   bool softmax_ready_ = false;
   int exp_in_ = 0, exp_out_ = 0, sq_level_ = 0, poly_in_ = 0;
