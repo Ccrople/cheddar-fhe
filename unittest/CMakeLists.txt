@@ -455,49 +455,15 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_stc2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_stc2.json COPYONLY)
 # Landing sub-ladders of ci16_35 (gen_landing.py, L in [5,19]); the test
 # defaults to land13 and reaches the rest via CHEDDAR_LAND_PARAM.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land5.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land5.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land6.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land6.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land7.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land7.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land8.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land8.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land9.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land9.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land10.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land12.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land12.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land14.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land14.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land16.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land16.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19.json COPYONLY)
 # The clean-landing sub-ladders of ci16_35 (gen_landing.py); boot_landing_test
 # defaults to land13 and reaches the others via CHEDDAR_LAND_PARAM.
 # The same ladders with TWO CoeffToSlot levels (gen_landing.py's 4th argument):
 # the module-basis CtS in its two-level real form (Doing.md 3.6/3.7), for the
 # feed-forward's BootContext.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15c2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19c2.json COPYONLY)
 # Nine EvalMod levels (CHEDDAR_BOOT_DOUBLE_ANGLE=4, K = 32): the range the
 # module-sparse secret's wrap-around wants (Doing.md 3.9).
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
@@ -511,8 +477,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c4e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c4e10.json COPYONLY)
 # The aux-boot-split tower (Doing.md 7.39): EvalMod ends at 13, so the fused
 # score boots land at score_top 12 on a climb-26 ladder.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
 # The gen_landing v3 twins (Doing.md 7.49): the EvalMod recursion SOLVED so
@@ -523,8 +487,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10v3.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10v3.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10v3.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10v3.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9v3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9v3.json COPYONLY)
 # The norm channel-boot ring (Doing.md 7.38): L = 11 with num_stc 2, so the
 # channel Boot lands at 9 on a climb-23 ladder; the deep ladder then serves
 # only the norm's accumulator (2 boots a layer).

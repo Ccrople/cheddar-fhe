@@ -142,7 +142,7 @@ class CiBatchAttention {
     //! ciphertext a head) bootstraps on its own short ring and the walk
     //! above `forward_level` shrinks to exp + mask + the two products --
     //! 8 levels at exp degree 15 -- so the scores can land at 12: a
-    //! shorter tower for the fused boots (`ci16_35_land13c3e10`, EvalMod
+    //! shorter tower for the fused boots (`ci16_35_land13c3e10v3`, EvalMod
     //! ending at 13), and the serial route LevelDowns to it. Requires
     //! `affine_in_prefix` on the fused route (the affine multiply has no
     //! level of its own at 12).
