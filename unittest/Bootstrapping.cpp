@@ -388,7 +388,20 @@ INSTANTIATE_TEST_SUITE_P(
                     "sylphflow16_40.json", "ci16_35.json", "ci16_40.json",
                     // The B = 512 batched layer's preset, for the boot
                     // benches; always run filtered to one preset.
-                    "ci16_35_stc2.json"),
+                    "ci16_35_stc2.json",
+                    // THE 2^40 CI FAMILY (`reference/scripts/ci20_family.py`):
+                    // one ladder per K with an EvalMod band whose every level
+                    // sits on the recursion's fixed point, so the landing
+                    // scale is 2^58 for any landing rather than a per-ladder
+                    // solve. Same max_level, dec and landing across the three.
+                    "ci16_40_k16.json", "ci16_40_k32.json",
+                    "ci16_40_k64.json",
+                    // The split variants, which separate two causes that the
+                    // family confounds: K rises WITH a shrinking CtS band
+                    // there, so `k32`/`k64` losing precision could be either
+                    // the extra double angle or the coarser transform.
+                    "ci16_40_k16_cts3.json", "ci16_40_k16_cts2.json",
+                    "ci16_40_k16_stc4.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

@@ -56,10 +56,37 @@ BootContext<word>::BootContext(const Parameter<word> &param,
   // StC is compiled below EvalMod's output on purpose ([SYLPH] figure 2 puts
   // the non-linear operators in between), and pinning the check to StC would
   // reject precisely the configuration the gap exists for.
-  AssertTrue(
-      param.max_level_ == boot_param.max_level_ &&
-          param.default_encryption_level_ == boot_param.GetEvalModEndLevel(),
-      "Parameter mismatch for BootContext");
+  //
+  // AND IT IS AN INEQUALITY, WHICH IS WHAT LETS ONE PRESET LAND FREELY.
+  // Equality forced a preset per landing level: `Boot` climbs to
+  // `boot_param.GetMaxLevel()` and everything below derives from there, so a
+  // shorter climb lands lower -- the mechanism [Grafting] D.2 asks for and
+  // the one `BootLandingTest` exercises -- but the check refused any climb
+  // that was not the ladder's own top, so the only way to land elsewhere was
+  // a whole new `Parameter`. That is where the twenty-odd `ci16_35_land*`
+  // files came from.
+  //
+  // What a shorter climb actually needs is that EvalMod's band still sits on
+  // levels that rescale by its start width, or the recursion `s <- s^2/prod`
+  // walks away from its fixed point (the 2^62 assert in `EvalMod`). That is a
+  // property of the LADDER, not of this check: a preset whose band levels are
+  // all stationary supports every landing inside the band, and
+  // `reference/scripts/ci20_family.py` builds one. So the invariant here
+  // becomes: climb no higher than the ladder goes, and land no higher than the
+  // level the ladder is willing to encrypt at.
+  AssertTrue(boot_param.max_level_ <= param.max_level_,
+             "BootContext: the boot climbs to " +
+                 std::to_string(boot_param.max_level_) +
+                 " but the parameter set tops out at " +
+                 std::to_string(param.max_level_));
+  AssertTrue(boot_param.GetEvalModEndLevel() <=
+                 param.default_encryption_level_,
+             "BootContext: EvalMod would land at " +
+                 std::to_string(boot_param.GetEvalModEndLevel()) +
+                 ", above the parameter set's encryption level " +
+                 std::to_string(param.default_encryption_level_));
+  AssertTrue(boot_param.GetEvalModEndLevel() >= 0,
+             "BootContext: the climb is too short to hold CtS + EvalMod");
 
   // At level 0, the scale is adjusted
   // level_zero_scale --> level_zero_scale * 2^log_scaleup_

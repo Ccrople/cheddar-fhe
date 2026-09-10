@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <random>
@@ -107,10 +108,38 @@ struct Ring {
       // 4 is K = 32 on nine EvalMod levels); otherwise the process default.
       const int num_double_angle =
           j.contains("num_double_angle") ? int(j["num_double_angle"]) : 0;
+      // THE MESSAGE RATIO IS A PRECISION KNOB AND IT WAS PINNED AT 5.
+      //
+      // EvalMod extracts `m` from `m + qI` through a sine, and what is left
+      // over is the sine's own cubic: the relative error is `a * w^2` with
+      // `w = 2^-log_message_ratio` the height the message rides at and
+      // `a = 2.58e-3` measured (Doing.md 1.5cv, identical to four digits
+      // across a factor of 256 in the argument). At `ratio = 5` that is
+      // `2.58e-3 * 2^-10 = 2.5e-6`, i.e. **18.6 bits** -- and `ci16_40`
+      // measures p = 18.9. So the cubic, not the scale and not the fit, is
+      // what caps a 20-bit bootstrap at this ratio, and every extra bit of
+      // ratio buys TWO bits until the additive floor `N/w` takes over.
+      //
+      // It is a U with an optimum, exactly as the ride is (1.5cv), so it
+      // belongs in the preset beside the scale that sets `N`. The env
+      // override exists to SWEEP it; a shipped preset states its own.
+      int log_message_ratio =
+          j.contains("log_message_ratio") ? int(j["log_message_ratio"]) : 5;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_MSG_RATIO");
+          e != nullptr && e[0] != 0) {
+        log_message_ratio = std::atoi(e);
+      }
+      // The climb, which is the landing: see `Testbed::BootMaxLevel`.
+      int climb = param->max_level_;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_CLIMB");
+          e != nullptr && e[0] != 0) {
+        climb = std::atoi(e);
+      }
       context = cheddar::BootContext<word>::Create(
-          *param, cheddar::BootParameter(param->max_level_,
+          *param, cheddar::BootParameter(climb,
                                          int(j["num_cts_levels"]),
-                                         int(j["num_stc_levels"]), 5,
+                                         int(j["num_stc_levels"]),
+                                         log_message_ratio,
                                          boot_slack_levels, num_double_angle));
     } else {
       context = cheddar::Context<word>::Create(*param);

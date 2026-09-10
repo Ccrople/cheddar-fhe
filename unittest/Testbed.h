@@ -8,6 +8,7 @@ using json = nlohmann::json;
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -229,10 +230,30 @@ class Testbed : public testing::TestWithParam<const char *> {
           json_data.contains("num_double_angle")
               ? int(json_data["num_double_angle"])
               : 0;
+      // The MESSAGE RATIO, which was pinned at 5 here as it was in
+      // `RingFixture`. It is EvalMod's ride height and therefore the term
+      // that caps a 20-bit bootstrap: the sine's cubic leaves a relative
+      // error `a * 2^(-2 ratio)` with `a = 2.58e-3` measured (1.5cv), so
+      // ratio 5 is 2.5e-6 = 18.6 bits and every extra bit of ratio buys two
+      // -- until the additive floor `N * 2^ratio` takes over and it turns
+      // into a U. A preset states its own; the env override sweeps it.
+      int log_message_ratio =
+          json_data.contains("log_message_ratio")
+              ? int(json_data["log_message_ratio"])
+              : 5;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_MSG_RATIO");
+          e != nullptr && e[0] != 0) {
+        log_message_ratio = std::atoi(e);
+      }
+      std::cout << "  boot: log_message_ratio " << log_message_ratio
+                << ", double angle "
+                << (num_double_angle > 0 ? std::to_string(num_double_angle)
+                                         : std::string("default"))
+                << std::endl;
       context_ = BootContext<word>::Create(
           *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
-                                 BootStcLevels(), 5, BootSlackLevels(),
-                                 num_double_angle));
+                                 BootStcLevels(), log_message_ratio,
+                                 BootSlackLevels(), num_double_angle));
     } else {
       context_ = Context<word>::Create(*param_);
     }
@@ -247,7 +268,19 @@ class Testbed : public testing::TestWithParam<const char *> {
   // CtS + EvalMod + StC -- so a test that wants a different landing level
   // overrides this. Climbing less far also makes every limb operation in
   // between shorter, which is the point.
-  virtual int BootMaxLevel() const { return param_->max_level_; }
+  virtual int BootMaxLevel() const {
+    // FREE LANDING FROM ONE PRESET. `Boot` climbs to this level and CtS,
+    // EvalMod and StC all derive from it, so a shorter climb lands lower --
+    // which is the whole of [Grafting] D.2's flexible output modulus. It
+    // needs a ladder whose EvalMod band is stationary wherever the band
+    // ends up (`ci20_family.py`); on one that is not, `EvalMod` says so by
+    // asserting that its scale ran away.
+    if (const char *e = std::getenv("CHEDDAR_BOOT_CLIMB");
+        e != nullptr && e[0] != 0) {
+      return std::atoi(e);
+    }
+    return param_->max_level_;
+  }
 
   // Levels left free between EvalMod and StC. Zero reproduces every shipped
   // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
