@@ -91,6 +91,31 @@ void EncryptAt(const Ring &r, Ciphertext<word> &ct,
   ct.SetNumSlots(r.param->MaxNumSlots());
 }
 
+// The HalfBoot -> SlotToCoeff cycle, WITH THE SLACK GAP CROSSED.
+//
+// Two gates run this cycle because HalfBoot's direct output holds the input's
+// coefficients bit-reversed in the slots, so only the cycle is comparable to
+// the message. HalfBoot lands where EvalMod ends; StC is compiled at
+// `GetStCStartLevel()`, which is `slack` levels lower ([SYLPH] figure 2 puts
+// the non-linear operators in between). With no slack the two coincide, which
+// is every shipped preset, so this is a no-op there -- but slack is the
+// LANDING knob (`CHEDDAR_BOOT_SLACK`), and without the LevelDown both gates
+// died on `Hoist: input level mismatch` and, because `AssertTrue` exits the
+// process, took every gate after them with it. `BootBack` does exactly this,
+// and tracks the LevelDown's drift into the scale it declares; here the
+// fitted `carried` absorbs it.
+void HalfBootThenStC(const std::shared_ptr<BootContext<word>> &b,
+                     const Ring &r, Ciphertext<word> &out,
+                     const Ciphertext<word> &in) {
+  const auto &bp = b->GetBootParameter();
+  Ciphertext<word> half;
+  b->HalfBoot(half, in, r.ui->GetEvkMap());
+  if (bp.GetNumSlackLevels() > 0) {
+    b->LevelDown(half, half, bp.GetStCStartLevel());
+  }
+  b->SlotToCoeff(out, r.param->MaxNumSlots(), half, r.ui->GetEvkMap());
+}
+
 std::vector<Complex> Decrypt(const Ring &r, const Ciphertext<word> &ct) {
   Plaintext<word> pt;
   r.ui->Decrypt(pt, ct);
@@ -193,11 +218,14 @@ TEST(ParamRobust, TheBootLandsAtItsNominalScale) {
   // so the honest check is the HalfBoot -> SlotToCoeff cycle, whose
   // permutations cancel and whose composite constant is measured, not
   // derived (BootContext.cpp says so at HalfBoot's SetScale).
-  Ciphertext<word> half;
-  b->HalfBoot(half, ct, r.ui->GetEvkMap());
-  ASSERT_EQ(r.param->NPToLevel(half.GetNP()), bp.GetEvalModEndLevel());
+  {
+    Ciphertext<word> half_probe;
+    b->HalfBoot(half_probe, ct, r.ui->GetEvkMap());
+    ASSERT_EQ(r.param->NPToLevel(half_probe.GetNP()),
+              bp.GetEvalModEndLevel());
+  }
   Ciphertext<word> cyc;
-  b->SlotToCoeff(cyc, num_slots, half, r.ui->GetEvkMap());
+  HalfBootThenStC(b, r, cyc, ct);
   const Fit h = FitResidual(msg, Decrypt(r, cyc));
   std::cout << "[landing] HalfBoot+StC cycle carried " << h.carried << " = 2^"
             << std::log2(std::abs(h.carried)) << " (derived crossing ratio 2^"
@@ -329,9 +357,8 @@ TEST(ParamRobust, TheRideProbe) {
     // The HalfBoot -> SlotToCoeff cycle (as in the landing test): the
     // direct HalfBoot output holds bit-reversed coefficients, whose
     // residual measures the encoding, not EvalMod's tail.
-    Ciphertext<word> half, res;
-    b->HalfBoot(half, ct, r.ui->GetEvkMap());
-    b->SlotToCoeff(res, num_slots, half, r.ui->GetEvkMap());
+    Ciphertext<word> res;
+    HalfBootThenStC(b, r, res, ct);
     const auto got = Decrypt(r, res);
     const Fit f = FitResidual(msg, got);
     double rms = 0.0;
