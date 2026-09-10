@@ -401,7 +401,15 @@ INSTANTIATE_TEST_SUITE_P(
                     // ANY landing instead of the per-ladder solve
                     // `gen_landing.py` v3 has to run.
                     "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
-                    "ci16_42_k64_w60.json"),
+                    "ci16_42_k64_w60.json",
+                    // Candidate: k32 without its thin single-terminal CtS
+                    // top. `num_ter - t_after_graft` must be a multiple of 3
+                    // or the CtS terminal levels come out ragged, and k32's
+                    // 9 - 2 = 7 left a level of ONE terminal (2^24.64) that
+                    // `EvalSpecialFFT` then consumes by a pure rescale --
+                    // legal, but it means num_cts 3 buys only 2 transform
+                    // levels. Eight terminals make it 6 = 3 + 3.
+                    "ci16_42_k32_w60c.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
