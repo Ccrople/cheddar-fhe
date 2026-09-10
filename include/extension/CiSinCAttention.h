@@ -263,20 +263,32 @@ class CiSinCAttention {
     //! multiplications: `O(2^((k-j)/2)) + j` against `O(2^(k/2))`, which at
     //! degree 64 and `j = 6` is 6 against 23.
     //!
-    //! **Appendix D's fold is implemented and switches on automatically when
-    //! `slim_j == k`**, which is also the depth where appendix D's search
-    //! keeps `m` near 1 -- the two constraints agree. The affine map onto the
-    //! fit domain is already a plaintext multiply followed by an add; folding
-    //! `v^(1)` in turns its two SCALARS into plaintexts, which costs the same
-    //! level, and Algorithm 1's leaf then becomes a plaintext ADD. Degree
-    //! `2^k` in `k` levels is exactly what Paterson-Stockmeyer spends on
-    //! `2^k - 1`, so at `slim_j == k` the degrees are equal and slim wins on
-    //! multiplications outright: 6 against 23 at degree 64.
+    //! Appendix D's fold (`SlimPolyHandler`'s `fold_leading`) switches on
+    //! automatically when `slim_j == k`, and it makes Algorithm 1 cost `k`
+    //! levels for degree `2^k` -- exactly Paterson-Stockmeyer's cost for
+    //! `2^k - 1`, so the degrees are then equal and slim wins on
+    //! multiplications outright.
     //!
-    //! At `slim_j < k` there is no fold and the level comes back, which is
-    //! what the landing assert in `PrepareSoftMax` reports.
+    //! **THE FOLD IS OUT OF REACH IN THIS POSITION, and the reason is worth
+    //! knowing before anyone tries.** How slim a ciphertext is decides how
+    //! many blocks the tree gets, and this auxiliary track is barely slim:
+    //! the norm is broadcast over the row's WHOLE period, which is
+    //! `num_slots / rank = 4096`, so only 16 blocks fit and `j <= 4`. The
+    //! fold needs `j == k`, hence degree at most 16 -- and degree 16 on the
+    //! later window `[1/live, 1]` is 2^-1.2, which is no use to anyone. So
+    //! what is actually available here is `j = 4, k = 6`: degree 64 in 7
+    //! levels where Paterson-Stockmeyer buys 63 in 6. **One extra level for
+    //! half the multiplications**, not a free win.
     //!
-    //! Default 0 (off) because none of this has met a GPU yet.
+    //! The payoff is gated on COMPACTING the auxiliary track to one slot per
+    //! row, which is what [SYLPH] 2.3 assumes when it says the auxiliary
+    //! track "operates on only d values" and is therefore "performed on
+    //! sparsely-packed ciphertexts". At a period of 128 the tree would get
+    //! 512 blocks and `j <= 9`, and the fold would reach degree 512. That
+    //! compaction, not appendix D, is the prerequisite.
+    //!
+    //! Default 0 (off): none of this has met a GPU yet, and on the numbers
+    //! above it should not be switched on before the compaction exists.
     int slim_j = 0;
   };
 

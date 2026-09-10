@@ -199,18 +199,24 @@ doing it rather than describing it:
   `block * 2^(l-1)` for `l = 1..j`, and the reduction tree already asks for
   exactly that set for every `j <= 4` — which is every `j` the period admits.
   There is an assert saying so.
-- **Appendix D's fold is implemented, and it is what makes the trade even.**
-  Without it degree 63 becomes 64 and lands one level lower. With it —
-  automatic when `slim_j == k`, which is also where the appendix D search keeps
-  `m` near 1, so the two constraints agree — Algorithm 1 costs `k` levels for
-  degree `2^k`, exactly what Paterson-Stockmeyer costs for `2^k - 1`. The fold
-  needs the input pre-multiplied by `v^(1)`, and the hook is the affine map
-  onto the fit domain: its two SCALARS become plaintexts, the same level and
-  the same two operations, and slim's leaf is then a plaintext ADD. So at
-  equal levels the degrees are equal and slim wins on multiplications
-  outright, 6 against 23 at degree 64. There is still an explicit assert at
-  the same floor `compile_inv` uses, so a `slim_j < k` (no fold) says why it
-  does not fit rather than landing wrong.
+- **Appendix D's fold is implemented, and it is out of reach HERE — which is
+  the most useful thing doing the wiring produced.** The fold makes Algorithm 1
+  cost `k` levels for degree `2^k`, exactly Paterson-Stockmeyer's cost for
+  `2^k - 1`, and it needs `j == k`. But how slim a ciphertext is decides how
+  many blocks the tree gets, and this auxiliary track is barely slim: the norm
+  is broadcast over the row's whole period, `num_slots / rank = 4096`, so only
+  16 blocks fit and `j <= 4`. `j == k <= 4` means degree at most 16, and
+  degree 16 on `[1/live, 1]` is 2^-1.2. So what is actually available is
+  `j = 4, k = 6`: **degree 64 in 7 levels where Paterson-Stockmeyer buys 63 in
+  6 — one extra level for half the multiplications**, not a free win.
+
+  The payoff is gated on **compacting the auxiliary track to one slot per
+  row**, which is exactly what §2.3 assumes when it says that track "operates
+  on only `d` values" and is therefore "performed on sparsely-packed
+  ciphertexts". At a period of 128 the tree would get 512 blocks, `j <= 9`,
+  and the fold would reach degree 512. That compaction, not appendix D, is the
+  prerequisite — and `SoftMax.h` had already flagged it ("here it is broadcast
+  across every slot by the reduction and bootstrapped at full width").
 
 **Eq. (5) is not wired.** `SylphPcmm` is built and host-tested, and so is the
 `tau^2` it needs (`TauPermutation`, one `SlotPermute` at one level and 64

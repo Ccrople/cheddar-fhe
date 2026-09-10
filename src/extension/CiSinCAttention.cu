@@ -1164,9 +1164,24 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                "FIRST one, over a different window at a different level");
     const int stride = num_slots_ / layout.rank;
     const int blocks = 1 << calib_.slim_j;
+    // The period argument only holds if the reduction tree covers a WHOLE
+    // period: slot `s` gets the cyclic sum over `{s + m stride}` for
+    // `m = 0 .. rank - 1`, and slot `s + stride` gets the same SET only when
+    // the tree's `log2(rank)` doublings span all of it. `reduce_dist_` is
+    // built with exactly four entries, so this is `rank == 16`, and a layout
+    // with a different rank must be refused rather than silently give slim a
+    // message that is not periodic at all.
+    AssertTrue(static_cast<int>(reduce_dist_.size()) ==
+                   Log2Ceil(layout.rank),
+               "CiSinCAttention: the reduction tree does not cover a whole "
+               "period, so the auxiliary track is not slim in the sense "
+               "[SYLPH] 3.4 needs");
     AssertTrue(stride > 0 && stride * blocks <= num_slots_,
-               "CiSinCAttention: [SYLPH] 3.4 needs 2^(t+j) <= N and the "
-               "auxiliary track's period is num_slots / rank");
+               "CiSinCAttention: [SYLPH] 3.4 needs 2^(t+j) <= N. The "
+               "auxiliary track's period here is num_slots / rank = 4096, so "
+               "only 16 blocks fit and j <= 4 -- which is the REAL limit on "
+               "what slim can do in this position, not the level budget. See "
+               "SoftMaxCalibration::slim_j");
     // Slim needs a degree that is exactly a power of two. The shipped 63
     // becomes 64, which is ONE MORE level than Paterson-Stockmeyer spends on
     // 63 -- theorem 1 is `k + 1` for `2^k` and PS is `k + 1` for `2^(k+1) - 1`
