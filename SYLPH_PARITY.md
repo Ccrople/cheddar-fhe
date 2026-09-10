@@ -39,7 +39,7 @@ implemented and verified on the host, the encrypted half awaits a GPU ·
 | § | What the paper specifies | Status | Where |
 |---|---|---|---|
 | 3.1.1 | sink-inducing prefix, precomputed KV, shared across queries | YES | `REF_SINKS=2`, the public rescaled copy at every norm |
-| 3.1.1 | **orthogonal rotations fused into down-proj, o-proj, v-proj** | HOST | `quarot_export.py`; the residual rotation was already there, the head-space `v -> o` pair is new (`QUAROT_VO=1`) and is the only one that can move v-proj's own range |
+| 3.1.1 | **orthogonal rotations fused into down-proj, o-proj, v-proj** | **MEASURED** | `quarot_export.py` (+ `QUAROT_VO=1` for the head-space `v -> o` pair, new). Tables 2 and 3 reproduced on our model by `sylph_tables.py` -- see "What the rotations actually buy" |
 | 3.1.2 | precision requirement estimated by injecting modelled CKKS noise and reading perplexity | YES | `reference/scripts/sylph_precision/` — reproduced, and see the caveat below |
 | 3.1.3 | non-linear degree from the calibrated range (SiLU 83 -> 31) | DIFF | `CiLlamaLayer::SiLuDegree` derives the degree from the range by a Bernstein-ellipse rule and caps at 63. See "Known gaps" |
 | 3.1.3 | **bootstrap input scaling by `1/B`**, `p - log2 B` effective bits | DIFF | this tree rides at `ride / abs_max` per crossing and derives the constant (`GetMessageRatio`), which is the same idea with a per-crossing `B` instead of a global 128 |
@@ -146,14 +146,15 @@ the cap is 2^-5.2 and that is the pipeline's current limiter (Doing 3.27).
 The range is also a corpus statistic (`1.2x` an observed maximum) that 7 of 600
 held-out prompts left.
 
-**A result that needs no measurement**: the certified sphere bound
-`|g_j| <= sqrt(H) * ||gain . W[:,j]||` is **exactly invariant under QuaRot**.
-The rotated model has `W' = Q (gain . W)` and `gain' = 1`, and `||Q v|| =
-||v||`, so the bound is the same number. Orthogonal rotations can therefore
-move the *observed* range and never the *certified* one. That is the sharp
-statement of what 3.1.1 can and cannot buy a pipeline that is trying to
-replace statistics with theorems — and it is why `sylph_tables.py` measures the
-observed range rather than assuming the rotation helps.
+**And it is worse than that, which the measurement settled.** The certified
+sphere bound `|g_j| <= sqrt(H) ||gain . W[:,j]||` is exactly invariant under
+QuaRot, because the rotated model has `W' = Q (gain . W)`, `gain' = 1`, and
+`||Q v|| = ||v||`. But the same algebra kills the *observed* range too:
+`g' = (u Q) . (Q w) = u . w = g`, so the SiLU's input is **the same number**,
+not merely the same bound. Measured over 8 held-out Wikipedia prompts and all
+32 layers, the SiLU range is identical to three digits at every single layer —
+layer 31 is 29.51 with the rotation and 29.51 without. See "What the rotations
+actually buy" above.
 
 **2. `first_hi` is a theorem here, not an estimate (4.3).** Section 4 says
 "Rather than relying on worst-case bounds as [25], we use the distributional
@@ -182,6 +183,58 @@ above and the one that produced 10 non-finite outputs in 600 prompts here. The
 paper reports no accuracy number measured from the encrypted execution.
 
 ---
+
+## What the rotations actually buy, measured
+
+`reference/scripts/sylph_tables.py`, 8 held-out Wikipedia prompts of 128
+tokens, all 32 layers, variants applied IN MEMORY so nothing depends on a
+second export agreeing with the first. `sink` is what this tree ships today;
+`vo` adds the residual rotation and the head-space `v -> o` pair.
+
+| quantity | `sink` | `+ rotation` | factor | [SYLPH] |
+|---|---|---|---|---|
+| SoftMax input | 76.88 | **76.88** | **1.00** | 39.24 -> 32.78 |
+| SiLU input | 29.51 | **29.51** | **1.00** | 23.00 -> 10.82 |
+| RMSNorm input | 29.31 | 3.67 | 8.0 | 2243.97 -> 7.65 |
+| down-proj output | 295.00 | 30.39 | 9.7 | 310.56 -> 1.92 |
+| o-proj output | 8.32 | 1.17 | 7.1 | 10.12 -> 1.08 |
+| v-proj output | 9.01 | 5.63 | 1.6 | 5.89 -> 4.74 |
+
+Three things follow, and the first is the one that matters.
+
+**1. The rotation cannot touch the SiLU or the SoftMax, and that is algebra,
+not a sampling artefact.** Their inputs are projections of a NORMED vector, and
+a residual rotation cancels inside the projection: `g' = (u Q)(Q w) = u w = g`.
+The per-layer table confirms it to three digits at all 32 layers (layer 31:
+29.51 against 29.51; only the `none` column moves, and only in the third digit,
+which is the sink rescaling). **The SiLU is this pipeline's current limiter, so
+3.1.1 buys our limiter nothing.** The 0.01-bit verdict that turned QuaRot off
+at 1.5dv was right, and now the reason is known — it was never about layer 2
+being unrepresentative.
+
+**2. What it does buy is real, and it is everything that LIVES in the residual
+stream**: RMSNorm's input 8x, down-proj's output 9.7x, o-proj's output 7.1x.
+Those are the operators the rotation reaches, because their input or output IS
+the rotated space rather than a projection out of it.
+
+**3. The head-space `v -> o` rotation is needed for table 3's third row and
+nothing else does it.** `resid` alone leaves v-proj at 9.01; `vo` brings it to
+5.63. That is why §3.1.1 names three layers, and it is the piece
+`quarot_export.py` did not have.
+
+**Caveats, because these are maxima.** Eight prompts is a weak estimate of a
+maximum and more prompts can only raise it. And our `none` column is NOT
+[SYLPH]'s "Baseline": it already carries the BOS x 2 prefix in the token ids
+and differs from `sink` only by the public rescaling. That matters for one
+comparison in particular — the paper attributes SiLU 23.00 -> 10.82 to
+*prefixing*, and our prefixing does nothing for the SiLU (29.44 -> 29.51).
+[SYLPH]'s prefix is a chosen-token KV cache identified offline; ours rescales
+the magnitude of two BOS tokens. **Those are different mechanisms, and theirs
+is the one reported to move the SiLU.** That, not the rotation, is the lead
+worth following for the remaining limiter.
+
+---
+
 
 ## Wiring
 
