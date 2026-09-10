@@ -1167,14 +1167,24 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // GELU's bands use, layer 0 reading the embedding norm) and the score
   // statistics are a held-out corpus's, with the served prompt excluded.
   //
-  // OPT-IN, and it is off by default. The plan's `softmax` section is
-  // host-verified (`bert_pop.py` walks it against the true softmax at
-  // 2^-15..-17 and both containment checks pass on the held-out prompt), but
-  // the CRYPTO path is not stable yet: three draws of layer 0 alone come back
-  // 2^-0.70 / 2^-1.34 / 2^+3.48 where the served-prompt control is
-  // 2^-11.465 / 2^-11.457 / 2^-11.462 -- so the pipeline is reproducible to
-  // half a hundredth of a bit and THIS path is not. The instability is the
-  // Cho walk's inter-pass Boot; see Doing.md 8.10.
+  // OPT-IN, because it carries a SECURITY trade and not an accuracy one.
+  //
+  // With it the leg stops reading the prompt it serves: `cq`, `ck`, `cv`,
+  // `m_eff`, `span`, `shift` and both per-row tables come from a corpus with
+  // the served prompt HELD OUT (`reference/scripts/bert_pop.py`). Twelve
+  // layers then run at 2^-7.79 / 2^-7.50 with the heads at 2^-11.47 and
+  // 2^-8.16, top-1 128 of 128 -- the SAME as the oracle-leg headline, so
+  // prompt independence here is free.
+  //
+  // What it costs is the sparse secret. The Cho iteration boots BETWEEN
+  // passes, and that is the first NATIVE full `Boot` this pipeline runs on
+  // `ci16_35` -- a K = 16 ring, against a MODULE-sparse secret whose native
+  // form has up to twice its module weight. `boot_test`'s own `Bootstrap` on
+  // that ring, nothing else changed: native h=32 3.76e+10, module 128,16
+  // 3.78e+10, module 128,32 **7.99e+06**. So this path is stable at h = 16
+  // (layer 0 three draws: 2^-10.162 / 2^-10.191 / 2^-10.171) and scatters by
+  // eight bits at h = 32, which is the security setting. Doing.md 8.10.7 has
+  // the two ways to have both; until one is done this is the user's call.
   const bool pop = have_plan && plan_all.contains("softmax") &&
                    std::getenv("BERT_POP_LEG") != nullptr;
   const json *pj = pop ? &plan_all["softmax"]["layers"][LAYER] : nullptr;
