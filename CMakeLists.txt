@@ -117,6 +117,8 @@ if(ENABLE_EXTENSION)
   src/extension/SlotPermute.cpp
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
+    src/extension/SlimPolyMath.cpp
+    src/extension/SlimPoly.cpp
     src/extension/SoftMax.cu
     src/extension/RoPe.cu
     src/extension/StripedMatrix.cpp

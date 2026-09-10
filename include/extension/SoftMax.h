@@ -102,12 +102,14 @@ namespace cheddar {
  * to multiply back. `SylphSchedule::Canonicalise` takes exactly that argument
  * and is also already being paid for.
  *
- * What remains unimplemented is section 3.4's *slim* evaluation. The
- * normalisation is one value per row, so it belongs in a sparsely-packed
- * ciphertext whose bootstrap is much cheaper than a full one; here it is
- * broadcast across every slot by the reduction and bootstrapped at full width.
- * That is a cost optimisation, not a level one -- theorem 1 keeps k+1 levels
- * for degree 2^k either way.
+ * Section 3.4's *slim* evaluation is `extension/SlimPoly.h` since this branch.
+ * The normalisation is one value per row, so it belongs in a sparsely-packed
+ * ciphertext; here it is broadcast across every slot by the reduction and
+ * bootstrapped at full width, which is what slim exists to stop paying for.
+ * It is a cost optimisation, not a level one -- theorem 1 keeps k+1 levels for
+ * degree 2^k either way -- and the measurement that decides where to use it is
+ * appendix D's `m`: without the lookahead half of that search it reaches 8.8e5
+ * on this very window at degree 64, and with it stays near 1.
  *
  * ## A row that spans several ciphertexts, which is a saving and not a cost
  *
@@ -138,7 +140,7 @@ namespace cheddar {
  * Section 3.4's slim polynomial evaluation is an auxiliary-track optimisation.
  * By its own theorem 1 it does not reduce levels (still k+1 for degree 2^k) --
  * it reduces multiplications to `O(2^((k-j)/2)) + j` and key-switchings. So it
- * is a later speedup, not a prerequisite.
+ * is a speedup, not a prerequisite; `SlimPolyHandler` implements it.
  *
  * @tparam word uint32_t or uint64_t
  */

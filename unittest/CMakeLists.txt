@@ -289,6 +289,13 @@ if (ENABLE_EXTENSION)
   target_link_libraries(softmax_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # [SYLPH] section 3.4 / Algorithm 1: the slim polynomial evaluation. The
+  # decomposition half is pure host arithmetic and runs without a GPU; the
+  # Algorithm 1 half needs one.
+  add_executable(slim_poly_test SlimPolyTest.cpp)
+  target_link_libraries(slim_poly_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Level-targeted bootstrapping: one landing level per fixture.
   add_executable(boot_level_test BootLevelTest.cpp)
   target_link_libraries(boot_level_test
