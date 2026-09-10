@@ -135,12 +135,15 @@ struct Ring {
           e != nullptr && e[0] != 0) {
         climb = std::atoi(e);
       }
+      const int initial_k =
+          j.contains("initial_k") ? int(j["initial_k"]) : 2;
       context = cheddar::BootContext<word>::Create(
           *param, cheddar::BootParameter(climb,
                                          int(j["num_cts_levels"]),
                                          int(j["num_stc_levels"]),
                                          log_message_ratio,
-                                         boot_slack_levels, num_double_angle));
+                                         boot_slack_levels, num_double_angle,
+                                         initial_k));
     } else {
       context = cheddar::Context<word>::Create(*param);
     }

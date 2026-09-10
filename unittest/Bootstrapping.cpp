@@ -389,19 +389,19 @@ INSTANTIATE_TEST_SUITE_P(
                     // The B = 512 batched layer's preset, for the boot
                     // benches; always run filtered to one preset.
                     "ci16_35_stc2.json",
-                    // THE 2^40 CI FAMILY (`reference/scripts/ci20_family.py`):
-                    // one ladder per K with an EvalMod band whose every level
-                    // sits on the recursion's fixed point, so the landing
-                    // scale is 2^58 for any landing rather than a per-ladder
-                    // solve. Same max_level, dec and landing across the three.
-                    "ci16_40_k16.json", "ci16_40_k32.json",
-                    "ci16_40_k64.json",
-                    // The split variants, which separate two causes that the
-                    // family confounds: K rises WITH a shrinking CtS band
-                    // there, so `k32`/`k64` losing precision could be either
-                    // the extra double angle or the coarser transform.
-                    "ci16_40_k16_cts3.json", "ci16_40_k16_cts2.json",
-                    "ci16_40_k16_stc4.json"),
+                    // THE 2^42 CI FAMILY, one ladder per K
+                    // (`reference/scripts/design_ci41.py`, band by
+                    // `ci20_family.py`). Measured p at ratio 4 (3 for k64):
+                    // **20.85 / 19.56 / 18.35**, so K = 16 clears [SYLPH]
+                    // 3.1.3's 20 bits and the other two do not -- a double
+                    // angle costs ~1.2 bits and only more scale buys it back.
+                    //
+                    // Every band level rescales by exactly 2^60, which is
+                    // EvalMod's fixed point, so the landing scale is 2^60 for
+                    // ANY landing instead of the per-ladder solve
+                    // `gen_landing.py` v3 has to run.
+                    "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
+                    "ci16_42_k64_w60.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

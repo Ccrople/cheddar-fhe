@@ -250,10 +250,16 @@ class Testbed : public testing::TestWithParam<const char *> {
                 << (num_double_angle > 0 ? std::to_string(num_double_angle)
                                          : std::string("default"))
                 << std::endl;
+      // `initial_k`: the base polynomial's period count. K = initial_k *
+      // 2^num_double_angle, so a preset can buy the same K with fewer
+      // double angles -- each of which costs ~1.2 bits.
+      const int initial_k = json_data.contains("initial_k")
+                                ? int(json_data["initial_k"]) : 2;
       context_ = BootContext<word>::Create(
           *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
                                  BootStcLevels(), log_message_ratio,
-                                 BootSlackLevels(), num_double_angle));
+                                 BootSlackLevels(), num_double_angle,
+                                 initial_k));
     } else {
       context_ = Context<word>::Create(*param_);
     }
