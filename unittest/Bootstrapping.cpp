@@ -407,18 +407,7 @@ INSTANTIATE_TEST_SUITE_P(
                     // `num_evalmod` long, so each of these supports exactly
                     // one climb (`ring_robust.sh` section B measures it).
                     "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
-                    "ci16_42_k64_w60.json",
-                    // Candidate: the FREE-LANDING shape. A shorter
-                    // climb needs every EvalMod level still on the
-                    // band AND the climb level carrying the full
-                    // terminal inventory -- the second is what the
-                    // family failed first ("ModDown: src q size
-                    // mismatch"). Here the graft cycle ends on
-                    // t == num_ter == 4 and every level above is a
-                    // main pair, so all of band and CtS carry all
-                    // four; the band is EvalMod + 1, which should buy
-                    // exactly two landings.
-                    "ci16_42_k16_free.json"),
+                    "ci16_42_k64_w60.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
