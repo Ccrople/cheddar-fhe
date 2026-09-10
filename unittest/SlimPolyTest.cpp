@@ -109,7 +109,8 @@ TEST(SlimMath, TheTreeReproducesThePolynomial) {
       EXPECT_EQ(plan.NumBlocks(), 1 << j);
       EXPECT_EQ(static_cast<int>(plan.leaf.size()), 1 << j);
       // Theorem 1's level count, which is the whole trade: `k + 1` levels for
-      // degree `2^k`, where Paterson-Stockmeyer spends `k + 1` on `2^(k+1) - 1`.
+      // degree `2^k`, where Paterson-Stockmeyer spends `k + 1` on
+      // `2^(k+1) - 1`.
       EXPECT_EQ(plan.NumLevels(), k + 1);
       // The plan's own arithmetic must sit far below the fit it is evaluating,
       // or slim would be paying for itself twice.
