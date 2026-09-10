@@ -6,6 +6,7 @@
 #include "core/Context.h"
 #include "core/DeviceVector.h"
 #include "core/Encode.h"
+#include "core/EncodeGpu.h"
 #include "core/NPInfo.h"
 #include "core/Parameter.h"
 
@@ -110,6 +111,7 @@ class SubringWeights {
   int GetColsIn() const;
   int GetColsOut() const;
   int GetSubDegree() const;
+  int GetEntryDegree() const;
   double GetScale() const;
   NPInfo GetNP() const;
 
@@ -117,6 +119,10 @@ class SubringWeights {
   int cols_in_ = 0;      // d', the number of input ciphertexts (contracted)
   int cols_out_ = 0;     // d'', the number of output ciphertexts
   int sub_degree_ = 0;   // k
+  //! Words a limb an entry: the ring degree when the element is stored
+  //! expanded, `sub_degree_` when it is stored as what it is. See
+  //! `EncodeWeights`'s `compact`.
+  int entry_degree_ = 0;
   double scale_ = 1.0;
   NPInfo np_;
   DeviceVector<word> data_;
@@ -161,15 +167,105 @@ class SubringMatrixHandler {
    * @param values the batch, indexed `values[t][j * cols_out + l]` with
    *        `t < sub_degree / 2` lanes and each inner vector of length
    *        `cols_in * cols_out`
+   * ## `compact`: storing a subring element as one
+   *
+   * A subring element has `k` degrees of freedom, so its NTT image can take
+   * only `k` distinct values -- `q(X^d)` evaluates at `psi^(d*e)` and `psi^d`
+   * has order `2k`. The default store nevertheless writes the whole ring
+   * degree, which is right for a WEIGHT (encoded once, read many times) and
+   * fatal for DATA: a per-user PC-attention operand is a plaintext per
+   * (public token, channel), millions a layer, and 127 words in 128 are
+   * copies.
+   *
+   * With `compact`, an entry is `num_total_primes * sub_degree` words instead
+   * -- the `k` distinct words, in the order the NTT leaves them. Cheddar's
+   * forward NTT is Cooley-Tukey (natural in, bit-reversed out), so the image
+   * is constant on runs of `d = degree / sub_degree` and the distinct words
+   * are the buffer read at stride `d`; `Multiply` gathers them back with
+   * `x >> log2(d)`, which makes 128 consecutive threads read one broadcast
+   * word. Pinned by PcPremapTest's TheExpandedSubringStoreIsOneBlockRepeated
+   * and TheCompactSubringStoreIsWordForWord.
+   *
    * @param cols_in d', the number of input ciphertexts
    * @param cols_out d'', the number of output ciphertexts
    * @param sub_degree k, a power of two dividing the ring degree
    * @param num_aux number of auxiliary primes (default: 0 --> none)
+   * @param compact store `sub_degree` words a limb instead of `degree`
    */
   void EncodeWeights(SubringWeights<word> &res, int level, double scale,
                      const std::vector<std::vector<Complex>> &values,
                      int cols_in, int cols_out, int sub_degree,
-                     int num_aux = 0) const;
+                     int num_aux = 0, bool compact = false) const;
+
+  /**
+   * @brief The same weights, encoded on the DEVICE from a real lane-major
+   * array -- the encode a per-user PC-attention can afford.
+   *
+   * `EncodeWeights` above is the reference route and it is a WEIGHT's route:
+   * it goes through `Encoder::EncodeSinC`, which runs `degree / sub_degree`
+   * host transforms of size `sub_degree` (127 of them on zeros, for a subring
+   * element), recomposes `degree` coefficients, and hands them to the host
+   * `EncodeCoeff` -- a `BigInt` and a GMP `mpz_mod` per (coefficient, prime).
+   * Encoded once and read for the whole run, that is free. A PC-attention
+   * operand is not: it is one plaintext per (public token, channel) per kv
+   * head, 4.06M a layer, and at that count the encode IS the algorithm.
+   *
+   * What makes the device route available is the same sentence `EncodeSinC`'s
+   * own documentation ends on -- "a sparse message *is* a subring element".
+   * Take the lane vector as a message of `sub_degree` SLOTS. The slot encoding
+   * derives its twiddle stride from the slot count, so the transform is the
+   * size-`sub_degree` one either way, and `GpuEncoder::FftToCoeff` writes slot
+   * `i` to coefficient `i * gap` with `gap = degree / num_slots` = `d`. That
+   * is exactly where `EncodeSinC` puts block 0 -- `CiSinCRecompose` with only
+   * component 0 non-zero collapses to `out[t * d] = comp[0][t]`, every other
+   * coefficient zero, because its second term reaches `comp[num_blocks - i]`
+   * and only `i = num_blocks` would hit component 0. So the two routes encode
+   * the same polynomial, and this one does it in ONE transform of size k on
+   * the device with no host arithmetic at all.
+   *
+   * `compact` defaults to true here because the caller is the one that could
+   * not afford the expanded store either.
+   *
+   * Word-for-word against `EncodeWeights` in PcPremapTest's
+   * TheDeviceSubringEncodeIsTheSinCOne, which also prices both.
+   *
+   * ## Why it encodes in CHUNKS
+   *
+   * Once the host arithmetic is gone the entry price is not the transform
+   * either. Measured by the limb count -- which every full-degree stage left
+   * in the route is linear in -- an entry costs 74 us at 21 limbs against
+   * 81 us at 7: three times the arithmetic, 0.9x the wall clock. So what a
+   * single entry pays for is per-entry OVERHEAD (a host wait on the staging
+   * DMA, six kernel launches, a 4 KiB transfer), and the lever is to spend it
+   * once for many entries. `GpuEncoder::EncodeRealBatch` does exactly that,
+   * and the input format above is why it is free to: a chunk of entries is
+   * already a contiguous run of `values`.
+   *
+   * The chunk is a byte budget rather than an entry count because the
+   * intermediate is FULL-DEGREE -- 11 MiB an entry at 21 limbs, of which only
+   * `sub_degree` words a limb survive the gather. Shrinking that intermediate
+   * to the k points it can actually take is the NEXT lever, and it is second
+   * because this one is what the measurement pointed at.
+   *
+   * @param res output weights
+   * @param gpu the device encoder (`Context::gpu_encoder_`)
+   * @param level level to encode at
+   * @param scale scale to apply
+   * @param values `cols_in * cols_out * lanes` reals, ENTRY-major:
+   *        `values[(j * cols_out + l) * lanes + t]` is lane `t` of entry
+   *        `(j, l)`, so an entry's lanes are contiguous and cross to the
+   *        device as one message
+   * @param cols_in d', the number of input ciphertexts
+   * @param cols_out d'', the number of output ciphertexts
+   * @param sub_degree k, a power of two dividing the ring degree
+   * @param num_aux number of auxiliary primes (default: 0 --> none)
+   * @param compact store `sub_degree` words a limb instead of `degree`
+   */
+  void EncodeWeightsReal(SubringWeights<word> &res, const GpuEncoder<word> &gpu,
+                         int level, double scale,
+                         const std::vector<double> &values, int cols_in,
+                         int cols_out, int sub_degree, int num_aux = 0,
+                         bool compact = true) const;
 
   /**
    * @brief [KANG] Algorithm 1: `(B, A) <- (B*U, A*U)`, then rescale.

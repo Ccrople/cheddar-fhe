@@ -99,10 +99,20 @@ class BatchCcmmHandler {
    * @brief [KANG] Algorithm 4. `res` is the matrix encryption of
    * `{M_l * M'_l}`, one level below the inputs.
    *
+   * The CONTRACTION need not be square. `lhs` is read column-wise as
+   * `d x d'` and `rhs` row-wise as `d' x d`, with `d'` the ciphertext count
+   * on either side, so the product is `d x d` for any `d'` and the whole tail
+   * of the algorithm works on `d` columns. Only `d`, the Vec dimension, is
+   * fixed by the ring. The one thing that still needs `d' = d` is the CMT
+   * that makes a column-wise `rhs` row-wise ([KANG] Algorithm 3 transposes a
+   * square encryption), so a rectangular contraction has to pass
+   * `rhs_row_wise`. BatchCcmmContractsARectangularInner pins this.
+   *
    * @param context the CKKS context
    * @param res output, resized to d = degree / sub_degree ciphertexts
-   * @param lhs the d ciphertexts of the first matrix encryption
-   * @param rhs the d ciphertexts of the second
+   * @param lhs the `d'` ciphertexts of the first matrix encryption
+   * @param rhs the `d'` ciphertexts of the second -- `d' = d` unless
+   *        `rhs_row_wise`
    * @param sub_degree k
    * @param evk_map the automorphism keys of `RotationIndices` and the
    *        multiplication key

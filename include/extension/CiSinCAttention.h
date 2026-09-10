@@ -243,6 +243,44 @@ class CiSinCAttention {
     //! deg 15 costs ~1.4e-2 on the row sums (measured) -- this fold is
     //! the fix, at zero levels and zero new mechanism.
     std::vector<std::vector<double>> row_norm;
+
+    //! THE CHO ITERATION, which is what makes `row_norm` a POPULATION
+    //! estimate rather than the served prompt's own.
+    //!
+    //! With `niter = 0` (the shipped path) the walk normalises ONCE, and the
+    //! single invsqrt has to carry the whole error of `row_norm`: that is
+    //! affordable only when `row_norm` IS the served row's exact live sum,
+    //! i.e. when the calibration saw the prompt it is serving. An offline
+    //! calibration cannot, so its estimate is off by the population's spread
+    //! and one pass does not converge.
+    //!
+    //! `niter = k > 0` runs [CHO] `k` normalise-and-square passes with the
+    //! main path bootstrapped between them, exactly as `CiBatchAttention`
+    //! does at B = 512. The estimate then only has to put the FIRST
+    //! invsqrt's argument inside a window; the later passes see a quantity
+    //! whose interval is a THEOREM: after the first normalisation the row is
+    //! a probability vector, so every later `sq` is its collision
+    //! probability and lives in `[1/live, 1]` whatever the calibration says.
+    //!
+    //! The estimate is FREE here, unlike at B = 512. There it folds into the
+    //! affine on `sq` and has to be taken back out of `r`, costing the last
+    //! invsqrt a level; here it rides the causal mask that already exists,
+    //! divides `y` itself, and cancels identically in `P = (y r)^2`.
+    int niter = 0;
+    //! The FIRST invsqrt's window: the population's range of `sq_0 / est`.
+    //! Both zero = fall back to `[norm_lo, norm_hi]`. Irreducibly a
+    //! STATISTIC -- audit it against held-out data every time.
+    double first_lo = 0.0, first_hi = 0.0;
+    //! Degrees for the first/intermediate and the last invsqrt; 0 = take
+    //! `inv_degree` for both. The first is crude on purpose (its error is
+    //! cancelled exactly by the next normalisation and matters only through
+    //! the domain it hands on); the last is the accurate one, since its
+    //! relative error is a per-row gain on the whole attention output.
+    int iter_inv_degree = 0;
+    int last_inv_degree = 0;
+    //! The largest live key count a row can have, for the later window's
+    //! theorem `sq_j >= 1 / live`. 0 = the layout's `dim`.
+    int live_max = 0;
   };
 
   /** @brief The keys one call needs, on three rings. */
@@ -467,6 +505,13 @@ class CiSinCAttention {
   bool softmax_ready_ = false;
   int exp_in_ = 0, exp_out_ = 0, sq_level_ = 0, poly_in_ = 0;
   std::vector<std::unique_ptr<EvalPoly<word>>> polys_;  // [0] exp, [1] invsqrt
+  //! niter > 0: the Cho iteration's invsqrts, [0] the FIRST (un-booted, read
+  //! at `poly_in_`) and [1] the LATER one (booted, read at `cho_inv_in_`).
+  //! The later polynomial is reused by every iteration after the first --
+  //! they all see the same booted level and the same theorem window.
+  std::vector<std::unique_ptr<EvalPoly<word>>> cho_inv_;
+  int cho_inv_in_ = 0;
+  double cho_later_lo_ = 0.0, cho_later_hi_ = 0.0;
   std::vector<Pt> causal_a0_, causal_mask_;             // per ciphertext
   std::vector<int> reduce_dist_;
 };

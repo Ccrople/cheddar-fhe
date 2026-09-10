@@ -163,7 +163,28 @@ INSTANTIATE_TEST_SUITE_P(
                     "sylphflow16_35.json", "sylphflow16_40.json",
                     "ci16_35.json", "ci16_40.json", "ci16_35_stc2.json",
                     "ci16_35_land17c3e10.json", "ci16_35_land17c3e10v3.json",
-                    "ci16_35_land13c2e9.json"),
+                    "ci16_35_land13c2e9.json",
+                    // The landing LADDER, land19 (= ci16_35's own shape, 60
+                    // Q limbs) down to land5 (44). A boot is bandwidth-bound
+                    // and most of the bytes are evaluation key, whose size is
+                    // `beta * (num_q + num_aux)` with `beta = DivCeil(num_q,
+                    // num_aux)` -- so shortening the chain to what the
+                    // consumer actually uses pays about quadratically, with a
+                    // step wherever beta drops.
+                    //
+                    // v3 ONLY (2026-09-10). These rungs solve EvalMod's scale
+                    // recursion instead of tolerating it, so the landing scale
+                    // is 2^58.000 rather than the v2 wander that `param_audit`
+                    // measured at -1.8 .. -6.2 bits. The v2 rungs they replace
+                    // were deleted with their presets: the comparison they
+                    // existed to make is settled and recorded in
+                    // `reference/audit/`, and keeping a ladder nothing ships
+                    // on costs a preset each. The two junction rungs (15, 9)
+                    // need a ninth EvalMod level for the solve to converge, so
+                    // they are their own shapes, not twins.
+                    "ci16_35_land19v3.json", "ci16_35_land12v3.json",
+                    "ci16_35_land6v3.json", "ci16_35_land5v3.json",
+                    "ci16_35_land15e9v3.json", "ci16_35_land9e9v3.json"),
     [](const testing::TestParamInfo<BootBed::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

@@ -941,12 +941,50 @@ double ExpFitError(double hb, int deg) {
 //! is 2^-13 on a window of [0.9, 1.1], against an exp fit at 15 that is
 //! 2^-8.49 on the ONE layer of 32 that wants more. Neither is near stage 2's
 //! 2^-5.70, so the cap costs nothing measurable and the alternative would.
-int ExpDegree(double m_eff) {
-  const double hb = std::max(m_eff, 0.0) / 4.0;
+//! Takes `hb` itself, not `m_eff`: with the Cho iteration `hb` is
+//! `m_eff / 2^(k+1)`, so raising `k` LOWERS the exp's dynamic range and can
+//! drop this degree -- which is how the extra iteration pays for itself in
+//! levels. (`CiPcAttention::ExpDegree` already had this signature.)
+int ExpDegree(double hb) {
+  hb = std::max(hb, 0.0);
   for (int d : {7, 9, 15}) {
     if (ExpFitError(hb, d) < std::pow(2.0, -16.0)) return d;
   }
   return 15;
+}
+
+//! Both ends of the factor the FIRST invsqrt's error multiplies `sq` by.
+//!
+//! `sq_j` for `j >= 1` is a collision probability, so `sq in [1/live, 1]` is a
+//! theorem -- but what actually REACHES the later invsqrt is that interval
+//! times `(finv(s) sqrt(s))^4`, the fourth power of the first invsqrt's
+//! relative error (two squarings, each doubling it). Both ends are needed:
+//! `CiBatchAttention` derives only the top (`1.10 * WorstCaseChoLaterSq`) and
+//! takes the bottom as given, and a flat `1/(1.3 live)` guess in its place is
+//! wrong in both directions -- too wide when the chain is tight (it costs the
+//! fit for nothing) and not containing when it is not.
+std::pair<double, double> LaterWidening(double lo, double hi, int degree) {
+  const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+  auto c = chebfit::Interpolate(
+      [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, degree);
+  double w_lo = 1e300, w_hi = 0.0;
+  constexpr int kGrid = 4001;
+  for (int i = 0; i < kGrid; i++) {
+    const double sqv = lo + (hi - lo) * i / (kGrid - 1);
+    const double v = (sqv - b) / a;
+    double b0 = 0.0, b1 = 0.0;
+    for (int j = static_cast<int>(c.size()) - 1; j > 0; j--) {
+      const double t = 2.0 * v * b0 - b1 + c[j];
+      b1 = b0;
+      b0 = t;
+    }
+    const double r = v * b0 - b1 + c[0];
+    const double f = r * std::sqrt(sqv);
+    const double f4 = f * f * f * f;
+    w_lo = std::min(w_lo, f4);
+    w_hi = std::max(w_hi, f4);
+  }
+  return {w_lo, w_hi};
 }
 
 }  // namespace
@@ -971,10 +1009,15 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   // is 3.2e-03 at a span of 24.36 and every caller has passed 15 by hand ever
   // since. At the REAL model's spans, which run 17.1 to 97.3 over the 32
   // layers, 15 is right for 31 of them and buys only 8.5 bits at layer 31.
+  // [CHO] k normalise-and-square passes: y = exp(m_eff (u - 1) / 2^(k+1)),
+  // squared k times by the normalisations. k = 1 is the shipped single pass
+  // and reproduces `m_eff / 4` exactly. Raising k LOWERS hb, so the exp fit
+  // gets easier -- at the real model's spans that is what funds the extra
+  // iteration's levels rather than costing them.
+  const int k = (calib_.niter > 0) ? calib_.niter : 1;
+  const double hb = calib_.m_eff / static_cast<double>(1 << (k + 1));
   const int exp_degree =
-      (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(calib_.m_eff);
-  // k = 1 (Cho): y = exp(m_eff (u - 1) / 4), squared later by the norm.
-  const double hb = calib_.m_eff / 4.0;
+      (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(hb);
   auto exp_coeffs = chebfit::Interpolate(
       [hb](double v) { return std::exp(hb * (v - 1.0)); }, exp_degree);
   const int exp_used =
@@ -992,23 +1035,90 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   // what freed it, so the downstream walk is unchanged either way.
   sq_level_ = (calib_.causal ? exp_out_ - 1 : exp_out_) - 1;
   poly_in_ = sq_level_ - 1;
-  const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
-  const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
-  auto inv_coeffs = chebfit::Interpolate(
-      [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
-      calib_.inv_degree);
-  const int inv_used =
-      EvalPoly<word>(inv_coeffs, poly_in_, boot_->param_.GetScale(poly_in_),
-                     boot_->param_.GetScale(poly_in_), true)
-          .GetPolyDegree();
-  const int inv_out = poly_in_ - Log2Ceil(inv_used + 1);
-  AssertTrue(inv_out - 2 >= cfg_.forward_level,
-             "CiSinCAttention: the softmax walk overspends its levels; P "
-             "would land below forward_level");
-  polys_.push_back(std::make_unique<EvalPoly<word>>(
-      inv_coeffs, poly_in_, boot_->param_.GetScale(poly_in_),
-      boot_->param_.GetScale(inv_out), true));
-  polys_[1]->Compile(boot_);
+  // Compiles one invsqrt over [lo, hi] reading at `in_level`; `floor_level` is
+  // what its output must clear. Returns the used degree through `out`.
+  auto compile_inv = [&](double lo, double hi, int degree, int in_level,
+                         int floor_level, const char *what, int *out) {
+    const double aff_a = 0.5 * (hi - lo);
+    const double aff_b = 0.5 * (hi + lo);
+    auto coeffs = chebfit::Interpolate(
+        [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+        degree);
+    const int used =
+        EvalPoly<word>(coeffs, in_level, boot_->param_.GetScale(in_level),
+                       boot_->param_.GetScale(in_level), true)
+            .GetPolyDegree();
+    const int landing = in_level - Log2Ceil(used + 1);
+    AssertTrue(landing >= floor_level,
+               std::string("CiSinCAttention: the softmax walk overspends its "
+                           "levels at the ") + what + " invsqrt");
+    auto p = std::make_unique<EvalPoly<word>>(
+        coeffs, in_level, boot_->param_.GetScale(in_level),
+        boot_->param_.GetScale(landing), true);
+    p->Compile(boot_);
+    if (out != nullptr) *out = used;
+    return p;
+  };
+
+  cho_inv_.clear();
+  int inv_used = 0, inv_out = 0, cho_used = 0;
+  if (calib_.niter <= 0) {
+    // THE SHIPPED SINGLE PASS. Byte-identical to before: same window, same
+    // degree, same level, and `P = (y r)^2` lands at forward_level.
+    polys_.push_back(compile_inv(calib_.norm_lo, calib_.norm_hi,
+                                 calib_.inv_degree, poly_in_,
+                                 cfg_.forward_level + 2, "single", &inv_used));
+    inv_out = poly_in_ - Log2Ceil(inv_used + 1);
+  } else {
+    // THE CHO ITERATION. Two polynomials, not k: every pass after the first
+    // reads a BOOTED `y` at the same level over the same theorem window, so
+    // they share one compilation.
+    //
+    //   pass 0   y0 fresh from exp -> sq at sq_level_, affine at poly_in_.
+    //            Its window is the POPULATION's ratio range and it is crude
+    //            on purpose: its error is cancelled exactly by the next
+    //            normalisation, and only the domain it hands on matters.
+    //   pass j>0 y booted to top -> sq at top-1, affine at top-2.
+    AssertTrue(calib_.causal,
+               "CiSinCAttention: niter > 0 is the causal path (it needs the "
+               "per-row shift and the population estimate on the mask)");
+    AssertTrue(!calib_.row_norm.empty(),
+               "CiSinCAttention: niter > 0 without row_norm would hand the "
+               "first invsqrt the raw row sums, which is the window this "
+               "iteration exists to avoid");
+    const double f_lo =
+        (calib_.first_hi > calib_.first_lo) ? calib_.first_lo : calib_.norm_lo;
+    const double f_hi =
+        (calib_.first_hi > calib_.first_lo) ? calib_.first_hi : calib_.norm_hi;
+    const int iter_deg =
+        (calib_.iter_inv_degree > 0) ? calib_.iter_inv_degree
+                                     : calib_.inv_degree;
+    const int last_deg =
+        (calib_.last_inv_degree > 0) ? calib_.last_inv_degree
+                                     : calib_.inv_degree;
+    // The LATER window is a theorem plus the chain's own widening, both ends
+    // derived (`LaterWidening`), not fitted. `sq_j >= 1/live` because the row
+    // is a probability vector after the first normalisation; `sq_j <= 1`
+    // likewise. The 1.10 is for the CIPHERTEXT's noise in `sq`, the data side
+    // being proven.
+    const int live_max =
+        (calib_.live_max > 0) ? calib_.live_max : ccmm_.GetLayout().dim;
+    const auto w = LaterWidening(f_lo, f_hi, iter_deg);
+    cho_later_lo_ = (w.first / static_cast<double>(live_max)) / 1.10;
+    cho_later_hi_ = 1.10 * w.second;
+    AssertTrue(cho_later_lo_ > 0.0 && cho_later_hi_ > cho_later_lo_,
+               "CiSinCAttention: the derived later window is empty -- the "
+               "first invsqrt's error over its window is not a contraction");
+    // pass 0's `(y r)^2` costs two levels and is then BOOTED, so its landing
+    // only has to stay above zero; the LAST pass's `(y r)^2` IS P.
+    cho_inv_.push_back(compile_inv(f_lo, f_hi, iter_deg, poly_in_,
+                                   /*floor=*/3, "first", &cho_used));
+    cho_inv_in_ = top - 2;
+    cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_, last_deg,
+                                   cho_inv_in_, cfg_.forward_level + 2,
+                                   "later", &inv_used));
+    inv_out = cho_inv_in_ - Log2Ceil(inv_used + 1);
+  }
 
   causal_a0_.clear();
   causal_mask_.clear();
@@ -1079,11 +1189,25 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   }
   softmax_ready_ = true;
   if (cfg_.verbose) {
-    std::cout << "CiSinCAttention::PrepareSoftMax: exp deg " << exp_used
-              << " @" << exp_in_ << ".." << exp_out_
+    std::cout << "CiSinCAttention::PrepareSoftMax: niter " << k << ", exp deg "
+              << exp_used << " @" << exp_in_ << ".." << exp_out_
               << (calib_.causal ? ", causal mask @" : ", no mask, sq @")
-              << (calib_.causal ? exp_out_ - 1 : sq_level_) << ", invsqrt deg "
-              << inv_used << " @" << poly_in_ << ".." << inv_out << std::endl;
+              << (calib_.causal ? exp_out_ - 1 : sq_level_);
+    if (calib_.niter > 0) {
+      std::cout << ", first invsqrt deg " << cho_used << " @" << poly_in_
+                << " on [" << ((calib_.first_hi > calib_.first_lo)
+                                   ? calib_.first_lo : calib_.norm_lo)
+                << ", " << ((calib_.first_hi > calib_.first_lo)
+                                ? calib_.first_hi : calib_.norm_hi)
+                << "], later deg " << inv_used << " @" << cho_inv_in_ << ".."
+                << inv_out << " on [" << cho_later_lo_ << ", " << cho_later_hi_
+                << "] (DERIVED), est "
+                << (calib_.row_norm.empty() ? "none" : "folded on the mask");
+    } else {
+      std::cout << ", invsqrt deg " << inv_used << " @" << poly_in_ << ".."
+                << inv_out;
+    }
+    std::cout << std::endl;
   }
 }
 
@@ -1129,43 +1253,102 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
     }
   }
 
-  // The Euclidean norm: the squared ciphertexts summed, then the top-field
-  // rotate-and-add tree -- exact at every slot, no mask (1.5bv).
-  Ct sq, term, rotated;
-  boot_->HMult(sq, y[0], y[0], mult_key);
-  for (int bi = 1; bi < layout.num_cts; bi++) {
-    boot_->HMult(term, y[bi], y[bi], mult_key);
-    boot_->Add(sq, sq, term);
-  }
-  for (int d : reduce_dist_) {
-    boot_->HRotAdd(rotated, sq, sq, evk.GetRotationKey(d), d);
-    boot_->Copy(sq, rotated);
-  }
-  {
-    const double aff_a = 0.5 * (calib_.norm_hi - calib_.norm_lo);
-    const double aff_b = 0.5 * (calib_.norm_hi + calib_.norm_lo);
-    Constant<word> inv_a;
-    boot_->encoder_.EncodeConstant(inv_a, sq_level_,
-                                   boot_->param_.GetScale(sq_level_),
-                                   1.0 / aff_a);
-    Ct scaled;
-    boot_->Mult(scaled, sq, inv_a);
-    boot_->Rescale(sq, scaled);
-    Constant<word> shift;
-    boot_->encoder_.EncodeConstant(shift, poly_in_, sq.GetScale(),
-                                   -aff_b / aff_a);
-    boot_->Add(sq, sq, shift);
-  }
-  Ct r;
-  polys_[1]->Evaluate(boot_, r, sq, mult_key);
-  const int meet = boot_->param_.NPToLevel(r.GetNP());
-  P.clear();
-  P.resize(layout.num_cts);
-  for (int bi = 0; bi < layout.num_cts; bi++) {
-    Ct levelled, prod;
-    boot_->LevelDown(levelled, y[bi], meet);
-    boot_->HMult(prod, levelled, r, mult_key);
-    boot_->HMult(P[bi], prod, prod, mult_key);
+  // [CHO] k normalise-and-square passes. k = 1 is the shipped walk, operation
+  // for operation; k > 1 bootstraps the main path between passes so every
+  // later `sq` arrives at the same level and reads the same THEOREM window.
+  //
+  // The population estimate rode the causal mask above, so `y` is already
+  // `y_raw / sqrt(est)` and this loop sees `sq / est` at pass 0 with nothing
+  // to take back out: `est` cancels identically in `(y r)^2`.
+  const int k = (calib_.niter > 0) ? calib_.niter : 1;
+  for (int it = 0; it < k; it++) {
+    const bool first = (it == 0);
+    const bool last = (it == k - 1);
+    if (!first) {
+      // Back to `top`, so `sq` lands at `top - 1` and the affine at `top - 2`
+      // -- the level the later invsqrt was compiled at. The causal mask is
+      // NOT re-applied: the dead slots are zero and the boot's own noise
+      // there is squared twice before it can reach `P`.
+      if (layout.num_cts == 1) {
+        Ct up;
+        boot_->Boot(up, y[0], evk);
+        y[0] = std::move(up);
+      } else {
+        std::vector<const Ct *> in(layout.num_cts);
+        for (int bi = 0; bi < layout.num_cts; bi++) in[bi] = &y[bi];
+        std::vector<Ct> out;
+        boot_->BootBatch(out, in, evk);
+        for (int bi = 0; bi < layout.num_cts; bi++) y[bi] = std::move(out[bi]);
+      }
+    }
+
+    // The Euclidean norm: the squared ciphertexts summed, then the top-field
+    // rotate-and-add tree -- exact at every slot, no mask (1.5bv).
+    Ct sq, term, rotated;
+    boot_->HMult(sq, y[0], y[0], mult_key);
+    for (int bi = 1; bi < layout.num_cts; bi++) {
+      boot_->HMult(term, y[bi], y[bi], mult_key);
+      boot_->Add(sq, sq, term);
+    }
+    for (int d : reduce_dist_) {
+      boot_->HRotAdd(rotated, sq, sq, evk.GetRotationKey(d), d);
+      boot_->Copy(sq, rotated);
+    }
+    // The pass's own window. Pass 0 sees the POPULATION's ratio range; every
+    // later pass sees the collision probability's derived interval.
+    double lo = calib_.norm_lo, hi = calib_.norm_hi;
+    EvalPoly<word> *inv = nullptr;
+    if (calib_.niter <= 0) {
+      // The shipped path keeps its polynomial in `polys_[1]`; with the
+      // iteration on, `polys_` holds only the exp and the pair lives in
+      // `cho_inv_`.
+      inv = polys_[1].get();
+    } else if (first) {
+      const bool have = (calib_.first_hi > calib_.first_lo);
+      lo = have ? calib_.first_lo : calib_.norm_lo;
+      hi = have ? calib_.first_hi : calib_.norm_hi;
+      inv = cho_inv_[0].get();
+    } else {
+      lo = cho_later_lo_;
+      hi = cho_later_hi_;
+      inv = cho_inv_[1].get();
+    }
+    {
+      // The levels are READ, not assumed: pass 0's `sq` is at `sq_level_`
+      // and every later pass's at `top - 1`.
+      const double aff_a = 0.5 * (hi - lo);
+      const double aff_b = 0.5 * (hi + lo);
+      const int sq_lvl = boot_->param_.NPToLevel(sq.GetNP());
+      Constant<word> inv_a;
+      boot_->encoder_.EncodeConstant(inv_a, sq_lvl,
+                                     boot_->param_.GetScale(sq_lvl),
+                                     1.0 / aff_a);
+      Ct scaled;
+      boot_->Mult(scaled, sq, inv_a);
+      boot_->Rescale(sq, scaled);
+      Constant<word> shift;
+      boot_->encoder_.EncodeConstant(shift,
+                                     boot_->param_.NPToLevel(sq.GetNP()),
+                                     sq.GetScale(), -aff_b / aff_a);
+      boot_->Add(sq, sq, shift);
+    }
+    Ct r;
+    inv->Evaluate(boot_, r, sq, mult_key);
+    const int meet = boot_->param_.NPToLevel(r.GetNP());
+    // `y <- (y r)^2`. On the LAST pass that product is P itself, which is why
+    // the two are the same three operations.
+    for (int bi = 0; bi < layout.num_cts; bi++) {
+      Ct levelled, prod, squared;
+      boot_->LevelDown(levelled, y[bi], meet);
+      boot_->HMult(prod, levelled, r, mult_key);
+      boot_->HMult(squared, prod, prod, mult_key);
+      y[bi] = std::move(squared);
+    }
+    if (last) {
+      P.clear();
+      P.resize(layout.num_cts);
+      for (int bi = 0; bi < layout.num_cts; bi++) P[bi] = std::move(y[bi]);
+    }
   }
   const int p_level = boot_->param_.NPToLevel(P[0].GetNP());
   AssertTrue(p_level >= cfg_.forward_level,

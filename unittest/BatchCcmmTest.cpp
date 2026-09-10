@@ -46,15 +46,19 @@ constexpr int kSubDegree = 128;  // [SYLPH] 3.3: d = 32, k/2 = 64 lanes
 
 using Batch = std::vector<std::vector<std::vector<Complex>>>;  // [lane][i][j]
 
-Batch RandomBatch(int lanes, int d, double bound) {
+Batch RandomBatchRect(int lanes, int rows, int cols, double bound) {
   Batch m(lanes,
-          std::vector<std::vector<Complex>>(d, std::vector<Complex>(d)));
+          std::vector<std::vector<Complex>>(rows, std::vector<Complex>(cols)));
   for (int t = 0; t < lanes; t++) {
-    for (int i = 0; i < d; i++) {
-      Random::SampleUniformComplex(m[t][i].data(), d, -bound, bound);
+    for (int i = 0; i < rows; i++) {
+      Random::SampleUniformComplex(m[t][i].data(), cols, -bound, bound);
     }
   }
   return m;
+}
+
+Batch RandomBatch(int lanes, int d, double bound) {
+  return RandomBatchRect(lanes, d, d, bound);
 }
 
 }  // namespace
@@ -255,6 +259,108 @@ TEST_P(Testbed32, TheBatchedRelinearizationIsTheSerialOneWordForWord) {
   std::cout << "batched relinearization: " << differ << " of " << total
             << " words differ from the serial loop" << std::endl;
   ASSERT_EQ(differ, 0u);
+}
+
+// A RECTANGULAR contraction. What Algorithm 4 fixes is `d`, the Vec dimension
+// -- it is the ring's, `degree / sub_degree`, and it is the outer size on both
+// sides. The ciphertext COUNT is the contraction, and nothing in step 2 or
+// after it depends on that being `d`: the product is `d x d` either way. The
+// square assertion this replaces was therefore stronger than the algorithm.
+//
+// The one real constraint stays: step 1's CMT transposes a subring matrix
+// encryption and [KANG] Algorithm 3 is square, so a rectangular contraction
+// has to hand the second operand over already row-wise -- which is exactly
+// what the score product does anyway (K as projected IS the row-wise form of
+// K^T).
+//
+// `inner = 8` against `d = 32`, so a path that quietly used `d` for the
+// contraction would read three times past the operand rather than land on a
+// plausible-looking wrong answer.
+TEST_P(Testbed32, BatchCcmmContractsARectangularInner) {
+  const int degree = param_->degree_;
+  const int d = degree / kSubDegree;  // the Vec dimension: the ring's
+  const int inner = 8;                // d', the contraction: free
+  const int lanes = kSubDegree / 2;
+  const int level = param_->max_level_;
+  const double scale = DetermineScale(level);
+  ASSERT_EQ(d, 32);
+  ASSERT_NE(inner, d) << "a square inner would test nothing";
+
+  BatchCcmmHandler<word> ccmm(*param_, context_->ntt_handler_);
+  for (int index : ccmm.RotationIndices(kSubDegree)) {
+    interface_->PrepareRotationKey(index, level);
+  }
+
+  // m is d x inner, mp is inner x d.
+  const Batch m = RandomBatchRect(lanes, d, inner, 0.15);
+  const Batch mp = RandomBatchRect(lanes, inner, d, 0.15);
+
+  // Column-wise: ciphertext j is column j, the Vec index the row.
+  auto encrypt_cols = [&](const Batch &src, int rows, int cols,
+                          std::vector<Ciphertext<word>> &out) {
+    out.resize(cols);
+    for (int j = 0; j < cols; j++) {
+      std::vector<Complex> message(degree / 2, Complex(0.0, 0.0));
+      for (int i = 0; i < rows; i++) {
+        for (int t = 0; t < lanes; t++) message[i * lanes + t] = src[t][i][j];
+      }
+      Plaintext<word> pt;
+      context_->encoder_.EncodeSinC(pt, level, scale, message, kSubDegree);
+      interface_->Encrypt(out[j], pt);
+    }
+  };
+  // Row-wise: ciphertext j is row j, the Vec index the column. This is what
+  // CMT would have produced from a column-wise encryption of the transpose.
+  auto encrypt_rows = [&](const Batch &src, int rows, int cols,
+                          std::vector<Ciphertext<word>> &out) {
+    out.resize(rows);
+    for (int j = 0; j < rows; j++) {
+      std::vector<Complex> message(degree / 2, Complex(0.0, 0.0));
+      for (int i = 0; i < cols; i++) {
+        for (int t = 0; t < lanes; t++) message[i * lanes + t] = src[t][j][i];
+      }
+      Plaintext<word> pt;
+      context_->encoder_.EncodeSinC(pt, level, scale, message, kSubDegree);
+      interface_->Encrypt(out[j], pt);
+    }
+  };
+
+  std::vector<Ciphertext<word>> lhs, rhs;
+  encrypt_cols(m, d, inner, lhs);
+  encrypt_rows(mp, inner, d, rhs);
+  ASSERT_EQ(static_cast<int>(lhs.size()), inner);
+  ASSERT_EQ(static_cast<int>(rhs.size()), inner);
+
+  std::vector<Ciphertext<word>> res;
+  ccmm.Multiply(context_, res, lhs, rhs, kSubDegree, interface_->GetEvkMap(),
+                /*rhs_row_wise=*/true);
+  ASSERT_EQ(static_cast<int>(res.size()), d)
+      << "the output is the Vec dimension, not the contraction";
+
+  double worst = 0.0;
+  for (int j = 0; j < d; j++) {
+    ASSERT_EQ(param_->NPToLevel(res[j].GetNP()), level - 1)
+        << "a rectangular contraction still spends exactly one level";
+    EXPECT_NEAR(res[j].GetScale() / param_->GetScale(level - 1), 1.0, 1e-6);
+
+    Plaintext<word> out;
+    interface_->Decrypt(out, res[j]);
+    std::vector<Complex> got;
+    context_->encoder_.DecodeSinC(got, out, kSubDegree);
+
+    for (int i = 0; i < d; i++) {
+      for (int t = 0; t < lanes; t++) {
+        Complex want(0.0, 0.0);
+        for (int x = 0; x < inner; x++) want += m[t][i][x] * mp[t][x][j];
+        worst = std::max(worst, std::abs(got[i * lanes + t] - want));
+      }
+    }
+  }
+
+  std::cout << "rectangular CCMM: " << lanes << " lanes of (" << d << "x"
+            << inner << ")(" << inner << "x" << d << "), max error " << worst
+            << std::endl;
+  ASSERT_LT(worst, 1e-2);
 }
 
 INSTANTIATE_TEST_SUITE_P(

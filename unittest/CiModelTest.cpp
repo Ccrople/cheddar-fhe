@@ -334,7 +334,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     std::cout << "STARTING AT LAYER " << first_layer
               << " from the reference's clean stream" << std::endl;
   } else {
-    ASSERT_TRUE(ReadF32(wdir + "/input_nosink.f32",
+    // LLAMA3_INPUT: the SERVED prompt. It defaults to the one beside the
+    // weights (which `reference_forward.py` also calibrated on, so that pair
+    // is an oracle); `gen_b1_pop.py` writes a HELD-OUT one as `input_pop.f32`
+    // beside its own reference, and pointing this at it is what makes the run
+    // a service measurement rather than a self-check.
+    const char *input_env = std::getenv("LLAMA3_INPUT");
+    const std::string input_path =
+        (input_env != nullptr && input_env[0] != 0)
+            ? std::string(input_env)
+            : wdir + "/input_nosink.f32";
+    ASSERT_TRUE(ReadF32(input_path,
                         static_cast<size_t>(kT) * kH, x0));
   }
 
@@ -1855,6 +1865,36 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     sc.exp_degree = 0;
     sc.inv_degree = 7;
     sc.causal = true;
+    // THE POPULATION CALIBRATION (`reference/scripts/gen_b1_pop.py`). Without
+    // it `calib.json` is `reference_forward.py`'s, built from the SAME prompt
+    // this test then serves -- an ORACLE, and the number it produces is not a
+    // service one. A calibration that carries `softmax_niter` is a held-out
+    // one: `row_norm` is then the calibration split's GEOMETRIC MEAN rather
+    // than the served row's exact live sum, which one normalisation cannot
+    // correct -- hence [CHO]'s k passes, and hence the two windows below.
+    // Absent the field, `niter` stays 0 and the walk is the shipped one.
+    if (cj.contains("softmax_niter")) {
+      sc.niter = EnvInt("CHEDDAR_CI_NITER", cj["softmax_niter"].get<int>());
+      sc.first_lo = cj.value("softmax_first_lo", 0.0);
+      sc.first_hi = cj.value("softmax_first_hi", 0.0);
+      sc.iter_inv_degree =
+          EnvInt("CHEDDAR_CI_ITER_INV_DEG",
+                 cj.value("softmax_iter_inv_degree", 0));
+      sc.last_inv_degree =
+          EnvInt("CHEDDAR_CI_LAST_INV_DEG",
+                 cj.value("softmax_last_inv_degree", 0));
+      sc.live_max = cj.value("softmax_live_max", 0);
+      // The generator derives BOTH ends of the later window (a theorem times
+      // the chain's own widening) and writes them here; `norm_lo/norm_hi`
+      // above are the shipped single-pass ratio bounds and are unused when
+      // the iteration is on.
+      if (cj.contains("softmax_later_lo"))
+        sc.norm_lo = cj["softmax_later_lo"].get<double>();
+      if (cj.contains("softmax_later_hi"))
+        sc.norm_hi = cj["softmax_later_hi"].get<double>();
+      if (cj.contains("exp_degree"))
+        sc.exp_degree = cj["exp_degree"].get<int>();
+    }
     sc.row_shift.assign(layout.lanes, std::vector<double>(kT, 0.0));
     sc.row_norm.assign(layout.lanes, std::vector<double>(kT, 0.0));
     {

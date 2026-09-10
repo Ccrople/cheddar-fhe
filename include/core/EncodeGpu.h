@@ -227,6 +227,33 @@ class GpuEncoder {
                   const std::vector<double> &message, int num_aux = 0) const;
 
   /**
+   * @brief `EncodeReal` for `batch` messages in one pass of each stage.
+   *
+   * A small encoding is not a small cost here. At 512 slots on a degree-65536
+   * ring `EncodeReal` is a one-block transform, a two-block placement and four
+   * full-degree passes behind a host wait on the staging DMA -- and it takes
+   * the SAME wall clock at 21 limbs as at 7, which is the measurement that
+   * says the price is per-entry overhead rather than the transform. So this
+   * spends that price once for `batch` entries: one host copy, one transfer,
+   * one wait, one launch of each stage. The arithmetic is untouched, and the
+   * output is word-for-word the loop's (PcPremapTest pins it).
+   *
+   * The messages must be contiguous and equal length in `values` -- which a
+   * lane-major weight array already is -- and the output is `batch` whole
+   * plaintexts back to back, `[entry][prime][coefficient]`, in the NTT domain
+   * and NOT in Montgomery form, exactly as `EncodeReal` leaves `ptxt.mx_`.
+   * There is no `Plaintext` wrapper because the caller of this is building an
+   * operand store, not a plaintext.
+   *
+   * @param dst device, `batch * np.GetNumTotal() * degree` words
+   * @param values host, `batch * num_slots` doubles, entry-major
+   * @param num_slots power of two, inside one block's transform chunk
+   */
+  void EncodeRealBatch(word *dst, int level, double scale,
+                       const double *values, int num_slots, int batch,
+                       int num_aux = 0) const;
+
+  /**
    * @brief The plaintext matrix encoding with the gather fused in, from a
    * weight matrix that is already on the device.
    *
@@ -264,10 +291,16 @@ class GpuEncoder {
    * finishes it -- because that permutation is free when it is fused into the
    * read of the next stage and a full pass when it is not.
    *
-   * @param data device buffer, 2 * num_slots doubles, in place
+   * @param data device buffer, 2 * num_slots * batch doubles, in place
    * @param num_slots power of two, at most MaxNumSlots()
+   * @param batch independent equal-sized transforms, back to back. Free: a
+   *        block already owns one contiguous chunk and reads its twiddles
+   *        modulo that chunk, so more transforms are more blocks and nothing
+   *        else. Only for `num_slots` inside one block's chunk -- above that
+   *        the transform is two passes and the high one strides across the
+   *        whole message.
    */
-  void SpecialIFFT(double *data, int num_slots) const;
+  void SpecialIFFT(double *data, int num_slots, int batch = 1) const;
 
   /**
    * @brief Stage 2. Bit-reverse, normalise by 1/num_slots, and place each slot
@@ -276,11 +309,13 @@ class GpuEncoder {
    * ring, where there is no imaginary axis and the real part is the whole of
    * it. Coefficients no slot reaches are zeroed.
    *
-   * @param coeff output device buffer, `degree` doubles
-   * @param fft input device buffer, 2 * num_slots doubles, bit-reversed
+   * @param coeff output device buffer, `degree * batch` doubles
+   * @param fft input device buffer, 2 * num_slots * batch doubles, bit-reversed
    * @param num_slots power of two
+   * @param batch messages, each landing in its own `degree` coefficients
    */
-  void FftToCoeff(double *coeff, const double *fft, int num_slots) const;
+  void FftToCoeff(double *coeff, const double *fft, int num_slots,
+                  int batch = 1) const;
 
   /**
    * @brief Stage 3. `dst[j * n + i] = round(src[i] * scale) mod p_j`, over the
@@ -295,9 +330,14 @@ class GpuEncoder {
    * @param montgomery leave each limb in Montgomery form, which is what a
    *        plaintext matrix wants and what a plaintext about to be NTT'd does
    *        not (the NTT converts on the way in)
+   * @param batch independent decompositions; the source is one run of
+   *        `n * batch` values, the destination `batch` whole plaintexts
+   * @param dst_batch_stride words between them -- `num_total_primes * n` for
+   *        the plaintext layout, which is what a batched NTT reads
    */
   void RnsDecompose(word *dst, const double *src, int n, const NPInfo &np,
-                    double scale, bool montgomery) const;
+                    double scale, bool montgomery, int batch = 1,
+                    int64_t dst_batch_stride = 0) const;
 
   /**
    * @brief The slot encoding, all four stages on the device. Same contract as

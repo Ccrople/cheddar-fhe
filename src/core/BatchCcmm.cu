@@ -79,9 +79,25 @@ void BatchCcmmHandler<word>::Multiply(ConstContextPtr<word> context,
   const int d = degree / sub_degree;
   AssertTrue(sub_degree >= 2 && sub_degree <= degree && IsPowOfTwo(sub_degree),
              "BatchCcmm: invalid sub_degree");
-  AssertTrue(static_cast<int>(lhs.size()) == d &&
-                 static_cast<int>(rhs.size()) == d,
-             "BatchCcmm: each side needs degree / sub_degree ciphertexts");
+  // The CONTRACTION is free; the Vec dimension is not. `lhs` is read
+  // column-wise as `d x d'` and `rhs` row-wise as `d' x d`, with `d'` the
+  // ciphertext count on either side, so step 2's product is `d x d` whatever
+  // `d'` is -- and everything after it (the two CMTs on the products, the
+  // relinearization, the rescale) works on `d` columns. The Vec dimension is
+  // fixed by the ring on both outer sides and cannot move.
+  //
+  // What genuinely needs the square count is the CMT that makes `rhs`
+  // row-wise when the caller did not: that is a transpose of a subring matrix
+  // encryption, and [KANG] Algorithm 3 is square by construction (`Cmt`
+  // asserts the count is `degree / sub_degree`).
+  AssertTrue(!lhs.empty(), "BatchCcmm: no input ciphertexts");
+  AssertTrue(lhs.size() == rhs.size(),
+             "BatchCcmm: the two sides must agree on the contraction "
+             "dimension");
+  AssertTrue(rhs_row_wise || static_cast<int>(rhs.size()) == d,
+             "BatchCcmm: a column-wise rhs is transposed by CMT, which needs "
+             "degree / sub_degree ciphertexts -- pass it row-wise, or keep "
+             "the contraction square");
 
   const NPInfo np = lhs.at(0).GetNP();
   AssertTrue(np == rhs.at(0).GetNP(),

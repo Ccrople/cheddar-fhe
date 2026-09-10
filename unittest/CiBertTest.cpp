@@ -83,7 +83,12 @@ constexpr const char *kLiftedParam = "ringdegree13_35_boot.json";
 // prefix IS the return, so there are no converters and no native tables on
 // the leg ring -- 15 GiB and 262 switching-ring rotation keys that the
 // converter route needs and this one does not.
-constexpr const char *kTowerParam = "ci16_35_land17c3e10.json";
+// v3 (2026-09-10): the same tower with EvalMod's scale recursion SOLVED, so
+// the landing scale is 2^58.000 rather than the v2 wander `param_audit`
+// measured at -1.8 .. -6.2 bits. `CiSinCBasisTest` and `CiBatchTest` already
+// read it; the B = 1 Llama leg has not moved yet, which is why the non-v3
+// still ships there.
+constexpr const char *kTowerParam = "ci16_35_land17c3e10v3.json";
 
 // BERT-Base, and the packing: T * rank is the slot count, 768 model channels
 // in two dense rank-512 ciphertexts and 3072 hidden ones in six.

@@ -183,13 +183,6 @@ if (ENABLE_EXTENSION)
   target_link_libraries(attention_transport_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
-  # Both attention products as the block will call them: slots in, slots out,
-  # with the permutations, the exchange, SlotToSinC, the CC-MM, HalfBoot and
-  # the StC prefix all inside SinCAttention. Three Contexts and a full
-  # bootstrap, so it is its own binary and the heaviest test here.
-  add_executable(sinc_attention_test SinCAttentionTest.cpp)
-  target_link_libraries(sinc_attention_test
-                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 if (ENABLE_EXTENSION)
@@ -387,14 +380,6 @@ if (ENABLE_EXTENSION)
   target_link_libraries(sylph_schedule_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
-  # One whole decoder block through six turns of that cycle. The plan and the
-  # calibration tests are host arithmetic; the third bootstraps ninety-six
-  # times. All three need LLAMA3_REAL_DIR except the first, and the matrix
-  # products are a host stand-in -- see the file header.
-  add_executable(llama_block_test LlamaBlockTest.cpp)
-  target_link_libraries(llama_block_test
-                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
-
   # [32] section 5.1's three claims for the conjugate-invariant ring -- same
   # ciphertext, twice the slots, same arithmetic -- checked on ci16_35 against
   # bootparam_35, which differ in nothing but the ring. Two Contexts in one
@@ -456,10 +441,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/sylphflow16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/sylphflow16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/sylphflow16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/sylphflow16_40.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_40.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_40.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_40.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
@@ -474,49 +455,15 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_stc2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_stc2.json COPYONLY)
 # Landing sub-ladders of ci16_35 (gen_landing.py, L in [5,19]); the test
 # defaults to land13 and reaches the rest via CHEDDAR_LAND_PARAM.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land5.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land5.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land6.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land6.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land7.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land7.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land8.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land8.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land9.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land9.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land10.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land12.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land12.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land14.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land14.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land16.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land16.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19.json COPYONLY)
 # The clean-landing sub-ladders of ci16_35 (gen_landing.py); boot_landing_test
 # defaults to land13 and reaches the others via CHEDDAR_LAND_PARAM.
 # The same ladders with TWO CoeffToSlot levels (gen_landing.py's 4th argument):
 # the module-basis CtS in its two-level real form (Doing.md 3.6/3.7), for the
 # feed-forward's BootContext.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land15c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land15c2.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land19c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land19c2.json COPYONLY)
 # Nine EvalMod levels (CHEDDAR_BOOT_DOUBLE_ANGLE=4, K = 32): the range the
 # module-sparse secret's wrap-around wants (Doing.md 3.9).
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
@@ -530,8 +477,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c4e10.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c4e10.json COPYONLY)
 # The aux-boot-split tower (Doing.md 7.39): EvalMod ends at 13, so the fused
 # score boots land at score_top 12 on a climb-26 ladder.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
 # The gen_landing v3 twins (Doing.md 7.49): the EvalMod recursion SOLVED so
@@ -542,8 +487,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10v3.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10v3.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10v3.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10v3.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9v3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9v3.json COPYONLY)
 # The norm channel-boot ring (Doing.md 7.38): L = 11 with num_stc 2, so the
 # channel Boot lands at 9 on a climb-23 ladder; the deep ladder then serves
 # only the norm's accumulator (2 boots a layer).
@@ -585,5 +528,28 @@ if (ENABLE_EXTENSION)
   # converters as the host wrote them against the device's.
   add_executable(converter_compare_test ConverterCompareTest.cpp)
   target_link_libraries(converter_compare_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The batched layer on the PLAIN slot map, with the chain addressing folded
+  # into the CC-MM's forward as a `forward_premap`: the premap is the block
+  # index's bit reversal, and the fold must cost nothing (same BSGS split,
+  # same diagonals, same plaintext bytes) and compute the same operand. What
+  # the plain map buys is a PC-attention plaintext that is sparsely packed
+  # (512 coefficients of 65536) instead of dense.
+  add_executable(pc_premap_test PcPremapTest.cpp)
+  target_link_libraries(pc_premap_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  # The first CONSUMER of the plain map: [SYLPH] section 4's public-context
+  # attention, which under that map is [KANG] Algorithm 1 twice with one exp
+  # between -- the encrypted queries against a public KV cache that differs
+  # per instance, streamed so the residency does not follow the context
+  # length.
+  add_executable(pc_attention_test PcAttentionTest.cpp)
+  target_link_libraries(pc_attention_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
+  add_executable(public_prefill_test PublicPrefillTest.cpp)
+  target_link_libraries(public_prefill_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()

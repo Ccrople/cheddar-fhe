@@ -109,11 +109,23 @@ class CiBatchLayer {
     //! GiB at the model's width) between the sum of squares and the apply,
     //! or boot each channel twice and hold nothing. The first is 4096
     //! bootstraps cheaper a norm, the second 24 GiB smaller.
-    //! The attention's norm holds nothing by default: the converters and
-    //! the split of the normalised stream already stand beside it. The
-    //! feed-forward's norm holds (`hold_channels_ffn`): its peak was 55 GiB
-    //! with them held, and 4096 bootstraps are four minutes a layer.
-    bool hold_channels = false;
+    //!
+    //! BOTH HOLD BY DEFAULT. The attention's norm used to hold nothing --
+    //! the converters and the split of the normalised stream already stand
+    //! beside it -- and the boot-site audit says what that cost: its pass-B
+    //! re-boot is 4096 boots a layer that land at 16 and spend ONE level,
+    //! because the very next line `LevelDown`s the result to
+    //! `norm_apply_level_attn`. It is the single largest wasted landing in
+    //! the layer, and no landing ladder fixes it -- holding DELETES it.
+    //! Measured on a B200 (25.43 ms a boot at group 1, about 20 at the
+    //! shipped group 8): the layer goes 766 -> 683 s, -10.9 %, for 23.6 GiB
+    //! standing at level 7 on a card with 183.
+    //!
+    //! On a smaller card that trade is not free -- the attention norm's
+    //! peak is what the old default was protecting -- so
+    //! `CHEDDAR_CI_BATCH_HOLD_CHANNELS=0` is still the memory
+    //! configuration, and it is the A/B for the saving.
+    bool hold_channels = true;
     bool hold_channels_ffn = true;
     //! Drop the boot's CoeffToSlot/SlotToCoeff tables (6.4 GiB on
     //! `ci16_35`) once a norm's bootstraps are done and rebuild them at the
@@ -182,6 +194,25 @@ class CiBatchLayer {
                                        //!< widened window, deg-63 fits the budget
     double softmax_first_lo = 0.0, softmax_first_hi = 0.0;
     double softmax_later_lo = 0.0, softmax_later_hi = 0.0;
+    //! The per-(iteration, head, row) estimate the FIRST invsqrt's argument is
+    //! divided by, so its polynomial sees a RATIO near one instead of the
+    //! population's raw `sq_0`. Empty = no fold (the shipped behaviour).
+    //!
+    //! It is not a statistic about the prompt. The causal mask makes the live
+    //! key count `live = t + 1` PUBLIC and `sq_0` scales with it, so the
+    //! per-row constant folds out something the server already knows; what is
+    //! left is the diffuse-vs-concentrated spread of the row, which is what
+    //! the window then has to cover. Measured over 2560 contexts at T = 128
+    //! (`reference/docs/ROBUST_CALIBRATION.md` 3.3): the first window goes
+    //! 10000x -> 271x and the LAST invsqrt's worst case 2.9e-01 -> 4.0e-05.
+    //! It costs the last invsqrt one level of floor, and at T = 128 there are
+    //! two spare. At T = 4096 there are not, and the fold is not the lever
+    //! there anyway -- see `gen_t4096_pop.py` and 3.2.
+    //!
+    //! `[niter][heads][tokens]`, handed to `SoftMaxCalibration::cho_est`
+    //! unchanged; `gen512.py` writes the first iteration and the reader fills
+    //! the rest with ones, which is a fold that does nothing.
+    std::vector<std::vector<std::vector<double>>> softmax_cho_est;
   };
 
   /** @brief The attention half's tensors on the device, `[in][out]` f32. */

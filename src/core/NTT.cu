@@ -861,14 +861,20 @@ void NTTHandler<word>::CiUnfold(make_signed_t<word> *dst, const word *primes,
 template <typename word>
 void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
                            const DvConstView<word> &src,
-                           bool montgomery_conversion /*= false*/) const {
+                           bool montgomery_conversion /*= false*/,
+                           int batch /*= 1*/) const {
   using signed_word = make_signed_t<word>;
   int log_degree = param_.log_degree_;
   int num_q_primes = np.GetNumQ();
   int q_size = num_q_primes * param_.degree_;
   int num_total_primes = np.GetNumTotal();
-  AssertTrue(dst.TotalSize() == num_total_primes * param_.degree_,
+  AssertTrue(batch >= 1, "NTT: invalid batch");
+  AssertTrue(dst.TotalSize() == batch * num_total_primes * param_.degree_,
              "NTT: Invalid dst size");
+  // Zero for a single transform, so that every kernel below is launched with
+  // the arguments it was launched with before this parameter existed.
+  const int batch_stride =
+      (batch == 1) ? 0 : num_total_primes * param_.degree_;
 
   const word *primes = param_.GetPrimesPtr(np);
   const signed_word *inv_primes = param_.GetInvPrimesPtr(np);
@@ -880,7 +886,12 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
   auto src_ptr = reinterpret_cast<const signed_word *>(src.data());
   InputPtrList<signed_word, 1> src_ptr_list;
   src_ptr_list.ptrs_[0] = src_ptr;
-  src_ptr_list.extra_ = src.QSize() - q_size;
+  // `extra_` is how far apart the source's prime slots are beyond this NP's
+  // own, so it is a property of ONE transform: a batched view holds `batch`
+  // of them back to back and its Q region is that many times as large.
+  AssertTrue(src.QSize() % batch == 0,
+             "NTT: src does not hold `batch` equal transforms");
+  src_ptr_list.extra_ = src.QSize() / batch - q_size;
 
   const word *tw_ptr = twiddle_factors_.data() + ter_left * param_.degree_;
   const word *tw_msb_ptr =
@@ -890,7 +901,8 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
   // reads a contiguous buffer and the aux offset is spent exactly once.
   if (param_.conjugate_invariant_) {
     CiFold(dst_ptr, primes, inv_primes, ter_left, main_left, num_q_primes,
-           num_total_primes, 0, 0, 0, 1, src_ptr, src_ptr_list.extra_);
+           num_total_primes, 0, 0, batch_stride, batch, src_ptr,
+           src_ptr_list.extra_);
     src_ptr_list.ptrs_[0] = dst_ptr;
     src_ptr_list.extra_ = 0;
   }
@@ -899,7 +911,7 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
   int block_dim = GetBlockDim(NTTType::NTT, Phase::Phase1);
   int stage_merging = GetStageMerging(NTTType::NTT, Phase::Phase1);
   dim3 grid_dim(param_.degree_ / (1 << stage_merging) / block_dim,
-                num_total_primes);
+                num_total_primes, batch);
   int shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
@@ -909,11 +921,11 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
       src_const_ptr_list.extra_ = main_left;
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, src_ptr_list, src_const_ptr_list);
+          batch_stride, src_ptr_list, src_const_ptr_list);
     } else {
       kernel::NTTPhase1<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
           dst_ptr, primes, inv_primes, tw_ptr, main_left, num_q_primes, 0, 0,
-          0, src_ptr_list);
+          batch_stride, src_ptr_list);
     }
   });
 
@@ -923,14 +935,14 @@ void NTTHandler<word>::NTT(DvView<word> &dst, const NPInfo &np,
   // Phase 2
   block_dim = GetBlockDim(NTTType::NTT, Phase::Phase2);
   stage_merging = GetStageMerging(NTTType::NTT, Phase::Phase2);
-  grid_dim =
-      dim3(param_.degree_ / (1 << stage_merging) / block_dim, num_total_primes);
+  grid_dim = dim3(param_.degree_ / (1 << stage_merging) / block_dim,
+                  num_total_primes, batch);
   shared_mem_size = block_dim * (1 << stage_merging) * sizeof(word);
   constexpr_for<min_log_degree_, max_log_degree_ + 1>([&](auto j) {
     if (log_degree != j) return;
     kernel::NTTPhase2<word, j><<<grid_dim, block_dim, shared_mem_size>>>(
         dst_ptr, primes, inv_primes, tw_ptr, tw_msb_ptr, main_left,
-        num_q_primes, 0, 0, 0, src_ptr_list);
+        num_q_primes, 0, 0, batch_stride, src_ptr_list);
   });
 }
 

@@ -142,11 +142,31 @@ class CiBatchAttention {
     //! ciphertext a head) bootstraps on its own short ring and the walk
     //! above `forward_level` shrinks to exp + mask + the two products --
     //! 8 levels at exp degree 15 -- so the scores can land at 12: a
-    //! shorter tower for the fused boots (`ci16_35_land13c3e10`, EvalMod
+    //! shorter tower for the fused boots (`ci16_35_land13c3e10v3`, EvalMod
     //! ending at 13), and the serial route LevelDowns to it. Requires
     //! `affine_in_prefix` on the fused route (the affine multiply has no
     //! level of its own at 12).
     int score_top = 0;
+    //! Run on the PLAIN slot map `Slot(t, b) = t * B + b` instead of the
+    //! chain addressing, with the chain's block map folded into the two
+    //! converters as a premap (`CiSinCConverter`'s `forward_premap` /
+    //! `inverse_premap`, the block index's bit reversal). It is free: those
+    //! transforms are already on the stride-`sub_degree` diagonal lattice
+    //! and already at its `degree / sub_degree` ceiling, so a block
+    //! relabelling costs no diagonal, no plaintext byte and no key
+    //! (PcPremapTest). Nothing inside the attention reads the map except
+    //! the per-token plaintexts, which follow it.
+    //!
+    //! What it BUYS is outside: a PC-attention operand is constant over the
+    //! token axis and varies over the instance axis, and under this map that
+    //! is a k = B subring element -- 512 coefficients of 65536, and lane t
+    //! is instance t exactly. Under the chain map the token sits in the
+    //! middle slot bits and the same operand is dense.
+    //!
+    //! Not compatible with `fused_scores`: the tower's lane prefix mixes
+    //! only WITHIN a lane group, so its offsets are off the block lattice
+    //! and a block relabelling multiplies the two sets (63 -> 15309).
+    bool plain_map = false;
     bool verbose = false;
   };
 
@@ -235,7 +255,14 @@ class CiBatchAttention {
   //! the shift down is ONE slot rotation by `lanes` -- no second forward
   //! converter (3.8 GiB of plaintexts) for it.
   void AddBootRotations(EvkRequest &req) const;
-  int GetShiftRotation() const { return cfg_.sub_degree; }
+  //! Under the PLAIN map the token is the SLOW axis instead, so the same
+  //! shift is `T/2 * B` slots -- a bigger index, still ONE rotation, still
+  //! lane-preserving (PcPremapTest).
+  int GetShiftRotation() const {
+    return layout_.lanes == 0
+               ? (cfg_.num_tokens / 2) * layout_.num_instances
+               : cfg_.sub_degree;
+  }
   //! Automorphism indices on the lifted ring.
   std::vector<int> LiftedRotationIndices() const {
     return ccmm_.RotationIndices(2 * cfg_.sub_degree);
@@ -318,6 +345,48 @@ class CiBatchAttention {
     //! on [0.9, 1.1] is 2^-13.
     int inv_degree = 7;
     bool causal = true;
+    /**
+     * @brief `niter > 0`: a per-ITERATION, per-HEAD, per-ROW estimate of
+     * `sq = sum_l y_l^2`, which the invsqrt's argument is divided by.
+     * `[iter][head][row]`; empty is 1 everywhere, i.e. today's behaviour.
+     *
+     * ## Why 4096 keys need it
+     *
+     * After the first normalise-and-square the row is a PROBABILITY VECTOR
+     * (`sum_l (y_l r)^2 = 1` by construction of `r`), so every later `sq` is
+     * that distribution's COLLISION PROBABILITY -- bounded below by
+     * `1 / live` and above by how concentrated the row is. The window a
+     * single affine has to cover therefore spans the rows' concentrations,
+     * and its lower edge falls with the key count.
+     *
+     * Measured on the real layer-0 weights and a real 4096-token prompt
+     * (`reference/scripts/cho_window.py`, 8 heads, niter 2):
+     *
+     *     later window   T = 128   [0.0131 .. 1.000]     deg-63  2^-19.4
+     *                    T = 4096  [0.00051 .. 0.1732]   deg-63  2^-5.4
+     *
+     * -- the lower edge drops by exactly the key ratio (1/128 -> 1/4096) and
+     * the fit collapses. It does NOT blow up, which is the dangerous part:
+     * the polynomial saturates, `r` comes back at 0.354x its true value, and
+     * the attention output is silently scaled down.
+     *
+     * Dividing `sq` by a per-row estimate collapses the window to the RATIO
+     * actual/estimate, which is what `row_norm` already does for the
+     * single-shot path. It is nearly free: the invsqrt's affine ALREADY
+     * multiplies `sq` by `1 / aff_a`, so the estimate rides that constant at
+     * no extra level, and only taking it back out of `r` costs one -- which
+     * the walk has (deg-63 lands `r` at 8 against a floor of
+     * `forward_level + 2`).
+     *
+     * And it buys accuracy back rather than spending it. On the same fit:
+     *
+     *     ratio window   [0.25, 4] = 16x   deg-31  6.1e-08   deg-63  2.0e-14
+     *                    [0.5, 2]  =  4x   deg-31  4.8e-15
+     *
+     * so a fold that lands inside 16x lets `last_inv_degree` come DOWN from
+     * 63 to 31 and gives a level back.
+     */
+    std::vector<std::vector<std::vector<double>>> cho_est;
 
     // --- Full Cho [25] normalize-and-square iteration (heterogeneous B=512) ---
     //! Extra squaring iterations `k`. 0 = the single-square shortcut above
@@ -355,6 +424,68 @@ class CiBatchAttention {
     //! spread not yet compressed). 0 = fall back to [norm_lo,norm_hi]. Later
     //! iterations use the data-independent [norm_lo,norm_hi] ~ [1/n,1].
     double first_lo = 0.0, first_hi = 0.0;
+    /**
+     * @brief The INTERMEDIATE normalizations' window (0 < j < k-1), and the
+     * degree fitted on it. 0 = fall back to [norm_lo, norm_hi] and
+     * `iter_inv_degree`, which is what k = 2 wants (there IS no intermediate)
+     * and what k >= 3 must not have.
+     *
+     * ## Why an intermediate needs its own window
+     *
+     * `y_j` for j >= 1 is the tempered distribution NORMALIZED TO SUM ONE, so
+     * `sq_j` is its collision probability and the LAST iteration -- always at
+     * temperature 2, whatever k is -- spans `[1/live, 1]`: 2069x at T = 4096
+     * against 350x at T = 128 (`reference/scripts/cho_ideal512.py`). The
+     * intermediates are at temperature 4, 8, 16 ... and span 25x, 5x, 18x.
+     * Compiling them on the LAST one's window is therefore a hole that only
+     * opens at k >= 3, and it opened: with `iter_inv_degree` 31 over a 5900x
+     * window the intermediate `r` is ~38% out, `y = (y r)^2` carries that to
+     * the fourth power, and `sq_{k-1}` leaves the window the last invsqrt was
+     * fitted on -- whose unclamped Chebyshev then grows like cosh. Measured on
+     * a T = 4096 population calibration: softmax 2^-3.7, and with the served
+     * context's own (tighter) last window 2.3e+49.
+     *
+     * It cannot be fixed by raising `iter_inv_degree`, because that degree is
+     * also the FIRST invsqrt's and the first is compiled at `exp_out_ - 3`
+     * with five levels to spend ("overspends its levels" at 63).
+     */
+    double mid_lo = 0.0, mid_hi = 0.0;
+    int mid_inv_degree = 0;  //!< 0 = `iter_inv_degree`
+    /**
+     * @brief `[iter][head][row]`: a per-row estimate of the public half's
+     * running scalar `R_{j+1}`, so the ciphertext that is BOOTSTRAPPED carries
+     * `R / est` instead of `R`. Empty is 1 everywhere -- today's behaviour.
+     *
+     * ## Why `R` is not O(1)
+     *
+     * `SoftMaxCho` carries `R_j` because the public keys leave the sum: with
+     * `y^(j)_l = (y0_l)^(2^j) R_j`, `R_j` has no key index, so the public half
+     * owes only power sums. But `sum_l y^(j)_l = 1`, so
+     *
+     *     R_j  =  1 / sum_l (y0_l)^(2^j)
+     *
+     * -- it IS the softmax's normaliser, and that spans orders of magnitude
+     * with the data. At T = 128 with a per-prompt calibration it happens to sit
+     * near 1 (measured 0.974) and the bootstrap at the end of each iteration is
+     * well posed. At T = 4096 with a POPULATION calibration the same quantity
+     * reaches 42 (host), the boot's message leaves EvalMod's range, and the
+     * result is 2.2e+49 -- silently, because a bootstrap out of range does not
+     * raise.
+     *
+     * With an estimate the boot sees `R / est ~ 1`. It costs no level of its
+     * own: the factor rides `r^2`, which is already formed for the recursion
+     * and is followed immediately by the boot, and the estimate comes back out
+     * where `R` is CONSUMED -- `est^2` folds into the per-row constant the
+     * public power sum already carries. The one thing the caller must do is
+     * take `est` back out of `pub_scale`, which comes back as
+     * `R_k / pub_r_est[niter-1][head][row]`; fold it into the public value
+     * accumulator, which carries a per-row constant of its own.
+     *
+     * The estimate itself is offline: `R_j = 1 / sum_l (y0_l)^(2^j)` is a
+     * function of the scores, so a calibration split gives it
+     * (reference/scripts/gen_t4096_pop.py).
+     */
+    std::vector<std::vector<std::vector<double>>> pub_r_est;
   };
 
   /**
@@ -362,6 +493,11 @@ class CiBatchAttention {
    * per-token plaintexts of the causal mask and the row shift. Cheap.
    */
   void PrepareSoftMax(const SoftMaxCalibration &calib);
+  //! How many exp evaluations `SoftMax` batches (<= 1 = the per-ciphertext
+  //! loop, the default). `CHEDDAR_BATCH_SOFTMAX_EXP` overrides; a setter so
+  //! one object can run both routes for a word-for-word comparison.
+  void SetExpBatch(int n) { exp_batch_ = n; }
+  int GetExpBatch() const { return exp_batch_; }
   //! Where `SoftMax` expects its booted scores: the boot's landing.
   int GetTopLevel() const {
     return cfg_.score_top > 0 ? cfg_.score_top
@@ -397,8 +533,56 @@ class CiBatchAttention {
    * @param carried the scores' recorded-over-canonical factor before their
    *        Boot, divided out in the affine map
    */
+  /**
+   * @brief The PUBLIC half of a T = 4096 head, exactly as `CiPcAttention`
+   * leaves it. Absent (a null pointer) is the T = 128 layer, and then not one
+   * instruction below changes -- the whole join is inside
+   * `if (pub != nullptr)`.
+   *
+   * Unrolling `SoftMaxCho`'s walk gives
+   * `y^(j)_l = (y0_l)^(2^j) R_j` with `R_j = prod_{i<j} (r^(i))^(2^(j-i))`,
+   * and `R_j` carries no key index -- it is one number a QUERY token. So it
+   * comes out of the denominator,
+   *
+   *     sq^(j) = sum_l (y^(j)_l)^2 = R_j^2 sum_l (y0_l)^(2^(j+1)) ,
+   *
+   * and the public keys never have to survive an iteration. What they hand
+   * over instead is `pow[j] = sum_p (y0_p)^(2^(j+1))`, one a iteration, and
+   * one value accumulator at the top power. `CiPcAttention::Head` returns
+   * exactly those.
+   */
+  struct PublicHalf {
+    //! `pow[j] = sum_p (y0_p)^(2^(j+1))` DIVIDED by `pow_scale[j]`, `niter`
+    //! of them.
+    const std::vector<Ct> *pow = nullptr;
+    /**
+     * @brief The per-ITERATION, per-ROW constant the caller divided `pow[j]`
+     * by. `[iter][row]`; required whenever `pow` is given.
+     *
+     * The public term has to be bootstrapped -- it arrives from the public
+     * branch far below the walk -- and a bootstrap wants an O(1) message
+     * (`GetMessageRatio`). The raw power sums are not: over 3968 keys
+     * `sum_p y0^2` runs to the hundreds, which puts EvalMod's sine outside
+     * its range and returns garbage rather than an error. So the caller
+     * hands over the sum already divided by a calibrated estimate of its own
+     * size, and this class multiplies the estimate back in BEFORE the boot,
+     * together with `1 / aff_a` and the row's `cho_est` -- one plaintext,
+     * and the thing that crosses the bootstrap is the public half of the
+     * invsqrt's ARGUMENT, which is O(1) by construction.
+     */
+    std::vector<std::vector<double>> pow_scale;
+  };
+
+  /**
+   * @param pub the public half of a T = 4096 head, or null for T = 128
+   * @param pub_scale out: `R_niter`, the per-query-token factor the public
+   *        VALUE accumulator has to be multiplied by before it joins the
+   *        output of `Values`. Written only when `pub` is given.
+   */
   void SoftMax(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
-               double carried, const EvkMap<word> &evk) const;
+               double carried, const EvkMap<word> &evk,
+               const PublicHalf *pub = nullptr,
+               Ct *pub_scale = nullptr) const;
 
   /**
    * @brief The FULL Cho [25] iteration (SoftMaxCalibration::niter > 0) for 512
@@ -414,7 +598,9 @@ class CiBatchAttention {
    * last (last_inv_degree). Plain causal path only (no fused/affine-prefix).
    */
   void SoftMaxCho(std::vector<Ct> &P, const std::vector<Ct> &scores, int head,
-                  double carried, const EvkMap<word> &evk) const;
+                  double carried, const EvkMap<word> &evk,
+                  const PublicHalf *pub = nullptr,
+                  Ct *pub_scale = nullptr) const;
 
   /**
    * @brief `res = P V` for one head: the 128 attention-output channel
@@ -434,6 +620,11 @@ class CiBatchAttention {
   //! The compiled softmax walk.
   SoftMaxCalibration calib_;
   bool softmax_ready_ = false;
+  //! How many of the softmax's `num_tokens` exp evaluations go through
+  //! `EvalPoly::EvaluateBatch` at once. <= 1 is the per-ciphertext loop, and
+  //! that is the DEFAULT because the batch measured flat -- see `SoftMax`.
+  //! `CHEDDAR_BATCH_SOFTMAX_EXP` overrides.
+  int exp_batch_ = 1;
   int exp_in_ = 0, exp_out_ = 0, mask_level_ = 0, sq_level_ = 0,
       poly_in_ = 0;
   // [1] is recompiled lazily on the aux path (its ladder's EvalMod can
@@ -461,6 +652,14 @@ class CiBatchAttention {
   //! last invsqrt cannot blow for any prompt. Used by both PrepareSoftMax (the
   //! compiled poly) and SoftMaxCho (the runtime affine) -- they must agree.
   double cho_later_lo_ = 0.0, cho_later_hi_ = 0.0;
+  //! The INTERMEDIATE window (0 < j < k-1) and its degree. Separate from the
+  //! later one because the intermediates are at temperature 4, 8, 16 ... and
+  //! span tens, while the last is always at temperature 2 and spans `live`.
+  //! Its upper end carries the FIRST invsqrt's overshoot, and the LAST one's
+  //! carries this one's -- the chain, not one step. See
+  //! `SoftMaxCalibration::mid_lo`.
+  double cho_mid_lo_ = 0.0, cho_mid_hi_ = 0.0;
+  int cho_mid_deg_ = 0;
   int cho_inv_in_ = 0;   //!< the level the later invsqrts read sq at (booted)
   //! The FIRST iteration skips the main-path boot (y0 is fresh from exp), so its
   //! invsqrt reads sq at a LOWER level -- compiled separately here.
@@ -524,6 +723,10 @@ class CiBatchAttention {
   RingSwitchHandler<word> switcher_;
   CiLiftHandler<word> lift_;
   BatchCcmmHandler<word> ccmm_;
+  //! `plain_map` only: the block permutation both converters fold, built
+  //! from the two layouts rather than transcribed from them. Held because
+  //! the converters take a pointer to it.
+  std::vector<int> premap_;
   //! The forward (slots -> SinC) and the inverse converter.
   std::unique_ptr<CiSinCConverter<word>> fwd_;
   std::unique_ptr<CiSinCConverter<word>> inv_;
