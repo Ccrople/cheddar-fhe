@@ -15,13 +15,15 @@ LayerNormHandler<word>::LayerNormHandler(ConstContextPtr<word> context,
                                          double eps, double window_ratio,
                                          int degree, int channel_stride,
                                          int live_channels,
-                                         const std::vector<double> &fitted)
+                                         const std::vector<double> &fitted,
+                                         Mode mode)
     : context_{std::move(context)},
       num_tokens_{num_tokens},
       num_channels_{num_channels},
       layer_constant_{layer_constant},
       eps_{eps},
-      input_level_{input_level} {
+      input_level_{input_level},
+      mode_{static_cast<int>(mode)} {
   AssertTrue(num_tokens_ > 0 && IsPowOfTwo(num_tokens_),
              "LayerNorm: num_tokens must be a power of two");
   AssertTrue(num_channels_ > 0, "LayerNorm: num_channels must be positive");
@@ -54,7 +56,11 @@ LayerNormHandler<word>::LayerNormHandler(ConstContextPtr<word> context,
   }
 
   // The centring: one plaintext multiply and a rescale, per the header.
-  centre_level_ = input_level_ - 1;
+  // `kRefine` has NONE. Its input is the crude stage's `y0 = (x - mu) r0`,
+  // and `r0` is one scalar a token, so the row is still centred; skipping the
+  // multiply is one of the levels the extra crossing gives back.
+  centre_level_ =
+      (mode == Mode::kRefine) ? input_level_ : input_level_ - 1;
   AssertTrue(centre_level_ >= 0,
              "LayerNorm: the centring does not fit below the input level");
 
@@ -88,6 +94,12 @@ LayerNormHandler<word>::LayerNormHandler(ConstContextPtr<word> context,
   // `Apply` multiplies the centred image by `r` first (landing one under
   // `r`'s level), then by the gain, then rescales -- so the gain sits one
   // under `r` and the bias one under the gain.
+  // `kCrude` keeps the GAIN and drops only the bias. The gain is not the
+  // model's there -- it is the one constant that puts `y0` on the stream's
+  // ride before the crossing, and it cannot be folded into `layer_constant`
+  // instead: that scales the ARGUMENT as well, and the argument has to stay
+  // inside the window (measured: `alpha = 1/out_scale^2` puts it at 2192
+  // against a window of [0.8, 1.2] and the chain comes back at 2^+11).
   weight_level_ = out_level - 1;
   bias_level_ = weight_level_ - 1;
   // Where the mask meets the channel sum: the sum costs no level, so it is
@@ -257,8 +269,14 @@ void LayerNormHandler<word>::Apply(
 
   // 1. Centre. One level, and the variance below is the mean square of what
   //    comes out -- no `mean(x^2) - mu^2` cancellation anywhere.
-  std::vector<Ct> xc;
-  Centre(xc, x, mask, evk_map);
+  //
+  //    `kRefine` skips it: its input IS the crude stage's centred row, and
+  //    the sum of squares below is then `var r0^2 = (1 + e)^2`, the quantity
+  //    whose interval is a theorem rather than a statistic (see the header).
+  const bool refine = mode_ == static_cast<int>(Mode::kRefine);
+  std::vector<Ct> centred;
+  if (!refine) Centre(centred, x, mask, evk_map);
+  const std::vector<Ct> &xc = refine ? x : centred;
 
   // 2. The variance, broadcast to every slot.
   Ct acc;
@@ -291,10 +309,11 @@ void LayerNormHandler<word>::Apply(
   //    `sqrt(alpha_L)` by this class's contract, since
   //    `1/sqrt(var) = sqrt(alpha_L) * r`; the bias is in the stream's units.
   const int r_level = context_->param_.NPToLevel(r.GetNP());
+  const bool crude = mode_ == static_cast<int>(Mode::kCrude);
   AssertTrue(r_level - 1 == weight_level_,
              "LayerNorm: the inverse square root did not land where Prepare "
              "assumed");
-  Prepare(weight, bias);
+  Prepare(weight, crude ? std::vector<std::vector<Complex>>{} : bias);
   res.clear();
   res.resize(num_ct_);
   Ct levelled, product;

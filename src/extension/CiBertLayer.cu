@@ -145,18 +145,38 @@ void CiBertLayer<word>::Canonicalise(Ct &ct, const Pt &pt) const {
 
 template <typename word>
 Plaintext<word> CiBertLayer<word>::TokenPlaintext(
-    double factor, const std::vector<double> &per_token, double scale) const {
-  AssertTrue(static_cast<int>(per_token.size()) == cfg_.num_tokens,
+    double factor, const std::vector<double> &per_token, double scale,
+    const std::vector<double> &per_channel, int ct_index) const {
+  AssertTrue(per_token.empty() ||
+                 static_cast<int>(per_token.size()) == cfg_.num_tokens,
              "CiBertLayer: the per-token rescale needs one factor per token");
+  AssertTrue(per_channel.empty() ||
+                 static_cast<int>(per_channel.size()) >= cfg_.model_declared,
+             "CiBertLayer: the per-channel suppression needs one factor per "
+             "declared model channel");
   // The stream's slot address is `channel * num_tokens + rev(token)` (1.5du),
   // so a per-token factor is a stride-`num_tokens` pattern. On the module
   // basis there is no duplicate band, so it is that and nothing else.
   const int log_t = Log2Ceil(cfg_.num_tokens);
   std::vector<Complex> vals(num_slots_, Complex(0.0, 0.0));
+  // Both axes ride the SAME plaintext: the slot address is
+  // `channel * num_tokens + rev(token)`, so a per-token factor is a
+  // stride-`num_tokens` pattern and a per-channel one is constant within each
+  // stride. `1 / d_c` is what the norm needs to see the TRUE variance, and
+  // putting it here costs nothing because the multiply was happening anyway.
   for (int t = 0; t < cfg_.num_tokens; t++) {
     const int p = Rev(t, log_t);
+    const double ft = per_token.empty() ? 1.0 : per_token[t];
     for (int c = 0; p + c * cfg_.num_tokens < num_slots_; c++) {
-      vals[p + c * cfg_.num_tokens] = Complex(factor * per_token[t], 0.0);
+      double fc = 1.0;
+      if (!per_channel.empty()) {
+        const int declared = ct_index * cfg_.proj_rank + c;
+        const double d = declared < static_cast<int>(per_channel.size())
+                             ? per_channel[declared]
+                             : 1.0;
+        fc = d > 0.0 ? 1.0 / d : 1.0;
+      }
+      vals[p + c * cfg_.num_tokens] = Complex(factor * ft * fc, 0.0);
     }
   }
   Plaintext<word> pt;
@@ -259,7 +279,8 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
                                  const std::vector<double> &token_scale,
                                  double in_scale, double out_scale,
                                  const std::vector<double> &row_suppress,
-                                 const EvkMap<word> &evk) {
+                                 const EvkMap<word> &evk,
+                                 const NormStages *stages) {
   NvtxScope _nv("bert: NormTurn");
   // THE OPERATOR'S INPUT RIDES AT ONE, AND THAT IS WHERE ITS PRECISION GOES.
   // LayerNorm is scale invariant, so feeding it `beta * x` with `alpha /
@@ -283,26 +304,162 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
   // times the model's own value, which is what the handler is calibrated for
   // -- and the per-token factor, which LayerNorm cancels identically.
   const double factor = beta / (crossing_ * in_scale);
-  Pt token_pt;
-  if (!token_scale.empty()) {
-    token_pt = TokenPlaintext(factor, token_scale, slots[0].GetScale());
+  const std::vector<double> *chan =
+      (stages != nullptr && stages->channel_suppress != nullptr &&
+       !stages->channel_suppress->empty())
+          ? stages->channel_suppress
+          : nullptr;
+  if (chan != nullptr) {
+    // ONE PLAINTEXT PER CIPHERTEXT, because `1 / d_c` differs along the
+    // channel axis and a ciphertext holds `proj_rank` channels. It is the
+    // same multiply and the same single level the per-token factor already
+    // used -- the channel half is free.
+    for (int i = 0; i < num_model_cts_; i++) {
+      Pt pt = TokenPlaintext(factor, token_scale, slots[i].GetScale(), *chan,
+                             i);
+      Canonicalise(slots[i], pt);
+    }
+  } else if (token_scale.empty()) {
+    for (int i = 0; i < num_model_cts_; i++) Canonicalise(slots[i], factor);
+  } else {
+    const Pt token_pt =
+        TokenPlaintext(factor, token_scale, slots[0].GetScale());
+    for (int i = 0; i < num_model_cts_; i++) Canonicalise(slots[i], token_pt);
   }
-  for (int i = 0; i < num_model_cts_; i++) {
-    if (token_scale.empty()) {
-      Canonicalise(slots[i], factor);
-    } else {
-      Canonicalise(slots[i], token_pt);
+
+  // The live mask, which the centring needs and therefore has to exist
+  // before the crude stage rather than beside the gain below.
+  const int rank_m = cfg_.proj_rank;
+  std::vector<std::vector<Complex>> live_mask(num_model_cts_);
+  for (int k = 0; k < num_model_cts_; k++) {
+    live_mask[k].assign(num_slots_, Complex(0.0, 0.0));
+    for (int ch = 0; ch < rank_m; ch++) {
+      const bool live = k * rank_m + ch < cfg_.model_live;
+      for (int t = 0; t < cfg_.num_tokens; t++) {
+        live_mask[k][static_cast<size_t>(ch) * cfg_.num_tokens +
+                     Rev(t, Log2Ceil(cfg_.num_tokens))] =
+            Complex(live ? 1.0 : 0.0, 0.0);
+      }
     }
   }
+
+  // THE INVERSE SQUARE ROOT IN TWO STAGES, when the calibration asks for it.
+  //
+  // The crude stage runs on the layer's own window and hands back
+  // `y0 = (x - mu) r0`; the stream then makes an ordinary crossing, which
+  // costs one bootstrap and buys the refine stage a fresh span; the refine
+  // stage reads `mean(y0^2)`, which is `(1 + e)^2` IDENTICALLY for the crude
+  // stage's relative error `e`, so its window is a theorem rather than a
+  // statistic. `LayerNorm.h`'s Mode comment carries the argument in full.
+  //
+  // THE CRUDE STAGE'S OUTPUT HAS TO RIDE THE CROSSING, and `y0` is the
+  // NORMALISED row -- magnitude ten to fifteen -- where the coefficient
+  // stream between layers rides at `out_scale` times the model, two orders
+  // smaller. Handed over raw it is far outside the crossing's message range
+  // and EvalMod returns noise (measured: the twelve-layer chain at 2^+9 to
+  // 2^+16). The fix costs no level: the handler's own layer constant scales
+  // its output as `1 / sqrt(alpha)`, so `alpha = 1 / out_scale^2` puts `y0`
+  // at exactly the stream's ride, the refine stage takes the SAME constant
+  // (its argument is then `out_scale^2 * (1/out_scale^2) = 1`, the window's
+  // centre), and the `1 / out_scale` that has to come back out rides the
+  // gain plaintext, which is a multiply that was happening anyway.
+  const bool staged = stages != nullptr && stages->crude_degree > 0;
+  std::vector<Ct> staged_slots;
+  if (staged) {
+    LayerNormHandler<word> crude(
+        boot_, cfg_.num_tokens, cfg_.model_declared, /*layer_constant=*/1.0,
+        op_level_, beta * beta * cfg_.eps, window, stages->crude_degree,
+        /*channel_stride=*/1, cfg_.model_live,
+        stages->crude_invsqrt ? *stages->crude_invsqrt : std::vector<double>{},
+        LayerNormHandler<word>::Mode::kCrude);
+    AssertTrue(crude.GetOutputLevel() >= sched_.GetStCLevel(),
+               "CiBertLayer: the crude invsqrt lands at level " +
+                   std::to_string(crude.GetOutputLevel()) + " but StC is at " +
+                   std::to_string(sched_.GetStCLevel()) + " -- degree " +
+                   std::to_string(stages->crude_degree) + " is " +
+                   std::to_string(sched_.GetStCLevel() -
+                                  crude.GetOutputLevel()) +
+                   " levels too many for the first span.");
+    // THE CRUDE STAGE'S GAIN IS NOT THE MODEL'S. `y0` is the NORMALISED row,
+    // magnitude ten to fifteen, and the coefficient stream between layers
+    // rides at `out_scale` times the model -- two orders smaller. Handed to
+    // the crossing raw it is far outside the message range and EvalMod
+    // returns noise (measured: the chain at 2^+9 to 2^+16). So the crude
+    // stage's one constant gain is `out_scale / kappa`: `ToCoeff` multiplies
+    // by `kappa` on the way out, and what the coefficient stream then carries
+    // is exactly `out_scale` times the normalised row, which is what every
+    // other stream in this layer carries.
+    //
+    // It cannot ride `layer_constant` instead. That scales the ARGUMENT by
+    // `alpha` as well as the output by `1/sqrt(alpha)`, and the argument has
+    // to stay inside the window -- `alpha = 1/out_scale^2` puts it at 2192
+    // against a window of [0.8, 1.2] (measured: the chain at 2^+11).
+    std::vector<std::vector<Complex>> crude_gain(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      crude_gain[k].assign(num_slots_, Complex(0.0, 0.0));
+      for (int ch = 0; ch < rank_m; ch++) {
+        const bool live = k * rank_m + ch < cfg_.model_live;
+        for (int t = 0; t < cfg_.num_tokens; t++) {
+          crude_gain[k][static_cast<size_t>(ch) * cfg_.num_tokens +
+                        Rev(t, Log2Ceil(cfg_.num_tokens))] =
+              Complex(live ? out_scale / kappa_ : 0.0, 0.0);
+        }
+      }
+    }
+    std::vector<Ct> y0;
+    crude.Apply(y0, slots, crude_gain, /*bias=*/{}, live_mask, evk);
+    // The crossing. `ToCoeff` multiplies by `kappa` and `ToSlot` by
+    // `crossing`, so the round trip has to be divided back out or the refine
+    // stage's argument is off its window by the square of the product.
+    std::vector<Ct> coeffed(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      sched_.ToCoeff(coeffed[k], y0[k], evk, /*min_ks=*/false);
+    }
+    {
+      std::vector<const Ct *> xs2(num_model_cts_);
+      for (int k = 0; k < num_model_cts_; k++) xs2[k] = &coeffed[k];
+      sched_.ToSlotBatch(staged_slots, xs2, evk, /*min_ks=*/false);
+    }
+    // `ToSlot` multiplied by `crossing`, and the stream carries `out_scale`;
+    // both come off here, so the refine stage reads the normalised row and
+    // its `mean(y0^2)` is one -- the centre of its window.
+    for (int k = 0; k < num_model_cts_; k++) {
+      Canonicalise(staged_slots[k], 1.0 / (crossing_ * out_scale));
+    }
+  }
+  const std::vector<Ct> &norm_in = staged ? staged_slots : slots;
 
   // The handler sees `beta * x`, so its own layer constant is one and its
   // epsilon carries `beta^2`; the gain then carries no `sqrt(alpha)` at all,
   // only the model's gain and the stream factor the output has to leave with.
-  const int degree = degree_in > 0 ? degree_in : NormDegree(window);
-  LayerNormHandler<word> ln(boot_, cfg_.num_tokens, cfg_.model_declared,
-                            /*layer_constant=*/1.0, op_level_,
-                            beta * beta * cfg_.eps, window, degree,
-                            /*channel_stride=*/1, cfg_.model_live, invsqrt);
+  // Staged, it sees `y0` instead: already centred, `mean(y0^2) ~ 1`, and its
+  // epsilon already spent -- so the constant is one, the epsilon zero, and
+  // the window the crude stage's own error bound.
+  // The window the handler below actually reads -- the refine stage's when
+  // staged -- so the degree fallback is taken against the right one. Without
+  // this a calibration that leaves the degree at zero (the served prompt's
+  // does) hands the refine stage a degree of zero and `EvalPoly` refuses it.
+  const double use_window = staged ? stages->refine_window : window;
+  // STAGED, `degree_in` IS THE ONE-STAGE DEGREE and belongs to neither
+  // stage: the plan's single-stage entry is what the norm would need without
+  // the split (511 at the feed-forward norms of layers 9 and 10), and asking
+  // the refine tree for it spends the span twice over. The refine degree is
+  // the length of its own fitted vector, and the fallback is the rate law on
+  // the refine WINDOW.
+  int degree = degree_in > 0 ? degree_in : NormDegree(use_window);
+  if (staged) {
+    degree = (stages->refine_invsqrt != nullptr &&
+              !stages->refine_invsqrt->empty())
+                 ? static_cast<int>(stages->refine_invsqrt->size()) - 1
+                 : NormDegree(use_window);
+  }
+  LayerNormHandler<word> ln(
+      boot_, cfg_.num_tokens, cfg_.model_declared, /*layer_constant=*/1.0,
+      op_level_, staged ? 0.0 : beta * beta * cfg_.eps, use_window,
+      degree, /*channel_stride=*/1, cfg_.model_live,
+      staged && stages->refine_invsqrt ? *stages->refine_invsqrt : invsqrt,
+      staged ? LayerNormHandler<word>::Mode::kRefine
+             : LayerNormHandler<word>::Mode::kWhole);
   AssertTrue(ln.GetNumCiphertexts() == num_model_cts_,
              "CiBertLayer: LayerNormHandler disagrees about the width");
   AssertTrue(ln.GetOutputLevel() >= sched_.GetStCLevel(),
@@ -317,12 +474,10 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
   // address is `channel * num_tokens + token`, so all three are constant
   // along the token axis (`NormWeights` in the Llama layer, same convention).
   const int rank = cfg_.proj_rank;
-  std::vector<std::vector<Complex>> wts(num_model_cts_), bs(num_model_cts_),
-      mask(num_model_cts_);
+  std::vector<std::vector<Complex>> wts(num_model_cts_), bs(num_model_cts_);
   for (int k = 0; k < num_model_cts_; k++) {
     wts[k].assign(num_slots_, Complex(0.0, 0.0));
     bs[k].assign(num_slots_, Complex(0.0, 0.0));
-    mask[k].assign(num_slots_, Complex(0.0, 0.0));
     for (int ch = 0; ch < rank; ch++) {
       const int declared = k * rank + ch;
       const bool live = declared < cfg_.model_live;
@@ -334,8 +489,16 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
       // units, and `ToCoeff` below multiplies by `kappa` on the way out, so
       // the gain and the bias carry the quotient and the coefficient stream
       // carries exactly `stream_scale`.
-      const double g = live ? gain[declared] * out_scale / kappa_ : 0.0;
-      const double b = live ? bias[declared] * out_scale / kappa_ : 0.0;
+      // The gain and the bias put `d_c` BACK, for the stream that leaves.
+      // Everything else that produces this stream (the O and down
+      // projections and their biases) folds the same factor into its weights,
+      // so the residual add downstream is consistent.
+      const double dc =
+          (chan != nullptr && declared < static_cast<int>(chan->size()))
+              ? (*chan)[declared]
+              : 1.0;
+      const double g = live ? gain[declared] * out_scale * dc / kappa_ : 0.0;
+      const double b = live ? bias[declared] * out_scale * dc / kappa_ : 0.0;
       for (int t = 0; t < cfg_.num_tokens; t++) {
         // In slots the address is `channel * num_tokens + rev(token)`; the
         // gain and the bias are token-uniform except for the row
@@ -345,12 +508,11 @@ void CiBertLayer<word>::NormTurn(std::vector<Ct> &res,
         const double ft = row_suppress.empty() ? 1.0 : row_suppress[t];
         wts[k][s] = Complex(g * ft, 0.0);
         bs[k][s] = Complex(b * ft, 0.0);
-        mask[k][s] = Complex(live ? 1.0 : 0.0, 0.0);
       }
     }
   }
   std::vector<Ct> outv;
-  ln.Apply(outv, slots, wts, bs, mask, evk);
+  ln.Apply(outv, norm_in, wts, bs, live_mask, evk);
   if (keep_norm_slots_) {
     norm_slots_.clear();
     norm_slots_.resize(num_model_cts_);
@@ -411,9 +573,15 @@ void CiBertLayer<word>::AttentionTurn(std::vector<Ct> &res,
       c.stream_out > 0.0 ? c.stream_out : c.stream_scale;
   // The post-attention norm is where the row suppression goes ON: `H`
   // carries it, and the OUTPUT norm below takes it back out.
+  NormStages attn_stages;
+  attn_stages.crude_degree = c.attn_crude_degree;
+  attn_stages.refine_window = c.attn_refine_window;
+  attn_stages.crude_invsqrt = &c.attn_crude_invsqrt;
+  attn_stages.refine_invsqrt = &c.attn_refine_invsqrt;
+  attn_stages.channel_suppress = &c.channel_suppress;
   NormTurn(res, h, *w.attn_gain, *w.attn_bias, c.attn_alpha, c.attn_window,
            c.attn_degree, c.attn_invsqrt, c.attn_scale, c.stream_scale,
-           out_scale, c.row_suppress, evk);
+           out_scale, c.row_suppress, evk, &attn_stages);
   MemoryPool::Report("bert: after the post-attention LayerNorm");
 }
 
@@ -680,11 +848,238 @@ void CiBertLayer<word>::FeedForward(std::vector<Ct> &res,
     MemoryPool::Report("bert: after the output projection and the residual");
     // And OFF: LayerNorm is exactly scale invariant per token, so the
     // factor both halves of `z` carry cancels identically here.
+    NormStages ffn_stages;
+    ffn_stages.crude_degree = c.ffn_crude_degree;
+    ffn_stages.refine_window = c.ffn_refine_window;
+    ffn_stages.crude_invsqrt = &c.ffn_crude_invsqrt;
+    ffn_stages.refine_invsqrt = &c.ffn_refine_invsqrt;
+    ffn_stages.channel_suppress = &c.channel_suppress;
     NormTurn(res, z, *w.ffn_gain, *w.ffn_bias, c.ffn_alpha, c.ffn_window,
              c.ffn_degree, c.ffn_invsqrt, c.ffn_scale, out_scale, out_scale,
-             {}, evk);
+             {}, evk, &ffn_stages);
   }
   MemoryPool::Report("bert: after the output LayerNorm");
+}
+
+// ---------------------------------------------------------------------------
+// The three prediction heads
+// ---------------------------------------------------------------------------
+
+template <typename word>
+void CiBertLayer<word>::Pooler(std::vector<Ct> &logits,
+                               const std::vector<Ct> &stream,
+                               const HeadWeights &w, const HeadCalibration &c,
+                               const EvkMap<word> &evk) {
+  NvtxScope _nv("bert: pooler + NSP classifier");
+  AssertTrue(w.pool.Given() && w.cls.Given(),
+             "CiBertLayer: the pooler and the classifier must be given");
+  AssertTrue(!w.tag.empty(), "CiBertLayer: a head needs a tag");
+  AssertTrue(c.tanh_degree >= 2 && !c.tanh_coeffs.empty(),
+             "CiBertLayer: the pooler needs a tanh fit of degree >= 2");
+  AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
+             "CiBertLayer: the head reads " + std::to_string(num_model_cts_) +
+                 " ciphertexts");
+
+  // ---- x W_p + b_p, every token at once ----------------------------------
+  std::vector<Ct> u;
+  {
+    std::vector<Ct> ins(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->LevelDown(ins[k], stream[k], cfg_.product_level);
+    }
+    base_.Project(u, ins, cfg_.model_declared, cfg_.model_declared, w.pool,
+                  c.pool_scale, (w.tag + ".pool").c_str(), 1, 1);
+  }
+
+  // ---- the crossing, the bias, tanh --------------------------------------
+  std::vector<Ct> p(num_model_cts_);
+  {
+    std::vector<Ct> us;
+    {
+      std::vector<const Ct *> xs(num_model_cts_);
+      for (int k = 0; k < num_model_cts_; k++) xs[k] = &u[k];
+      sched_.ToSlotBatch(us, xs, evk, /*min_ks=*/false);
+      u.clear();
+    }
+    std::vector<typename GeLuHandler<word>::Group> groups{
+        {GeLuHandler<word>::Kind::kFit, c.tanh_range, c.tanh_degree,
+         c.tanh_coeffs}};
+    GeLuHandler<word> tanh_h(boot_, groups, op_level_);
+    const double range = tanh_h.GetRange();
+    // The projection's output carries `pool_scale * stream_scale` per model
+    // unit and `ToSlot` has just multiplied by `crossing`; what is left after
+    // this multiply is `u / range`, which is what the fit takes. The stream's
+    // per-channel suppression is gone by here -- it lives on the INPUT axis
+    // and `w.pool` was folded with it, so `u` is already in model units.
+    const double base =
+        1.0 / (crossing_ * c.pool_scale * c.stream_scale * range);
+    const int rank = cfg_.proj_rank;
+    for (int i = 0; i < num_model_cts_; i++) {
+      Canonicalise(us[i], base);
+      if (w.pool_bias != nullptr) {
+        std::vector<Complex> bmsg(num_slots_, Complex(0.0, 0.0));
+        for (int ch = 0; ch < rank; ch++) {
+          const int declared = i * rank + ch;
+          const double b = declared >= cfg_.model_live
+                               ? 0.0
+                               : (*w.pool_bias)[declared] / range;
+          for (int t = 0; t < cfg_.num_tokens; t++) {
+            bmsg[static_cast<size_t>(ch) * cfg_.num_tokens + t] =
+                Complex(b, 0.0);
+          }
+        }
+        Pt bpt;
+        boot_->gpu_encoder_.Encode(bpt, op_level_,
+                                   boot_->param_.GetScale(op_level_), bmsg);
+        boot_->Add(us[i], us[i], bpt);
+      }
+      // One group, so no mask: `Apply` reads an empty vector as "all of it".
+      tanh_h.Apply(p[i], us[i], {}, evk);
+      us[i] = Ct{};
+    }
+  }
+  MemoryPool::Report("bert: after the pooler's tanh");
+
+  // ---- p W_c + b_c -------------------------------------------------------
+  {
+    std::vector<Ct> ins(num_model_cts_);
+    for (int i = 0; i < num_model_cts_; i++) {
+      Ct co;
+      sched_.ToCoeff(co, p[i], evk, /*min_ks=*/false);
+      boot_->LevelDown(ins[i], co, cfg_.product_level);
+      p[i] = Ct{};
+    }
+    base_.Project(logits, ins, cfg_.model_declared, cfg_.proj_rank, w.cls,
+                  c.cls_scale, (w.tag + ".cls").c_str(), 1, 1);
+    // `ToCoeff` multiplied by `kappa`, so the classifier's input carries it
+    // and its bias has to as well.
+    if (w.cls_bias != nullptr) {
+      AddBias(logits, *w.cls_bias, c.cls_scale * kappa_);
+    }
+  }
+  MemoryPool::Report("bert: after the NSP classifier");
+}
+
+template <typename word>
+void CiBertLayer<word>::MlmHead(std::vector<Ct> &logits,
+                                const std::vector<Ct> &stream,
+                                const HeadWeights &w, const HeadCalibration &c,
+                                const EvkMap<word> &evk,
+                                std::vector<Ct> *norm_out) {
+  NvtxScope _nv("bert: MLM head");
+  AssertTrue(w.mlm.Given() && w.dec.Given() && w.mlm_gain != nullptr &&
+                 w.mlm_norm_bias != nullptr,
+             "CiBertLayer: the MLM transform, its norm and the tied decoder "
+             "must be given");
+  AssertTrue(!w.tag.empty(), "CiBertLayer: a head needs a tag");
+  AssertTrue(c.gelu_degree >= 2 && !c.gelu_coeffs.empty(),
+             "CiBertLayer: the MLM head needs a GELU fit of degree >= 2");
+  AssertTrue(c.vocab_declared > 0 && c.vocab_declared % cfg_.proj_rank == 0,
+             "CiBertLayer: the vocabulary must be declared at a multiple of "
+             "the module rank");
+  AssertTrue(static_cast<int>(stream.size()) == num_model_cts_,
+             "CiBertLayer: the head reads " + std::to_string(num_model_cts_) +
+                 " ciphertexts");
+
+  // ---- x W_t + b_t -------------------------------------------------------
+  std::vector<Ct> u;
+  {
+    std::vector<Ct> ins(num_model_cts_);
+    for (int k = 0; k < num_model_cts_; k++) {
+      boot_->LevelDown(ins[k], stream[k], cfg_.product_level);
+    }
+    base_.Project(u, ins, cfg_.model_declared, cfg_.model_declared, w.mlm,
+                  c.mlm_scale, (w.tag + ".mlm").c_str(), 1, 1);
+  }
+
+  // ---- the crossing, the bias, GELU --------------------------------------
+  std::vector<Ct> g(num_model_cts_);
+  {
+    std::vector<Ct> us;
+    {
+      std::vector<const Ct *> xs(num_model_cts_);
+      for (int k = 0; k < num_model_cts_; k++) xs[k] = &u[k];
+      sched_.ToSlotBatch(us, xs, evk, /*min_ks=*/false);
+      u.clear();
+    }
+    // The answer's ride rides the FIT (see `gelu_out_scale`): the handler
+    // evaluates the vector it is handed, so a constant factor on it is free.
+    std::vector<double> fit(c.gelu_coeffs);
+    if (c.gelu_out_scale != 1.0) {
+      for (double &x : fit) x *= c.gelu_out_scale;
+    }
+    std::vector<typename GeLuHandler<word>::Group> groups{
+        {GeLuHandler<word>::Kind::kFit, c.gelu_range, c.gelu_degree, fit}};
+    GeLuHandler<word> gelu(boot_, groups, op_level_);
+    const double range = gelu.GetRange();
+    const double base =
+        1.0 / (crossing_ * c.mlm_scale * c.stream_scale * range);
+    const int rank = cfg_.proj_rank;
+    for (int i = 0; i < num_model_cts_; i++) {
+      Canonicalise(us[i], base);
+      if (w.mlm_bias != nullptr) {
+        std::vector<Complex> bmsg(num_slots_, Complex(0.0, 0.0));
+        for (int ch = 0; ch < rank; ch++) {
+          const int declared = i * rank + ch;
+          const double b = declared >= cfg_.model_live
+                               ? 0.0
+                               : (*w.mlm_bias)[declared] / range;
+          for (int t = 0; t < cfg_.num_tokens; t++) {
+            bmsg[static_cast<size_t>(ch) * cfg_.num_tokens + t] =
+                Complex(b, 0.0);
+          }
+        }
+        Pt bpt;
+        boot_->gpu_encoder_.Encode(bpt, op_level_,
+                                   boot_->param_.GetScale(op_level_), bmsg);
+        boot_->Add(us[i], us[i], bpt);
+      }
+      gelu.Apply(g[i], us[i], {}, evk);
+      us[i] = Ct{};
+    }
+  }
+  MemoryPool::Report("bert: after the MLM transform's GELU");
+
+  // ---- its LayerNorm, and the tied decoder that reads it -----------------
+  {
+    std::vector<Ct> gc(num_model_cts_);
+    for (int i = 0; i < num_model_cts_; i++) {
+      sched_.ToCoeff(gc[i], g[i], evk, /*min_ks=*/false);
+      g[i] = Ct{};
+    }
+    // `ToCoeff` multiplied by `kappa`, so that is what the norm's input
+    // carries per model unit. There is NO channel suppression here: the
+    // stream's lives on the encoder's residual and the transform above has
+    // already taken it out on the input axis.
+    NormStages mlm_stages;
+    mlm_stages.crude_degree = c.mlm_crude_degree;
+    mlm_stages.refine_window = c.mlm_refine_window;
+    mlm_stages.crude_invsqrt = &c.mlm_crude_invsqrt;
+    mlm_stages.refine_invsqrt = &c.mlm_refine_invsqrt;
+    std::vector<Ct> n;
+    NormTurn(n, gc, *w.mlm_gain, *w.mlm_norm_bias, c.mlm_alpha, c.mlm_window,
+             c.mlm_degree, c.mlm_invsqrt, c.mlm_norm_token_scale,
+             kappa_ * c.gelu_out_scale,
+             c.mlm_out_scale, {}, evk,
+             c.mlm_crude_degree > 0 ? &mlm_stages : nullptr);
+    std::vector<Ct> ins(num_model_cts_);
+    for (int i = 0; i < num_model_cts_; i++) {
+      boot_->LevelDown(ins[i], n[i], cfg_.product_level);
+    }
+    if (norm_out != nullptr) *norm_out = std::move(n);
+    n.clear();
+    base_.Project(logits, ins, cfg_.model_declared, c.vocab_declared, w.dec,
+                  c.dec_scale, (w.tag + ".dec").c_str(), 1, 1);
+    AssertTrue(static_cast<int>(logits.size()) ==
+                   c.vocab_declared / cfg_.proj_rank,
+               "CiBertLayer: the tied decoder did not land in " +
+                   std::to_string(c.vocab_declared / cfg_.proj_rank) +
+                   " ciphertexts");
+    if (w.dec_bias != nullptr) {
+      AddBias(logits, *w.dec_bias, c.dec_scale * c.mlm_out_scale);
+    }
+  }
+  MemoryPool::Report("bert: after the tied decoder");
 }
 
 template class CiBertLayer<uint32_t>;

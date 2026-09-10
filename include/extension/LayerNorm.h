@@ -117,9 +117,57 @@ class LayerNormHandler {
   mutable int cached_mask_level_ = -1;
   int weight_level_ = -1;
   int bias_level_ = -1;
+  int mode_ = 0;  //!< `Mode`, kept as an int so the enum can be declared below
   std::unique_ptr<EvalPoly<word>> inv_sqrt_;
 
  public:
+  /**
+   * @brief Which part of the operator this handler is.
+   *
+   * ## Why the inverse square root is worth splitting
+   *
+   * Its cost is `degree ~ ln(1/delta) sqrt(R) / 2` in the window ratio `R`,
+   * and `R` is the only lever (`BERT_BASE_B1.md` 11.3). Without a per-prompt
+   * per-token rescale the feed-forward norms of layers 9 and 10 face
+   * `R ~ 10000`, which wants degree 511 -- fourteen levels against the seven
+   * or eight a span has, and no landing that affords it.
+   *
+   * 11.3 rejects a crude-then-refine split on the arithmetic `6 + 2 + 5 = 13`,
+   * which adds both stages inside ONE span. They do not have to be in one.
+   * The norms already sit between crossings, and a crossing between the
+   * stages buys the second one a fresh span for the price of a bootstrap --
+   * which is what `SoftMaxCho` does on the batched branch for the same shape
+   * of problem.
+   *
+   * ## Why the second stage needs no margin
+   *
+   * With `r0 = (1 + e) / sqrt(var)` and `y0 = (x - mu) r0`,
+   *
+   *     u = mean(y0^2) = var r0^2 = (1 + e)^2   IDENTICALLY,
+   *
+   * the variance cancelling. So the refine stage's argument lies in
+   * `[(1-eps)^2, (1+eps)^2]` where `eps` is the crude stage's worst RELATIVE
+   * error over its own interval -- a sup over the interval, not a statistic
+   * over prompts. The second window is a THEOREM given the first, and the
+   * whole statistical assumption of the operator stays where it already was.
+   * `eps < 1` is the only hard condition: at one the next window reaches zero
+   * and the singularity is back inside it.
+   *
+   * And `y0 / sqrt(u) = (x - mu) / sqrt(var)` exactly, so the refine stage's
+   * gain carries `sqrt(alpha)` on ITS window exactly as `kWhole`'s does on
+   * the layer's -- the caller's gain convention does not move.
+   *
+   * Measured on the host over 35 English prompts, ten held out
+   * (`reference/scripts/bert_sim.py`, design `st10`): one stage at the degree
+   * a ten-level span affords leaves the twelve-layer chain at 3.5e-01; this
+   * split leaves it at 2.9e-03, for two extra bootstraps a MODEL.
+   */
+  enum class Mode {
+    kWhole,   //!< centre, invsqrt, gain, bias -- the operator in one span
+    kCrude,   //!< centre, invsqrt, apply: hands back `y0`, no gain, no bias
+    kRefine,  //!< NO centring (`y0` is already centred), then gain and bias
+  };
+
   /**
    * @param context the Context this evaluates in
    * @param num_tokens T, a power of two
@@ -152,7 +200,8 @@ class LayerNormHandler {
                    double eps = 1e-12, double window_ratio = 4.0,
                    int degree = 15, int channel_stride = 1,
                    int live_channels = 0,
-                   const std::vector<double> &invsqrt_coeffs = {});
+                   const std::vector<double> &invsqrt_coeffs = {},
+                   Mode mode = Mode::kWhole);
 
   LayerNormHandler(const LayerNormHandler &) = delete;
   LayerNormHandler &operator=(const LayerNormHandler &) = delete;

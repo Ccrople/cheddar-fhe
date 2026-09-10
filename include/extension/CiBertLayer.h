@@ -203,6 +203,67 @@ class CiBertLayer {
     //! spends its accuracy in the wrong place -- worth about a level, and at
     //! degree 31 the absolute objective took the chain to 9e+08.
     std::vector<double> attn_invsqrt, ffn_invsqrt;
+    //! THE INVERSE SQUARE ROOT IN TWO STAGES, with a crossing between them.
+    //!
+    //! Non-zero `*_crude_degree` turns it on for that norm. The crude stage
+    //! runs on the layer's own window (`*_alpha`, `*_window`) at the crude
+    //! degree and hands back `y0 = (x - mu) r0`; the stream crosses; the
+    //! refine stage runs on `*_alpha` again (the crude leaves
+    //! `mean(y0^2) ~ 1/alpha`, so the same constant re-centres it) over
+    //! `*_refine_window`, which is `((1+eps)/(1-eps))^2` for the crude
+    //! stage's worst RELATIVE error `eps` -- a sup over its interval, so the
+    //! second window is a THEOREM and needs no margin of its own.
+    //!
+    //! What it buys, measured on the host over 35 English prompts with ten
+    //! held out (`bert_sim.py`, `st10` against `ln31-loo`): a twelve-layer
+    //! chain at 2.9e-03 instead of 3.5e-01, for two extra bootstraps a MODEL.
+    //! What it costs in levels: `levels(crude) + 4` in the first span and
+    //! `levels(refine) + 4` in the second, against `levels(deg) + 5` for the
+    //! whole operator in one -- so a budget of ten affords degree 63 in both,
+    //! which is what layers 9 and 10 need without a per-prompt rescale.
+    //! `reference/scripts/bert_ln_stages.py` prices it per norm.
+    int attn_crude_degree = 0;
+    int ffn_crude_degree = 0;
+    double attn_refine_window = 4.0;
+    double ffn_refine_window = 4.0;
+    //! A PUBLIC per-channel suppression of the model stream, at declared
+    //! MODEL channels; empty for none.
+    //!
+    //! ## Why the ride needs it and the token axis cannot give it
+    //!
+    //! One ciphertext carries every token under ONE scale, and the stream is
+    //! encoded at `kRide / max |value|`. BERT's pre-norm residual has a few
+    //! entries about two hundred times the rest -- layer 10 reaches 1070
+    //! where the bulk is 5 -- so those set the encoding budget and everything
+    //! else rides two orders low. Bootstrap noise is ABSOLUTE, so that is a
+    //! straight loss: 3.24 bits on the twelve-layer chain.
+    //!
+    //! `row_suppress` fixes it per TOKEN, and is read off the served prompt's
+    //! own forward, so a certified plan may not use it. A per-POSITION factor
+    //! is public but recovers almost nothing (measured, `bert_ride.py`: layer
+    //! 10 1070 -> 923 against the per-prompt 12.3) because the outlier's
+    //! position is not stable.
+    //!
+    //! The CHANNEL axis is different. A channel is a model coordinate, not a
+    //! token, so which channels are large is a property of the WEIGHTS and is
+    //! public. Measured over 35 English prompts, scaling the sixteen largest
+    //! channels of each layer takes the residual maximum to 4.6-6.3 at EVERY
+    //! layer -- layer 10 from 1070 to 5.4, a factor of 198 -- which is better
+    //! than the per-prompt token suppression manages.
+    //!
+    //! ## What carries it, and why it costs no level
+    //!
+    //! The model-channel stream carries `d_c` end to end. Everything that
+    //! PRODUCES that stream folds `d_c` into its weights (the O and down
+    //! projections, their biases, both norms' gain and bias); everything that
+    //! CONSUMES it folds `1/d_c` (q/k/v and the up projection). The one place
+    //! it cannot be a weight fold is the norm's own reduction, which needs
+    //! the TRUE variance -- and that is undone on the crossing's own constant
+    //! multiply, which was happening anyway. So the whole scheme is weight
+    //! folding plus one plaintext that already existed.
+    std::vector<double> channel_suppress;
+    std::vector<double> attn_crude_invsqrt, ffn_crude_invsqrt;
+    std::vector<double> attn_refine_invsqrt, ffn_refine_invsqrt;
     //! The public per-token rescale at each norm, one entry per token, empty
     //! for none. See the header: LayerNorm is exactly scale invariant, so
     //! these cancel and cost nothing.
@@ -306,6 +367,107 @@ class CiBertLayer {
     std::vector<double> gelu_rad, gelu_centre;
   };
 
+  /**
+   * @brief The three prediction heads BERT-Base ships with, which is what a
+   * deployment actually serves.
+   *
+   *     pooler      p = tanh(x[0] W_p + b_p)                768 -> 768
+   *     classifier  c = p W_c + b_c                         768 -> 2   (NSP)
+   *     MLM         m = LayerNorm(GELU(x W_t + b_t)) E^T + b_o
+   *                                                         768 -> 30522
+   *
+   * `x` is the encoder's last hidden state -- what `FeedForward` wrote for
+   * layer 11 -- so a head reads the stream in exactly the units the next
+   * layer would have, and `stream_scale` here is that layer's `stream_out`.
+   *
+   * The decoder is TIED to the word embeddings: there is no
+   * `cls.predictions.decoder.weight` in the checkpoint and `export_bert.py`
+   * writes the transposed embedding in its place.
+   */
+  struct HeadWeights {
+    //! `model_declared x model_declared`.
+    ProjectionWeight pool, mlm;
+    //! `model_declared x proj_rank`, two live columns.
+    ProjectionWeight cls;
+    //! `model_declared x vocab_declared`, the tied embedding.
+    ProjectionWeight dec;
+    const std::vector<double> *pool_bias = nullptr;
+    const std::vector<double> *cls_bias = nullptr;
+    const std::vector<double> *mlm_bias = nullptr;
+    //! The MLM transform's own LayerNorm, at declared model channels.
+    const std::vector<double> *mlm_gain = nullptr;
+    const std::vector<double> *mlm_norm_bias = nullptr;
+    //! At declared VOCABULARY indices.
+    const std::vector<double> *dec_bias = nullptr;
+    std::string tag;
+  };
+
+  /**
+   * @brief What the heads need fitted offline, on the clear model.
+   *
+   * Both non-linearities are CERTIFIED the way the feed-forward's GELU is
+   * (`GeLu.h`): `x` is a LayerNorm output, so it lies exactly on the sphere
+   * of radius `sqrt(model_live)` and Cauchy-Schwarz bounds every output
+   * channel of `x W + b` for EVERY prompt --
+   * `|u_j - centre_j| <= sqrt(H) ||gain * W[:,j] - mean||`. Nothing here is
+   * read off a served prompt.
+   *
+   * `tanh` is easier than the GELU: `|tanh(u) - sign(u)| < 1.4e-04` past
+   * `|u| = 5`, so outside its transition it IS its sign and only the
+   * interval has to be stated.
+   */
+  struct HeadCalibration {
+    //! What the encoder's output carries (layer 11's `stream_out`), and the
+    //! public per-channel suppression it carries with it.
+    double stream_scale = 1.0;
+    std::vector<double> channel_suppress;
+    //! THE POOLER. `pool_scale` sizes the projection so its crossing rides;
+    //! the fit is stated over `[-tanh_range, tanh_range]`.
+    double pool_scale = 1.0;
+    double tanh_range = 0.0;
+    int tanh_degree = 0;
+    std::vector<double> tanh_coeffs;
+    //! THE CLASSIFIER, which is linear and needs only a scale.
+    double cls_scale = 1.0;
+    //! THE MLM TRANSFORM: the same GELU circuit the feed-forward runs, over
+    //! its own certified interval.
+    double mlm_scale = 1.0;
+    double gelu_range = 0.0;
+    int gelu_degree = 0;
+    std::vector<double> gelu_coeffs;
+    //! THE RIDE THE GELU'S ANSWER LEAVES ON, folded into the fit itself.
+    //! The MLM's LayerNorm reads the GELU through a CROSSING, so what
+    //! `ToCoeff` writes has to ride EvalMod's range like any other crossing
+    //! input -- and `kappa * GELU(u)` does not: `|u| <= 93` certified, so it
+    //! arrives two orders too high and the norm reads a wrapped message.
+    //! Scaling the supplied Chebyshev vector is free (the handler evaluates
+    //! whatever it is given), so this is `ride / (kappa * gelu_range)` and
+    //! costs no level. Measured: without it the transform+GELU+LayerNorm
+    //! half sits at 2^-3.78 against the chain's own 2^-7.79.
+    double gelu_out_scale = 1.0;
+    //! Its LayerNorm: `alpha` at the geometric midpoint of the variance
+    //! range and `window` the range itself, exactly as a layer's norms.
+    double mlm_alpha = 1.0;
+    double mlm_window = 4.0;
+    int mlm_degree = 0;
+    std::vector<double> mlm_invsqrt;
+    //! Its TWO-STAGE form, when the budget cannot hold one span: a crude
+    //! stage over the whole window and a refine stage whose own window is a
+    //! THEOREM given the crude stage's worst relative error (`LayerNorm.h`).
+    //! Zero degree runs the one-stage operator.
+    int mlm_crude_degree = 0;
+    double mlm_refine_window = 4.0;
+    std::vector<double> mlm_crude_invsqrt, mlm_refine_invsqrt;
+    //! [SYLPH] 3.1.1's public rescaled copy, per token.
+    std::vector<double> mlm_norm_token_scale;
+    //! What the norm writes and what the tied decoder reads it at.
+    double mlm_out_scale = 1.0;
+    double dec_scale = 1.0;
+    //! 30522 rounded up to a multiple of `proj_rank`; the dead tail is zero.
+    int vocab_declared = 0;
+    int vocab_live = 0;
+  };
+
   CiBertLayer(std::shared_ptr<const BootContext<word>> boot,
               const CiSwitchedCcmmLayout &layout,
               std::vector<const EvaluationKey<word> *> modpack_keys,
@@ -350,6 +512,37 @@ class CiBertLayer {
             int qkv_declared, const Weights &w, const Calibration &c);
 
   /**
+   * @brief The pooler and the NSP classifier: `tanh(x W_p + b_p) W_c + b_c`.
+   *
+   * The pooler reads the [CLS] row only, but this runs the projection on
+   * every token: a mask would cost a level and buy nothing, the arithmetic
+   * is the same, and the certified interval bounds every row and not just
+   * the first. The caller reads token 0 out of the answer.
+   *
+   * @param logits one ciphertext, the two NSP logits at declared 0 and 1,
+   *        carrying `cls_scale * GetKappa()` per model unit
+   * @param stream the encoder's last hidden state at `GetStreamLevel()`
+   */
+  void Pooler(std::vector<Ct> &logits, const std::vector<Ct> &stream,
+              const HeadWeights &w, const HeadCalibration &c,
+              const EvkMap<word> &evk);
+
+  /**
+   * @brief The masked-language-model head:
+   * `LayerNorm(GELU(x W_t + b_t)) E^T + b_o`, every token at once.
+   *
+   * @param logits `vocab_declared / proj_rank` ciphertexts carrying
+   *        `dec_scale * mlm_out_scale` per model unit
+   * @param stream the encoder's last hidden state at `GetStreamLevel()`
+   */
+  //! @param norm_out when given, receives the LayerNorm's output before the
+  //!        decoder reads it -- the one place the head can be cut in two,
+  //!        and `mlm_norm_out.f64` is the reference for it.
+  void MlmHead(std::vector<Ct> &logits, const std::vector<Ct> &stream,
+               const HeadWeights &w, const HeadCalibration &c,
+               const EvkMap<word> &evk, std::vector<Ct> *norm_out = nullptr);
+
+  /**
    * @brief The O projection with its bias, the residual, and the
    * post-attention LayerNorm.
    *
@@ -387,19 +580,39 @@ class CiBertLayer {
                double scale,
                const std::vector<double> &per_token = {}) const;
   //! The crossing, the LayerNorm and the return to coefficients.
+  //! The two-stage invsqrt's extra pieces; null runs the whole operator in
+  //! one span, which is what every existing caller wants.
+  struct NormStages {
+    int crude_degree = 0;
+    double refine_window = 4.0;
+    const std::vector<double> *crude_invsqrt = nullptr;
+    const std::vector<double> *refine_invsqrt = nullptr;
+    //! `Calibration::channel_suppress`, or null. The stream CARRIES it (the
+    //! weights fold it in), so the crossing's plaintext takes it out before
+    //! the reduction and this norm's gain and bias put it back for the
+    //! stream that leaves.
+    const std::vector<double> *channel_suppress = nullptr;
+  };
   void NormTurn(std::vector<Ct> &res, const std::vector<Ct> &stream,
                 const std::vector<double> &gain,
                 const std::vector<double> &bias, double alpha, double window,
                 int degree, const std::vector<double> &invsqrt,
                 const std::vector<double> &token_scale, double in_scale,
                 double out_scale, const std::vector<double> &row_suppress,
-                const EvkMap<word> &evk);
+                const EvkMap<word> &evk,
+                const NormStages *stages = nullptr);
   //! `x *= factor`, on the crossing's own constant multiply.
   void Canonicalise(Ct &ct, double factor) const;
   void Canonicalise(Ct &ct, const Pt &pt) const;
-  //! The per-token plaintext the crossing's multiply carries.
+  //! The per-token plaintext the crossing's multiply carries. With
+  //! `channel_suppress` non-empty it is per (channel, token) instead and one
+  //! is built per ciphertext -- the slot address is
+  //! `channel * num_tokens + rev(token)`, so both axes ride the same
+  //! plaintext and the channel half costs nothing extra.
   Pt TokenPlaintext(double factor, const std::vector<double> &per_token,
-                    double scale) const;
+                    double scale,
+                    const std::vector<double> &per_channel = {},
+                    int ct_index = 0) const;
   int NormDegree(double window) const;
 
   std::shared_ptr<const BootContext<word>> boot_;

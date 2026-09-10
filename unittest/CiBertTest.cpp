@@ -90,8 +90,22 @@ constexpr const char *kTowerParam = "ci16_35_land17c3e10.json";
 constexpr int kT = 128, kH = 768, kI = 3072, kHeads = 12, kD = 64;
 constexpr int kRank = 512, kPcmmLevel = 1;
 constexpr int kDeclaredH = 1024, kDeclaredI = 3072;
+// The tied MLM decoder's vocabulary, and it rounded up to a multiple of
+// the module rank: the dead tail is exactly zero.
+constexpr int kV = 30522, kVDeclared = 30720;
 constexpr double kEps = 1e-12;
-constexpr double kRide = 0.2;
+// The crossings ride at a fifth of EvalMod's range. `BERT_RIDE` is a
+// DIAGNOSTIC: raising the public per-channel suppression raises every
+// crossing's ride by the same factor, so lowering this one separates "the
+// suppression is too deep" from "the ride is now too high" -- the two move
+// together otherwise and cannot be told apart from a single sweep.
+double Ride() {
+  static const double v = [] {
+    const char *e = std::getenv("BERT_RIDE");
+    return (e != nullptr && *e != 0) ? std::atof(e) : 0.2;
+  }();
+  return v;
+}
 
 int Rev(int v, int bits) {
   int r = 0;
@@ -534,8 +548,8 @@ TEST(CiBert, TheTurnsRunOnTheRealWeights) {
             << " s" << std::endl;
 
   // ---- the calibration ---------------------------------------------------
-  const double stream_scale = kRide / L.resid_absmax;
-  const double int_scale = kRide / (stream_scale * L.u_absmax);
+  const double stream_scale = Ride() / L.resid_absmax;
+  const double int_scale = Ride() / (stream_scale * L.u_absmax);
   typename cheddar::CiBertLayer<word>::Calibration cal;
   cal.stream_scale = stream_scale;
   // WITH THE PER-TOKEN RESCALE THE WINDOW IS ONE. LayerNorm is exactly scale
@@ -717,6 +731,43 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // and nothing per prompt in it: the GELU's bands come from the weights
   // alone and both norms state a window with a margin. Everything the served
   // prompt would otherwise contribute is switched off together, here.
+  // THE PUBLIC PER-CHANNEL SUPPRESSION, read once. The model-channel
+  // stream carries it end to end, so it is ONE vector for the whole
+  // chain and not one a layer: the residual add is `X + O` and both
+  // sides must carry the same factor.
+  std::vector<double> chan_sup;
+  if (const char *cdir0 = std::getenv("BERT_CALIB_DIR")) {
+    std::ifstream cf0(std::string(cdir0) + "/corpus.json");
+    if (cf0.good()) {
+      json p0;
+      cf0 >> p0;
+      if (p0.contains("channel_suppress")) {
+        chan_sup = p0["channel_suppress"].get<std::vector<double>>();
+        chan_sup.resize(kDeclaredH, 1.0);
+        // `BERT_CHAN_CAP` floors the suppression. The plan's smallest factor
+        // is 1/238, and a consumer of the stream divides its weights by it --
+        // so sixteen rows of every q/k/v and up projection grow by that
+        // factor, which the int8 product has to hold, and the crossing's
+        // plaintext grows by it too. A cap trades ride for both.
+        if (const char *cp = std::getenv("BERT_CHAN_CAP")) {
+          const double floor_v = 1.0 / std::atof(cp);
+          for (double &v : chan_sup) v = std::max(v, floor_v);
+        }
+        double lo = 1.0;
+        for (double v : chan_sup) lo = std::min(lo, v);
+        std::cout << "PUBLIC channel suppression: " << chan_sup.size()
+                  << " channels, smallest factor " << lo << std::endl;
+      }
+    }
+  }
+  const bool CS = !chan_sup.empty();
+  auto unsup = [&](std::vector<double> &v) {
+    if (!CS) return;
+    for (int t = 0; t < kT; t++)
+      for (int c = 0; c < kH; c++)
+        v[static_cast<size_t>(t) * kH + c] /= chan_sup[c];
+  };
+
   const bool certified = std::getenv("BERT_CALIB_DIR") != nullptr;
   const bool gelu_only_env = std::getenv("BERT_CERT_GELU_ONLY") != nullptr;
   std::vector<double> attn_resid(num_layers, 0.0), ffn_resid(num_layers, 0.0);
@@ -725,8 +776,21 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     Layer0 probe;
     ASSERT_TRUE(LoadLayer(wdir_env, rdir_env, n, probe))
         << "could not read layer " << n;
-    for (double a : probe.h_pre) {
-      attn_resid[n] = std::max(attn_resid[n], std::abs(a));
+    // THE RIDE IS SIZED ON WHAT ACTUALLY CROSSES. The stream carries the
+    // public per-channel factor `d_c` end to end, so the message the
+    // crossing sees is `s * d_c * resid`, and sizing `s` off the RAW
+    // maximum would put the message a factor `max|d_c resid| / max|resid|`
+    // BELOW `Ride()` -- which is the whole point of the suppression, spent
+    // backwards. Measured: with the plan's sixteen channels that factor is
+    // 1/88 at layer 10, so the un-suppressed sizing rides 6.5 bits low and
+    // the suppression reads as no gain at all.
+    for (int t = 0; t < kT; t++) {
+      for (int c = 0; c < kH; c++) {
+        const double d = CS ? chan_sup[c] : 1.0;
+        attn_resid[n] = std::max(
+            attn_resid[n],
+            std::abs(probe.h_pre[static_cast<size_t>(t) * kH + c]) * d);
+      }
     }
     // THE FEED-FORWARD'S RESIDUAL ROWS. A handful of them are a hundred times
     // the rest -- layer 10 reaches 1001.5 at token 48 against a row-maximum
@@ -736,8 +800,9 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     std::vector<double> row(kT, 0.0);
     for (int t = 0; t < kT; t++) {
       for (int c = 0; c < kH; c++) {
-        row[t] = std::max(row[t],
-                          std::abs(probe.z_pre[static_cast<size_t>(t) * kH + c]));
+        row[t] = std::max(
+            row[t], std::abs(probe.z_pre[static_cast<size_t>(t) * kH + c]) *
+                        (CS ? chan_sup[c] : 1.0));
       }
     }
     std::vector<double> sorted = row;
@@ -773,9 +838,9 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   for (int n = 0; n < num_layers; n++) {
     double reach = ffn_resid[n];
     if (n + 1 < num_layers) reach = std::max(reach, attn_resid[n + 1]);
-    s_out[n] = kRide / reach;
+    s_out[n] = Ride() / reach;
   }
-  s_in[0] = kRide / attn_resid[0];
+  s_in[0] = Ride() / attn_resid[0];
   for (int n = 1; n < num_layers; n++) s_in[n] = s_out[n - 1];
   std::cout << num_layers << " layer(s); residuals";
   for (int n = 0; n < num_layers; n++) {
@@ -862,9 +927,27 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // saved and put back around this one construction.
   std::unique_ptr<Ring> tower;
   {
+    // `BERT_TOWER_SPARSE` is the tower weight as a KNOB, because it is a
+    // SECURITY parameter and sixteen is not enough. `security_estimate.py`
+    // prices the sparse secret the attacker actually sees -- the NATIVE
+    // coefficients, which the tower map spreads a nonzero over up to four of
+    // -- against the drop-columns hybrid at this ring's logQP of 1771:
+    //
+    //     tower h=16 -> 57 native -> 121.1 bits   (below the 128 the MAIN
+    //                                              secret has at the same QP)
+    //     tower h=24 -> 91 native -> 127.8 bits
+    //     tower h=32 -> 122 native -> 128.1 bits  = the primal ceiling
+    //
+    // and `ci_nested_sinc.py`'s wrap-around says it is free in levels: the
+    // tower-centred ModRaise reads max 32.1 at h = 16, 42.5 at 24 and 47.1 at
+    // 32, all inside the K = 64 this ring already pays for (48 reaches 51.7,
+    // which is the first weight that looks tight).
     const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
     const std::string saved = prev ? prev : "";
-    setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", /*overwrite=*/1);
+    const char *tower_env = std::getenv("BERT_TOWER_SPARSE");
+    setenv("CHEDDAR_MODULE_SPARSE_SECRET",
+           (tower_env && *tower_env) ? tower_env : "4096:128,16",
+           /*overwrite=*/1);
     tower = std::make_unique<Ring>(kTowerParam, boot.ui->GetSecretCoeffs(),
                                    /*boot_slack_levels=*/0);
     if (prev) {
@@ -941,6 +1024,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
 
   // ---- the stream, encrypted once; every layer after the first reads the
   //      one before it ------------------------------------------------------
+
   const int op_level = layer.GetStreamLevel();
   std::vector<Ciphertext<word>> stream(kDeclaredH / kRank);
   {
@@ -952,7 +1036,8 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
       for (int c = k * kRank; c < std::min(kH, (k + 1) * kRank); c++) {
         for (int t = 0; t < kT; t++) {
           comp[Rev(c - k * kRank, 9)][t] =
-              s_in[0] * first.x[static_cast<size_t>(t) * kH + c];
+              s_in[0] * first.x[static_cast<size_t>(t) * kH + c] *
+              (chan_sup.empty() ? 1.0 : chan_sup[c]);
         }
       }
       const auto co = Recompose(comp);
@@ -988,9 +1073,15 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   const double stream_scale = s_in[LAYER];
   const double stream_out = s_out[LAYER];
   // The intermediate crossing reads what the attention turn WROTE.
-  const double int_scale = kRide / (stream_out * L.u_absmax);
+  const double int_scale = Ride() / (stream_out * L.u_absmax);
   typename cheddar::CiBertLayer<word>::Calibration cal;
   cal.stream_scale = stream_scale;
+  // The PUBLIC per-channel suppression the weights above were folded
+  // with. Without this the library never takes it back out at the
+  // crossing, and the norm reads a stream that still carries `d_c` --
+  // measured: the sixteen suppressed channels are most of the row's
+  // energy, so the LayerNorm comes back 24 % wrong at a cap of two.
+  cal.channel_suppress = chan_sup;
   cal.stream_out = stream_out;
   cal.row_suppress = suppress[LAYER];
   cal.attn_alpha = 1.0;
@@ -1007,6 +1098,24 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // multiply, so they simply multiply.
   cal.ffn_scale = L.ffn_token_scale;
   for (int t = 0; t < kT; t++) cal.ffn_scale[t] /= suppress[LAYER][t];
+  // `BERT_LN_CRUDE=<degree>` runs the inverse square root in TWO stages with
+  // a crossing between them (`LayerNorm.h`'s Mode comment). On the served
+  // prompt's own window of 1.5 the split has nothing to buy -- the point of
+  // running it here is that it must be a NO-OP in accuracy, which is what
+  // says the plumbing is right before a wide window is asked of it.
+  // `BERT_LN_REFINE_WINDOW` is the second stage's window; the default of 4
+  // covers a crude relative error up to about a third.
+  if (const char *cd = std::getenv("BERT_LN_CRUDE")) {
+    const int d = std::atoi(cd);
+    const char *rw = std::getenv("BERT_LN_REFINE_WINDOW");
+    const double w = (rw && *rw) ? std::atof(rw) : 4.0;
+    cal.attn_crude_degree = d;
+    cal.ffn_crude_degree = d;
+    cal.attn_refine_window = w;
+    cal.ffn_refine_window = w;
+    std::cout << "TWO-STAGE invsqrt: crude degree " << d
+              << ", refine window " << w << std::endl;
+  }
   cal.q_scale = cq / stream_scale;
   cal.k_scale = ck / stream_scale;
   cal.v_scale = cv / stream_scale;
@@ -1105,6 +1214,50 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
       cal.ffn_degree =
           static_cast<int>(cl["ffn_norm"]["degree"].get<double>());
       cal.ffn_invsqrt = cl["ffn_norm"]["coeffs"].get<std::vector<double>>();
+      // THE TWO-STAGE INVERSE SQUARE ROOT, when the plan carries one
+      // (`LN_BUDGET=<levels a span>` in `bert_plan.py`). A norm whose window
+      // no affordable degree covers in ONE span gets a crude stage on the
+      // same alpha and window, a crossing, and a refine stage whose window is
+      // `((1+eps)/(1-eps))^2` for the crude stage's worst relative error --
+      // a bound over its interval, not a statistic over prompts. Without it
+      // the feed-forward norms of layers 9 and 10 want degree 511 and no
+      // landing affords that; with it they want 31 and 63.
+      auto stage = [](const nlohmann::json &j,
+                      typename cheddar::CiBertLayer<word>::Calibration &c,
+                      bool ffn) {
+        if (!j.contains("crude_degree")) return;
+        const int d = static_cast<int>(j["crude_degree"].get<double>());
+        auto c1 = j["crude_coeffs"].get<std::vector<double>>();
+        const double rw = j["refine_window"].get<double>();
+        auto c2 = j["refine_coeffs"].get<std::vector<double>>();
+        if (ffn) {
+          c.ffn_crude_degree = d;
+          c.ffn_crude_invsqrt = c1;
+          c.ffn_refine_window = rw;
+          c.ffn_refine_invsqrt = c2;
+        } else {
+          c.attn_crude_degree = d;
+          c.attn_crude_invsqrt = c1;
+          c.attn_refine_window = rw;
+          c.attn_refine_invsqrt = c2;
+        }
+      };
+      stage(cl["attn_norm"], cal, /*ffn=*/false);
+      stage(cl["ffn_norm"], cal, /*ffn=*/true);
+      if (cal.attn_crude_degree > 0 || cal.ffn_crude_degree > 0) {
+        std::cout << "TWO-STAGE norms: attn crude "
+                  << cal.attn_crude_degree << " refine window "
+                  << cal.attn_refine_window << " deg "
+                  << (cal.attn_refine_invsqrt.empty()
+                          ? 0
+                          : int(cal.attn_refine_invsqrt.size()) - 1)
+                  << " | ffn crude " << cal.ffn_crude_degree
+                  << " refine window " << cal.ffn_refine_window << " deg "
+                  << (cal.ffn_refine_invsqrt.empty()
+                          ? 0
+                          : int(cal.ffn_refine_invsqrt.size()) - 1)
+                  << std::endl;
+      }
       // AND EVERYTHING PER TOKEN GOES. The plan's windows are stated for the
       // RAW variance, so a per-token rescale left on would move the invsqrt's
       // argument off the window it was fitted for.
@@ -1241,19 +1394,54 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   const std::vector<double> fg_dec = Declare(L.fg, kDeclaredH);
   const std::vector<double> fb_dec = Declare(L.fb, kDeclaredH);
 
+  // THE WEIGHT FOLD. The model-channel stream carries `d_c`, so everything
+  // that PRODUCES it multiplies by `d_c` (the O and down projections and
+  // their biases) and everything that CONSUMES it divides (q/k/v and the up
+  // projection). The norms' gain and bias are NOT folded here -- `NormTurn`
+  // applies `d_c` to them itself, and the crossing's plaintext takes it back
+  // out before the reduction, which is the one place a weight cannot.
+  std::vector<double> wq_f(wq_dec), wk_f(wk_dec), wv_f(wv_dec), wo_f(wo_dec),
+      wint_f(wint_dec), wout_f(wout_dec), bo_f(bo_dec), bout_f(bout_dec);
+  if (CS) {
+    const int qkv_declared = static_cast<int>(wq_dec.size()) / kDeclaredH;
+    for (int in_d = 0; in_d < kDeclaredH; in_d++) {
+      const double inv = 1.0 / chan_sup[in_d];
+      for (int o = 0; o < qkv_declared; o++) {
+        const size_t x = static_cast<size_t>(in_d) * qkv_declared + o;
+        wq_f[x] *= inv;
+        wk_f[x] *= inv;
+        wv_f[x] *= inv;
+      }
+      for (int o = 0; o < kDeclaredI; o++) {
+        wint_f[static_cast<size_t>(in_d) * kDeclaredI + o] *= inv;
+      }
+    }
+    for (int c = 0; c < kDeclaredH; c++) {
+      const double d = chan_sup[c];
+      for (int in_d = 0; in_d < attn_declared; in_d++) {
+        wo_f[static_cast<size_t>(in_d) * kDeclaredH + c] *= d;
+      }
+      for (int in_d = 0; in_d < kDeclaredI; in_d++) {
+        wout_f[static_cast<size_t>(in_d) * kDeclaredH + c] *= d;
+      }
+      bo_f[c] *= d;
+      bout_f[c] *= d;
+    }
+  }
+
   typename cheddar::CiBertLayer<word>::Weights w;
-  w.q.host = &wq_dec;
-  w.k.host = &wk_dec;
-  w.v.host = &wv_dec;
-  w.o.host = &wo_dec;
-  w.inter.host = &wint_dec;
-  w.out.host = &wout_dec;
+  w.q.host = &wq_f;
+  w.k.host = &wk_f;
+  w.v.host = &wv_f;
+  w.o.host = &wo_f;
+  w.inter.host = &wint_f;
+  w.out.host = &wout_f;
   w.bq = &bq_dec;
   w.bk = &bk_dec;
   w.bv = &bv_dec;
-  w.bo = &bo_dec;
+  w.bo = &bo_f;
   w.bint = &bint_dec;
-  w.bout = &bout_dec;
+  w.bout = &bout_f;
   w.attn_gain = &ag_dec;
   w.attn_bias = &ab_dec;
   w.ffn_gain = &fg_dec;
@@ -1393,6 +1581,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     }
     std::vector<double> got;
     ReadStream(ffn, h_ct, got);
+    unsup(got);
     Report("stage 2: H = LayerNorm(X + O + b_o), suppressed", got, want);
     EXPECT_LT(RelBits(got, want), -7.0);
   }
@@ -1404,6 +1593,7 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   {
     std::vector<double> got;
     ReadStream(ffn, z_ct, got);
+    unsup(got);
     const double bits =
         RelBits(got, L.href);
     Report(("stage 3: THE LAYER, against h_L" + Two(LAYER) + ".f64").c_str(),
@@ -1427,6 +1617,249 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // twelve layers' worth would stand on the card at once otherwise.
   stream = std::move(z_ct);
   layer.Base().ReleaseWeights(tag);
+  }
+  // ---- THE THREE PREDICTION HEADS ---------------------------------------
+  //
+  // What a deployment actually serves. They read the encoder's output -- the
+  // `stream` the loop above just left -- so they run once at the end of the
+  // chain and not once a layer, and `BERT_HEADS=1` is what asks for them.
+  // Both of their non-linearities are CERTIFIED by the same sphere argument
+  // the feed-forward's GELU is (`bert_plan.py head_plan`): the encoder's
+  // output is a LayerNorm output, so nothing here is read off this prompt.
+  if (std::getenv("BERT_HEADS") != nullptr && num_layers == 12) {
+    json hp;
+    {
+      const char *cdirh = std::getenv("BERT_CALIB_DIR");
+      ASSERT_NE(cdirh, nullptr) << "the heads need a plan (BERT_CALIB_DIR)";
+      std::ifstream hf(std::string(cdirh) + "/corpus.json");
+      ASSERT_TRUE(hf.good()) << "no corpus.json in BERT_CALIB_DIR";
+      json all;
+      hf >> all;
+      ASSERT_TRUE(all.contains("head"))
+          << "the plan has no head section -- rerun bert_plan.py against a "
+             "bert_all that has head/ and a corpus built by bert_cache.py";
+      hp = all["head"];
+    }
+    const std::string hdir = std::string(wdir_env) + "/head";
+    std::vector<double> pw, pb, cw, cb, mw, mb, mg, mnb, dec, ob;
+    const size_t hh = static_cast<size_t>(kH) * kH;
+    ASSERT_TRUE(ReadF32(hdir + "/pool_w.f32", hh, pw));
+    ASSERT_TRUE(ReadF32(hdir + "/pool_b.f32", kH, pb));
+    ASSERT_TRUE(ReadF32(hdir + "/cls_w.f32", static_cast<size_t>(kH) * 2, cw));
+    ASSERT_TRUE(ReadF32(hdir + "/cls_b.f32", 2, cb));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_w.f32", hh, mw));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_b.f32", kH, mb));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_norm.f32", kH, mg));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_norm_bias.f32", kH, mnb));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_dec.f32",
+                        static_cast<size_t>(kH) * kV, dec));
+    ASSERT_TRUE(ReadF32(hdir + "/mlm_out_b.f32", kV, ob));
+
+    std::vector<double> pool_ref, pooled_ref, cls_ref, mlm_ref;
+    ASSERT_TRUE(ReadF64(std::string(rdir_env) + "/pooled.f64", kH, pooled_ref));
+    ASSERT_TRUE(ReadF64(std::string(rdir_env) + "/cls_logits.f64", 2, cls_ref));
+    ASSERT_TRUE(ReadF64(std::string(rdir_env) + "/mlm_logits.f64",
+                        static_cast<size_t>(kT) * kV, mlm_ref));
+
+    // The declared forms, and the SAME fold the layers use: the head's two
+    // first projections CONSUME the model stream, so they divide by `d_c`;
+    // the classifier and the decoder read the head's own intermediate, which
+    // never carried it.
+    std::vector<double> pool_f =
+        DeclareSquare(pw, kH, kDeclaredH, kH, kDeclaredH);
+    std::vector<double> mlm_f =
+        DeclareSquare(mw, kH, kDeclaredH, kH, kDeclaredH);
+    if (CS) {
+      for (int in_d = 0; in_d < kDeclaredH; in_d++) {
+        const double inv = 1.0 / chan_sup[in_d];
+        for (int o = 0; o < kDeclaredH; o++) {
+          pool_f[static_cast<size_t>(in_d) * kDeclaredH + o] *= inv;
+          mlm_f[static_cast<size_t>(in_d) * kDeclaredH + o] *= inv;
+        }
+      }
+    }
+    const std::vector<double> cls_d =
+        DeclareSquare(cw, kH, kDeclaredH, 2, kRank);
+    const std::vector<double> dec_d =
+        DeclareSquare(dec, kH, kDeclaredH, kV, kVDeclared);
+    const std::vector<double> pb_d = Declare(pb, kDeclaredH);
+    const std::vector<double> cb_d = Declare(cb, kRank);
+    const std::vector<double> mb_d = Declare(mb, kDeclaredH);
+    const std::vector<double> mg_d = Declare(mg, kDeclaredH);
+    const std::vector<double> mnb_d = Declare(mnb, kDeclaredH);
+    const std::vector<double> ob_d = Declare(ob, kVDeclared);
+
+    typename cheddar::CiBertLayer<word>::HeadWeights hw;
+    hw.pool.host = &pool_f;
+    hw.cls.host = &cls_d;
+    hw.mlm.host = &mlm_f;
+    hw.dec.host = &dec_d;
+    hw.pool_bias = &pb_d;
+    hw.cls_bias = &cb_d;
+    hw.mlm_bias = &mb_d;
+    hw.mlm_gain = &mg_d;
+    hw.mlm_norm_bias = &mnb_d;
+    hw.dec_bias = &ob_d;
+    hw.tag = "head";
+
+    typename cheddar::CiBertLayer<word>::HeadCalibration hc;
+    hc.stream_scale = s_out[num_layers - 1];
+    hc.channel_suppress = chan_sup;
+    hc.tanh_range = hp["pool_range"].get<double>();
+    hc.tanh_degree = static_cast<int>(hp["pool_degree"].get<double>());
+    hc.tanh_coeffs = hp["pool_coeffs"].get<std::vector<double>>();
+    hc.gelu_range = hp["mlm_range"].get<double>();
+    hc.gelu_degree = static_cast<int>(hp["mlm_degree"].get<double>());
+    hc.gelu_coeffs = hp["mlm_coeffs"].get<std::vector<double>>();
+    hc.mlm_alpha = hp["mlm_norm"]["alpha"].get<double>();
+    hc.mlm_window = hp["mlm_norm"]["window"].get<double>();
+    hc.mlm_degree = static_cast<int>(hp["mlm_norm"]["degree"].get<double>());
+    hc.mlm_invsqrt = hp["mlm_norm"]["coeffs"].get<std::vector<double>>();
+    if (hp["mlm_norm"].contains("crude_degree")) {
+      hc.mlm_crude_degree =
+          static_cast<int>(hp["mlm_norm"]["crude_degree"].get<double>());
+      hc.mlm_crude_invsqrt =
+          hp["mlm_norm"]["crude_coeffs"].get<std::vector<double>>();
+      hc.mlm_refine_window = hp["mlm_norm"]["refine_window"].get<double>();
+      hc.mlm_refine_invsqrt =
+          hp["mlm_norm"]["refine_coeffs"].get<std::vector<double>>();
+    }
+    hc.vocab_live = kV;
+    hc.vocab_declared = kVDeclared;
+    // The two projections' rides. `u` is bounded by the certified interval,
+    // so both are a division and not a fit -- and the two output scales are
+    // free, because nothing crosses after them: the answer is decrypted.
+    hc.pool_scale = Ride() / (hc.stream_scale * hc.tanh_range);
+    hc.mlm_scale = Ride() / (hc.stream_scale * hc.gelu_range);
+    // The norm's output has a CERTIFIED bound of its own and needs no
+    // prompt: a LayerNorm output lies exactly on the sphere of radius
+    // sqrt(kH), so `|gain_j n_j + bias_j| <= sqrt(kH) |gain_j| + |bias_j|`.
+    // Riding it there is worth real bits -- the decoder reads it through an
+    // int8 product and a message at the stream's own factor would sit two
+    // orders under the ride for no reason.
+    double nbound = 0.0;
+    for (int j = 0; j < kH; j++) {
+      nbound = std::max(nbound,
+                        std::sqrt(static_cast<double>(kH)) * std::abs(mg[j]) +
+                            std::abs(mnb[j]));
+    }
+    hc.mlm_out_scale = Ride() / nbound;
+    // The GELU's answer crosses once more (its LayerNorm's `ToSlot`), so it
+    // has to ride like any other crossing input. `|GELU(u)| <= |u| <=
+    // gelu_range` is certified, and the factor rides the fit.
+    hc.gelu_out_scale = Ride() / (layer.GetKappa() * hc.gelu_range);
+    // Nothing crosses after the two answers, so their scales are free.
+    hc.cls_scale = 1.0;
+    hc.dec_scale = 1.0;
+    std::cout << "THE HEADS: tanh over +-" << hc.tanh_range << " at degree "
+              << hc.tanh_degree << ", the MLM GELU over +-" << hc.gelu_range
+              << " at degree " << hc.gelu_degree
+              << ", its LayerNorm window " << hc.mlm_window << " at degree "
+              << hc.mlm_degree << "; kappa " << layer.GetKappa()
+              << ", the GELU's answer rides " << hc.gelu_out_scale
+              << " and the norm's output " << hc.mlm_out_scale << std::endl;
+
+    const auto t_head0 = std::chrono::steady_clock::now();
+    {
+      std::vector<Ciphertext<word>> lg;
+      layer.Pooler(lg, stream, hw, hc, fevk);
+      cudaDeviceSynchronize();
+      ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+      ASSERT_EQ(lg.size(), 1u);
+      Plaintext<word> pt;
+      ffn.ui->Decrypt(pt, lg[0]);
+      std::vector<double> co;
+      ffn.context->encoder_.DecodeCoeff(co, pt);
+      const auto comp = Components(co);
+      // Two logits, at declared 0 and 1, and only the [CLS] row is the
+      // pooler's -- so token 0 is what a deployment reads.
+      std::vector<double> got(2, 0.0), want(cls_ref);
+      const double f = hc.cls_scale * layer.GetKappa();
+      for (int j = 0; j < 2; j++) got[j] = comp[Rev(j, 9)][0] / f;
+      std::cout << "  NSP logits " << got[0] << " " << got[1] << " against "
+                << want[0] << " " << want[1] << std::endl;
+      const double bits = RelBits(got, want);
+      std::cout << "  [the NSP classifier] rms 2^" << bits << std::endl;
+      EXPECT_LT(bits, -5.0) << "the pooler and the classifier disagree with "
+                               "the float64 reference";
+    }
+    const auto t_head1 = std::chrono::steady_clock::now();
+    {
+      std::vector<Ciphertext<word>> lg, nrm;
+      layer.MlmHead(lg, stream, hw, hc, fevk, &nrm);
+      cudaDeviceSynchronize();
+      ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+      ASSERT_EQ(static_cast<int>(lg.size()), kVDeclared / kRank);
+      std::vector<double> got(static_cast<size_t>(kT) * kV, 0.0);
+      const double f = hc.dec_scale * hc.mlm_out_scale;
+      for (size_t g = 0; g < lg.size(); g++) {
+        Plaintext<word> pt;
+        ffn.ui->Decrypt(pt, lg[g]);
+        std::vector<double> co;
+        ffn.context->encoder_.DecodeCoeff(co, pt);
+        const auto comp = Components(co);
+        for (int j = 0; j < kRank; j++) {
+          const int declared = static_cast<int>(g) * kRank + j;
+          if (declared >= kV) continue;
+          for (int t = 0; t < kT; t++) {
+            got[static_cast<size_t>(t) * kV + declared] =
+                comp[Rev(j, 9)][t] / f;
+          }
+        }
+      }
+      // THE HEAD CUT IN TWO. The transform, its GELU and its LayerNorm on
+      // one side and the tied decoder on the other -- so a number that
+      // disagrees says WHICH half, and `mlm_norm_out.f64` is the reference
+      // for the join.
+      {
+        std::vector<double> nref, ngot(static_cast<size_t>(kT) * kH, 0.0);
+        if (ReadF64(std::string(rdir_env) + "/mlm_norm_out.f64",
+                    static_cast<size_t>(kT) * kH, nref)) {
+          for (size_t k = 0; k < nrm.size(); k++) {
+            Plaintext<word> pt;
+            ffn.ui->Decrypt(pt, nrm[k]);
+            std::vector<double> co;
+            ffn.context->encoder_.DecodeCoeff(co, pt);
+            const auto comp = Components(co);
+            for (int j = 0; j < kRank; j++) {
+              const int declared = static_cast<int>(k) * kRank + j;
+              if (declared >= kH) continue;
+              for (int t = 0; t < kT; t++) {
+                ngot[static_cast<size_t>(t) * kH + declared] =
+                    comp[Rev(j, 9)][t] / hc.mlm_out_scale;
+              }
+            }
+          }
+          Report("the MLM transform + GELU + LayerNorm", ngot, nref);
+        }
+      }
+      const double bits = RelBits(got, mlm_ref);
+      std::cout << "  [the MLM head] rms 2^" << bits << std::endl;
+      // The number a deployment reads is the ARGMAX, so it is reported
+      // beside the rms: a head that agrees on every token's top-1 is right
+      // whatever the logits' last bits do.
+      int agree = 0;
+      for (int t = 0; t < kT; t++) {
+        int ga = 0, wa = 0;
+        for (int j = 1; j < kV; j++) {
+          const size_t b = static_cast<size_t>(t) * kV;
+          if (got[b + j] > got[b + ga]) ga = j;
+          if (mlm_ref[b + j] > mlm_ref[b + wa]) wa = j;
+        }
+        if (ga == wa) agree++;
+      }
+      std::cout << "  [the MLM head] top-1 agrees on " << agree << " of " << kT
+                << " tokens" << std::endl;
+      EXPECT_LT(bits, -5.0)
+          << "the MLM head disagrees with the float64 reference";
+      EXPECT_GE(agree, kT - 2) << "the MLM head's top-1 moved";
+    }
+    const auto t_head2 = std::chrono::steady_clock::now();
+    std::cout << "cost: the pooler + classifier "
+              << std::chrono::duration<double>(t_head1 - t_head0).count()
+              << " s, the MLM head "
+              << std::chrono::duration<double>(t_head2 - t_head1).count()
+              << " s" << std::endl;
   }
   std::cout << "the chain: " << num_layers << " layer(s), worst rms 2^"
             << worst_layer << std::endl;
