@@ -16,7 +16,8 @@ namespace cheddar {
  * The algebra, lemma 2 and the reference implementation are in
  * `SylphPcmmMath.h`; this is the encrypted loop and nothing else:
  *
- *     tau^l(C) = sum_j rot_R^(j b) ( sum_i pt_{A,i,j,l} . rot_R^i(tau^(l+1) B) )
+ *     tau^l(C) = sum_j rot_R^(j b) ( sum_i pt_{A,i,j,l}
+ *                                          . rot_R^i(tau^(l+1) B) )
  *
  * One plaintext multiply deep, `(b - 1) + (g - 1)` rotations wide, and no
  * bootstrap -- which is the whole requirement section 4 states for PC-attention
@@ -33,7 +34,7 @@ namespace cheddar {
  * **The plaintexts are rebuilt, not stored.** Section 4.2 is explicit that
  * keeping all `d` of them is "impractical for large-scale models due to the
  * massive memory overhead", and that each one costs only two plaintext
- * rotations from `tau^l . sigma(A)`. `Config::cache_plaintexts` chooses: on by
+ * rotations from `tau^l . sigma(A)`. The `cache_plaintexts` argument chooses: on by
  * default because at `d = 128` the whole set is 128 plaintexts and setup is
  * where this project has always paid for its encodes, off when memory is the
  * binding constraint and the encode can ride the GPU encoder instead.

@@ -17,7 +17,7 @@ SylphPcmm<word>::SylphPcmm(ConstContextPtr<word> context,
       input_scale_{input_scale},
       cache_{cache_plaintexts} {
   AssertTrue(plan_.ok, "SylphPcmm: the plan is not usable: " + plan_.why);
-  const int slots = context_->param_.degree_;
+  const int slots = context_->param_.MaxNumSlots();
   AssertTrue(plan_.d * plan_.d <= slots,
              "SylphPcmm: a d x d matrix laid out row by row needs d^2 slots");
   // ONE level. That is the section's whole claim, and the assert is where it
@@ -33,7 +33,7 @@ void SylphPcmm<word>::Compile() {
     compiled_ = true;
     return;
   }
-  const int slots = context_->param_.degree_;
+  const int slots = context_->param_.MaxNumSlots();
   const double out_scale = context_->param_.GetScale(output_level_);
   // The plaintext rides at whatever scale makes the product land canonically,
   // which is the same bookkeeping every other plaintext multiply in this tree
@@ -93,7 +93,8 @@ void SylphPcmm<word>::Apply(Ct &res, const Ct &tau_b,
         // the device so the host is not the bottleneck (Doing.md 3.25 is what
         // happens when it is).
         const sylph_pcmm::Mat m = sylph_pcmm::PlaintextFor(plan_, i, j);
-        std::vector<Complex> msg(context_->param_.degree_, Complex(0.0, 0.0));
+        std::vector<Complex> msg(context_->param_.MaxNumSlots(),
+                                 Complex(0.0, 0.0));
         for (size_t s = 0; s < m.size(); s++) msg[s] = Complex(m[s], 0.0);
         const double out_scale = context_->param_.GetScale(output_level_);
         const double pt_scale =

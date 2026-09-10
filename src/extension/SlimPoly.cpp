@@ -21,8 +21,11 @@ SlimPolyHandler<word>::SlimPolyHandler(ConstContextPtr<word> context,
       output_scale_{output_scale} {
   AssertTrue(plan_.ok, "SlimPoly: the plan is not usable: " + plan_.why);
   AssertTrue(block_slots_ > 0 && (block_slots_ & (block_slots_ - 1)) == 0,
+  // MaxNumSlots, not `degree_`: the CI ring has `degree_` real slots and an
+  // ordinary one has `degree_ / 2` complex ones, and a message encoded at the
+  // wrong length is not an error the encoder reports.
              "SlimPoly: block_slots must be a power of two");
-  const int slots = context_->param_.degree_;
+  const int slots = context_->param_.MaxNumSlots();
   AssertTrue(block_slots_ * plan_.NumBlocks() <= slots,
              "SlimPoly: the tree does not fit -- [SYLPH] section 3.4 needs "
              "2^(t+j) <= N, and the input's own slots are 2^t");
@@ -49,7 +52,7 @@ std::vector<int> SlimPolyHandler<word>::GetRotationDistances() const {
 
 template <typename word>
 void SlimPolyHandler<word>::Compile() {
-  const int slots = context_->param_.degree_;
+  const int slots = context_->param_.MaxNumSlots();
   const int blocks = plan_.NumBlocks();
   const int leaf_degree = 1 << (plan_.k - plan_.j);
 
