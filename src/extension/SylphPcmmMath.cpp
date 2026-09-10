@@ -128,6 +128,21 @@ Mat PlaintextFor(const SylphPcmmPlan &plan, int i, int j) {
   return RotR(col, d, -(plan.tau_power * k + j * plan.b));
 }
 
+std::vector<int> TauPermutation(int d, int n, int num_slots) {
+  std::vector<int> perm(num_slots);
+  for (int s = 0; s < num_slots; s++) perm[s] = s;
+  // `(tau^n(A))_{i,j} = A_{i + n j, j}`, so output slot `i d + j` holds input
+  // slot `((i + n j) mod d) d + j`. Inverting that for `SlotPermute`'s
+  // convention -- output slot `perm[s]` receives input slot `s` -- input slot
+  // `i d + j` goes to `((i - n j) mod d) d + j`.
+  for (int i = 0; i < d; i++) {
+    for (int j = 0; j < d; j++) {
+      perm[i * d + j] = Mod(i - n * j, d) * d + j;
+    }
+  }
+  return perm;
+}
+
 Mat PlainApply(const SylphPcmmPlan &plan, const Mat &tau_b) {
   const int d = plan.d;
   Mat res(static_cast<size_t>(d) * d, 0.0);

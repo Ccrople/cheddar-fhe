@@ -57,7 +57,7 @@ implemented and verified on the host, the encrypted half awaits a GPU ·
 | 4.1 | PC-attention and CC-attention split | YES | `CiPcAttention` / `CiSinCAttention` |
 | **4.2** | **eq. (5): depth-one PCMM, `tau^(l+1)(B) -> tau^l(C)`, BSGS, `O(sqrt d)` rotations** | **HOST** | **`SylphPcmmMath.h` + `SylphPcmm.h`, new on this branch** |
 | 4.2 | `pt_{A,i,j,l}` rebuilt at runtime from one stored `tau^l sigma(A)` | HOST | `sylph_pcmm::PlaintextFor`, `Config::cache_plaintexts` |
-| 4.2 | `tau^2` applied once, right after RoPE | NO | needs the wiring below |
+| 4.2 | `tau^2` applied once, right after RoPE | HOST | `sylph_pcmm::TauPermutation` + `SlotPermute`; one level, and **64 diagonals at `d = 128`, measured** -- an even power halves the orbit of `n j mod d`, so the one the paper applies is the cheapest |
 | **4.3** | **SoftMax on `tau(M)` is `tau(SoftMax(M))`** | **HOST** | verified as an identity in `SylphPcmmTest.SoftMaxSeesColumnsOfTau` |
 | 4.3 | two Cho iterations, 8 levels in the main track | YES | `SoftMaxCalibration::niter`; at our `m_eff` **k = 1 is better** and the header says why |
 | 4.3 | sharp range estimates from distributional calibration | DIFF | **this is the one we changed on purpose**; see below |
@@ -208,12 +208,11 @@ doing it rather than describing it:
   evaluation — already exists as the affine map onto the fit domain. That is
   the next step and it is not implemented.
 
-**Eq. (5) is not wired.** `SylphPcmm` is built and host-tested but is not on
-the model's path, because two things have to happen first and neither is
-mechanical:
-
-- `tau^2` applied once after RoPE (4.2), before the computation becomes wide.
-- A decision that is genuinely open: the T = 4096 branch's `CiPcAttention`
+**Eq. (5) is not wired.** `SylphPcmm` is built and host-tested, and so is the
+`tau^2` it needs (`TauPermutation`, one `SlotPermute` at one level and 64
+diagonals for `d = 128` -- measured, and cheaper than the 255 the square
+transpose costs, because an even power halves the orbit of `n j mod d`). What
+is missing is not machinery but a decision that is genuinely open: the T = 4096 branch's `CiPcAttention`
   reaches PC-attention through [KANG] Algorithm 1, which is **depth 1 with no
   rotation, no automorphism key and no relinearization key at all**. Eq. (5)
   is depth 1 with `O(sqrt d)` rotations. So the paper's algorithm is not

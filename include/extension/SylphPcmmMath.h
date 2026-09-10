@@ -139,6 +139,29 @@ SylphPcmmPlan BuildPlan(const Mat &a, int d, int tau_power, int b = 0);
 Mat PlaintextFor(const SylphPcmmPlan &plan, int i, int j);
 
 /**
+ * @brief The slot permutation that applies `tau^n`, for `SlotPermute`.
+ *
+ * Section 4.2 applies `tau^2` ONCE, "right after RoPE, before the computation
+ * becomes wide", because each PCMM call consumes one power. `tau` is a
+ * permutation of the slot index and nothing else, so it is a `SlotPermute` and
+ * costs one level -- and a cheaper one than the estimate: output slot
+ * `i d + j` reads input slot `((i + n j) mod d) d + j`, so every offset
+ * `s - perm[s]` is a multiple of `d`, and the count is however many values
+ * `n j mod d` takes. MEASURED at `d = 128` in 16384 slots: 128 distinct
+ * offsets at `n = 1` and **64 at `n = 2`**, because an even `n` halves the
+ * orbit. So the `tau^2` section 4.2 wants is about 64 diagonals and a BSGS
+ * grid of 8 x 8 -- well inside the square-transpose case `SlotPermute`'s
+ * header prices at 255 and 31 rotations, and nowhere near the field-swap case
+ * that costs 2048 and 95.
+ *
+ * Slots at or beyond `d * d` map to themselves, so the result is a bijection
+ * on the whole slot vector as `SlotPermute` requires.
+ *
+ * @param perm convention: output slot `perm[s]` receives input slot `s`
+ */
+std::vector<int> TauPermutation(int d, int n, int num_slots);
+
+/**
  * @brief Eq. (5) in the clear: `tau^l(C)` from `A`'s plan and `tau^(l+1)(B)`.
  *
  * This is the reference the encrypted path is checked against, and it is also

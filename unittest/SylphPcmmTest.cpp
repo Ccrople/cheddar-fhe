@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "Testbed.h"
@@ -138,6 +139,53 @@ TEST(SylphPcmmMath, CostIsSquareRootAndOneLevel) {
     std::cout << "d " << d << ": b " << plan.b << " g " << plan.g << ", "
               << plan.NumRotations() << " rotations (naive " << (d - 1)
               << "), 1 level" << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Section 4.2's `tau^2`, as the slot permutation it is.
+// ---------------------------------------------------------------------------
+TEST(SylphPcmmMath, TauIsASlotPermutation) {
+  // "As each PCMM call simultaneously evaluates tau^-1, we apply tau^2(.)
+  // right after RoPE, before the computation becomes wide." That `tau^2` is a
+  // permutation of the slot index and nothing else, so it is one
+  // `SlotPermute` at one level -- and the diagonal count, which is what a
+  // linear transform actually costs, is measured here rather than estimated.
+  for (int d : {4, 8, 16, 128}) {
+    const int slots = (d == 128) ? 16384 : d * d * 2;
+    const Mat m = Rand(d, 7u + d);
+    for (int n = 0; n <= 3; n++) {
+      const std::vector<int> p =
+          cheddar::sylph_pcmm::TauPermutation(d, n, slots);
+      ASSERT_EQ(static_cast<int>(p.size()), slots);
+      std::vector<double> in(slots, 0.0), out(slots, 0.0);
+      for (size_t s = 0; s < m.size(); s++) in[s] = m[s];
+      std::vector<char> hit(slots, 0);
+      for (int s = 0; s < slots; s++) {
+        ASSERT_GE(p[s], 0);
+        ASSERT_LT(p[s], slots);
+        ASSERT_FALSE(hit[p[s]]) << "not a bijection at d " << d << " n " << n;
+        hit[p[s]] = 1;
+        out[p[s]] = in[s];
+      }
+      const Mat want = TauPow(m, d, n);
+      double w = 0.0;
+      for (size_t s = 0; s < want.size(); s++) {
+        w = std::max(w, std::abs(out[s] - want[s]));
+      }
+      EXPECT_LT(w, 1e-12) << "d " << d << " n " << n;
+      if (d == 128) {
+        std::set<int> offs;
+        for (int s = 0; s < slots; s++) {
+          offs.insert(((s - p[s]) % slots + slots) % slots);
+        }
+        std::cout << "tau^" << n << " at d 128: " << offs.size()
+                  << " distinct offsets" << std::endl;
+        // An even power halves the orbit of `n j mod d`, so tau^2 -- the one
+        // section 4.2 actually applies -- is the cheapest of them.
+        if (n == 2) EXPECT_LE(static_cast<int>(offs.size()), d / 2);
+      }
+    }
   }
 }
 
