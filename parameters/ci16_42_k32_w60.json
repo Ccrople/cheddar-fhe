@@ -4,7 +4,7 @@
   "boot": true,
   "dense_hamming_weight": 32768,
   "sparse_hamming_weight": 32,
-  "num_cts_levels": 3,
+  "num_cts_levels": 2,
   "num_stc_levels": 3,
   "num_double_angle": 4,
   "log_message_ratio": 4,
@@ -16,8 +16,7 @@
     16515073,
     21495809,
     22806529,
-    23068673,
-    26214401
+    23068673
   ],
   "main_primes": [
     1049100289,
@@ -183,10 +182,6 @@
     [
       39,
       8
-    ],
-    [
-      39,
-      9
     ]
   ],
   "additional_base": [

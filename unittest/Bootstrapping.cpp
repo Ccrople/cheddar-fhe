@@ -391,25 +391,34 @@ INSTANTIATE_TEST_SUITE_P(
                     "ci16_35_stc2.json",
                     // THE 2^42 CI FAMILY, one ladder per K
                     // (`reference/scripts/design_ci41.py`, band by
-                    // `ci20_family.py`). Measured p at ratio 4 (3 for k64):
-                    // **20.85 / 19.56 / 18.35**, so K = 16 clears [SYLPH]
+                    // `ci20_family.py`). Measured p, each at the ratio it
+                    // ships -- 4, 4, 3, which are their own optima:
+                    // **20.93 / 19.61 / 18.28**. K = 16 clears [SYLPH]
                     // 3.1.3's 20 bits and the other two do not -- a double
                     // angle costs ~1.2 bits and only more scale buys it back.
+                    // All three pass `Bootstrap`, this test and
+                    // `param_robust_test --strict` 7/7 (`ring_accept.sh`).
                     //
                     // Every band level rescales by exactly 2^60, which is
-                    // EvalMod's fixed point, so the landing scale is 2^60 for
-                    // ANY landing instead of the per-ladder solve
-                    // `gen_landing.py` v3 has to run.
+                    // EvalMod's fixed point, so the LANDING SCALE is 2^60
+                    // with wander -0.00 instead of the per-ladder solve
+                    // `gen_landing.py` v3 has to run. That is the landing
+                    // SCALE, not the landing LEVEL: the band here is exactly
+                    // `num_evalmod` long, so each of these supports exactly
+                    // one climb (`ring_robust.sh` section B measures it).
                     "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
                     "ci16_42_k64_w60.json",
-                    // Candidate: k32 without its thin single-terminal CtS
-                    // top. `num_ter - t_after_graft` must be a multiple of 3
-                    // or the CtS terminal levels come out ragged, and k32's
-                    // 9 - 2 = 7 left a level of ONE terminal (2^24.64) that
-                    // `EvalSpecialFFT` then consumes by a pure rescale --
-                    // legal, but it means num_cts 3 buys only 2 transform
-                    // levels. Eight terminals make it 6 = 3 + 3.
-                    "ci16_42_k32_w60c.json"),
+                    // Candidate: the FREE-LANDING shape. A shorter
+                    // climb needs every EvalMod level still on the
+                    // band AND the climb level carrying the full
+                    // terminal inventory -- the second is what the
+                    // family failed first ("ModDown: src q size
+                    // mismatch"). Here the graft cycle ends on
+                    // t == num_ter == 4 and every level above is a
+                    // main pair, so all of band and CtS carry all
+                    // four; the band is EvalMod + 1, which should buy
+                    // exactly two landings.
+                    "ci16_42_k16_free.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
