@@ -183,13 +183,6 @@ if (ENABLE_EXTENSION)
   target_link_libraries(attention_transport_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
-  # Both attention products as the block will call them: slots in, slots out,
-  # with the permutations, the exchange, SlotToSinC, the CC-MM, HalfBoot and
-  # the StC prefix all inside SinCAttention. Three Contexts and a full
-  # bootstrap, so it is its own binary and the heaviest test here.
-  add_executable(sinc_attention_test SinCAttentionTest.cpp)
-  target_link_libraries(sinc_attention_test
-                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 endif()
 
 if (ENABLE_EXTENSION)
@@ -368,14 +361,6 @@ if (ENABLE_EXTENSION)
   target_link_libraries(sylph_schedule_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
-  # One whole decoder block through six turns of that cycle. The plan and the
-  # calibration tests are host arithmetic; the third bootstraps ninety-six
-  # times. All three need LLAMA3_REAL_DIR except the first, and the matrix
-  # products are a host stand-in -- see the file header.
-  add_executable(llama_block_test LlamaBlockTest.cpp)
-  target_link_libraries(llama_block_test
-                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
-
   # [32] section 5.1's three claims for the conjugate-invariant ring -- same
   # ciphertext, twice the slots, same arithmetic -- checked on ci16_35 against
   # bootparam_35, which differ in nothing but the ring. Two Contexts in one
@@ -437,10 +422,6 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/sylphflow16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/sylphflow16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/sylphflow16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/sylphflow16_40.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_40.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_40.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_40.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringdegree12_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringdegree12_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json

@@ -66,6 +66,8 @@
 #include "extension/EvalSpecialFFT.h"
 #include "extension/LinearTransform.h"
 #include "extension/LlamaLinear.h"
+#include "extension/RmsNorm.h"
+#include "extension/SiLu.h"
 #include "extension/SylphSchedule.h"
 #include "extension/StripedMatrix.h"
 

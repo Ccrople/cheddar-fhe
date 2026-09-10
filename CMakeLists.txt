@@ -112,12 +112,9 @@ if(ENABLE_EXTENSION)
     src/extension/EvalSpecialFFT.cpp
     src/extension/Hoist.cu
     src/extension/LinearTransform.cpp
-    src/extension/LlamaAttention.cu
-    src/extension/LlamaBlock.cu
     src/extension/LlamaLinear.cu
     src/extension/Profile.cpp
   src/extension/SlotPermute.cpp
-    src/extension/SinCAttention.cu
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
     src/extension/SoftMax.cu

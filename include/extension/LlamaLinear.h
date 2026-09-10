@@ -19,7 +19,7 @@
 #ifdef USE_CUBLAS
 #include "core/PcmmBlas.h"
 #endif
-#include "extension/LlamaBlock.h"
+#include "extension/LinearLeg.h"
 
 namespace cheddar {
 
@@ -135,7 +135,7 @@ namespace cheddar {
  * @tparam word uint32_t or uint64_t
  */
 template <typename word>
-class CoeffLinearLeg : public LlamaBlock<word>::LinearLeg {
+class CoeffLinearLeg : public LinearLeg<word> {
  private:
   using Ct = Ciphertext<word>;
 
