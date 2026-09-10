@@ -421,7 +421,11 @@ void BootContext<word>::ModUpToLevel(Ct &res, const Ct &input,
   if (sse) {
     // StD key-switch
     const auto &std_key = evk_map.GetSparseToDenseKey();
-    const auto &std_mod_switcher = this->GetStDModSwitchHandler();
+    // AT THE CLIMB'S LEVEL, not the parameter set's maximum. This was the
+    // second place still pinned to `param_.max_level_` after ModUp was freed
+    // (see the note above), and it is what made every short climb die in
+    // `ModDownAndRescale` with a q-size mismatch before any transform ran.
+    const auto &std_mod_switcher = this->GetStDModSwitchHandler(target_level);
     // MultKey
     Ct tmp_std(max_level_np);
     std::vector<DvView<word>> tmp_std_view = tmp_std.ViewVector();

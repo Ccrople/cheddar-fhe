@@ -370,6 +370,18 @@ TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
             << std::endl;
   std::cout << "  at Sylph's B = 128: effective " << (p - 7.0)
             << " bits, and the target is 12" << std::endl;
+  // WHERE IT LANDED, read off the ciphertext rather than predicted, because
+  // the landing level is a knob now (`CHEDDAR_BOOT_SLACK`) and a sweep that
+  // trusted the arithmetic would not notice the boot ignoring it.
+  const auto &bp = boot_context->GetBootParameter();
+  const int landed = param_->NPToLevel(ct_res.GetNP());
+  std::cout << "  LANDED at level " << landed << " (climb "
+            << bp.GetMaxLevel() << ", CtS " << bp.num_cts_levels_
+            << ", EvalMod " << bp.GetNumEvalModLevels() << " ending at "
+            << bp.GetEvalModEndLevel() << ", slack " << bp.GetNumSlackLevels()
+            << ", StC " << bp.num_stc_levels_ << ")" << std::endl;
+  EXPECT_EQ(landed, bp.GetEndLevel())
+      << "the boot did not land where its BootParameter says";
   std::cout << "  largest B this preset affords at 12 bits: 2^" << (p - 12.0)
             << " = " << std::exp2(p - 12.0) << std::endl;
   std::cout << "  ([SYLPH] has p = 20, B = 128, effective 13)" << std::endl;

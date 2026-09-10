@@ -2,6 +2,7 @@
 #include "core/Context.h"
 
 #include <cstdlib>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -119,10 +120,19 @@ const ModSwitchHandler<word> &Context<word>::GetDtSModSwitchHandler() const {
 }
 
 template <typename word>
-const ModSwitchHandler<word> &Context<word>::GetStDModSwitchHandler() const {
+const ModSwitchHandler<word> &Context<word>::GetStDModSwitchHandler(
+    int level /* = -1 */) const {
   AssertTrue(param_.IsUsingSparseSecretEncapsulation(),
              "Sparse secret encapsulation is not enabled");
-  return mod_switch_handlers_.at(param_.max_level_);
+  if (level < 0) level = param_.max_level_;
+  AssertTrue(level <= param_.max_level_,
+             "GetStDModSwitchHandler: level " + std::to_string(level) +
+                 " is above the parameter set's maximum " +
+                 std::to_string(param_.max_level_));
+  // `mod_switch_handlers_` holds one per level 0..max_level_ in order, plus
+  // the level -1 entry SSE appends for the dense-to-sparse direction, so the
+  // level IS the index.
+  return mod_switch_handlers_.at(level);
 }
 
 template <typename word>

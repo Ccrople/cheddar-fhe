@@ -36,7 +36,13 @@ class Context {
 
   DvConstView<word> GetPProd(NPInfo &np) const;
   const ModSwitchHandler<word> &GetDtSModSwitchHandler() const;
-  const ModSwitchHandler<word> &GetStDModSwitchHandler() const;
+  /// The sparse-to-dense key switch's mod-down, AT THE LEVEL THE CLIMB
+  /// REACHED. It used to be pinned to `param_.max_level_`, which is right
+  /// only when the bootstrap climbs the whole ladder; `BootContext::
+  /// ModUpToLevel` climbs to `boot_param_.GetMaxLevel()`, so any shorter
+  /// climb handed a handler built for a different number of primes.
+  /// `level < 0` keeps the old meaning, the parameter set's own maximum.
+  const ModSwitchHandler<word> &GetStDModSwitchHandler(int level = -1) const;
 
 
  public:

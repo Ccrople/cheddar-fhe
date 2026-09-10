@@ -291,7 +291,23 @@ class Testbed : public testing::TestWithParam<const char *> {
   // Levels left free between EvalMod and StC. Zero reproduces every shipped
   // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
   // the slot domain before the conversion -- overrides it.
-  virtual int BootSlackLevels() const { return 0; }
+  //
+  // THIS IS THE LANDING KNOB, and it is the one that does not disturb EvalMod.
+  // A shorter CLIMB (`CHEDDAR_BOOT_CLIMB`) moves CtS, EvalMod and StC together,
+  // so it drags EvalMod's band off the levels the band was mined for and the
+  // recursion `s <- s^2/prod` leaves its fixed point. Slack moves only StC:
+  // `GetStCStartLevel() = GetEvalModEndLevel() - slack`, so EvalMod still runs
+  // top to bottom inside the band, still lands at 2^60, and `Boot` crosses the
+  // gap with LevelDown -- a multiply by a level-down constant plus a rescale,
+  // which leaves the DECLARED scale alone. So one parameter set lands anywhere
+  // from `GetEndLevel()` down to 0 by choosing slack.
+  virtual int BootSlackLevels() const {
+    if (const char *e = std::getenv("CHEDDAR_BOOT_SLACK");
+        e != nullptr && e[0] != 0) {
+      return std::atoi(e);
+    }
+    return 0;
+  }
   // Levels CoeffToSlot spends. The preset's count reproduces every shipped
   // bootstrap; a test whose CoeffToSlot is a different transform, or whose
   // EvalMod is wider (CHEDDAR_BOOT_DOUBLE_ANGLE), moves it so that EvalMod

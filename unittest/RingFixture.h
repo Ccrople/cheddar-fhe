@@ -129,11 +129,24 @@ struct Ring {
           e != nullptr && e[0] != 0) {
         log_message_ratio = std::atoi(e);
       }
-      // The climb, which is the landing: see `Testbed::BootMaxLevel`.
+      // THE CLIMB IS NOT THE LANDING KNOB -- slack is. A shorter climb moves
+      // CtS, EvalMod and StC together, so it drags EvalMod off the levels a
+      // stationary band was mined for and the recursion `s <- s^2/prod` walks
+      // away from its fixed point: measured, a climb one below the top lands
+      // where it is asked to and returns p = -518 bits. Slack moves only StC
+      // (`GetStCStartLevel() = GetEvalModEndLevel() - slack`), so EvalMod
+      // still runs inside its band and the message survives -- the same three
+      // ladders land at every level from `GetEndLevel()` down to 0 at full
+      // precision. Use the climb to make the whole bootstrap cheaper on a
+      // ladder with band to spare; use slack to choose where it lands.
       int climb = param->max_level_;
       if (const char *e = std::getenv("CHEDDAR_BOOT_CLIMB");
           e != nullptr && e[0] != 0) {
         climb = std::atoi(e);
+      }
+      if (const char *e = std::getenv("CHEDDAR_BOOT_SLACK");
+          e != nullptr && e[0] != 0) {
+        boot_slack_levels = std::atoi(e);
       }
       const int initial_k =
           j.contains("initial_k") ? int(j["initial_k"]) : 2;
