@@ -118,6 +118,8 @@ if(ENABLE_EXTENSION)
     src/extension/RmsNorm.cu
     src/extension/SiLu.cu
     src/extension/SlimPolyMath.cpp
+    src/extension/SylphPcmmMath.cpp
+    src/extension/SylphPcmm.cpp
     src/extension/SlimPoly.cpp
     src/extension/SoftMax.cu
     src/extension/RoPe.cu

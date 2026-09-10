@@ -296,6 +296,12 @@ if (ENABLE_EXTENSION)
   target_link_libraries(slim_poly_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # [SYLPH] section 4.2 eq. (5) and appendix E lemma 2: the depth-one PCMM.
+  # The index algebra runs without a GPU.
+  add_executable(sylph_pcmm_test SylphPcmmTest.cpp)
+  target_link_libraries(sylph_pcmm_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # Level-targeted bootstrapping: one landing level per fixture.
   add_executable(boot_level_test BootLevelTest.cpp)
   target_link_libraries(boot_level_test
