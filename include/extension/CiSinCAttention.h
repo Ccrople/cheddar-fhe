@@ -278,6 +278,24 @@ class CiSinCAttention {
     //! relative error is a per-row gain on the whole attention output.
     int iter_inv_degree = 0;
     int last_inv_degree = 0;
+    //! THE RIDE THE BOOT BETWEEN PASSES SEES. After a normalisation `y` is a
+    //! probability vector, so its largest entry is near ONE -- and this ring
+    //! crosses at 0.35, whose EvalMod error is a CUBIC in the ride. Measured
+    //! on the host for BERT: `|y|` reaches 0.53 to 0.88 after the first pass
+    //! and 0.99 after the second, so a two-pass walk boots at 1.5x the ride
+    //! and a three-pass one at nearly 3x -- and the three-pass layer came
+    //! back ANTI-correlated with its reference (`carried` negative), which is
+    //! a wrap and not noise.
+    //!
+    //! Setting this makes every pass whose output feeds a boot leave `y` at
+    //! `ride * (probability vector)` instead. It costs NOTHING: the factor is
+    //! `sqrt(ride)` folded into that pass's invsqrt COEFFICIENTS, which the
+    //! handler evaluates as given, and the next pass's window is the same
+    //! theorem times `ride^2`. The LAST pass keeps its own gain at one,
+    //! because its `(y r)^2` IS P.
+    //!
+    //! 0 = off, which is the shipped behaviour.
+    double cho_boot_ride = 0.0;
     //! The largest live key count a row can have, for the later window's
     //! theorem `sq_j >= 1 / live`. 0 = the layout's `dim`.
     int live_max = 0;
@@ -509,6 +527,9 @@ class CiSinCAttention {
   //! at `poly_in_`) and [1] the LATER one (booted, read at `cho_inv_in_`).
   //! The later polynomial is reused by every iteration after the first --
   //! they all see the same booted level and the same theorem window.
+  //! [0] the FIRST pass, [1] a MIDDLE pass (only when niter >= 3; its
+  //! output feeds another boot so it carries the ride gain), [2] the LAST
+  //! pass (no gain -- its `(y r)^2` is P).
   std::vector<std::unique_ptr<EvalPoly<word>>> cho_inv_;
   int cho_inv_in_ = 0;
   double cho_later_lo_ = 0.0, cho_later_hi_ = 0.0;

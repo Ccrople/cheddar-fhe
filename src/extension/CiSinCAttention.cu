@@ -1037,12 +1037,19 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   poly_in_ = sq_level_ - 1;
   // Compiles one invsqrt over [lo, hi] reading at `in_level`; `floor_level` is
   // what its output must clear. Returns the used degree through `out`.
+  // `gain` multiplies the fit itself, which is FREE: the handler evaluates
+  // whatever vector it is given, so a constant on the answer costs no level.
+  // It is how the Cho walk puts `y` back on the crossing's ride before the
+  // boot between passes (`SoftMaxCalibration::cho_boot_ride`).
   auto compile_inv = [&](double lo, double hi, int degree, int in_level,
-                         int floor_level, const char *what, int *out) {
+                         int floor_level, const char *what, int *out,
+                         double gain = 1.0) {
     const double aff_a = 0.5 * (hi - lo);
     const double aff_b = 0.5 * (hi + lo);
     auto coeffs = chebfit::Interpolate(
-        [aff_a, aff_b](double v) { return 1.0 / std::sqrt(aff_a * v + aff_b); },
+        [aff_a, aff_b, gain](double v) {
+          return gain / std::sqrt(aff_a * v + aff_b);
+        },
         degree);
     const int used =
         EvalPoly<word>(coeffs, in_level, boot_->param_.GetScale(in_level),
@@ -1109,14 +1116,43 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     AssertTrue(cho_later_lo_ > 0.0 && cho_later_hi_ > cho_later_lo_,
                "CiSinCAttention: the derived later window is empty -- the "
                "first invsqrt's error over its window is not a contraction");
+    // THE RIDE BETWEEN PASSES. `(y r)^2` is a probability vector, so its
+    // largest entry is near one and the boot that follows sees three times
+    // this ring's crossing height. Every pass whose output feeds a boot
+    // therefore carries `sqrt(ride)` on its fit, and every window after the
+    // first is the same theorem times `ride^2`.
+    const double ride = calib_.cho_boot_ride;
+    const bool ride_on = (ride > 0.0 && k > 1);
+    const double gain = ride_on ? std::sqrt(ride) : 1.0;
+    if (ride_on) {
+      cho_later_lo_ *= ride * ride;
+      cho_later_hi_ *= ride * ride;
+    }
     // pass 0's `(y r)^2` costs two levels and is then BOOTED, so its landing
-    // only has to stay above zero; the LAST pass's `(y r)^2` IS P.
-    cho_inv_.push_back(compile_inv(f_lo, f_hi, iter_deg, poly_in_,
-                                   /*floor=*/3, "first", &cho_used));
+    // only has to stay above zero -- unless k == 1, when it IS the last.
+    cho_inv_.push_back(compile_inv(
+        f_lo, f_hi, iter_deg, poly_in_,
+        /*floor=*/(k > 1) ? 3 : cfg_.forward_level + 2, "first", &cho_used,
+        gain));
     cho_inv_in_ = top - 2;
+    // A MIDDLE pass exists only at k >= 3, and it is the one that differs:
+    // its output feeds another boot, so it carries the gain where the last
+    // one must not.
+    // ...and it exists ONLY when the ride is on. With the ride off this is
+    // null and the dispatch falls back to the last polynomial for every pass
+    // after the first, which is what the shipped path did -- so nothing on
+    // the Llama line moves unless a caller asks for a ride.
+    if (ride_on && k >= 3) {
+      cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_, iter_deg,
+                                     cho_inv_in_, /*floor=*/3, "middle",
+                                     nullptr, gain));
+    } else {
+      cho_inv_.push_back(nullptr);
+    }
+    // the LAST pass's `(y r)^2` IS P, so its gain is one.
     cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_, last_deg,
                                    cho_inv_in_, cfg_.forward_level + 2,
-                                   "later", &inv_used));
+                                   "last", &inv_used));
     inv_out = cho_inv_in_ - Log2Ceil(inv_used + 1);
   }
 
@@ -1201,7 +1237,11 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
                                 ? calib_.first_hi : calib_.norm_hi)
                 << "], later deg " << inv_used << " @" << cho_inv_in_ << ".."
                 << inv_out << " on [" << cho_later_lo_ << ", " << cho_later_hi_
-                << "] (DERIVED), est "
+                << "] (DERIVED), boot ride "
+                << (calib_.cho_boot_ride > 0.0
+                        ? std::to_string(calib_.cho_boot_ride)
+                        : std::string("off"))
+                << ", est "
                 << (calib_.row_norm.empty() ? "none" : "folded on the mask");
     } else {
       std::cout << ", invsqrt deg " << inv_used << " @" << poly_in_ << ".."
@@ -1311,7 +1351,12 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
     } else {
       lo = cho_later_lo_;
       hi = cho_later_hi_;
-      inv = cho_inv_[1].get();
+      // [1] is the middle pass (gain on, feeds another boot) and [2] the
+      // last (gain off, its square is P). They share the window. With the
+      // ride off there is no middle polynomial and every later pass reads
+      // [2], which is the shipped behaviour exactly.
+      inv = (last || cho_inv_[1] == nullptr) ? cho_inv_[2].get()
+                                             : cho_inv_[1].get();
     }
     {
       // The levels are READ, not assumed: pass 0's `sq` is at `sq_level_`

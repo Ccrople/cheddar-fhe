@@ -56,23 +56,29 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char *kFfnParamDefault = "ci16_35_land13c2e9.json";
-// The layer half's ring, overridable: a CERTIFIED calibration has no
-// per-token rescale, so its invsqrt windows are the raw variance's (17 to
-// 12,000 across the twenty-four norms) and the degree the Chebyshev rate
-// asks of those does not fit the landing at 13. `gen_landing.py ci16_35.json
-// 17 parameters/ci16_35_land17c2e9.json 2 9` builds the deeper one.
+// The layer half's ring. THE DEFAULT IS THE SHIPPING RECIPE, because a
+// default that no supported configuration uses is a trap: `land13c2e9` was
+// the served prompt's ring and a CERTIFIED calibration does not fit it. With
+// no per-token rescale the invsqrt windows are the raw variance's (17 to
+// 12,000 across the twenty-four norms), and the degree the Chebyshev rate
+// asks of those needs a budget of eleven -- which is landing 17 at slack 12,
+// and landing 17 is the CEILING (the leg lands at 16 and `op = landing - 1`).
+// v3 because v2's EvalMod wanders off its nominal landing (`param_audit.py`).
+constexpr const char *kFfnParamDefault = "ci16_35_land17c3e10v3.json";
 inline const char *FfnParam() {
   const char *e = std::getenv("BERT_FFN_PARAM");
   return (e && *e) ? e : kFfnParamDefault;
 }
-// The layer half's boot SLACK, overridable. Only StC depends on it
-// (`BootContext.h`): more slack puts StC lower, which is one more level for
-// the norm and the GELU between the landing and `ToCoeff` -- and, measured
-// there, LESS StC memory, not more. Nine is what the Llama FFN uses.
+// The layer half's boot SLACK. Only StC depends on it (`BootContext.h`):
+// more slack puts StC lower, which is one more level for the norm and the
+// GELU between the landing and `ToCoeff` -- and, measured there, LESS StC
+// memory, not more. The OPERATOR's budget is `slack - 1`, because `EvalPoly`
+// asserts a canonical input scale and `Canonicalise` spends the first level.
+// Twelve is what the certified plan needs (budget 11); nine was the Llama
+// FFN's and is what the served prompt's plan ran on.
 inline int FfnSlack() {
   const char *e = std::getenv("BERT_FFN_SLACK");
-  return (e && *e) ? std::atoi(e) : 9;
+  return (e && *e) ? std::atoi(e) : 12;
 }
 constexpr const char *kBootParam = "ci16_35.json";
 constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
@@ -88,7 +94,17 @@ constexpr const char *kLiftedParam = "ringdegree13_35_boot.json";
 // measured at -1.8 .. -6.2 bits. `CiSinCBasisTest` and `CiBatchTest` already
 // read it; the B = 1 Llama leg has not moved yet, which is why the non-v3
 // still ships there.
-constexpr const char *kTowerParam = "ci16_35_land17c3e10v3.json";
+constexpr const char *kTowerParamDefault = "ci16_35_land17c3e10v3.json";
+// ...and it is a KNOB, because it is the ring the tail failures happen on.
+// The leg is where a draw blows up (stage 1, layers 9/10, 2^+8..+10 with
+// everything before it clean at 2^-8.5), the tower ring is the leg's own
+// crossing, and without a lever here the only way to ask "is it this ring?"
+// was to edit and rebuild. `gen_landing.py ci16_35.json 17 <out> 3 11`
+// builds the K = 128 twin if the answer turns out to be EvalMod's range.
+inline const char *TowerParam() {
+  const char *e = std::getenv("BERT_TOWER_PARAM");
+  return (e && *e) ? e : kTowerParamDefault;
+}
 
 // BERT-Base, and the packing: T * rank is the slot count, 768 model channels
 // in two dense rank-512 ciphertexts and 3072 hidden ones in six.
@@ -104,6 +120,13 @@ constexpr double kEps = 1e-12;
 // crossing's ride by the same factor, so lowering this one separates "the
 // suppression is too deep" from "the ride is now too high" -- the two move
 // together otherwise and cannot be told apart from a single sweep.
+//! An integer knob with a fallback, so a plan's value can be overridden from
+//! the environment for one run without editing the plan.
+int EnvInt(const char *name, int fallback) {
+  const char *e = std::getenv(name);
+  return (e != nullptr && *e != 0) ? std::atoi(e) : fallback;
+}
+
 double Ride() {
   static const double v = [] {
     const char *e = std::getenv("BERT_RIDE");
@@ -740,22 +763,48 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // stream carries it end to end, so it is ONE vector for the whole
   // chain and not one a layer: the residual add is `X + O` and both
   // sides must carry the same factor.
+  //
+  // The plan is parsed ONCE here and kept: the softmax's population section
+  // is read before the q/k/v sizing and the GELU's after it, and a 16 MB
+  // file has no business being parsed twice a layer.
+  json plan_all;
+  bool have_plan = false;
   std::vector<double> chan_sup;
   if (const char *cdir0 = std::getenv("BERT_CALIB_DIR")) {
     std::ifstream cf0(std::string(cdir0) + "/corpus.json");
     if (cf0.good()) {
       json p0;
       cf0 >> p0;
+      plan_all = p0;
+      have_plan = true;
       if (p0.contains("channel_suppress")) {
         chan_sup = p0["channel_suppress"].get<std::vector<double>>();
         chan_sup.resize(kDeclaredH, 1.0);
-        // `BERT_CHAN_CAP` floors the suppression. The plan's smallest factor
-        // is 1/238, and a consumer of the stream divides its weights by it --
-        // so sixteen rows of every q/k/v and up projection grow by that
-        // factor, which the int8 product has to hold, and the crossing's
-        // plaintext grows by it too. A cap trades ride for both.
-        if (const char *cp = std::getenv("BERT_CHAN_CAP")) {
-          const double floor_v = 1.0 / std::atof(cp);
+        // `BERT_CHAN_CAP` floors the suppression, and its DEFAULT is the
+        // measured optimum rather than "no floor". The plan's smallest
+        // factor is 1/238, and a consumer of the stream divides its weights
+        // by it -- so sixteen rows of every q/k/v and up projection grow by
+        // that factor, which the int8 product has to hold, and the
+        // crossing's plaintext grows by it too.
+        //
+        // But the real trade is not that. Suppressing a channel by `d_c`
+        // buys every OTHER row its ride back and costs THAT channel its own
+        // SNR, because the norm multiplies its accumulated absolute error by
+        // `1/d_c` when it takes the factor out -- and the suppressed
+        // channels are most of the row's energy. So the curve TURNS OVER
+        // (twelve layers, worst rms, everything else the shipping plan):
+        //
+        //     no suppression  2^-5.26     cap 16  2^-7.77
+        //     cap  2          2^-6.17     cap 32  2^-7.84
+        //     cap  4          2^-6.99     cap 64  2^-7.64
+        //     cap  8          2^-7.55     uncapped (1/238)  2^-7.14
+        //
+        // Sixteen and thirty-two are the flat top; uncapped is 0.7 bits
+        // worse than either, so leaving this unset was leaving bits behind.
+        const char *cp = std::getenv("BERT_CHAN_CAP");
+        const double cap = (cp != nullptr && *cp != 0) ? std::atof(cp) : 16.0;
+        if (cap > 0.0) {
+          const double floor_v = 1.0 / cap;
           for (double &v : chan_sup) v = std::max(v, floor_v);
         }
         double lo = 1.0;
@@ -766,6 +815,21 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     }
   }
   const bool CS = !chan_sup.empty();
+  // THE CHO ITERATION NEEDS A FULL BOOT ON THE LEG'S RING. Fused, `ci16_35`
+  // builds no native tables at all -- the scores and the attention output
+  // return through the tower, q/k/v and the stream cross through
+  // `HalfBootModule` -- and that is worth ~6 GiB and a rotation-key set. But
+  // `CiSinCAttention::SoftMax` bootstraps the main path BETWEEN Cho passes,
+  // and a `Boot` is a native `EvalSpecialFFT`, so a population plan has to
+  // buy them back. Read before the rings so the leg is built knowing.
+  int pop_niter = 0;
+  if (have_plan && plan_all.contains("softmax") &&
+      std::getenv("BERT_POP_LEG") != nullptr) {
+    for (const auto &lj : plan_all["softmax"]["layers"]) {
+      pop_niter = std::max(pop_niter, lj.value("niter", 0));
+    }
+    pop_niter = EnvInt("BERT_NITER", pop_niter);
+  }
   auto unsup = [&](std::vector<double> &v) {
     if (!CS) return;
     for (int t = 0; t < kT; t++)
@@ -884,6 +948,17 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   // the FFN ring -- so `PrepareEvalSpecialFFT` here would be ~6 GiB and a
   // rotation-key set for nobody.
   bctx->PrepareEvalMod();
+  if (pop_niter > 1) {
+    // ...and here is where it is bought back. `niter > 1` is the only path
+    // that boots on this ring; `niter <= 1` is the shipped single pass and
+    // still builds nothing.
+    bctx->PrepareEvalSpecialFFT(num_slots);
+    EvkRequest req;
+    bctx->AddRequiredRotations(req, num_slots, /*min_ks=*/false);
+    boot.ui->PrepareRotationKey(req);
+    std::cout << "the Cho iteration boots on the leg's ring, so ci16_35's "
+                 "native tables are built after all" << std::endl;
+  }
   fui.PrepareModPackKeys(kT, kPcmmLevel, /*num_aux=*/-1);
   std::vector<const cheddar::EvaluationKey<word> *> pack_keys;
   for (int j = 0; j < kRank; j++) {
@@ -943,17 +1018,33 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     //     tower h=24 -> 91 native -> 127.8 bits
     //     tower h=32 -> 122 native -> 128.1 bits  = the primal ceiling
     //
-    // and `ci_nested_sinc.py`'s wrap-around says it is free in levels: the
+    // `ci_nested_sinc.py`'s wrap-around says it is free in LEVELS -- the
     // tower-centred ModRaise reads max 32.1 at h = 16, 42.5 at 24 and 47.1 at
-    // 32, all inside the K = 64 this ring already pays for (48 reaches 51.7,
-    // which is the first weight that looks tight).
+    // 32, all inside the K = 64 this ring already pays for -- and it is NOT
+    // free in the TAIL, which is what running it said and the sample maxima
+    // above did not:
+    //
+    //     module h   tower h   clean 12-layer draws (cap 16)
+    //         16        16          5 / 5
+    //         32        16          5 / 5
+    //         16        32          5 / 5
+    //         32        32          4 / 5   (+2 more failures elsewhere)
+    //
+    // Neither secret is the culprit alone. A chain makes many crossings, so
+    // what matters is the JOINT probability that SOME slot in SOME crossing
+    // lands past K, and only raising both weights pushes it over; the mean is
+    // identical either way (2^-7.7 .. -7.86 on the clean draws), so this
+    // lives entirely in the tail. The margin against K = 64 is what moved:
+    // 2.00x at h = 16, 1.36x at h = 32, and a sample maximum is not an
+    // extreme-value bound over 65536 slots x 12 layers x many crossings.
+    // h = 24 (127.8 bits, margin 1.51x) is the untried middle.
     const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
     const std::string saved = prev ? prev : "";
     const char *tower_env = std::getenv("BERT_TOWER_SPARSE");
     setenv("CHEDDAR_MODULE_SPARSE_SECRET",
            (tower_env && *tower_env) ? tower_env : "4096:128,16",
            /*overwrite=*/1);
-    tower = std::make_unique<Ring>(kTowerParam, boot.ui->GetSecretCoeffs(),
+    tower = std::make_unique<Ring>(TowerParam(), boot.ui->GetSecretCoeffs(),
                                    /*boot_slack_levels=*/0);
     if (prev) {
       setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
@@ -982,6 +1073,10 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   acfg.fused = true;
   acfg.chain_level = 1;
   acfg.inverse_level = 0;
+  // `BERT_LEG_VERBOSE=1` makes `PrepareSoftMax` print the levels it compiled
+  // the exp and both invsqrts at. It is the only way to see whether a Cho
+  // pass count actually fits.
+  acfg.verbose = std::getenv("BERT_LEG_VERBOSE") != nullptr;
   cheddar::CiSinCAttention<word> attn(bctx, swtch.context, small.context,
                                       lifted.context, acfg, lctx);
   ASSERT_EQ(attn.GetNumImages(), kD / layout.rank);
@@ -1062,18 +1157,58 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   std::cout << "==== layer " << LAYER << " ====" << std::endl;
   // ---- the calibration ---------------------------------------------------
   //
+  // THE LEG'S POPULATION CALIBRATION (`reference/scripts/bert_pop.py`).
+  // Without it every number below -- the three ride heights, the score span
+  // and shift, `m_eff`, and both per-row tables -- comes out of `LoadLayer`'s
+  // float64 forward OF THE PROMPT THIS TEST IS ABOUT TO SERVE. That is an
+  // oracle: a server holds ciphertext and cannot compute any of it, so the
+  // GELU and the norms being certified did not make the LEG a service. With
+  // it, `q/k/v_absmax` are CERTIFIED from the sphere (the same argument the
+  // GELU's bands use, layer 0 reading the embedding norm) and the score
+  // statistics are a held-out corpus's, with the served prompt excluded.
+  //
+  // OPT-IN, and it is off by default. The plan's `softmax` section is
+  // host-verified (`bert_pop.py` walks it against the true softmax at
+  // 2^-15..-17 and both containment checks pass on the held-out prompt), but
+  // the CRYPTO path is not stable yet: three draws of layer 0 alone come back
+  // 2^-0.70 / 2^-1.34 / 2^+3.48 where the served-prompt control is
+  // 2^-11.465 / 2^-11.457 / 2^-11.462 -- so the pipeline is reproducible to
+  // half a hundredth of a bit and THIS path is not. The instability is the
+  // Cho walk's inter-pass Boot; see Doing.md 8.10.
+  const bool pop = have_plan && plan_all.contains("softmax") &&
+                   std::getenv("BERT_POP_LEG") != nullptr;
+  const json *pj = pop ? &plan_all["softmax"]["layers"][LAYER] : nullptr;
+  const double qmax = pop ? (*pj)["q_absmax"].get<double>() : L.qmax;
+  const double kmax = pop ? (*pj)["k_absmax"].get<double>() : L.kmax;
+  const double vmax = pop ? (*pj)["v_absmax"].get<double>() : L.vmax;
+  const double s_raw_max = pop ? (*pj)["s_raw_max"].get<double>() : L.s_raw_max;
+  const double s_raw_min = pop ? (*pj)["s_raw_min"].get<double>() : L.s_raw_min;
+  const double span_raw = pop ? (*pj)["span_raw"].get<double>() : L.span_raw;
+  const double m_eff = pop ? (*pj)["m_eff"].get<double>() : L.m_eff;
+
   // The q/k/v sizing is the Llama model test's, on BERT's own maxima: the
   // HalfBoot image bound first, then the cap on the chain-unit score message.
-  const double img_max = 0.45;
-  double cq = img_max / L.qmax, ck = img_max / L.kmax;
-  const double s_abs = std::max(std::abs(L.s_raw_max), std::abs(L.s_raw_min));
-  const double prod_cap = 0.36 / s_abs;
+  //
+  // BOTH RIDE, and both ride off `Ride()` rather than off constants of their
+  // own. They did not, and that is why `BERT_RIDE` could not say anything
+  // about the leg: the layer half moved with the knob and the leg's three
+  // crossings sat at a fixed 0.45, so a failure IN THE LEG -- which is where
+  // the tail failures are -- had no lever at all. The two ratios below are
+  // what the constants were, kept exactly: the images at `2.25 x` the layer
+  // half's ride (the leg is the [SYLPH] 0.35 line, not the FFN's 0.2), and
+  // the score product at `1.8 x`, which is the cap that keeps `q.k` inside
+  // EvalMod's range in chain units. Scaling both with the knob keeps every
+  // ratio this calibration was fitted at and moves the whole leg together.
+  const double img_max = 2.25 * Ride();
+  double cq = img_max / qmax, ck = img_max / kmax;
+  const double s_abs = std::max(std::abs(s_raw_max), std::abs(s_raw_min));
+  const double prod_cap = (1.8 * Ride()) / s_abs;
   if (cq * ck > prod_cap) {
     const double sh = std::sqrt(prod_cap / (cq * ck));
     cq *= sh;
     ck *= sh;
   }
-  const double cv = std::min(1.0, img_max / L.vmax);
+  const double cv = std::min(1.0, img_max / vmax);
   const double cqk = cq * ck;
   const double stream_scale = s_in[LAYER];
   const double stream_out = s_out[LAYER];
@@ -1311,7 +1446,8 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
   }
   std::cout << "cq " << cq << ", ck " << ck << ", cv " << cv
             << ", stream in " << stream_scale << " out " << stream_out
-            << ", int_scale " << int_scale << ", m_eff " << L.m_eff
+            << ", int_scale " << int_scale << ", m_eff " << m_eff
+            << (pop ? " [population]" : " [served prompt]")
             << std::endl;
 
   // ---- the weights, declared --------------------------------------------
@@ -1472,14 +1608,65 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
 
   // ---- the softmax calibration, in chain units ---------------------------
   typename cheddar::CiSinCAttention<word>::SoftMaxCalibration sc;
-  sc.m_eff = L.m_eff;
-  sc.span = cqk * L.span_raw;
-  sc.shift = cqk * L.s_raw_max;
+  sc.m_eff = m_eff;
+  sc.span = cqk * span_raw;
+  sc.shift = cqk * s_raw_max;
+  // The SHIPPED single-pass bounds. They are ratio bounds around one and
+  // they are affordable only because `row_norm` IS the served row's exact
+  // live sum -- which is exactly the oracle the population plan removes, so
+  // the iteration below replaces them whenever there is one.
   sc.norm_lo = 0.9;
   sc.norm_hi = 1.1;
   sc.inv_degree = 7;
   sc.causal = true;         // the per-row walk
   sc.bidirectional = true;  // with every key live
+  // THE CHO ITERATION. A held-out `row_norm` is the calibration split's
+  // GEOMETRIC MEAN, not this row's own sum, and one normalisation cannot
+  // absorb the spread WITHIN a (head, row) ACROSS prompts. `niter = k` runs
+  // k normalise-and-square passes with the main path bootstrapped between
+  // them: `hb = m_eff / 2^(k+1)`, so each pass halves the exponent, and
+  // after the FIRST normalisation the row is a probability vector -- every
+  // later `sq` is its collision probability and lives in `[1/live, 1]`
+  // whatever the calibration said. Only the first window is a statistic.
+  // At B = 1 the estimate is FREE: it rides the per-row mask that already
+  // exists and cancels identically in `P = (y r)^2`.
+  if (pop && pj->contains("niter") &&
+      EnvInt("BERT_NITER", (*pj)["niter"].get<int>()) > 0) {
+    sc.niter = EnvInt("BERT_NITER", (*pj)["niter"].get<int>());
+    sc.first_lo = pj->value("first_lo", 0.0);
+    sc.first_hi = pj->value("first_hi", 0.0);
+    sc.iter_inv_degree =
+        EnvInt("BERT_ITER_INV_DEG", pj->value("iter_inv_degree", 0));
+    sc.last_inv_degree =
+        EnvInt("BERT_LAST_INV_DEG", pj->value("last_inv_degree", 0));
+    sc.live_max = pj->value("live_max", kT);
+    // THE BOOT BETWEEN PASSES. `(y r)^2` is a probability vector, so without
+    // this the boot sees a message near ONE where the leg crosses at 0.35 --
+    // measured on the host, 0.53-0.88 after one pass and 0.99 after two, and
+    // the three-pass layer came back anti-correlated. `sqrt(ride)` folds
+    // into the pass's own invsqrt fit, so it costs no level.
+    {
+      // OFF by default: a ride sweep over 1.0 / 0.85 / 0.7 / 0.55 / 0.4 is
+      // NON-MONOTONE (only 0.55 came back clean, and not on a repeat), so
+      // there is no value the measurements support yet.
+      const char *e = std::getenv("BERT_CHO_RIDE");
+      sc.cho_boot_ride = (e != nullptr && *e != 0) ? std::atof(e) : 0.0;
+    }
+    // The generator derives BOTH ends of the later window (the theorem times
+    // the first invsqrt's own widening) and writes them here; `norm_lo/hi`
+    // above are the single-pass bounds and are unused once this is on.
+    if (pj->contains("later_lo")) sc.norm_lo = (*pj)["later_lo"].get<double>();
+    if (pj->contains("later_hi")) sc.norm_hi = (*pj)["later_hi"].get<double>();
+    if (pj->contains("exp_degree"))
+      sc.exp_degree = (*pj)["exp_degree"].get<int>();
+    std::cout << "POPULATION softmax: niter " << sc.niter << ", first ["
+              << sc.first_lo << ", " << sc.first_hi << "] "
+              << (sc.first_hi / sc.first_lo) << "x, later [" << sc.norm_lo
+              << ", " << sc.norm_hi << "] " << (sc.norm_hi / sc.norm_lo)
+              << "x; q/k/v from the "
+              << plan_all["softmax"].value("qkv_bound", std::string("?"))
+              << " bound" << std::endl;
+  }
   // A DEAD LANE NEEDS A LIVE-LOOKING ROW. Its scores are zero, so shift zero
   // and norm `dim` put its argument at exactly one; left at zero the inverse
   // square root would be asked for 1/sqrt(0), outside every window.
@@ -1490,8 +1677,11 @@ TEST(CiBert, TheWholeLayerRunsOnTheRealWeights) {
     const int head = Rev(lane, 5);
     if (head >= kHeads) continue;
     for (int t = 0; t < kT; t++) {
-      sc.row_shift[lane][t] = cqk * L.row_shift[head][t];
-      sc.row_norm[lane][t] = L.row_norm[head][t];
+      sc.row_shift[lane][t] =
+          cqk * (pop ? (*pj)["row_shift_raw"][head][t].get<double>()
+                     : L.row_shift[head][t]);
+      sc.row_norm[lane][t] = pop ? (*pj)["row_norm"][head][t].get<double>()
+                                 : L.row_norm[head][t];
     }
   }
   attn.PrepareSoftMax(sc);
