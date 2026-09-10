@@ -34,10 +34,10 @@ namespace cheddar {
  * **The plaintexts are rebuilt, not stored.** Section 4.2 is explicit that
  * keeping all `d` of them is "impractical for large-scale models due to the
  * massive memory overhead", and that each one costs only two plaintext
- * rotations from `tau^l . sigma(A)`. The `cache_plaintexts` argument chooses: on by
- * default because at `d = 128` the whole set is 128 plaintexts and setup is
- * where this project has always paid for its encodes, off when memory is the
- * binding constraint and the encode can ride the GPU encoder instead.
+ * rotations from `tau^l . sigma(A)`. The `cache_plaintexts` argument chooses:
+ * on by default because at `d = 128` the whole set is 128 plaintexts and setup
+ * is where this project has always paid for its encodes, off when memory is
+ * the binding constraint and the encode can ride the GPU encoder instead.
  *
  * ## Where the tau goes, and why SoftMax does not mind
  *
