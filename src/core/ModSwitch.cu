@@ -1,3 +1,4 @@
+#include <string>
 #include <algorithm>
 
 #include "common/Assert.h"
@@ -1404,13 +1405,20 @@ void ModSwitchHandler<word>::ModDown(DvView<word> &dst,
   NPInfo np = param_.LevelToNP(level_, num_aux_);
   int num_q_primes = np.GetNumQ();
 
+  const std::string where = "ModDown(level " + std::to_string(level_) + ")";
   AssertTrue(src.AuxSize() == np.num_aux_ * degree,
-             "ModDown: src aux size mismatch");
+             where + ": src aux size mismatch, want " +
+                 std::to_string(np.num_aux_) + " aux primes, got " +
+                 std::to_string(src.AuxSize() / degree));
   AssertTrue(src.QSize() == num_q_primes * degree,
-             "ModDown: src q size mismatch");
-  AssertTrue(dst.AuxSize() == 0, "ModDown: dst aux size mismatch");
+             where + ": src q size mismatch, want " +
+                 std::to_string(num_q_primes) + " q primes, got " +
+                 std::to_string(src.QSize() / degree));
+  AssertTrue(dst.AuxSize() == 0, where + ": dst aux size mismatch");
   AssertTrue(dst.QSize() == num_q_primes * degree,
-             "ModDown: dst q size mismatch");
+             where + ": dst q size mismatch, want " +
+                 std::to_string(num_q_primes) + " q primes, got " +
+                 std::to_string(dst.QSize() / degree));
 
   ModDownWorker(dst, src, ModDownType::ModDown);
 }
@@ -1423,12 +1431,17 @@ void ModSwitchHandler<word>::Rescale(DvView<word> &dst,
   NPInfo next_np = param_.LevelToNP(level_ - 1);
   int num_q_primes = np.GetNumQ();
 
-  AssertTrue(src.AuxSize() == 0, "ModDown: src aux size mismatch");
+  const std::string where = "Rescale(level " + std::to_string(level_) + ")";
+  AssertTrue(src.AuxSize() == 0, where + ": src aux size mismatch");
   AssertTrue(src.QSize() == num_q_primes * degree,
-             "ModDown: src q size mismatch");
-  AssertTrue(dst.AuxSize() == 0, "ModDown: dst aux size mismatch");
+             where + ": src q size mismatch, want " +
+                 std::to_string(num_q_primes) + " q primes, got " +
+                 std::to_string(src.QSize() / degree));
+  AssertTrue(dst.AuxSize() == 0, where + ": dst aux size mismatch");
   AssertTrue(dst.QSize() == next_np.GetNumQ() * degree,
-             "ModDown: dst q size mismatch");
+             where + ": dst q size mismatch, want " +
+                 std::to_string(next_np.GetNumQ()) + " q primes, got " +
+                 std::to_string(dst.QSize() / degree));
 
   ModDownWorker(dst, src, ModDownType::Rescale);
 }
@@ -1441,13 +1454,21 @@ void ModSwitchHandler<word>::ModDownAndRescale(
   NPInfo next_np = param_.LevelToNP(level_ - 1);
   int num_q_primes = np.GetNumQ();
 
+  const std::string where =
+      "ModDownAndRescale(level " + std::to_string(level_) + ")";
   AssertTrue(src.AuxSize() == np.num_aux_ * degree,
-             "ModDown: src aux size mismatch");
+             where + ": src aux size mismatch, want " +
+                 std::to_string(np.num_aux_) + " aux primes, got " +
+                 std::to_string(src.AuxSize() / degree));
   AssertTrue(src.QSize() == num_q_primes * degree,
-             "ModDown: src q size mismatch");
-  AssertTrue(dst.AuxSize() == 0, "ModDown: dst aux size mismatch");
+             where + ": src q size mismatch, want " +
+                 std::to_string(num_q_primes) + " q primes, got " +
+                 std::to_string(src.QSize() / degree));
+  AssertTrue(dst.AuxSize() == 0, where + ": dst aux size mismatch");
   AssertTrue(dst.QSize() == next_np.GetNumQ() * degree,
-             "ModDown: dst q size mismatch");
+             where + ": dst q size mismatch, want " +
+                 std::to_string(next_np.GetNumQ()) + " q primes, got " +
+                 std::to_string(dst.QSize() / degree));
 
   ModDownWorker(dst, src, ModDownType::ModDownAndRescale);
 }
