@@ -243,6 +243,9 @@ class CiSinCAttention {
     int live_max = 0;
     //! [SYLPH] 3.4's SLIM evaluation for the LAST inverse square root, at
     //! recursion depth `j`. 0 = the shipped Paterson-Stockmeyer path.
+    //! **Requires `niter >= 2`**: at k = 1 the only pass is both the first and
+    //! the last, so the invsqrt it runs is the FIRST one, over a different
+    //! window at a different level.
     //!
     //! This is the auxiliary track section 3.4 was written for: after the
     //! rotate-and-add the norm is one value per row broadcast over every slot

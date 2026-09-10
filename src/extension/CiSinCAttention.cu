@@ -1153,9 +1153,15 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   slim_inv_.reset();
   slim_block_ = 0;
   if (calib_.slim_j > 0) {
-    AssertTrue(calib_.niter > 0,
-               "CiSinCAttention: slim_j is for the Cho iteration's last "
-               "invsqrt; the single-pass walk has no separate one");
+    // `niter >= 2`, not `> 0`. At k = 1 the only pass is BOTH the first and
+    // the last, so the invsqrt it runs is the first one -- a different window
+    // at a different level from the one compiled here. Slim would then be
+    // handed the wrong domain, which for a Chebyshev fit is not a small error
+    // but a `cosh(deg arccosh|v|)` one.
+    AssertTrue(calib_.niter >= 2,
+               "CiSinCAttention: slim_j replaces the LATER invsqrt, which only "
+               "exists at niter >= 2; at niter = 1 the single pass runs the "
+               "FIRST one, over a different window at a different level");
     const int stride = num_slots_ / layout.rank;
     const int blocks = 1 << calib_.slim_j;
     AssertTrue(stride > 0 && stride * blocks <= num_slots_,
@@ -1373,7 +1379,7 @@ void CiSinCAttention<word>::SoftMax(std::vector<Ct> &P,
       boot_->Add(sq, sq, shift);
     }
     Ct r;
-    if (last && slim_inv_ != nullptr) {
+    if (last && !first && slim_inv_ != nullptr) {
       // [SYLPH] Algorithm 1. `sq` is periodic in the slot index after the
       // reduction, so every block evaluates a different leaf of the eq. (3)
       // tree and the fold puts `P` back in every block -- which is what the
