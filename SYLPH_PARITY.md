@@ -183,20 +183,42 @@ paper reports no accuracy number measured from the encrypted execution.
 
 ---
 
-## Wiring, and what is left
+## Wiring
 
-The two new operators are **not yet on the model's critical path**. They are
-built, unit-tested at the host level, and ready to be switched on:
+**Slim is wired**, into the place section 3.4 names: `CiSinCAttention`'s
+auxiliary track, through `SoftMaxCalibration::slim_j`. Default 0, so the
+shipped walk is untouched operation for operation. Three things came out of
+doing it rather than describing it:
 
-- `SlimPolyHandler` belongs in `CiSinCAttention`'s auxiliary track, where the
-  normalisation is one value per row and is currently broadcast to full width.
-  That is section 3.4's own use case.
-- `SylphPcmm` belongs in `CiPcAttention`, as the alternative to the [KANG]
-  Algorithm 1 route the T = 4096 branch uses. Note that Kang's route is
-  **depth 1 with no rotation and no key at all**, so eq. (5) is not obviously
-  better here — it is the paper's algorithm and the comparison is worth having,
-  which is exactly why both should exist.
-- `tau^2` after RoPE (4.2) is needed before eq. (5) can drive PC-attention.
+- **The slim period is derivable, so it is derived.** The reduction tree
+  rotates by `stride << t` for `t = 0..3` with `stride = num_slots / rank`, so
+  after it slot `s` and slot `s + stride` hold the same row's norm.
+  `PrepareSoftMax` computes the period from the layout and refuses a `j` it
+  cannot hold.
+- **It needs no new rotation key.** Algorithm 1's fold rotates by
+  `block * 2^(l-1)` for `l = 1..j`, and the reduction tree already asks for
+  exactly that set for every `j <= 4` — which is every `j` the period admits.
+  There is an assert saying so.
+- **It costs a level at equal accuracy.** Degree 63 becomes 64 and lands one
+  level lower, and on this window 63 is 2^-14.3 against 32's 2^-5.7. There is
+  an explicit assert at the same floor `compile_inv` uses, so switching the
+  knob on either works or names the reason. **Appendix D's
+  leading-coefficient fold is what makes it free** (`k` levels for degree
+  `2^k`), and the hook it needs — a plaintext multiply immediately before the
+  evaluation — already exists as the affine map onto the fit domain. That is
+  the next step and it is not implemented.
+
+**Eq. (5) is not wired.** `SylphPcmm` is built and host-tested but is not on
+the model's path, because two things have to happen first and neither is
+mechanical:
+
+- `tau^2` applied once after RoPE (4.2), before the computation becomes wide.
+- A decision that is genuinely open: the T = 4096 branch's `CiPcAttention`
+  reaches PC-attention through [KANG] Algorithm 1, which is **depth 1 with no
+  rotation, no automorphism key and no relinearization key at all**. Eq. (5)
+  is depth 1 with `O(sqrt d)` rotations. So the paper's algorithm is not
+  obviously the better one *here*, and the comparison is the point — which is
+  why both should exist rather than one replacing the other.
 
 ## Running it
 

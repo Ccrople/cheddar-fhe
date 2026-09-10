@@ -18,9 +18,10 @@ namespace cheddar {
  * `j` rotations.
  *
  * By [SYLPH] theorem 1 (appendix D) it is **not a level optimisation**:
- * degree `2^k` costs `k + 1` levels, exactly what Paterson-Stockmeyer costs
- * for degree `2^k - 1`, and `k` levels if the leading plaintext coefficient
- * is folded into a preceding multiplication. What it buys is
+ * degree `2^k` costs `k + 1` levels, which is what Paterson-Stockmeyer spends
+ * on degree `2^(k+1) - 1` -- twice the degree for the same budget -- and `k`
+ * levels if the leading plaintext coefficient is folded into a preceding
+ * multiplication, which is the case where the two are even. What it buys is
  *
  *     O(2^((k-j)/2)) + j   ciphertext-ciphertext multiplications, and
  *     j                    rotations
