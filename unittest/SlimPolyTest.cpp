@@ -22,8 +22,8 @@
 // D's objective, `m` on the softmax's own inverse-square-root window reaches
 // 8.8e5 at degree 64 -- 16 bits of dynamic range spent on a cancellation --
 // and with it `m` stays near 1 at every depth. That measurement is the reason
-// `DecomposeOptions::lookahead` defaults to true, and `SlimMath.AppendixDSearch`
-// pins it.
+// `DecomposeOptions::lookahead` defaults to true, and the
+// `SlimMath.AppendixDSearch` case pins it.
 
 #include <algorithm>
 #include <cmath>
@@ -55,8 +55,8 @@ double WorstOnInterval(const cheddar::slim::SlimPlan &plan, const ChebPoly &p) {
   double worst = 0.0;
   for (int i = 0; i < 2049; i++) {
     const double x = -1.0 + 2.0 * i / 2048.0;
-    worst = std::max(worst,
-                     std::abs(plan.PlainEvaluate(x) - cheddar::slim::Eval(p, x)));
+    worst = std::max(
+        worst, std::abs(plan.PlainEvaluate(x) - cheddar::slim::Eval(p, x)));
   }
   return worst;
 }
@@ -108,8 +108,8 @@ TEST(SlimMath, TheTreeReproducesThePolynomial) {
       EXPECT_EQ(plan.k, k);
       EXPECT_EQ(plan.NumBlocks(), 1 << j);
       EXPECT_EQ(static_cast<int>(plan.leaf.size()), 1 << j);
-      // Theorem 1's level count, which is the whole trade: the same levels
-      // Paterson-Stockmeyer spends for degree 2^k - 1.
+      // Theorem 1's level count, which is the whole trade: `k + 1` levels for
+      // degree `2^k`, where Paterson-Stockmeyer spends `k + 1` on `2^(k+1) - 1`.
       EXPECT_EQ(plan.NumLevels(), k + 1);
       // The plan's own arithmetic must sit far below the fit it is evaluating,
       // or slim would be paying for itself twice.
@@ -264,6 +264,76 @@ TEST_P(Testbed32, SlimAlgorithmOne) {
   EXPECT_LT(worst_block_spread, 1e-2)
       << "every block must hold P after the last iteration";
   EXPECT_LT(worst_plan, 1e-2);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Appendix D's fold: the same answer, one level cheaper.
+// ---------------------------------------------------------------------------
+TEST_P(Testbed32, SlimAppendixDFold) {
+  constexpr int kBlockSlots = 128;
+  constexpr int kDegree = 16;  // 2^k with k = j, which is what the fold needs
+  constexpr int kJ = 4;
+
+  const int level = default_encryption_level_;
+  const int slots = param_->degree_ / 2;
+  ASSERT_GE(slots, kBlockSlots * (1 << kJ));
+
+  const ChebPoly p = InvSqrtFit(kLaterLo, kLaterHi, kDegree);
+  cheddar::slim::DecomposeOptions opt;
+  const cheddar::slim::SlimPlan plan = cheddar::slim::BuildPlan(p, kJ, opt);
+  ASSERT_TRUE(plan.ok) << plan.why;
+  ASSERT_EQ(plan.k, kJ) << "the fold needs a leaf of degree one";
+
+  const double in_scale = param_->GetScale(level);
+  // NumLevels(true) is `k`, one less than the unfolded `k + 1`.
+  const int out_level = level - plan.NumLevels(/*fold_leading=*/true);
+  ASSERT_GE(out_level, 0);
+  cheddar::SlimPolyHandler<word> h(context_, plan, kBlockSlots, level, in_scale,
+                                   param_->GetScale(out_level),
+                                   /*fold_leading=*/true);
+  h.Compile();
+  for (int d : h.GetRotationDistances()) {
+    interface_->PrepareRotationKey(d, level);
+  }
+
+  // The caller's half of appendix D: the input arrives ALREADY multiplied by
+  // `v^(1)`. In the softmax walk that multiply is the affine map onto the fit
+  // domain, whose scalars simply become plaintexts; here it is done in the
+  // clear, which is the same thing one operation earlier.
+  const std::vector<cheddar::Complex> &v1 = h.GetLeadingMessage();
+  ASSERT_EQ(static_cast<int>(v1.size()), param_->MaxNumSlots());
+  std::vector<double> arg(kBlockSlots);
+  for (int s = 0; s < kBlockSlots; s++) {
+    arg[s] = -1.0 + 2.0 * s / (kBlockSlots - 1.0);
+  }
+  std::vector<cheddar::Complex> msg(slots, cheddar::Complex(0.0, 0.0));
+  for (int s = 0; s < slots; s++) {
+    msg[s] = cheddar::Complex(v1[s].real() * arg[s % kBlockSlots], 0.0);
+  }
+
+  Ciphertext<word> ct;
+  EncodeAndEncrypt(ct, msg, level);
+  Ciphertext<word> res;
+  h.Evaluate(res, ct, interface_->GetEvkMap());
+  cudaDeviceSynchronize();
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  EXPECT_EQ(level - param_->NPToLevel(res.GetNP()), plan.k)
+      << "appendix D's fold makes Algorithm 1 k levels, not k + 1";
+
+  std::vector<cheddar::Complex> got;
+  DecryptAndDecode(got, res);
+  double worst = 0.0;
+  for (int s = 0; s < kBlockSlots; s++) {
+    const double want = plan.PlainEvaluate(arg[s]);
+    for (int b = 0; b < (1 << kJ); b++) {
+      worst = std::max(worst,
+                       std::abs(got[b * kBlockSlots + s].real() - want));
+    }
+  }
+  std::cout << "appendix D fold: " << plan.k << " levels (unfolded would be "
+            << plan.k + 1 << "), worst " << worst << std::endl;
+  EXPECT_LT(worst, 1e-2);
 }
 
 INSTANTIATE_TEST_SUITE_P(
