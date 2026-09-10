@@ -138,9 +138,15 @@ namespace cheddar {
  * `group_size = 1` is the ordinary case and everything below reduces to it.
  *
  * Section 3.4's slim polynomial evaluation is an auxiliary-track optimisation.
- * By its own theorem 1 it does not reduce levels (still k+1 for degree 2^k) --
- * it reduces multiplications to `O(2^((k-j)/2)) + j` and key-switchings. So it
- * is a speedup, not a prerequisite; `SlimPolyHandler` implements it.
+ * By its own theorem 1 it does not reduce levels (still k+1 for degree 2^k, or
+ * k with appendix D's fold) -- it reduces multiplications to
+ * `O(2^((k-j)/2)) + j` and key-switchings. `SlimPolyHandler` implements it,
+ * and wiring it into `CiSinCAttention` produced the number that decides where
+ * it is worth using: **the tree gets as many blocks as the ciphertext is
+ * slim**, and broadcasting the norm over the row's whole period leaves only
+ * `num_slots / rank = 16` of them. That caps `j` at 4, which caps the folded
+ * degree at 16, which on `[1/live, 1]` is 2^-1.2. Compacting this track to one
+ * slot per row is therefore the PREREQUISITE, not the follow-up.
  *
  * @tparam word uint32_t or uint64_t
  */
