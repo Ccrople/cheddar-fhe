@@ -163,12 +163,26 @@ calibration recipe (`sim.py` on the batch's own prompts, k = 2): only
 |---|---|---|---|---|---|---|
 | (128, 512) | 512 held-out | 2^-10.07 (worst 2^-9.75) | 2^-9.37 (worst 2^-7.74) | 26 / 31 s | 384 / 512 | 11.5 s |
 | (256, 256) | 256 (own) | 2^-9.53 (worst 2^-9.05) | 2^-9.02 (worst 2^-7.66) | 39 / 44 s | 640 / 768 | 22.9 s |
-| (512, 128) | 128 (own) | (running) | | | | |
+| (512, 128) | 128 (own) | 2^-8.81 (worst 2^-8.34) | 2^-8.41 (worst 2^-7.03), k = 3 | 64 / 112 s | 1152 / 2304 | 45 / 89 s |
 
-Per token-layer the three cost about the same (26 s / 65536 = 0.4 ms ->
-44 s / 65536 = 0.7 ms): the softmax's 2T(k-1) main-path boots grow with T
-and everything else is flat. 8640 rotations and 4870 relinearizations a
-layer at T = 256 (6080 / 2566 at 128).
+Everything but the softmax is flat in T (GELU 4.7 s, projections 0.4 s,
+LN 0.5 s at every shape; the diagonal products 1.6 -> 3.5 s); what grows
+is the softmax's main-path boots, `2T(k-1)` a head-pair, and the sim
+raised k to 3 at T = 512's layer 1 (its k = 2 first window exceeded the
+300x rule). Per token-layer: 0.4 ms (T 128), 0.7 ms (256), 1.0 / 1.7 ms
+(512). The crypto floor also slides with T (2^-10 -> 2^-8.4) while the
+host approximation-only chain stays at 2^-17..-21: it is boot noise on the
+main path through the softmax's and norms' Jacobians. The levers, in
+order: (1) the `cho_est`-style per-row fold of the first window, which is
+what took T = 4096's k down and which brings k back to 1-2 here; (2) fewer
+main-path boots by landing the last pass without one; (3) hoisted
+rotations and `EvaluateBatch` for the GELU (4.7 s of every layer).
+Rotations / relinearizations a layer: 6080 / 2566 (T 128), 8640 / 4870
+(256), 13696 / 7430-9480 (512).
+
+Where the host work runs: `sim.py` on 1000 + 1000 prompts took 10 min on
+the laptop (numpy, one core); the T = 256 / 512 calibrations ran on vessl
+(96 cores) -- do that by default.
 
 Probe table of the first correct run (layer 0, recorded prompt, rms bits):
 q 13.7, k 14.3, v 13.5, scores 13.0, exp 13.5, sq 14.1, r 13.2, P 11.7,
@@ -177,13 +191,13 @@ attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out
 
 ## 6. Plan
 
-1. B = 1, T = 128 on the A100: build, layer 0, the 2-layer chain. <- here
-2. Population calibration: `export.py --prompts 1000 --corpus ...`,
-   `sim.py --inputs ... --held-out ...`; the softmax's k rises with the
-   population (k = 2 expected), the windows widen, `cho_est`-style folds if
-   the first window is wide.
-3. The three service shapes: `export.py --tokens 256/512` (positions up
-   to 512 are in the checkpoint); only the rotation stride, the BSGS split
-   and the calibration change.
-4. Per-channel certified GELU intervals (the sphere bound), padding masks,
-   the pooler/classifier head.
+1. B = 1, T = 128 on the A100: build, layer 0, the 2-layer chain. DONE.
+2. Population calibration on 1000 prompts, 512 held-out on the crypto.
+   DONE (k = 2, 2^-10.07 / -9.37).
+3. The three service shapes. DONE (table above); T = 512 wants the
+   first-window fold to keep k at 2.
+4. Next, in order: the `cho_est` fold (k down, boots down); per-channel
+   certified GELU intervals (the sphere bound: nothing per prompt, no
+   escape possible); padding masks (per-slot plaintexts on `y`); the
+   pooler/classifier head on the `[CLS]` slots; hoisted rotations and the
+   batched GELU; the security statement for the sampled secret.
