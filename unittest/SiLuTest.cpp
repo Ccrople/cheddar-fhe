@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -358,6 +359,82 @@ TEST_P(Testbed32, SiLuOnRealLlama3Gate) {
   } else {
     EXPECT_GT(Bits(max_err, ref_interval), kTargetBits);
   }
+}
+
+// ---------------------------------------------------------------------------
+// A CERTIFIED BAND PLAN, and the one thing that makes it wrong.
+//
+// Layer 31's SiLU range is 29.51 where every other layer is under 10.6, and the
+// excess is in its WEIGHTS: its certified per-channel bound has max 168.4
+// against a p50 of 29.2. One interval hands every channel the worst one's
+// error; a band gives a channel an interval its own size. The band's mask rides
+// the gate's own multiply, so bands cost no level.
+//
+// The trap is that every band's polynomial is evaluated on the MASKED input, so
+// a channel outside band b hands b a ZERO -- and collects `p_b(0)` for it, once
+// per band it is not in. `SiLU(0)` is 0 but the interpolant's `p(0)` is only 0
+// to within the fit error, so seven other bands put seven fit errors on every
+// slot. The BERT branch paid a GPU run for that (+0.29 a slot, 2^+6.7 in the
+// crypto). `zero_at_origin` is the fix and this is what pins it.
+TEST_P(Testbed32, SiLuBandPlanSumsToSiLu) {
+  const int level = default_encryption_level_;
+  // Layer 31's shape: a long tail over a median of about 29.
+  const std::vector<double> tops{4.0, 11.0, 29.0, 78.0, 168.0};
+
+  double worst_zero = 0.0;
+  std::vector<std::unique_ptr<cheddar::SiLuHandler<word>>> bands;
+  for (double r : tops) {
+    bands.push_back(std::make_unique<cheddar::SiLuHandler<word>>(
+        context_, r, level, 63, /*zero_at_origin=*/true));
+    worst_zero = std::max(worst_zero, std::abs(bands.back()->PlainSiLu(0.0)));
+  }
+  std::cout << "band plan: worst |p_b(0)| = " << worst_zero << std::endl;
+  // Every band must vanish at the origin, or the masked channels poison it.
+  EXPECT_LT(worst_zero, 1e-12);
+
+  // Unconstrained, for the contrast the comment above claims.
+  double worst_free = 0.0;
+  for (double r : tops) {
+    cheddar::SiLuHandler<word> f(context_, r, level, 63);
+    worst_free = std::max(worst_free, std::abs(f.PlainSiLu(0.0)));
+  }
+  std::cout << "unconstrained: worst |p_b(0)| = " << worst_free
+            << "  (x " << (tops.size() - 1) << " bands on every masked slot)"
+            << std::endl;
+  EXPECT_GT(worst_free, worst_zero);
+
+  // And a channel in band b, evaluated by band b, is SiLU -- while the other
+  // bands contribute exactly nothing.
+  double worst = 0.0;
+  for (size_t b = 0; b < bands.size(); b++) {
+    const double lo = (b == 0) ? 0.0 : tops[b - 1];
+    for (int s = 0; s <= 64; s++) {
+      const double x = lo + (tops[b] - lo) * s / 64.0;
+      double sum = bands[b]->PlainSiLu(x);
+      for (size_t o = 0; o < bands.size(); o++) {
+        if (o != b) sum += bands[o]->PlainSiLu(0.0);
+      }
+      worst = std::max(worst, std::abs(sum - x / (1.0 + std::exp(-x))));
+    }
+  }
+  std::cout << "band plan vs true SiLU over every band's own interval: "
+            << worst << std::endl;
+  // Degree 63 over the widest band (168) is the limiter here, and that is the
+  // point: only the channels that need 168 pay for it.
+  EXPECT_LT(worst, 1.5);
+  // A channel in the NARROWEST band must be far better than the single-interval
+  // plan, which is the whole claim.
+  cheddar::SiLuHandler<word> one(context_, tops.back(), level, 63);
+  double narrow = 0.0, single = 0.0;
+  for (int s = 0; s <= 64; s++) {
+    const double x = tops[0] * s / 64.0;
+    const double t = x / (1.0 + std::exp(-x));
+    narrow = std::max(narrow, std::abs(bands[0]->PlainSiLu(x) - t));
+    single = std::max(single, std::abs(one.PlainSiLu(x) - t));
+  }
+  std::cout << "on [0, " << tops[0] << "]: band " << narrow << " against one "
+            << "interval " << single << std::endl;
+  EXPECT_LT(narrow, single);
 }
 
 INSTANTIATE_TEST_SUITE_P(
