@@ -90,10 +90,59 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char *kBootParam = "ci16_35.json";
+// THE BASE RING: the 2^35 family's K = 16 pool (2026-09-11), which is
+// ci16_35's own ladder -- dec 19, Boot landing 16, four CtS levels, the
+// compute prefix, terminals and aux primes byte for byte -- with its EvalMod
+// band rebuilt as stationary 2^58 pairs (`reference/scripts/ci35_family.py`).
+// `CHEDDAR_CI_BOOT_PARAM` replaces it so a whole layer can be tried on
+// another family (the 2^42 pools) and the card can name what stops it; the
+// FFN and leg rings default to it as before.
+const std::string kBootParam = [] {
+  const char *e = std::getenv("CHEDDAR_CI_BOOT_PARAM");
+  return std::string((e != nullptr && e[0] != 0) ? e : "ci16_35_k16_w58.json");
+}();
 constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
 constexpr const char *kSmallParam = "ci12_35_boot.json";
 constexpr const char *kLiftedParam = "ringdegree13_35_boot.json";
+
+// A RING FROM A POOL, CUT TO THE LANDING THE LAYER NEEDS (2026-09-11). The
+// family's three presets (`ci16_35_k{16,32,64}_w58`, one per K, all on
+// ci16_35's compute prefix) each serve any landing at or below their own
+// through `LandingLadder`: `landing_env` names the level the ring's
+// HalfBoot lands at -- the cut's `default_encryption_level`; its Boot lands
+// `num_stc` lower -- and levels 0..that are the pool's primes in the pool's
+// order, which is the keyless crossing's whole condition. Unset, the file
+// is used as it is. So the retired `ci16_35_land13c2e9` is
+// `CHEDDAR_CI_FFN_PARAM=ci16_35_k32_w58.json CHEDDAR_CI_FFN_LANDING=13`,
+// and the retired `ci16_35_land17c3e10v3` is the K = 64 pool at its own 17.
+// A landing the pool cannot cut exactly (`LandingLadder::IsClean`) is served
+// by the exact ladder above it plus StC slack, which lands the Boot where
+// asked but the HalfBoot higher; the line printed says which.
+std::unique_ptr<Ring> MakeRing(const std::string &file, const char *landing_env,
+                               const std::vector<int> &secret = {},
+                               int slack = 0, bool build_ui = true) {
+  auto spec =
+      ladderjson::Parse<word>(std::string(PARAM_DIR) + "/" + file);
+  int extra = 0;
+  if (const char *e = std::getenv(landing_env);
+      e != nullptr && e[0] != 0 && spec.boot) {
+    const int want = std::atoi(e);
+    const cheddar::LandingLadder<word> ladder(spec);
+    const auto r = ladder.ForLanding(want - spec.num_stc_levels);
+    std::cout << "[landing ladder] " << file << " for " << landing_env << "="
+              << want << ": " << cheddar::LandingLadder<word>::Describe(r)
+              << std::endl;
+    if (r.slack != 0) {
+      std::cout << "  NOTE: HalfBoot lands at "
+                << r.spec.default_encryption_level << ", not " << want
+                << " (not a clean landing of this pool); the Boot lands at "
+                << want - spec.num_stc_levels << " through slack" << std::endl;
+    }
+    spec = r.spec;
+    extra = r.slack;
+  }
+  return std::make_unique<Ring>(spec, secret, slack + extra, build_ui);
+}
 
 // The model.
 constexpr int kT = 128, kH = 4096, kKv = 1024, kD = 128, kI = 14336;
@@ -118,7 +167,7 @@ const bool kModule = [] {
 const int kDensity = kModule ? 1 : 2;
 // `CHEDDAR_CI_FUSED=1` (Doing.md 3.16): the leg's SinC conversions fused into
 // the bootstrap. The leg's landing ring (`CHEDDAR_CI_LEG_PARAM`, the K = 64
-// `ci16_35_land17c3e10`) becomes the TOWER ring whose HalfBoot and lane
+// pool `ci16_35_k64_w58`) becomes the TOWER ring whose HalfBoot and lane
 // prefix return the scores and the attention output at 16, and the three
 // converters become the tower forwards on the switching ring; the 8 score
 // Boots and the 8 chain-output Boots go with them.
@@ -413,7 +462,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << " hidden ciphertexts, CHEDDAR_MODULE_SPARSE_SECRET="
               << std::getenv("CHEDDAR_MODULE_SPARSE_SECRET") << std::endl;
   }
-  Ring boot(kBootParam);  // the leg: slack zero, the softmax walk needs it
+  // The leg: slack zero, the softmax walk needs it. `CHEDDAR_CI_BASE_LANDING`
+  // (the HalfBoot landing; the pool's own 19 unless set) cuts the pool.
+  auto boot_p = MakeRing(kBootParam, "CHEDDAR_CI_BASE_LANDING");
+  Ring &boot = *boot_p;
   auto swtch = std::make_unique<Ring>(kSwitchParam, boot.ui->GetSecretCoeffs());
   auto small = std::make_unique<Ring>(kSmallParam);
   auto lifted = std::make_unique<Ring>(
@@ -453,15 +505,17 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     boot.ui->PrepareRotationKey(req);
   }
 
-  // THE FEED-FORWARD'S RING. `CHEDDAR_CI_FFN_PARAM` names a landing sub-ladder
-  // of ci16_35 (gen_landing.py; `ci16_35_land13c2` climbs to 23 and lands
-  // HalfBoot at 13 with a two-level CtS, Doing.md 3.9) for the layer's
-  // non-leg half; its levels 0..L are ci16_35's own, so ciphertexts cross
-  // between the two rings without a key, while the KEYS are per ring -- the
-  // key layout follows the ring's main count -- so that ring gets its own
-  // UserInterface on the same secret, and every key the layer uses comes from
-  // it. Unset, the FFN's Context is a second BootContext on ci16_35 itself,
-  // sharing the leg's keys, as before.
+  // THE FEED-FORWARD'S RING. `CHEDDAR_CI_FFN_PARAM` names the pool
+  // (`ci16_35_k32_w58`: K = 32, two CtS levels, dec 19) and
+  // `CHEDDAR_CI_FFN_LANDING` the level its HalfBoot lands at -- 13 is the
+  // retired `land13c2e9` (climb 24, CtS [50, 50], Doing.md 3.9), and the
+  // pool's own 19 buys the slot-domain half six more levels -- for the
+  // layer's non-leg half; its levels 0..L are the base ring's own, so
+  // ciphertexts cross between the two rings without a key, while the KEYS
+  // are per ring -- the key layout follows the ring's main count -- so that
+  // ring gets its own UserInterface on the same secret, and every key the
+  // layer uses comes from it. Unset, the FFN's Context is a second
+  // BootContext on the base ring itself, sharing the leg's keys, as before.
   const char *ffn_param_env = std::getenv("CHEDDAR_CI_FFN_PARAM");
   const std::string ffn_param =
       (ffn_param_env && ffn_param_env[0]) ? ffn_param_env : kBootParam;
@@ -473,8 +527,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // one more level (255 / 31) IF the coefficient side can live at level 1 --
   // which is what `CHEDDAR_CI_FFN_SLACK=10` exists to measure.
   const int ffn_slack = EnvInt("CHEDDAR_CI_FFN_SLACK", 9);
-  Ring boot_ffn(ffn_param, boot.ui->GetSecretCoeffs(), ffn_slack,
-                /*build_user_interface=*/ffn_own_ring);
+  auto boot_ffn_p = MakeRing(ffn_param, "CHEDDAR_CI_FFN_LANDING",
+                             boot.ui->GetSecretCoeffs(), ffn_slack,
+                             /*build_ui=*/ffn_own_ring);
+  Ring &boot_ffn = *boot_ffn_p;
   cheddar::UserInterface<word> &fui = ffn_own_ring ? *boot_ffn.ui : *boot.ui;
   const cheddar::EvkMap<word> &fevk = fui.GetEvkMap();
   auto fctx = std::dynamic_pointer_cast<BootContext<word>>(boot_ffn.context);
@@ -496,7 +552,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     for (int L = 0; L <= boot_ffn.param->default_encryption_level_; L++) {
       ASSERT_EQ(boot.param->GetPrimeVector(boot.param->LevelToNP(L)),
                 boot_ffn.param->GetPrimeVector(boot_ffn.param->LevelToNP(L)))
-          << "the FFN ring's level " << L << " differs from ci16_35's";
+          << "the FFN ring's level " << L << " differs from the base ring's";
     }
   }
 
@@ -551,12 +607,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   std::cout << "crossing constant " << crossing << " = 2^"
             << std::log2(std::abs(crossing)) << " (derived)" << std::endl;
 
-  // THE LEG'S LANDING RING. `CHEDDAR_CI_LEG_PARAM` names a landing sub-ladder
-  // (Doing.md 3.9: `ci16_35_land13`, climb to 25) for the 48 q/k/v HalfBoots
-  // -- only RoPE spends a level before `Merge` drops to the exchange at 8 --
-  // and the 8 chain-output Boots, which feed the seam at its input level.
-  // The 8 score Boots stay on ci16_35: the softmax walk needs exactly 16 -> 3.
-  // Same secret, its own keys; ciphertexts cross as they are.
+  // THE LEG'S LANDING RING. `CHEDDAR_CI_LEG_PARAM` names the pool -- fused,
+  // the K = 64 tower pool `ci16_35_k64_w58` at its own 17 (three CtS levels
+  // for the compiled tower CtS'); `CHEDDAR_CI_LEG_LANDING` would cut it
+  // lower -- for the 48 q/k/v HalfBoots -- only RoPE spends a level before
+  // `Merge` drops to the exchange at 8 -- and the 8 chain-output Boots, which
+  // feed the seam at its input level. The 8 score Boots stay on the base
+  // ring: the softmax walk needs exactly 16 -> 3. Same secret, its own keys;
+  // ciphertexts cross as they are.
   const char *leg_env = std::getenv("CHEDDAR_CI_LEG_PARAM");
   const std::string leg_param = (leg_env && leg_env[0]) ? leg_env : kBootParam;
   const bool leg_own_ring = leg_param != kBootParam;
@@ -573,8 +631,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       const char *prev = std::getenv("CHEDDAR_MODULE_SPARSE_SECRET");
       const std::string saved = prev ? prev : "";
       if (kFused) setenv("CHEDDAR_MODULE_SPARSE_SECRET", "4096:128,16", 1);
-      leg_land = std::make_unique<Ring>(leg_param, boot.ui->GetSecretCoeffs(),
-                                        /*slack=*/0);
+      leg_land = MakeRing(leg_param, "CHEDDAR_CI_LEG_LANDING",
+                          boot.ui->GetSecretCoeffs(), /*slack=*/0);
       if (kFused) {
         if (prev) {
           setenv("CHEDDAR_MODULE_SPARSE_SECRET", saved.c_str(), 1);
@@ -596,11 +654,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     }
     levk = &leg_land->ui->GetEvkMap();
     ASSERT_NEAR(lctx->GetMessageRatio() / crossing, 1.0, 1e-9)
-        << "the landing ring's crossing constant differs from ci16_35's";
+        << "the landing ring's crossing constant differs from the base ring's";
     for (int L = 0; L <= leg_land->param->default_encryption_level_; L++) {
       ASSERT_EQ(boot.param->GetPrimeVector(boot.param->LevelToNP(L)),
                 leg_land->param->GetPrimeVector(leg_land->param->LevelToNP(L)))
-          << "the leg's landing ring differs from ci16_35 at level " << L;
+          << "the leg's landing ring differs from the base ring at level " << L;
     }
     MemRow("setup: + the leg's landing ring (tables, keys)");
     std::cout << "leg landing ring " << leg_param << ": climbs to "
@@ -1627,7 +1685,23 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     const double vmax = cj["v_absmax"].get<double>();
     const double s_raw_min = cj["s_raw_min"].get<double>();
     const double s_raw_max = cj["s_raw_max"].get<double>();
-    const double span_raw = s_raw_max - s_raw_min;
+    // THE SPAN THE CALIBRATION WAS WALKED WITH, not the population's raw
+    // extremes. `reference_forward.py`'s oracle and `gen512.py` carry no
+    // margin, and there `span` (m_eff) is exactly `(s_max - s_min) / sqrt(D)`.
+    // `gen_b1_pop.py` widens every row shift by its leave-one-out margin `a`
+    // (`shift_margin`, 0.18 .. 0.54 across the 32 layers) and walks its
+    // windows with `span_raw = (1 + a) (s_max - s_min)`, which it stores as
+    // `span` while `s_raw_*` stay the extremes. Taking the difference here
+    // put the exp's `u = 1 + 2 (S - shift) / span` at -1.36 .. -2.09 for the
+    // lowest live scores of EVERY row of the held-out chain (2026-09-11) --
+    // outside the [-1, 1] the exp is fitted on, where a degree-15
+    // interpolant of exp(hb (u - 1)) returns ~0.05 instead of ~1e-4. The
+    // exponent itself was right (m_eff shrank by the same factor), the
+    // polynomial's domain was not.
+    const double span_raw =
+        cj.contains("span")
+            ? cj["span"].get<double>() * std::sqrt(static_cast<double>(kD))
+            : s_raw_max - s_raw_min;
     const double m_eff = span_raw / std::sqrt(static_cast<double>(kD));
     double cq = img_max / qmax, ck = img_max / kmax;
     const double s_abs = std::max(std::abs(s_raw_max), std::abs(s_raw_min));

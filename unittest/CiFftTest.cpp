@@ -188,7 +188,7 @@ TEST_P(CiFft, SlotToCoeff) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, CiFft, testing::Values("ci16_35.json", "bootparam_35.json"),
+    Cheddar, CiFft, testing::Values("ci16_35_k16_w58.json", "bootparam_35.json"),
     [](const testing::TestParamInfo<CiFft::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

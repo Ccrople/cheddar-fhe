@@ -80,7 +80,7 @@ namespace {
 // the crossing costs is the difference. CHEDDAR_CI_FFN_PARAM overrides.
 const char *Param() {
   const char *env = std::getenv("CHEDDAR_CI_FFN_PARAM");
-  return (env && env[0]) ? env : "ci16_35.json";
+  return (env && env[0]) ? env : "ci16_35_k16_w58.json";
 }
 constexpr int kTokens = 128;      // T, and the small degree on R+
 constexpr int kRank = 512;        // degree / T, the channels a ciphertext holds

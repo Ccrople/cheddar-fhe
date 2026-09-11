@@ -36,9 +36,10 @@
 //       folklore.
 //
 // One preset per process (the project's minimal-regression habit):
-//   CHEDDAR_ROBUST_PARAM=ci16_35_land17c3e10.json ./param_robust_test
-// Default preset: ci16_35.json. CHEDDAR_ROBUST_STRICT=1 tightens the gates
-// to what gen_landing v3's output must satisfy.
+//   CHEDDAR_ROBUST_PARAM=ci16_35_k64_w58.json ./param_robust_test
+// Default preset: ci16_35_k16_w58.json (the 2^35 family's base ring).
+// CHEDDAR_ROBUST_STRICT=1 tightens the gates to what a stationary band must
+// satisfy; CHEDDAR_BOOT_LANDING=L runs them on the pool's ladder for L.
 
 #include <gtest/gtest.h>
 
@@ -68,7 +69,7 @@ using cheddar::Plaintext;
 
 const char *RobustParam() {
   const char *e = std::getenv("CHEDDAR_ROBUST_PARAM");
-  return (e && e[0]) ? e : "ci16_35.json";
+  return (e && e[0]) ? e : "ci16_35_k16_w58.json";
 }
 bool Strict() {
   const char *e = std::getenv("CHEDDAR_ROBUST_STRICT");

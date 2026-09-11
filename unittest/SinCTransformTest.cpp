@@ -364,7 +364,7 @@ class CiSinCTransformFixture : public Testbed32 {
 };
 
 INSTANTIATE_TEST_SUITE_P(CheddarCi, CiSinCTransformFixture,
-                         testing::Values("ci16_35.json"),
+                         testing::Values("ci16_35_k16_w58.json"),
                          [](const testing::TestParamInfo<const char *> &info) {
                            std::string name = info.param;
                            return name.substr(0, name.find('.')) + "_json";

@@ -63,7 +63,7 @@ using cheddar::Plaintext;
 
 namespace {
 
-constexpr const char *kCiParam = "ci16_35.json";
+constexpr const char *kCiParam = "ci16_35_k16_w58.json";
 constexpr const char *kOrdParam = "bootparam_35.json";
 
 // The levels the comparison is taken at. The dnum boundary makes a per-op cost

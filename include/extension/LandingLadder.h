@@ -66,6 +66,31 @@ namespace cheddar {
  *
  * The pool's own landing is the pool, byte for byte.
  *
+ * ## The 2^35 family (2026-09-11)
+ *
+ * `ci16_35_k{16,32,64}_w58` (`reference/scripts/ci35_family.py`) are the
+ * same construction on ci16_35's own compute prefix -- 30-bit mains, 25-bit
+ * terminals, the graft cycle `[+2m, -1t] x5, [-3m, +5t]` -- with the band
+ * mined to 2^58 pair by pair. Two things about that prefix the 2^42 rule
+ * did not meet. Its `[-3m, +5t]` steps put ALL FIVE terminals in the
+ * modulus at levels 3, 9 and 15, so every cut above those must declare all
+ * five: CoeffToSlot's levels have to bring the terminal count back up to
+ * what the compute prefix needs (`NeedT`), and a triple-first greedy that
+ * left one terminal over could not. And its terminals are 25 bits, so a
+ * terminal PAIR (2^50) is a transform level there, where the 2^42 family's
+ * 23.5-bit pairs (2^47) fall in `param_audit`'s starved band. So the CtS
+ * levels are now PLANNED (`CtSPlan`): the same preference order as before
+ * -- a terminal triple, then a pair of unused compute mains, then a
+ * terminal pair -- with a lookahead that refuses any choice from which the
+ * remaining levels cannot both be formed and reach the needed terminal
+ * count, and with a terminal pair admitted wherever it is at least 2^49.
+ * On the three 2^42 pools every recorded ladder is unchanged (the old
+ * greedy never had to backtrack there); a landing whose CtS cannot be
+ * formed is not clean and is served, like a junction, by the exact ladder
+ * above it plus slack. The `[-3m, +5t]` step also leaves THREE mains out
+ * below its peak, so the levels right after it are neither clean nor
+ * junctions (`peak - m` is 3, then 1): slack from above serves them too.
+ *
  * The host mirror is `reference/scripts/landing_ladder.py`; every ladder it
  * writes passes `param_audit.py --strict`, and `landing_ladder_test` diffs
  * the two implementations and runs the crossing on the device.
@@ -111,6 +136,15 @@ class LandingLadder {
 
  private:
   int Peak(int upto) const;
+  //! The largest terminal count any level 0..dec holds: a ladder cut at dec
+  //! must declare at least that many, so its CtS levels have to reach it.
+  int NeedT(int dec) const;
+  //! CoeffToSlot's levels from what a cut leaves: one char a level, '3' a
+  //! terminal triple, 'M' a pair of unused compute mains, '2' a terminal
+  //! pair. Empty when `num_cts_levels` levels cannot be formed. See the
+  //! header comment: the order is the 2^42 rule's and the lookahead is what
+  //! the 2^35 family adds.
+  std::string CtSPlan(int t, int spares, int need_t) const;
   Result Cut(int ladder_landing, bool fill_junction) const;
 
   LadderSpec<word> pool_;

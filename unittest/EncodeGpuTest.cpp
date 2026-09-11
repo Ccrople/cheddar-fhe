@@ -1059,7 +1059,7 @@ TEST_P(EncodeGpuTest, TheEncodingUnitIsMeasured) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Cheddar, EncodeGpuTest,
-                         testing::Values("ci16_35.json", "bootparam_35.json"),
+                         testing::Values("ci16_35_k16_w58.json", "bootparam_35.json"),
                          [](const testing::TestParamInfo<const char *> &info) {
                            std::string name(info.param);
                            std::replace(name.begin(), name.end(), '.', '_');

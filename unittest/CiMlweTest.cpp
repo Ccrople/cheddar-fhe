@@ -783,7 +783,7 @@ INSTANTIATE_TEST_SUITE_P(
     // ringdegree12_30 is the same primes and shape with the flag off -- the
     // control that the dispatch leaves the ordinary ring alone.
     Cheddar, Testbed32,
-    testing::Values("ci12_30.json", "ci16_35.json", "ringdegree12_30.json"),
+    testing::Values("ci12_30.json", "ci16_35_k16_w58.json", "ringdegree12_30.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

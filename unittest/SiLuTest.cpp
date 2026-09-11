@@ -443,7 +443,7 @@ INSTANTIATE_TEST_SUITE_P(
     // it nothing but give it twice the slots ([SYLPH] section 2.1). Measured
     // rather than assumed.
     testing::Values("bootparam_30.json", "bootparam_35.json",
-                    "bootparam_40.json", "ci16_35.json", "ci16_40.json"),
+                    "bootparam_40.json", "ci16_35_k16_w58.json", "ci16_40.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

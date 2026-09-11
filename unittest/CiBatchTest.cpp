@@ -63,25 +63,31 @@ using Ring = ringfixture::Ring<word>;
 
 namespace {
 
+// The layer preset: the 2^35 family's K = 16 pool (2026-09-11), which is
+// ci16_35's own ladder -- dec 19, Boot landing 16, four CtS levels -- with its
+// EvalMod band rebuilt as stationary 2^58 pairs. The B = 1 calibration and
+// every prefix/ride constant carry over because levels 0..19 are ci16_35's
+// primes byte for byte.
 const char *Param() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_PARAM");
-  return (env && env[0]) ? env : "ci16_35.json";
+  return (env && env[0]) ? env : "ci16_35_k16_w58.json";
 }
 // The fused scores' tower ring: K = 64 with the prefix landing where the
-// layer preset's own Boot does. The default pairs the default layer preset
-// `ci16_35` (landing 16, `bdeafd3`'s causal fold): the ROBUST
-// `land17c3e10v3` -- gen_landing v3's twin of the shipped land17c3e10, whose
-// EvalMod recursion lands the honest 2^58 fixed point (v2 wandered to 2^51.8;
-// param_robust_test STRICT + the ci_sinc_basis hunt1 diagnostic prove 0 ppm
-// measured-vs-nominal, and the fused-vs-serial gate is 2^-9.74, = v2). It is
-// a drop-in: same K = 64, same 3 CtS + 10 EvalMod levels, and the prefix
-// re-encodes from the measured landing regardless. ci16_35_stc2 (17) needs
-// `land18c4e10`. The landing-15 layer preset `ci16_35_land17c4e8s2` rides
-// the SAME tower (the prefix enters after a LevelDown; the junction L16
-// ladder's EvalMod measured 2^-7) plus `CHEDDAR_CI_BATCH_AFFINE_PREFIX=1`.
+// layer preset's own Boot does. The family's K = 64 pool is the old ROBUST
+// `land17c3e10v3` -- ci16_35's prefix to 17, three CtS levels, ten EvalMod
+// levels landing the honest 2^58 fixed point (param_robust_test STRICT + the
+// ci_sinc_basis hunt1 diagnostic proved 0 ppm measured-vs-nominal on that
+// shape; the fused-vs-serial gate is 2^-9.74) -- with every band level
+// stationary on its own instead of the recursion solved once. The shorter
+// tower of the aux-boot split (`land13c3e10v3`, EvalMod ending at 13) is the
+// same pool cut by `LandingLadder` (`CHEDDAR_BOOT_LANDING=10` on the
+// fixture); the StC-2 layer shapes (`stc2`, `land17c4e8s2`, the channel ring
+// `land11c4e8s2`) are not in the family -- a pool's StC count is fixed and
+// slack only lowers a landing -- and their files are gone with the results
+// that settled them (Doing.md 7.36-7.39).
 const char *TowerParam() {
   const char *env = std::getenv("CHEDDAR_CI_BATCH_TOWER_PARAM");
-  return (env && env[0]) ? env : "ci16_35_land17c3e10v3.json";
+  return (env && env[0]) ? env : "ci16_35_k64_w58.json";
 }
 int EnvInt(const char *name, int fallback) {
   const char *e = std::getenv(name);
@@ -3267,9 +3273,14 @@ TEST(CiBatch, TheAttentionHalfRunsOnTheRealLayerZero) {
       }
     }
     const double s_min = cj["s_raw_min"], s_max = cj["s_raw_max"];
-    cal.span_raw = s_max - s_min;
-    cal.s_raw_max = s_max;
     cal.m_eff = cj["span"];
+    // The span the calibration's windows were walked with: `gen512.py` has
+    // no row-shift margin and `span` is exactly `(s_max - s_min) / sqrt(D)`,
+    // but a `gen_b1_pop.py` bundle (the B = 1 coefficients applied here,
+    // 2026-09-11) widens `span` by its margin while `s_raw_*` stay the raw
+    // extremes -- see `CiModelTest.cpp`'s `span_raw`. D = 128.
+    cal.span_raw = cal.m_eff * std::sqrt(128.0);
+    cal.s_raw_max = s_max;
     const auto &rs = cj["row_shift_raw"];
     const auto &rn = cj["row_norm"];
     cal.row_shift_raw.assign(kHeads, std::vector<double>(kTokens, 0.0));
@@ -4030,9 +4041,14 @@ TEST(CiBatch, TheLayerChainRunsOnTheRealWeights) {
       }
     }
     const double s_min = cj["s_raw_min"], s_max = cj["s_raw_max"];
-    cal.span_raw = s_max - s_min;
-    cal.s_raw_max = s_max;
     cal.m_eff = cj["span"];
+    // The span the calibration's windows were walked with: `gen512.py` has
+    // no row-shift margin and `span` is exactly `(s_max - s_min) / sqrt(D)`,
+    // but a `gen_b1_pop.py` bundle (the B = 1 coefficients applied here,
+    // 2026-09-11) widens `span` by its margin while `s_raw_*` stay the raw
+    // extremes -- see `CiModelTest.cpp`'s `span_raw`. D = 128.
+    cal.span_raw = cal.m_eff * std::sqrt(128.0);
+    cal.s_raw_max = s_max;
     cal.row_shift_raw.assign(kHeads, std::vector<double>(kTokens, 0.0));
     cal.row_norm.assign(kHeads, std::vector<double>(kTokens, 1.0));
     for (int h = 0; h < kHeads; h++) {

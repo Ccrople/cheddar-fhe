@@ -123,7 +123,7 @@ class CiBatchAttention {
     //! TOWER ring plus the lane prefix, landing the booted scores at the
     //! layer's top level with the carried factor in the message -- no
     //! `SinCToSlot`, no full Boot, one level given back to the chain's
-    //! side. Needs the `tower` BootContext (K = 64, `ci16_35_land17c3e10`,
+    //! side. Needs the `tower` BootContext (K = 64, `ci16_35_k64_w58`,
     //! its SSE secret tower-sparse). Values' returns keep the converter.
     bool fused_scores = false;
     //! The landing-15 lever (the level idea [4] freed): the softmax's
@@ -142,7 +142,7 @@ class CiBatchAttention {
     //! ciphertext a head) bootstraps on its own short ring and the walk
     //! above `forward_level` shrinks to exp + mask + the two products --
     //! 8 levels at exp degree 15 -- so the scores can land at 12: a
-    //! shorter tower for the fused boots (`ci16_35_land13c3e10v3`, EvalMod
+    //! shorter tower for the fused boots (`ci16_35_k64_w58` cut at 13, EvalMod
     //! ending at 13), and the serial route LevelDowns to it. Requires
     //! `affine_in_prefix` on the fused route (the affine multiply has no
     //! level of its own at 12).

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <sstream>
 
 #include "common/Assert.h"
@@ -53,12 +54,65 @@ int LandingLadder<word>::Peak(int upto) const {
 }
 
 template <typename word>
+int LandingLadder<word>::NeedT(int dec) const {
+  int need = 0;
+  for (int i = 0; i <= dec; i++)
+    need = std::max(need, pool_.level_config.at(i).second);
+  return need;
+}
+
+template <typename word>
+std::string LandingLadder<word>::CtSPlan(int t, int spares, int need_t) const {
+  const int num_ter = static_cast<int>(pool_.ter_primes.size());
+  const int num_cts = pool_.num_cts_levels;
+  auto ter_pair_bits = [&](int tt) {
+    return std::log2(double(pool_.ter_primes.at(tt))) +
+           std::log2(double(pool_.ter_primes.at(tt + 1)));
+  };
+  std::string plan;
+  // The 2^42 rule's order -- a terminal triple (the pool's own CtS, ~2^72),
+  // a pair of unused compute mains (2^60), a terminal pair -- and a
+  // lookahead: a choice is kept only if the levels after it can still be
+  // formed and the terminals still reach `need_t`. On the 2^42 pools the
+  // greedy never had to backtrack, so their ladders are what they were.
+  std::function<bool(int, int, int)> go = [&](int tt, int sp, int c) -> bool {
+    if (c == num_cts) return tt >= need_t;
+    const int left = num_ter - tt;
+    const bool last = (c + 1 == num_cts);
+    if (left >= 3) {
+      plan.push_back('3');
+      if (go(tt + 3, sp, c + 1)) return true;
+      plan.pop_back();
+    }
+    if (sp >= 2) {
+      plan.push_back('M');
+      if (go(tt, sp - 2, c + 1)) return true;
+      plan.pop_back();
+    }
+    // A terminal pair: on the last level with nothing else left (the 2^42
+    // rule, the k64 pool's own top), or wherever the compute prefix still
+    // needs terminals declared -- and only where it carries a transform
+    // (2^49; EvalSpecialFFT's thin rule is 2^30, param_audit's starved band
+    // ends at 2^49).
+    if (left >= 2 && (last || tt < need_t) && ter_pair_bits(tt) >= 49.0) {
+      plan.push_back('2');
+      if (go(tt + 2, sp, c + 1)) return true;
+      plan.pop_back();
+    }
+    return false;
+  };
+  return go(t, spares, 0) ? plan : std::string();
+}
+
+template <typename word>
 bool LandingLadder<word>::IsClean(int landing) const {
   if (landing < 0 || landing > PoolLanding()) return false;
   if (landing == PoolLanding()) return true;  // the pool is its own ladder
   const int dec = landing + pool_.num_stc_levels;
   const int peak = Peak(dec);
-  return pool_.level_config.at(dec).first == peak && peak <= band_lo_;
+  const auto [m, t] = pool_.level_config.at(dec);
+  return m == peak && peak <= band_lo_ &&
+         !CtSPlan(t, band_lo_ - peak, NeedT(dec)).empty();
 }
 
 template <typename word>
@@ -66,7 +120,11 @@ bool LandingLadder<word>::IsJunction(int landing) const {
   if (landing < 0 || landing >= PoolLanding() || IsClean(landing)) return false;
   const int dec = landing + pool_.num_stc_levels;
   const int peak = Peak(dec);
-  return pool_.level_config.at(dec).first + 1 == peak && peak <= band_lo_;
+  const auto [m, t] = pool_.level_config.at(dec);
+  // The fill takes the pinned prime plus one spare into the band and hands
+  // the pool's top pair to the spares: `band_lo_ - peak + 2 - 1` remain.
+  return m + 1 == peak && peak <= band_lo_ &&
+         !CtSPlan(t, band_lo_ - peak + 1, NeedT(dec)).empty();
 }
 
 template <typename word>
@@ -161,32 +219,31 @@ typename LandingLadder<word>::Result LandingLadder<word>::Cut(
                "LandingLadder::Cut: band count");
     for (int k = 1; k <= nem_; k++) s.level_config.emplace_back(m + 2 * k, t);
 
-    // CoeffToSlot: terminal triples (the pool's own CtS levels, ~2^72),
-    // then pairs of unused compute mains (2^60), and a terminal PAIR only
-    // on the last level with nothing else left -- the k64 pool's own top.
+    // CoeffToSlot: the planned levels -- terminal triples (the pool's own
+    // CtS levels, ~2^72), pairs of unused compute mains (2^60), terminal
+    // pairs where the compute prefix needs the terminals declared or on the
+    // last level with nothing else left (the k64 pool's own top).
     int mm = m + 2 * nem_, tt = t;
-    const int num_ter = static_cast<int>(pool_.ter_primes.size());
-    for (int c = 0; c < pool_.num_cts_levels; c++) {
-      const bool last = (c == pool_.num_cts_levels - 1);
-      const int left = num_ter - tt;
-      if (left >= 3) {
+    const int need_t = NeedT(dec);
+    const std::string plan =
+        CtSPlan(t, static_cast<int>(spares.size()), need_t);
+    AssertTrue(!plan.empty(),
+               "LandingLadder::Cut: landing " + std::to_string(ladder_landing) +
+                   " cannot form " + std::to_string(pool_.num_cts_levels) +
+                   " CtS levels from what the cut leaves");
+    for (const char c : plan) {
+      if (c == '3') {
         tt += 3;
-      } else if (spares.size() >= 2) {
+      } else if (c == 'M') {
         s.main_primes.push_back(spares[0]);
         s.main_primes.push_back(spares[1]);
         spares.erase(spares.begin(), spares.begin() + 2);
         mm += 2;
-      } else if (left == 2 && last) {
-        tt += 2;
       } else {
-        Fail("LandingLadder::Cut: landing " + std::to_string(ladder_landing) +
-             " has no primes left for CtS level " + std::to_string(c));
+        tt += 2;
       }
       s.level_config.emplace_back(mm, tt);
     }
-    int need_t = 0;
-    for (int i = 0; i <= dec; i++)
-      need_t = std::max(need_t, pool_.level_config[i].second);
     AssertTrue(tt >= need_t, "LandingLadder::Cut: a compute level needs a "
                              "terminal the ladder dropped");
     s.ter_primes.assign(pool_.ter_primes.begin(),

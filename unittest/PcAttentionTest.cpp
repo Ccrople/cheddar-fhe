@@ -223,7 +223,7 @@ CiPcAttention<word>::Calibration MakeCalibration(bool with_fold) {
 //    is one level below the queries at the canonical scale.
 // ---------------------------------------------------------------------------
 TEST(PcAttention, TheScoreProductIsTheHostsPublicContextScores) {
-  Ring ring("ci16_35.json");
+  Ring ring("ci16_35_k16_w58.json");
   ASSERT_EQ(ring.Degree(), kTokens * kInstances);
   constexpr int kWidth = 8;
 
@@ -312,7 +312,7 @@ TEST(PcAttention, TheScoreProductIsTheHostsPublicContextScores) {
 //    join is two adds. That is the claim this measures the numbers of.
 // ---------------------------------------------------------------------------
 TEST(PcAttention, TheStreamedHeadMatchesTheHost) {
-  Ring ring("ci16_35.json");
+  Ring ring("ci16_35_k16_w58.json");
   constexpr int kPubTokens = 32;
   constexpr int kChunk = 8;
 
@@ -463,7 +463,7 @@ TEST(PcAttention, TheResidencyDoesNotMoveWithTheContextLength) {
   const bool ledger = cheddar::MemoryPool::SetStatisticsEnabled(true) ||
                       cheddar::MemoryPool::StatisticsEnabled();
 
-  Ring ring("ci16_35.json");
+  Ring ring("ci16_35_k16_w58.json");
   constexpr int kChunk = 8;
 
   auto bctx = std::dynamic_pointer_cast<cheddar::BootContext<word>>(
@@ -574,7 +574,7 @@ TEST(PcAttention, TheResidencyDoesNotMoveWithTheContextLength) {
 //    is that a group of three is three groups of one.
 // ---------------------------------------------------------------------------
 TEST(PcAttention, TheGroupShareIsTheSeparateHeadsWordForWord) {
-  Ring ring("ci16_35.json");
+  Ring ring("ci16_35_k16_w58.json");
   constexpr int kChunk = 8;
   constexpr int kPtok = 24;   // three chunks
   constexpr int kGroup = 3;
@@ -711,7 +711,7 @@ TEST(PcAttention, TheContextPriceSplitsByHeadCount) {
   const bool ledger = cheddar::MemoryPool::SetStatisticsEnabled(true) ||
                       cheddar::MemoryPool::StatisticsEnabled();
 
-  Ring ring("ci16_35.json");
+  Ring ring("ci16_35_k16_w58.json");
   auto bctx = std::dynamic_pointer_cast<cheddar::BootContext<word>>(
       ring.context);
   ASSERT_NE(bctx, nullptr);

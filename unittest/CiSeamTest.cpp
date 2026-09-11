@@ -48,7 +48,7 @@ using cheddar::Plaintext;
 
 namespace {
 
-constexpr const char *kParam = "ci16_35.json";
+constexpr const char *kParam = "ci16_35_k16_w58.json";
 // The layer's own shape: 128 tokens, 16 columns of the chain layout, 32 lanes,
 // rank 512 with 256 declared per half.
 constexpr int kCols = 16, kRows = 128, kLanes = 32, kRank = 512;

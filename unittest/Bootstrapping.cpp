@@ -397,10 +397,19 @@ INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
     testing::Values("bootparam_30.json", "bootparam_35.json",
                     "bootparam_40.json", "sylphflow16_35.json",
-                    "sylphflow16_40.json", "ci16_35.json", "ci16_40.json",
-                    // The B = 512 batched layer's preset, for the boot
-                    // benches; always run filtered to one preset.
-                    "ci16_35_stc2.json",
+                    "sylphflow16_40.json", "ci16_40.json",
+                    // THE 2^35 CI FAMILY (2026-09-11,
+                    // `reference/scripts/ci35_family.py`): ci16_35's own
+                    // compute prefix, terminals, CtS mains and aux primes,
+                    // with the EvalMod band rebuilt as stationary 2^58
+                    // pairs so that `LandingLadder` cuts any landing from
+                    // one file. `ci16_35_k16_w58` IS ci16_35 (dec 19, four
+                    // CtS levels) with that band; k32 (dec 19, two CtS) is
+                    // the FFN ring's pool, k64 (dec 17, three CtS) the
+                    // tower's. At scale 35 p is the additive floor's, ~15.2
+                    // whatever the band or the ratio (CI_PARAM_20BIT.md 1).
+                    "ci16_35_k16_w58.json", "ci16_35_k32_w58.json",
+                    "ci16_35_k64_w58.json",
                     // THE 2^42 CI FAMILY, one ladder per K
                     // (`reference/scripts/design_ci41.py`, band by
                     // `ci20_family.py`). Measured p, each at the ratio it

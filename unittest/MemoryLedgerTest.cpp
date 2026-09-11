@@ -46,7 +46,7 @@ using cheddar::MemoryPool;
 
 namespace {
 
-constexpr const char *kParam = "ci16_35.json";
+constexpr const char *kParam = "ci16_35_k16_w58.json";
 
 // The FFN half of the layer runs at slack nine and the leg at slack zero, and
 // that difference is the whole reason the layer holds two BootContexts over

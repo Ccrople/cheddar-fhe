@@ -449,51 +449,23 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ringswitch16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_30.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci12_30.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35.json COPYONLY)
-# ci16_35 with two SlotToCoeff levels: its Boot lands at 17, which is what
-# the batched attention's softmax walk needs above the chain (Doing.md 7.6).
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_stc2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_stc2.json COPYONLY)
-# Landing sub-ladders of ci16_35 (gen_landing.py, L in [5,19]); the test
-# defaults to land13 and reaches the rest via CHEDDAR_LAND_PARAM.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13.json COPYONLY)
-# The clean-landing sub-ladders of ci16_35 (gen_landing.py); boot_landing_test
-# defaults to land13 and reaches the others via CHEDDAR_LAND_PARAM.
-# The same ladders with TWO CoeffToSlot levels (gen_landing.py's 4th argument):
-# the module-basis CtS in its two-level real form (Doing.md 3.6/3.7), for the
-# feed-forward's BootContext.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2.json COPYONLY)
-# Nine EvalMod levels (CHEDDAR_BOOT_DOUBLE_ANGLE=4, K = 32): the range the
-# module-sparse secret's wrap-around wants (Doing.md 3.9).
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c2e9.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c2e9.json COPYONLY)
-# The leg's fused-return ring (Doing.md 3.16): L = 17, three CtS levels for
-# the tower CtS', ten EvalMod levels (K = 64) for the tower-sparse secret's
-# wrap-around.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land18c4e10.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land18c4e10.json COPYONLY)
-# The aux-boot-split tower (Doing.md 7.39): EvalMod ends at 13, so the fused
-# score boots land at score_top 12 on a climb-26 ladder.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c4e8s2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c4e8s2.json COPYONLY)
-# The gen_landing v3 twins (Doing.md 7.49): the EvalMod recursion SOLVED so
-# the half/fused landing scale is 2^58.000 on every ladder (v2 towers wander
-# to 2^51.8), with the scale manifest in the JSON. param_robust_test runs
-# them under CHEDDAR_ROBUST_STRICT=1.
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land17c3e10v3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land17c3e10v3.json COPYONLY)
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land13c3e10v3.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land13c3e10v3.json COPYONLY)
-# The norm channel-boot ring (Doing.md 7.38): L = 11 with num_stc 2, so the
-# channel Boot lands at 9 on a climb-23 ladder; the deep ladder then serves
-# only the norm's accumulator (2 boots a layer).
-configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c4e8s2.json
-               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c4e8s2.json COPYONLY)
+# THE 2^35 FAMILY (2026-09-11, `reference/scripts/ci35_family.py`): three
+# pools on ci16_35's own compute prefix, one per K, each with an EvalMod band
+# of stationary 2^58 pairs so that `LandingLadder` (`CHEDDAR_BOOT_LANDING=L`
+# in the fixtures, `CHEDDAR_CI_{BASE,FFN,LEG}_LANDING` in ci_model_test) cuts
+# any landing at run time. They replace ci16_35_k16_w58.json and every
+# `ci16_35_land*` / `ci16_35_stc2` file:
+#   ci16_35_k16_w58  K 16, dec 19, four CtS levels  -- the base ring (ci16_35's shape)
+#   ci16_35_k32_w58  K 32, dec 19, two CtS levels   -- the FFN ring's pool
+#                    (cut at 13 = the old land13c2e9, CtS [50, 50])
+#   ci16_35_k64_w58  K 64, dec 17, three CtS levels -- the tower ring
+#                    (the old land17c3e10v3; cut at 13 = the old land13c3e10v3)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_k16_w58.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_k16_w58.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_k32_w58.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_k32_w58.json COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_k64_w58.json
+               ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_k64_w58.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json

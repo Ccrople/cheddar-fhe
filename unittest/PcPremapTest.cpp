@@ -205,7 +205,7 @@ TEST(PcPremap, ThePlainMapThroughThePremapIsTheChainMap) {
   // the layer ring's, and the two share their bottom primes, so a ciphertext
   // crosses keylessly (Doing.md 1.5bt). This is `CiBootSet`'s own recipe:
   // encode and encrypt on ci16_35, convert on the switching Context.
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   const int degree = swtch.Degree();
   ASSERT_EQ(boot.Degree(), degree);
@@ -345,7 +345,7 @@ TEST(PcPremap, TheInversePremapDoesNotGrowTheInverse) {
 //    and at the plain map's out of the second.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, ThePlainMapInverseIsTheChainMapRelabelled) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   Ring swtch("ci_ringswitch16_35_boot.json", boot.ui->GetSecretCoeffs());
   const int degree = swtch.Degree();
   const CiSwitchedCcmmLayout layout(degree, degree / kRank, kLanes);
@@ -477,7 +477,7 @@ std::pair<int, int> Split(int num_diag) {
 //    displacements out of 2048 blocks, and 3^floor(bits/2) at any width.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, TheStandaloneBlockPermutationIsThreeToTheFive) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   const auto premap = BuildPremap(degree);
   const int num_blocks = degree / kLanes;
@@ -632,7 +632,7 @@ TEST(PcPremap, TheStandaloneBlockPermutationIsThreeToTheFive) {
 //    matters.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, TheSubringLaneIsThePlainMapsInstance) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   ASSERT_TRUE(boot.param->conjugate_invariant_)
       << "the lane count is sub_degree only on the conjugate-invariant ring";
@@ -804,7 +804,7 @@ TEST(PcPremap, TheSubringLaneIsThePlainMapsInstance) {
 //    than assume it.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, TheExpandedSubringStoreIsOneBlockRepeated) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   constexpr int kSubDegree = kInstances;       // 512
   const int num_blocks = degree / kSubDegree;  // d = 128
@@ -877,7 +877,7 @@ TEST(PcPremap, TheExpandedSubringStoreIsOneBlockRepeated) {
 //    `cols_in = 128` entries and the store is what has to be streamed.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, TheCompactSubringStoreIsWordForWord) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   constexpr int kSubDegree = kInstances;       // 512
   const int num_blocks = degree / kSubDegree;  // d = 128
@@ -1004,7 +1004,7 @@ TEST(PcPremap, TheCompactSubringStoreIsWordForWord) {
 //     settles.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, ThePlainMapsKeyTokenShiftIsStillOneRotation) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   const CiBatchLayout plain(degree, kTokens);
   const CiBatchLayout chain(degree, kTokens, kLanes, kRank);
@@ -1177,7 +1177,7 @@ TEST(PcPremap, TheShiftComposedWithThePremapStillFoldsAtTheCeiling) {
 //     WORDS, at the shape and level the PC-attention uses.
 // ---------------------------------------------------------------------------
 TEST(PcPremap, TheDeviceSubringEncodeIsTheSinCOne) {
-  Ring boot("ci16_35.json");
+  Ring boot("ci16_35_k16_w58.json");
   const int degree = boot.Degree();
   constexpr int kSubDegree = kInstances;  // 512 = the batch = the lanes
   constexpr int kLevel = 4;

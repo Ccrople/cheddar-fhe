@@ -568,7 +568,7 @@ TEST_P(Testbed32, TheConversionPermutationIsABitReversal) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
-    testing::Values("bootparam_35.json", "ci16_35.json"),
+    testing::Values("bootparam_35.json", "ci16_35_k16_w58.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string p = info.param;
       std::replace(p.begin(), p.end(), '.', '_');

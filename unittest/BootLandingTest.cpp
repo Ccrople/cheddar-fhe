@@ -34,22 +34,31 @@
 //
 // WHAT IS MEASURED. (1) The preset bootstraps, lands where its BootParameter
 // asks, and preserves the message -- HalfBoot at every L, Boot where valid.
-// (2) A ciphertext ENCRYPTED ON ci16_35 crosses into this ladder with no key
-// and comes back readable by ci16_35 -- the layer-usable form. The preset and
-// its level are env-driven (CHEDDAR_LAND_PARAM / CHEDDAR_LAND_LEVEL), so any
-// generated ladder validates by dropping its JSON into the binary dir -- no
-// rebuild. Correctness only.
+// (2) A ciphertext ENCRYPTED ON the base ring crosses into this ladder with
+// no key and comes back readable by it -- the layer-usable form. The pool
+// and the level are env-driven (CHEDDAR_LAND_PARAM / CHEDDAR_LAND_LEVEL).
+//
+// 2026-09-11: the ladders are no longer files. The 2^35 family is three
+// pools on ci16_35's compute prefix (`ci16_35_k{16,32,64}_w58`) whose bands
+// are stationary pair by pair, and `LandingLadder` cuts the ladder for any
+// landing at run time: CHEDDAR_LAND_LEVEL names the level the HalfBoot lands
+// at (the cut's `default_encryption_level`), the pool defaults to the FFN
+// ring's K = 32 one, and the old default `ci16_35_land13` is that pool at
+// 13. Correctness only.
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <vector>
 
+#include "LadderJson.h"
 #include "RingFixture.h"
 #include "extension/CiModuleBasis.h"
+#include "extension/LandingLadder.h"
 
 namespace {
 
@@ -59,17 +68,33 @@ using cheddar::BootContext;
 using cheddar::Ciphertext;
 using cheddar::Complex;
 using cheddar::EvkRequest;
+using cheddar::LandingLadder;
 using cheddar::Plaintext;
 
-constexpr const char *kFull = "ci16_35.json";  // the leg's ring
+constexpr const char *kFull = "ci16_35_k16_w58.json";  // the base ring
 
 const char *LandParam() {
   const char *e = std::getenv("CHEDDAR_LAND_PARAM");
-  return (e && e[0]) ? e : "ci16_35_land13.json";
+  return (e && e[0]) ? e : "ci16_35_k32_w58.json";
 }
 int LandLevel() {
   const char *e = std::getenv("CHEDDAR_LAND_LEVEL");
   return (e && e[0]) ? std::atoi(e) : 13;
+}
+// The landing ring: the pool cut so that its HalfBoot lands at LandLevel()
+// (the pool itself when that is its own encryption level). A landing the
+// pool cannot cut exactly is served by the exact ladder above it plus slack,
+// which lowers only the Boot's landing; the HalfBoot then lands higher than
+// asked and test (1) reports it.
+std::unique_ptr<Ring> MakeLand(const std::vector<int> &secret = {}) {
+  auto spec = ladderjson::Parse<word>(std::string(PARAM_DIR) + "/" +
+                                      LandParam());
+  const LandingLadder<word> ladder(spec);
+  const auto r = ladder.ForLanding(LandLevel() - spec.num_stc_levels);
+  std::cout << "[landing ladder] " << LandParam() << " for HalfBoot at "
+            << LandLevel() << ": " << LandingLadder<word>::Describe(r)
+            << std::endl;
+  return std::make_unique<Ring>(r.spec, secret, r.slack);
 }
 bool MinKs() {  // memory lever on this shared A6000; correctness is unaffected
   const char *e = std::getenv("CHEDDAR_CI_MINKS");
@@ -145,7 +170,8 @@ int LimbsAt(const Ring &r, int level) {
 // preserves the message, via both HalfBoot and (where the level budget allows)
 // Boot -- with a control that the climb really is shorter.
 TEST(BootLanding, LandsLowerAndPreservesTheMessage) {
-  Ring land(LandParam());
+  auto land_p = MakeLand();
+  Ring &land = *land_p;
   auto b = PrepareBoot(land);
   const int num_slots = land.param->MaxNumSlots();
 
@@ -207,7 +233,8 @@ TEST(BootLanding, LandsLowerAndPreservesTheMessage) {
 // 0..L are byte-identical.
 TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
   Ring full(kFull);
-  Ring land(LandParam(), full.ui->GetSecretCoeffs());  // SAME secret -> keyless
+  auto land_p = MakeLand(full.ui->GetSecretCoeffs());  // SAME secret -> keyless
+  Ring &land = *land_p;
   auto b = PrepareBoot(land);
   const int num_slots = full.param->MaxNumSlots();
   ASSERT_EQ(num_slots, land.param->MaxNumSlots());
@@ -220,11 +247,12 @@ TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
                                  LimbsAt(land, land_climb))
             << " fewer, on every ModUp/CtS/EvalMod" << std::endl;
 
-  // The shared bottom is byte-identical -- what "keyless" rests on.
-  for (int L = 0; L <= LandLevel(); L++) {
+  // The shared bottom is byte-identical -- what "keyless" rests on. The cut
+  // keeps the pool's levels 0..dec, and the pool shares the base ring's.
+  for (int L = 0; L <= land.param->default_encryption_level_; L++) {
     const auto pf = full.param->GetPrimeVector(full.param->LevelToNP(L));
     const auto pl = land.param->GetPrimeVector(land.param->LevelToNP(L));
-    ASSERT_EQ(pf, pl) << "levels 0.." << LandLevel()
+    ASSERT_EQ(pf, pl) << "levels 0.." << land.param->default_encryption_level_
                       << " must be byte-identical for a keyless crossing; "
                       << "they differ at level " << L;
   }
@@ -269,7 +297,8 @@ TEST(BootLanding, Ci16CiphertextCrossesInAndBackKeylessly) {
 // sampled in the module basis, which this test sets unless given.
 TEST(BootLanding, HalfBootModuleLandsTheModuleCoordinates) {
   setenv("CHEDDAR_MODULE_SPARSE_SECRET", "128,16", /*overwrite=*/0);
-  Ring land(LandParam());
+  auto land_p = MakeLand();
+  Ring &land = *land_p;
   auto b = PrepareBoot(land);
   const int n = land.param->MaxNumSlots();
   const int T = 128;

@@ -755,6 +755,155 @@ pay, and why:
 
 ---
 
+## The 2^35 family (2026-09-11): three presets, a stationary band, any landing
+
+The user's ask, verbatim: reduce `ci16_35` to THREE presets like the 2^42
+family -- a flat EvalMod, free landing, the best precision the scale affords
+-- and delete the rest. Done on the B200, branch `llama3_CI_Sylph`.
+
+### What the three are
+
+`reference/scripts/ci35_family.py` splices; it does not synthesise. ci16_35's
+compute region (q0 = two 25-bit terminals, then `[+2m, -1t] x5, [-3m, +5t]` on
+30-bit mains) is kept byte for byte to each pool's encryption level, with its
+five terminals, its four 30.02-bit CtS mains and its twelve aux primes -- the
+keyless crossing's whole condition, the `_boot` companion trio's, and why the
+B = 1 calibration carries over untouched. Only the band is rebuilt: every
+level a pair mined to 2^58 to microbits and ORDERED so the signed residues
+cancel under EvalMod's doubling (`ci20_family.stationary_pairs`), so the
+landing scale is 2^58.000 for every landing and every band length.
+
+    pool             K   dec  band  CtS (bottom -> top)         role                          logQP
+    ci16_35_k16_w58  16  19    8    main x2, ter x2 [60,60,50,50] the base ring = ci16_35's shape  1771.5
+    ci16_35_k32_w58  32  19    9    ter x2 [50,50]                 the FFN pool (cut at 13 today)  1709.4
+    ci16_35_k64_w58  64  17   10    main x2, ter [60,60,50]        the tower ring                  1767.3
+
+All under the 1771.06 anchor, dnum 4, `param_audit --strict` 0 violations 0
+warnings, wander +0.00. `log_message_ratio` 5 and `num_double_angle` are
+stated in the file. The scale is pinned at 35 twice over: the cycle gives
+`m = 30, t = 25` and tops out at 35.23 under `HOIST_MAIN_CAP`, and the tower's
+17 + 10 + 3 levels are over the anchor at scale 36 whatever the CtS.
+
+**The rule had to grow.** `LandingLadder`'s CtS rule (terminal triples, then
+unused-main pairs, a terminal pair only on the last level) was the 2^42
+family's. ci16_35's `[-3m, +5t]` steps put ALL FIVE terminals in the modulus
+at levels 3, 9 and 15, so a cut above them must bring the terminal count back
+to five, which a triple-first greedy that leaves one over cannot; and its
+terminals are 25 bits, so a terminal PAIR is 2^50 -- a transform level, where
+the 2^42 family's 23.5-bit pairs are starved. `LandingLadder::CtSPlan`
+(mirrored in `landing_ladder.py`) keeps the order and adds a lookahead, with a
+terminal pair admitted wherever it is >= 2^49. The 2^42 pools are untouched:
+52 device ladders identical to the mirror, 0 plan differences at every
+landing. Supported (clean) landings: k16 {2,3,4,5,8,9,10,11,16}, k32
+{2,3,4,5,8,9,10,11,14,15,16}, k64 {2,3,4,5,8,9,10,14}; the rest are the exact
+ladder above plus slack. k32 cut at HalfBoot 13 is the retired `land13c2e9`
+to the level: climb 24, 39 primes, CtS [50.14, 50.19].
+
+### What was measured (B200, `reference/vessl/family_accept.sh`)
+
+| gate | k16_w58 | k32_w58 | k64_w58 |
+|---|---|---|---|
+| `param_robust_test --strict` | 7/7 | 7/7 | 7/7 |
+| Boot residual / landing-scale miss | 2^-15.09 / 0.05 ppm | 2^-14.70 / -0.05 ppm | 2^-14.55 / -0.01 ppm |
+| `Bootstrap` SNR | 3.76e10 | 2.75e10 | 4.99e9 |
+| `BootstrapPrecisionAgainstSylph` p | 14.90 | 15.00 | 14.47 |
+| crossing pool -> ladder at HalfBoot 13 (rel. residual) | 2^-14.89 | 2^-14.99 | 2^-14.60 |
+| boot at the pool's own landing (median of 10) | 25.0 ms | 74.0 ms | 27.1 ms |
+
+`ci16_35` measured p = 15.05 on the A100; the run-to-run spread is 0.07-0.20.
+The ratio curve (`CHEDDAR_BOOT_MSG_RATIO` 3/4/5/6): k16 14.97 / 15.33 / 14.72 /
+14.82, k64 14.85 / 14.58 / 14.71 / 13.65 -- flat within half a bit until 6
+on K 64, so the pools ship 5, the value every fixture always passed. Band 60
+(30-bit pairs) measures 2^-15.15 at the crossing against band 58's 2^-15.17 on
+the same pool, and puts K16 and K64 sixteen bits over the anchor: **at scale
+35 the precision is the additive floor's, ~15 bits, whatever the band or the
+ratio** (`CI_PARAM_20BIT.md` 1) -- "최대한" is what the family already is,
+and more needs more scale, which the leg cannot afford (the 2^42 verdict
+above). The one surprise is the K 32 pool's native boot at 74 ms: two CtS
+levels make each transform radix-256. The layer never runs a native boot on
+that ring (its crossings are `HalfBootModule`, whose CtS is the module
+basis), and the short climb is what it pays for: **k32 cut at 13 by the
+ladder 64.5 ms against 72.5 ms by slack 6 (0.89x)**.
+
+### What changed in the tree
+
+Deleted: `ci16_35.json` and sixteen `ci16_35_land*`/`stc2` files, and
+`gen_landing.py` (the v3 solve is what the stationary band makes unnecessary).
+`ci16_35_k16_w58` is the base ring everywhere `ci16_35.json` was (29 tests and
+scripts renamed; gtest instances are `*ci16_35_k16_w58_json*` now). The StC-2
+shapes (`stc2`, `land17c4e8s2`, the channel ring `land11c4e8s2`) have no
+equivalent: a pool's StC count is fixed and slack only lowers a landing; their
+results stand in Doing.md 7.36-7.39. `ci_model_test` builds its rings through
+`MakeRing`: `CHEDDAR_CI_{BASE,FFN,LEG}_LANDING` name the HalfBoot landing the
+pool is cut to (unset = the file as it is), and `sylph_run2.sh` defaults to
+`ci16_35_k32_w58.json` at 13 and `ci16_35_k64_w58.json` at its own 17.
+`boot_landing_test` builds its landing ring from the k32 pool by the same cut;
+`ci_sinc_basis_test` runs the tower basis on the k64 pool; `landing_ladder_test`
+covers all six pools.
+
+### The B = 1 / T = 128 chains on the family (item 2)
+
+Both 32-layer chains, seed 11, the same calibrations as the runs above
+(`reference/vessl/family_layer.sh`; ledgers in
+`reference/audit/2026-09-11_b200_degrees/fam_*_ledger.txt`):
+
+| chain | before (ci16_35 + land13c2e9 + land17c3e10) | on the family (k16 + k32 cut at 13 + k64) |
+|---|---|---|
+| oracle, L31 rel / rms | 2^-3.78 / 2^-5.34 | **2^-3.75 / 2^-5.22** |
+| oracle, layers 0..30 | -- | every layer within 0.1 bit of before (L0 2^-6.33 = 2^-6.33) |
+| held-out (pop6), median rel | 2^-4.81 | **2^-4.87** |
+| held-out, worst | L19 2^-2.77 | L19 2^-2.92 |
+| held-out, L31 rel / rms | 2^-5.10 / 2^-5.12 | 2^-5.03 / 2^-5.12 |
+| held-out, 32 layers | 349 s | 395 s (11.5 s a layer, ledger on) |
+
+The family is the same layer to the run-to-run spread, which is what a
+byte-identical compute prefix and a band stationary to 2e-3 bits should give.
+The FFN ring's cut (`[landing ladder] ci16_35_k32_w58.json for
+CHEDDAR_CI_FFN_LANDING=13: landing 10 ... climb 24, 39 primes, CtS [50.14,
+50.19]`) is printed by the layer itself.
+
+**A calibration-reading defect found on the way.** `gen_b1_pop.py` widens
+every row shift by its leave-one-out margin `a` (0.18 .. 0.54 across the 32
+layers) and walks its windows with `span_raw = (1 + a)(s_max - s_min)`, which
+it stores as `span` (m_eff) -- `s_raw_min/max` stay the population's raw
+extremes. `CiModelTest` (and `CiBatchTest`) rebuilt `span_raw` from the raw
+extremes, so the exp's `u = 1 + 2 (S - shift) / span` reached -1.36 .. -2.09
+for the lowest live scores of every row of the held-out chain, outside the
+[-1, 1] the exp is fitted on (a degree-15 interpolant of `exp(hb (u - 1))`
+returns ~0.05 there instead of ~1e-4). The exponent itself was right --
+`m_eff` shrank by the same factor -- so the walk was the generator's up to the
+polynomial's extrapolation. Both tests now take the span from `span` when the
+bundle carries it (a no-op for the oracle and for `gen512.py`, whose `span` is
+exactly the raw difference: ratio 1.000000 on every layer).
+
+**Measured (`fam_pop6_fix`, same seed):** the rms column does not move (every
+layer within 0.05 bits), and the max-relative column moves by +0.01 .. +0.1
+at layers 0-15 and +0.2 .. +0.36 at layers 16-30, a mean of +0.12 bits the
+WRONG way (median 2^-4.78 against 2^-4.87, worst L19 2^-2.73 against
+2^-2.92, L31 2^-5.06 against 2^-5.03). The mechanism is a level, not the
+polynomial: the exponent `hb (u - 1)` was already the generator's on both
+readings (`m_eff` shrank by the same factor `span` grew), so the walk was
+the same up to the extrapolation -- but the exp's DEGREE is chosen from `hb`
+by the 2^-16 rule, and the widened `hb` (x 1.18 .. 1.54) takes it from 7 to 9
+at 19 of the 32 layers (1, 2, 5, 6, 8, 9, 11, 15-17, 19, 21, 23, 25-28, 30),
+one more level in the exp before the first invsqrt, and what the chain then
+accumulates over layers 16-30 is a fifth of a bit on the worst element. The
+fix stays: the certified upper end of the first window
+(`softmax_first_hi_certified`) is a statement about the walk the generator
+did, and a polynomial read outside the interval it was fitted on is the one
+thing this project's calibration rule forbids -- but the number to quote for
+the held-out chain on the family is the fixed one, 2^-4.78 median.
+
+**The FFN pool at its own 19 (`CHEDDAR_CI_FFN_LANDING=19 CHEDDAR_CI_FFN_SLACK=15`,
+`fam_pop6_f19`).** Six more levels for the slot-domain half: both RMSNorms go
+from degree 15 to 31 wherever their window asks (most layers), layer 31's
+SiLU from 127 to 255, the FFN ring climbs to 30 (46 limbs) instead of 24 (39).
+The held-out chain: median 2^-4.78 against 2^-4.87 at 13, worst L19 2^-2.71
+against 2^-2.92, L31 2^-4.84 against 2^-5.03 -- the same to the spread, and
+11.5 s a layer either way. So on the card the FFN half is not level-limited,
+which is what the single-layer A/Bs of the section above already said of the
+SiLU (127 invisible at the crypto floor); the cut at 13 stays the default.
+
 ## Wiring
 
 **Slim is wired**, into the place section 3.4 names: `CiSinCAttention`'s
@@ -846,6 +995,13 @@ at the first layer whenever one is read, so a log proves it):
                                  a held-out bundle (gen_b1_pop.py, KMAX=6
                                  RS_MIN=0.25 WIKI_IDS=b1_ids.npy); the test
                                  builds ci16_35's native boot for its Cho pass
+    CHEDDAR_CI_FFN_PARAM=ci16_35_k32_w58.json CHEDDAR_CI_FFN_LANDING=13
+    CHEDDAR_CI_LEG_PARAM=ci16_35_k64_w58.json CHEDDAR_CI_LEG_LANDING=17
+    CHEDDAR_CI_BOOT_PARAM=ci16_35_k16_w58.json CHEDDAR_CI_BASE_LANDING=19
+                                 the 2^35 family (2026-09-11): one pool per K,
+                                 each cut by LandingLadder to the HalfBoot
+                                 landing named (unset = the file as it is);
+                                 these are sylph_run2.sh's defaults
 
 The B200 recipe (`reference/vessl/sylph_b200_setup.sh` from a git bundle,
 `sylph_b200_data.sh`, `sylph_run2.sh <tag> <first> <layers> [ENV=..]` with

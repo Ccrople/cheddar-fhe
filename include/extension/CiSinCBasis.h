@@ -71,7 +71,7 @@ namespace cheddar {
  * the SSE secret must be sampled sparse in the tower
  * (`CHEDDAR_MODULE_SPARSE_SECRET=<small_degree>:<inner_rank>,<h>`). Measured
  * on the host at the layer's shape (16; 128; 32), h = 16: max 32 / std 5.05
- * against K = 32, so the ring carries K = 64 (`ci16_35_land17c3e10`, ten
+ * against K = 32, so the ring carries K = 64 (`ci16_35_k64_w58`, ten
  * EvalMod levels); a native- or (128,512)-sparse secret puts it at 780 / 270.
  *
  * ## Conventions

@@ -567,14 +567,14 @@ TEST(CiNestedPacking, TheFlatEncodingOfTheBlockSumsIsTheNestedOperand) {
 // The bootstrap trio: ci16_35's own bottom primes, so a ci16_35 ciphertext at
 // level <= 4 crosses keylessly (Doing.md 1.5bt). Correctness-lane on the small
 // ring (Q * P = 2^182+ at degree 4096); no security or timing claim.
-constexpr const char *kBootParam = "ci16_35.json";
+constexpr const char *kBootParam = "ci16_35_k16_w58.json";
 constexpr const char *kBootSwitchParam = "ci_ringswitch16_35_boot.json";
 constexpr const char *kBootSmallParam = "ci12_35_boot.json";
 constexpr const char *kBootLiftedParam = "ringdegree13_35_boot.json";
-// The leg's fused-return ring (Doing.md 3.16): ci16_35's sub-ladder at L = 17
-// with three CtS levels for the tower CtS' and K = 64 for the tower-sparse
-// secret's wrap-around.
-constexpr const char *kTowerParam = "ci16_35_land17c3e10.json";
+// The leg's fused-return ring (Doing.md 3.16): the 2^35 family's K = 64 pool,
+// ci16_35's compute prefix to L = 17 with three CtS levels for the tower CtS'
+// and K = 64 for the tower-sparse secret's wrap-around.
+constexpr const char *kTowerParam = "ci16_35_k64_w58.json";
 
 TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
   Ring boot(kBootParam);

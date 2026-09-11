@@ -56,8 +56,15 @@ using cheddar::LadderSpec;
 using cheddar::LandingLadder;
 using cheddar::Plaintext;
 
+// The 2^42 pools, and the 2^35 family on ci16_35's own compute prefix
+// (`reference/scripts/ci35_family.py`; the layer's three rings). On the
+// latter the CtS levels are planned rather than taken greedily -- see
+// `LandingLadder.h`, "The 2^35 family" -- and terminal PAIRS are transform
+// levels (2^50), which is what makes `ci16_35_k32_w58` cut at 13 the same
+// [50, 50] CoeffToSlot the retired `ci16_35_land13c2e9` had.
 const char *kPools[] = {"ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
-                        "ci16_42_k64_w60.json"};
+                        "ci16_42_k64_w60.json", "ci16_35_k16_w58.json",
+                        "ci16_35_k32_w58.json", "ci16_35_k64_w58.json"};
 
 const char *PoolParam() {
   const char *e = std::getenv("CHEDDAR_LADDER_POOL");

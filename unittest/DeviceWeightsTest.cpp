@@ -72,7 +72,7 @@ class ProjectOnlyLeg : public cheddar::CoeffLinearLeg<word> {
 
 std::string Param() {
   const char *e = std::getenv("CHEDDAR_DEVICE_WEIGHTS_PARAM");
-  return e ? e : "ci16_35.json";
+  return e ? e : "ci16_35_k16_w58.json";
 }
 
 // The layer's half-density maps (CiLlamaLayer): a model ciphertext carries

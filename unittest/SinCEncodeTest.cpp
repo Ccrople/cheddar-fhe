@@ -384,7 +384,7 @@ TEST_P(Testbed32, SinCSubringProductIsSlotwiseWithinABlock) {
 INSTANTIATE_TEST_SUITE_P(
     SinC, Testbed32,
     testing::Values("ringdegree12_30.json", "ci12_30.json", "ci12_35.json",
-                    "ci16_35.json"),
+                    "ci16_35_k16_w58.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

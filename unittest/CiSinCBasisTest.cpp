@@ -415,15 +415,15 @@ TEST_P(CiSinCBasisTest, HalfBootTowerReturnsTheMessage) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, CiSinCBasisTest,
-    testing::Values(// `land17c3e10` is kept as the ONE non-v3 ladder that
-                    // still ships: it is the B = 1 prefill leg's tower
-                    // (`CiModelTest`'s `CHEDDAR_CI_LEG_PARAM`), and moving
-                    // that leg to v3 is an open item, not a done one.
-                    "ci16_35_land17c3e10.json", "ci16_35_land18c4e10.json",
-                    // The gen_landing v3 twins (Doing 7.50): the same towers
-                    // with the EvalMod recursion solved, landing 2^58.000.
-                    "ci16_35_land17c3e10v3.json",
-                    "ci16_35_land13c3e10v3.json"),
+    testing::Values(// The tower ring (2026-09-11): the 2^35 family's K = 64
+                    // pool, dec 17 with three CtS levels, EvalMod on
+                    // stationary 2^58 pairs (the old `land17c3e10v3`'s
+                    // shape with the recursion stationary level by level
+                    // instead of solved once). The short tower the batched
+                    // layer's aux-boot split used (`land13c3e10v3`) is the
+                    // same file under `CHEDDAR_BOOT_LANDING=10` (HalfBoot
+                    // at 13, CtS [60, 50, 50]).
+                    "ci16_35_k64_w58.json"),
     [](const testing::TestParamInfo<CiSinCBasisTest::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

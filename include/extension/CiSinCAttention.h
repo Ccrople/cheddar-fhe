@@ -101,7 +101,7 @@ class CiSinCAttention {
     //! The declared scale the images ARRIVE at: 0 = this leg's own boot's
     //! `GetStCInputScale()` (a HalfBoot on the same ring). A crossing on
     //! another ring lands at ITS EvalMod's end scale -- 2^56 on the K = 32
-    //! ladder `ci16_35_land13c2e9` against ci16_35's 2^58 -- with the same
+    //! ladder `ci16_35_k32_w58` cut at 13 against ci16_35's 2^58 -- with the same
     //! message on 4x smaller integers, and the score Boot would then see a
     //! 4x smaller message and lose two bits. The RoPE masks are encoded at
     //! `stc / landing_scale` times their scale, which moves the integers
@@ -321,7 +321,7 @@ class CiSinCAttention {
    * @param small_ctx the conjugate-invariant product ring
    * @param lifted_ctx the ordinary ring of the small ring's conductor
    * @param tower fused mode only: the landing ring whose `HalfBootTower`
-   *        returns the chain's outputs (`ci16_35_land17c3e10`), a
+   *        returns the chain's outputs (`ci16_35_k64_w58`), a
    *        sub-ladder of `boot`'s sharing its levels 0..17, its
    *        `PrepareEvalMod` done
    */
@@ -340,7 +340,7 @@ class CiSinCAttention {
   int GetNumCiphertexts() const { return ccmm_.GetLayout().num_cts; }
   /// Where SoftMax expects its booted input: the leg ring's full-Boot
   /// landing, or in fused mode the tower's HalfBoot landing less the prefix
-  /// (16 on both `ci16_35` and `ci16_35_land17c3e10`).
+  /// (16 on both `ci16_35` and `ci16_35_k64_w58`).
   int GetTopLevel() const {
     if (cfg_.fused) {
       return tower_->GetBootParameter().GetEvalModEndLevel() -
