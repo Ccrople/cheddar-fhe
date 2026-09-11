@@ -220,7 +220,42 @@ attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out
 
 Ledger additions: mask = 1 wide level (choice: multiplicative on `y`);
 tanh interval = certified (theorem), degree by tol; the calibration is now
-the PADDED population (1000 prompts with random real lengths 16..128).
+the PADDED population (1000 prompts with random real lengths).
+
+**Measured (A100, T = 128, B = 512, 2 layers + head):**
+
+| run | calibration | layers | head (7.7 s) |
+|---|---|---|---|
+| recorded prompt x 512 | oracle | 2^-10.22 / 2^-9.43 | logits 2^-9.92, labels 512 / 512 |
+| 512 held-out, padded 16..128, masked | 1000 padded prompts (k = 3) | 2^-9.89 / 2^-9.37 (worst 2^-8.01) | logits 2^-7.25, labels 512 / 512 |
+| `demo.txt` (8 lines, 9..56 real tokens) | the same | **2^+236** | garbage |
+
+The demo's failure is the calibration rule again, from the other side: its
+shortest line has 9 real tokens, the calibration's prompts had at least
+16, so the first Cho window (a statistic of the row sum, which shrinks
+with the number of real keys) was escaped by ONE prompt, the degree-63
+polynomial there is ~1e26, and every instance of the batch came back as
+garbage. The run now records the calibration's shortest prompt
+(`min_real_tokens`) and WARNS when a served prompt is shorter; the
+calibration is re-cut with lengths 3..128 (section 5c).
+
+## 5c. The calibration re-cut with lengths 3..128, and the demo
+
+`export.py --min-len 3` (1000 prompts of *War and Peace*, 1000 held out of
+*Great Expectations*, real lengths uniform in 3..128). The sim now picks
+Cho k = 3 (L0) and k = 4 (L1): with three real keys the row sum's window is
+what it is, and the fold that would narrow it (`cho_est`) is the next
+lever. Host held-out: 2^-18.7 / -17.0, head labels 1000 / 1000.
+
+| run | layers | head |
+|---|---|---|
+| 512 held-out, lengths 3..128, masked (k = 3 / 4) | 2^-9.90 / 2^-9.00 (worst 2^-8.23), 36 + 52 s | logits 2^-7.53, labels 512 / 512 |
+| `demo.txt`, 8 lines of 9..56 real tokens, `serve.sh` | 2^-10.34 / 2^-9.46, 36 + 52 s | logits 2^-9.04, labels 8 / 8 (512 / 512 instances) |
+
+`serve.sh demo.txt` end to end: encode (client) 1 s, keys + tables 8 s,
+two layers 88 s, head 8 s, decrypt; the labels file lists each line's two
+logits and its label (line 3, "call me ishmael...", is the one the NSP
+head calls class 1). Every logit is within 2^-9 of the float64 model's.
 
 ## 6. Plan
 
@@ -229,8 +264,12 @@ the PADDED population (1000 prompts with random real lengths 16..128).
    DONE (k = 2, 2^-10.07 / -9.37).
 3. The three service shapes. DONE (table above); T = 512 wants the
    first-window fold to keep k at 2.
-4. Next, in order: the `cho_est` fold (k down, boots down); per-channel
-   certified GELU intervals (the sphere bound: nothing per prompt, no
-   escape possible); padding masks (per-slot plaintexts on `y`); the
-   pooler/classifier head on the `[CLS]` slots; hoisted rotations and the
-   batched GELU; the security statement for the sampled secret.
+4. The head, the padding mask and serve mode. DONE (5b, 5c): text in,
+   labels out, every logit checked.
+5. Next, in order: the `cho_est` fold (the first Cho window is the one
+   statistic left that a short prompt can escape; folding the per-row
+   estimate out takes k from 3-4 back to 2 and the softmax's boots with
+   it); per-channel certified GELU intervals (the sphere bound: nothing
+   per prompt, no escape possible); hoisted rotations and the batched
+   GELU (4.7 s of every layer); a fine-tuned task head (the same two GEMMs
+   with its weights); the security statement for the sampled secret.
