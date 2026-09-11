@@ -99,7 +99,12 @@ namespace cheddar {
  * triples only the terminals its prefix declared). Those CtS mains sit above
  * the band, outside every cut ladder's prefix and band, so `Cut` counts them
  * among the spares a cut's CtS may pair up (`NumCtSMains`); on the first
- * cut's pools there are none and nothing changes.
+ * cut's pools there are none and nothing changes. And `kFillJunction` is
+ * now conditional: the fill is taken only when its pair is within 0.15 bits
+ * of the band (`ForLanding`), because this family's B-compensated compute
+ * primes (2^29.3-29.6) have no partner under the hoist cap that comes
+ * closer than 0.25-0.54 bits, and a landing scale that far off is worse
+ * than the one level of slack the stationary route costs.
  *
  * The host mirror is `reference/scripts/landing_ladder.py`; every ladder it
  * writes passes `param_audit.py --strict`, and `landing_ladder_test` diffs

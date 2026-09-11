@@ -152,14 +152,28 @@ typename LandingLadder<word>::Result LandingLadder<word>::ForLanding(
                  " is outside [0, " + std::to_string(PoolLanding()) +
                  "]; above the pool's own landing there are no primes to "
                  "put a band on");
-  int ladder = landing;
-  bool fill = false;
   if (policy == JunctionPolicy::kFillJunction && IsJunction(landing)) {
-    fill = true;
-  } else {
-    while (!IsClean(ladder)) ladder++;
+    // The fill pairs the pinned compute prime with the best spare, and how
+    // good that pair is depends on what the compute primes ARE: on the first
+    // 2^42 cut (mains at 2^30.00) it lands within 0.06 bits of the band; on
+    // the second cut, whose B-compensated mains sit at 2^29.3-29.6, the best
+    // partner under the hoist cap leaves 0.25-0.54 bits, at the band's
+    // bottom where the recursion weights it by 2^0 -- a landing scale that
+    // far off is worse than one level of slack, which costs no precision at
+    // all. So the fill is taken only when it is a fill, else the stationary
+    // route serves the junction as it always has.
+    constexpr double kMaxFillDeviationBits = 0.15;
+    Result f = Cut(landing, /*fill_junction=*/true);
+    if (f.band_deviation_bits <= kMaxFillDeviationBits) {
+      f.landing = landing;
+      f.ladder_landing = landing;
+      f.slack = 0;
+      return f;
+    }
   }
-  Result r = Cut(ladder, fill);
+  int ladder = landing;
+  while (!IsClean(ladder)) ladder++;
+  Result r = Cut(ladder, /*fill_junction=*/false);
   r.landing = landing;
   r.ladder_landing = ladder;
   r.slack = ladder - landing;
