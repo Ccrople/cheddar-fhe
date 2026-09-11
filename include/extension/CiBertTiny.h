@@ -182,6 +182,36 @@ class CiBertTinyLayer {
   int TopLevel() const;
 
   /**
+   * @brief The attention mask, `valid[b * T + t]` = 1 for a real token of
+   * instance b (0 for [PAD]). Pads are projected, scored and exp'd like
+   * every key -- so the calibration's exp domain covers them -- and their
+   * `y` is zeroed by a per-slot plaintext before the row sum: one wide
+   * level, which `Prepare` reserves, so call this BEFORE `Prepare`. Empty
+   * = no mask (every token real).
+   */
+  void SetMask(const std::vector<uint8_t> &valid);
+
+  /** @brief The pooler + classifier: `tanh(z[CLS] W + b) W_c + b_c`. */
+  struct HeadWeights {
+    const float *pool_w = nullptr;  //!< `[model][model]`
+    const float *cls_w = nullptr;   //!< `[model][classes]`
+    std::vector<double> pool_b, cls_b;
+  };
+  struct HeadCalibration {
+    PolySpec tanh;  //!< the pooler input's CERTIFIED interval (the sphere)
+  };
+  //! `in_absmax`: the stream the head reads (the last layer's LN2 output).
+  void PrepareHead(const HeadWeights &w, const HeadCalibration &c,
+                   double in_absmax);
+  /**
+   * @brief `logits`: `classes` ciphertexts in model units; the answer for
+   * instance b is at token 0 (the [CLS] slot). Every other token's slot is
+   * the same head on that token -- inside the certified interval, so no
+   * escape anywhere. `z` is booted in place.
+   */
+  void Head(std::vector<Ct> &logits, Stream &z, const EvkMap<word> &evk);
+
+  /**
    * @brief A tap on every intermediate: `probe(name, cts, factor)` where
    * `decrypted / factor` is the model-unit quantity `bert_tiny/debug.py`
    * recomputes on the host (its table names the quantity per `name`).
@@ -246,6 +276,21 @@ class CiBertTinyLayer {
   std::vector<double> bq_, bk_, bv_, bo_, bint_, bout_;  //!< folded biases
   std::vector<Pt> shift_pt_;          //!< per head, at l_s
   std::unique_ptr<EvalPoly<word>> exp_poly_, gelu_poly_;
+  // the mask: T per-slot 0/1 plaintexts `M_d[t][b] = valid[b][(t + d) % T]`,
+  // encoded at the level and scale `y` has (rebuilt when those change)
+  std::vector<uint8_t> mask_valid_;
+  bool has_mask_ = false;
+  std::vector<Pt> mask_pt_;
+  int mask_level_ = -1;
+  double mask_scale_ = 0.0;
+  void MaskPlaintexts(const Ct &like);
+  // the head
+  HeadWeights hw_;
+  HeadCalibration hc_;
+  std::vector<double> hpb_, hcb_;     //!< folded pooler / classifier biases
+  std::unique_ptr<EvalPoly<word>> tanh_poly_;
+  double c_head_ = 0.0;               //!< the carry `Head` expects
+  int classes_ = 0;
   mutable Stages stages_;
 };
 

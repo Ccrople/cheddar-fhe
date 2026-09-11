@@ -16,6 +16,16 @@
 // batch with N DISTINCT prompts (cyclically if N < B), each checked against
 // its own row of `h_L{k}.f64` ([N, T, H], reference.py --inputs).
 // Layer L reads layer L-1's ENCRYPTED output: the chain is what is measured.
+//
+// More knobs: `BERT_TINY_MASK=<mask.u8>` ([N, T] bytes, 1 = real token;
+// default: the `mask.u8` beside BERT_TINY_INPUTS if it exists, `none` to
+// ignore it); `BERT_TINY_HEAD=1` runs the pooler + classifier after the last
+// layer and prints every instance's logits and label (checked against
+// `cls_logits.f64` [N, 2] when the reference has it); `BERT_TINY_CALIB`
+// points at the calibration (default `$BERT_TINY_REF/calib.json`), and a
+// reference directory WITHOUT `h_L*.f64` is serve mode: no comparison, just
+// the labels (`BERT_TINY_LABELS_OUT=<file>` writes "instance logit0 logit1
+// label" lines, `BERT_TINY_PRINT_LABELS=1` prints them all).
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -245,10 +255,13 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     std::ifstream f(ad + "/meta.json");
     ASSERT_TRUE(f.good()) << ad + "/meta.json";
     meta = json::parse(f);
-    std::ifstream g(rd + "/calib.json");
-    ASSERT_TRUE(g.good()) << rd + "/calib.json";
+    const std::string cpath = Env("BERT_TINY_CALIB", (rd + "/calib.json").c_str());
+    std::ifstream g(cpath);
+    ASSERT_TRUE(g.good()) << cpath;
     calib = json::parse(g);
   }
+  const bool have_ref = std::ifstream(rd + "/h_L00.f64").good();
+  const bool want_head = EnvInt("BERT_TINY_HEAD", 0) != 0;
   Layer::Config cfg;
   cfg.shape.model = meta["channels"].get<int>();
   cfg.shape.hidden = meta["hidden"].get<int>();
@@ -306,6 +319,54 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     x0 = ReadVec(inputs, static_cast<size_t>(N) * T * H);
   }
   std::cout << "  " << N << " prompt(s) -> " << live << " instance(s)" << std::endl;
+  // The attention mask, if the prompts are padded.
+  {
+    std::string mpath = Env("BERT_TINY_MASK", "");
+    if (mpath.empty() && !inputs.empty()) {
+      const std::string beside = inputs.substr(0, inputs.find_last_of("/\\") + 1) + "mask.u8";
+      if (std::ifstream(beside).good()) mpath = beside;
+    }
+    if (!mpath.empty() && mpath != "none") {
+      std::ifstream f(mpath, std::ios::binary);
+      ASSERT_TRUE(f.good()) << mpath;
+      std::vector<uint8_t> m(static_cast<size_t>(N) * T);
+      f.read(reinterpret_cast<char *>(m.data()), static_cast<std::streamsize>(m.size()));
+      ASSERT_EQ(static_cast<size_t>(f.gcount()), m.size()) << mpath;
+      std::vector<uint8_t> valid(static_cast<size_t>(layout.num_instances) * T, 1);
+      int shortest = T;
+      for (int b = 0; b < layout.num_instances; b++) {
+        const size_t n = static_cast<size_t>(b % N);
+        int real = 0;
+        for (int t = 0; t < T; t++) {
+          valid[static_cast<size_t>(b) * T + t] = m[n * T + t];
+          real += m[n * T + t] != 0;
+        }
+        shortest = std::min(shortest, real);
+      }
+      layer.SetMask(valid);
+      std::cout << "  mask " << mpath << ": shortest prompt " << shortest
+                << " real tokens of " << T << std::endl;
+    }
+  }
+  // The head's tensors.
+  cheddar::DeviceVector<float> pool_w, cls_w;
+  Layer::HeadWeights hw;
+  Layer::HeadCalibration hc;
+  const int last = num_layers - 1;
+  if (want_head) {
+    ASSERT_TRUE(calib.contains("head") && !calib["head"].is_null())
+        << "the calibration has no head section (sim.py on an export with head/)";
+    std::vector<float> f;
+    ASSERT_TRUE(ReadF32(ad + "/head/pool_w.f32", static_cast<size_t>(H) * H, f));
+    ToDevice(pool_w, f);
+    hw.pool_b = ReadVec(ad + "/head/pool_b.f32", H);
+    hw.cls_b = ReadVec(ad + "/head/cls_b.f32", 2);
+    ASSERT_TRUE(ReadF32(ad + "/head/cls_w.f32", static_cast<size_t>(H) * 2, f));
+    ToDevice(cls_w, f);
+    hw.pool_w = pool_w.data();
+    hw.cls_w = cls_w.data();
+    hc.tanh = Spec(calib["head"]["tanh"]);
+  }
   std::vector<LayerFiles> files(num_layers);
   for (int L = 0; L < num_layers; L++) {
     char d[8];
@@ -361,13 +422,16 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     if (L > 0) layer.Prepare(files[L].w, ReadCalib(calib["layers"][L]));
     Layer::Stream out;
     layer.Layer(out, in, evk);
-    std::vector<double> got, want;
-    DecryptAll(boot, layout, out.cts, H, live, out.carry, got);
-    char name[16];
-    std::snprintf(name, sizeof name, "/h_L%02d.f64", L);
-    ASSERT_TRUE(ReadF64(rd + name, static_cast<size_t>(N) * T * H, want)) << rd + name;
-    const Err e = Compare(got, want, N, live, T, H);
     const auto &s = layer.GetStages();
+    Err e;
+    if (have_ref) {
+      std::vector<double> got, want;
+      DecryptAll(boot, layout, out.cts, H, live, out.carry, got);
+      char name[16];
+      std::snprintf(name, sizeof name, "/h_L%02d.f64", L);
+      ASSERT_TRUE(ReadF64(rd + name, static_cast<size_t>(N) * T * H, want)) << rd + name;
+      e = Compare(got, want, N, live, T, H);
+    }
     std::cout << "LAYER " << L << ": rms 2^" << std::fixed << std::setprecision(2)
               << -Bits(e.rms_rel) << " (worst instance 2^" << -Bits(e.worst_instance)
               << ", max |err| " << std::setprecision(4) << e.max_abs << ")  "
@@ -381,9 +445,77 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     worst = std::max(worst, e.rms_rel);
     in = std::move(out);
   }
-  std::cout << "CHAIN worst rms 2^" << std::setprecision(2) << -Bits(worst)
-            << " over " << num_layers << " layer(s), " << live << " instance(s)"
-            << std::endl;
-  EXPECT_LT(worst, std::ldexp(1.0, -3));
+  if (have_ref) {
+    std::cout << "CHAIN worst rms 2^" << std::setprecision(2) << -Bits(worst)
+              << " over " << num_layers << " layer(s), " << live << " instance(s)"
+              << std::endl;
+    EXPECT_LT(worst, std::ldexp(1.0, -3));
+  }
+
+  // The head: the pooler + classifier on the last layer's output, the
+  // answer of instance b at its [CLS] slot (token 0).
+  if (want_head) {
+    layer.PrepareHead(hw, hc, calib["layers"][last]["ln2"]["out_absmax"].get<double>());
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<Ciphertext<word>> logits;
+    layer.Head(logits, in, evk);
+    cudaDeviceSynchronize();
+    const double head_s = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - t0).count();
+    const int C = static_cast<int>(logits.size());
+    std::vector<double> got;
+    DecryptAll(boot, layout, logits, C, live, 1.0, got);  // [b][t][c]
+    std::vector<double> want;
+    const bool have_logits =
+        ReadF64(rd + "/cls_logits.f64", static_cast<size_t>(N) * C, want);
+    std::ofstream lab_out;
+    const std::string lab_path = Env("BERT_TINY_LABELS_OUT", "");
+    if (!lab_path.empty()) lab_out.open(lab_path);
+    const bool print_all = EnvInt("BERT_TINY_PRINT_LABELS", 0) != 0;
+    int agree = 0;
+    double se = 0.0, sr = 0.0;
+    for (int b = 0; b < live; b++) {
+      const size_t n = static_cast<size_t>(b % N);
+      int lab = 0, ref_lab = -1;
+      for (int c = 1; c < C; c++) {
+        if (got[(static_cast<size_t>(b) * T) * C + c] > got[(static_cast<size_t>(b) * T) * C + lab]) lab = c;
+      }
+      if (have_logits) {
+        ref_lab = 0;
+        for (int c = 0; c < C; c++) {
+          const double g = got[(static_cast<size_t>(b) * T) * C + c], w = want[n * C + c];
+          se += (g - w) * (g - w);
+          sr += w * w;
+          if (w > want[n * C + ref_lab]) ref_lab = c;
+        }
+        agree += (lab == ref_lab);
+      }
+      if (b < N && (print_all || b < 8)) {
+        std::cout << "  prompt " << b << ": logits";
+        for (int c = 0; c < C; c++) {
+          std::cout << " " << std::setprecision(4) << got[(static_cast<size_t>(b) * T) * C + c];
+        }
+        std::cout << " -> label " << lab;
+        if (have_logits) {
+          std::cout << " (float64";
+          for (int c = 0; c < C; c++) std::cout << " " << want[n * C + c];
+          std::cout << " -> " << ref_lab << ")";
+        }
+        std::cout << std::endl;
+      }
+      if (lab_out.is_open() && b < N) {
+        lab_out << b;
+        for (int c = 0; c < C; c++) lab_out << " " << got[(static_cast<size_t>(b) * T) * C + c];
+        lab_out << " " << lab << "\n";
+      }
+    }
+    std::cout << "HEAD: " << head_s << " s";
+    if (have_logits) {
+      std::cout << ", logits rms 2^" << std::setprecision(2) << -Bits(std::sqrt(se / sr))
+                << ", labels agree " << agree << " / " << live;
+      EXPECT_GE(agree, live - live / 50);
+    }
+    std::cout << std::endl;
+  }
 #endif
 }

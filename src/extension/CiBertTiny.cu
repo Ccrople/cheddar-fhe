@@ -248,9 +248,10 @@ void CiBertTinyLayer<word>::Prepare(const Weights &w, const Calibration &c) {
 
   // ---- the level plan (see the header) ----------------------------------
   exp_levels_ = Levels(c.exp.degree);
-  l_s_ = exp_levels_ + (c.niter == 1 ? 6 : 2);
+  const int mask_levels = has_mask_ ? 1 : 0;
+  l_s_ = exp_levels_ + (c.niter == 1 ? 6 : 2) + mask_levels;
   {
-    int y = l_s_ - exp_levels_;
+    int y = l_s_ - exp_levels_ - mask_levels;
     for (int j = 0; j < c.niter; j++) {
       const int lv = Levels(c.inv[j].degree);
       const int sq = y - 1;
@@ -332,8 +333,109 @@ void CiBertTinyLayer<word>::Prepare(const Weights &w, const Calibration &c) {
               << l_v_in_ << ", o in " << l_o_in_ << ", GELU deg "
               << c.gelu.degree << ", Cho k " << c.niter << ", BSGS " << baby_
               << " x " << giant_ << ", carries in " << c_in << " h " << c_h
-              << std::endl;
+              << (has_mask_ ? ", masked" : "") << std::endl;
   }
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::SetMask(const std::vector<uint8_t> &valid) {
+  const size_t n = static_cast<size_t>(layout_.num_instances) * cfg_.shape.tokens;
+  AssertTrue(valid.empty() || valid.size() == n,
+             "CiBertTinyLayer::SetMask: valid is [instances][tokens]");
+  mask_valid_ = valid;
+  has_mask_ = !valid.empty();
+  mask_pt_.clear();
+  mask_level_ = -1;
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::MaskPlaintexts(const Ct &like) {
+  const int T = cfg_.shape.tokens, B = layout_.num_instances;
+  const int level = Level(like);
+  const double scale = like.GetScale();
+  if (mask_level_ == level && std::abs(mask_scale_ - scale) <= 1e-9 * scale &&
+      static_cast<int>(mask_pt_.size()) == T) {
+    return;
+  }
+  mask_pt_.clear();
+  mask_pt_.resize(T);
+  std::vector<double> values(static_cast<size_t>(B) * T);
+  std::vector<Complex> msg;
+  for (int d = 0; d < T; d++) {
+    for (int b = 0; b < B; b++) {
+      for (int t = 0; t < T; t++) {
+        values[static_cast<size_t>(b) * T + t] =
+            mask_valid_[static_cast<size_t>(b) * T + (t + d) % T] ? 1.0 : 0.0;
+      }
+    }
+    layout_.Pack(msg, values);
+    boot_->gpu_encoder_.Encode(mask_pt_[d], level, scale, msg);
+  }
+  mask_level_ = level;
+  mask_scale_ = scale;
+}
+
+// ------------------------------------------------------------------ head
+template <typename word>
+void CiBertTinyLayer<word>::PrepareHead(const HeadWeights &w,
+                                        const HeadCalibration &c,
+                                        double in_absmax) {
+  const int H = cfg_.shape.model;
+  AssertTrue(w.pool_w != nullptr && w.cls_w != nullptr,
+             "CiBertTinyLayer::PrepareHead: two tensors");
+  AssertTrue(static_cast<int>(w.pool_b.size()) == H && !w.cls_b.empty(),
+             "CiBertTinyLayer::PrepareHead: the biases' widths");
+  hw_ = w;
+  hc_ = c;
+  classes_ = static_cast<int>(w.cls_b.size());
+  c_head_ = cfg_.ride / in_absmax;
+  const int top = TopLevel();
+  const Parameter<word> &param = boot_->param_;
+  // t = (z W + b - b_t) / a_t rides the pooler's weight; tanh(a_t t + b_t)
+  const double a_t = 0.5 * (c.tanh.hi - c.tanh.lo), b_t = 0.5 * (c.tanh.hi + c.tanh.lo);
+  proj_->Prepare("pool", w.pool_w, H, H, top, 1.0 / (a_t * c_head_));
+  hpb_.resize(H);
+  for (int i = 0; i < H; i++) hpb_[i] = (w.pool_b[i] - b_t) / a_t;
+  int landing = 0;
+  tanh_poly_ = Compile([a_t, b_t](double t) { return std::tanh(a_t * t + b_t); },
+                       c.tanh.degree, top - 1, param.GetScale(top - 1), &landing);
+  proj_->Prepare("cls", w.cls_w, H, classes_, landing, 1.0);
+  hcb_ = w.cls_b;
+  if (cfg_.verbose) {
+    std::cout << "  [bert-tiny] head: pooler at " << top << " -> " << top - 1
+              << ", tanh deg " << c.tanh.degree << " on [" << c.tanh.lo << ", "
+              << c.tanh.hi << "] -> " << landing << ", classifier -> "
+              << landing - 1 << ", " << classes_ << " classes" << std::endl;
+  }
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::Head(std::vector<Ct> &logits, Stream &z,
+                                 const EvkMap<word> &evk) {
+  NvtxScope _nv("bert-tiny: head");
+  const int H = cfg_.shape.model;
+  const auto &mult_key = evk.GetMultiplicationKey();
+  AssertTrue(tanh_poly_ != nullptr, "CiBertTinyLayer::Head: PrepareHead first");
+  AssertTrue(static_cast<int>(z.cts.size()) == H, "Head: model channels");
+  AssertTrue(std::abs(z.carry - c_head_) <= 1e-9 * c_head_,
+             "CiBertTinyLayer::Head: the stream's carry is not the head's "
+             "(ride / the last LN2's out_absmax)");
+  auto t0 = Clock::now();
+  Lift(z, TopLevel(), evk);
+  std::vector<Ct> u;
+  proj_->Project(u, z.cts, "pool");
+  for (int i = 0; i < H; i++) AddScalar(u[i], u[i], hpb_[i]);
+  Tap("t_tanh", u, 1.0);
+  std::vector<Ct> p(H);
+  for (int i = 0; i < H; i++) {
+    tanh_poly_->Evaluate(boot_, p[i], u[i], mult_key);
+    u[i] = Ct();
+  }
+  Tap("pooled", p, 1.0);
+  proj_->Project(logits, p, "cls");
+  for (int c = 0; c < classes_; c++) AddScalar(logits[c], logits[c], hcb_[c]);
+  Tap("logits", logits, 1.0);
+  stages_.o += Since(t0);
 }
 
 // ---------------------------------------------------- diagonal products
@@ -449,6 +551,16 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
     S[d] = Ct();
   }
   if (head == 0) Tap("y", y, 1.0);
+  if (has_mask_) {
+    // pads out of the row: y_d <- y_d (.) M_d, one wide level
+    MaskPlaintexts(y[0]);
+    for (int d = 0; d < T; d++) {
+      Ct t;
+      boot_->Mult(t, y[d], mask_pt_[d]);
+      boot_->Rescale(y[d], t);
+    }
+    if (head == 0) Tap("y_masked", y, 1.0);
+  }
   for (int j = 0; j < k; j++) {
     // sq = sum_d y_d^2: one relinearization
     Ct acc;
