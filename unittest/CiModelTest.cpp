@@ -672,6 +672,11 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // so ten bits are made between them -- and `SlotToCoeff` is seven hoisted
   // key-switch layers standing right there.
   lcfg.keep_norm_slots = EnvInt("CHEDDAR_CI_NORM_SLOTS", 0) != 0;
+  // The SiLU's degree, forced. `SiLuDegree` stops at 63, which is right for a
+  // statistical interval and wrong for a CERTIFIED one: a certified band plan
+  // prices at 2^-7.7 worst-layer at 63 and 2^-12.0 at 127 (`silu_plan.py`),
+  // so testing the plan at all needs the degree to be a knob. 0 = derived.
+  lcfg.silu_degree = EnvInt("CHEDDAR_CI_SILU_DEG", 0);
   lcfg.verbose = true;
   // `stream_scale` is derived below from the reference, but the layer needs
   // the ciphertext's epsilon at construction, so it is computed here.
@@ -1218,6 +1223,52 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     cal.alpha = cj["alpha"].get<double>();
     cal.norm_window = cj["norm_window"].get<double>();
     cal.silu_range = cj["silu_range"].get<double>();
+    // THE CERTIFIED BANDED SiLU (`Calibration::silu_bands`). The library has
+    // taken it since the band plan went in, and `gen_b1_pop.py SILU_BANDS=n`
+    // has written it -- and until this line nothing read it, so no run could
+    // switch it on. A plan is a property of the WEIGHTS alone (the sphere
+    // bound), so `silu_band_inject.py` adds one to ANY calib.json, including
+    // the oracle's. Absent, the single interval runs unchanged;
+    // `CHEDDAR_CI_SILU_BANDS=0` ignores a plan that is present, which is the
+    // A/B on one calibration file.
+    if (cj.contains("silu_bands") && EnvInt("CHEDDAR_CI_SILU_BANDS", 1) != 0) {
+      cal.silu_bands = cj["silu_bands"].get<std::vector<double>>();
+      cal.silu_band_of_channel =
+          cj["silu_band_of_channel"].get<std::vector<int>>();
+      ASSERT_EQ(static_cast<int>(cal.silu_band_of_channel.size()), kI)
+          << "layer " << L << ": a band plan names every LIVE hidden channel";
+      if (L == first_layer) {
+        std::cout << "SILU: " << cal.silu_bands.size()
+                  << " certified bands, tops";
+        for (double r : cal.silu_bands) std::cout << " " << r;
+        std::cout << std::endl;
+      }
+    }
+    // [SYLPH] 3.1.1's prefix AT THE SiLU (`Calibration::silu_sink`): the sink
+    // rows reach the polynomial scaled into the USER interval and the public
+    // difference is added back. `silu_sink_inject.py` (the oracle) and
+    // `gen_b1_pop.py SILU_SINK=1` (the population) write it: `silu_sink` per
+    // sink token, `silu_range` then the user rows' range, and
+    // `silu_restore_L<NN>.f64` beside calib.json. `CHEDDAR_CI_SILU_SINK=0`
+    // ignores a plan that is present.
+    if (cj.contains("silu_sink") && EnvInt("CHEDDAR_CI_SILU_SINK", 1) != 0) {
+      const auto v = cj["silu_sink"].get<std::vector<double>>();
+      ASSERT_GT(v.size(), 0u);
+      ASSERT_LE(static_cast<int>(v.size()), kT);
+      cal.silu_sink.assign(kT, 1.0);
+      for (size_t t = 0; t < v.size(); t++) cal.silu_sink[t] = v[t];
+      cal.silu_restore_rows = static_cast<int>(v.size());
+      const std::string rf = rdir + "/silu_restore_L" + (L < 10 ? "0" : "") +
+                             std::to_string(L) + ".f64";
+      ASSERT_TRUE(ReadF64(rf, v.size() * static_cast<size_t>(kI),
+                          cal.silu_restore))
+          << "silu_sink is set but " << rf << " cannot be read";
+      if (L == first_layer) {
+        std::cout << "SILU SINK: range " << cal.silu_range << ", factors";
+        for (double f : v) std::cout << " " << f;
+        std::cout << std::endl;
+      }
+    }
     cal.stream_scale = stream_scale;
     // [SYLPH] 3.1.1, at BOTH norms. Without it a 32-layer run dies at layer 1:
     // the sink rows leave layer 1 at 74327x the user rows' mean square and the
@@ -2440,6 +2491,26 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
               << std::log2(err / absmax) << ", rms 2^"
               << 0.5 * std::log2(qerr / den) << "), carried " << fit
               << std::endl;
+    // THE SINK ROWS TOO, against their own magnitude. The closing number is
+    // on the user rows, so anything that lands only on the sink rows -- a
+    // `silu_restore` at the wrong address, say -- is invisible in a one-layer
+    // run and surfaces a layer later through their K and V.
+    {
+      double serr = 0.0, sabs = 0.0;
+      for (int m = 0; m < kH; m++) {
+        const int k = m / kPerModel;
+        const int c = ModelSlot(m) - k * kRank;
+        for (int t = 0; t < kSinkTokens; t++) {
+          const double want = ref[static_cast<size_t>(t) * kH + m];
+          serr = std::max(serr, std::abs(got[k][Rev(c, 9)][Pos(t)] / fit -
+                                         want));
+          sabs = std::max(sabs, std::abs(want));
+        }
+      }
+      std::cout << "LAYER " << L << " SINK ROWS: " << serr << " against |h| <= "
+                << sabs << " (relative 2^" << std::log2(serr / sabs) << ")"
+                << std::endl;
+    }
     EXPECT_LT(err / absmax, 0.25)
         << "layer " << L << " disagrees with the same layer in double by more "
         << "than the circuit can explain";

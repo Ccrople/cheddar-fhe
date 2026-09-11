@@ -294,6 +294,35 @@ class CiLlamaLayer {
     //! `cosh(63 arccosh v)`, not a small error.
     std::vector<double> silu_bands;
     std::vector<int> silu_band_of_channel;
+
+    //! [SYLPH] 3.1.1's prefix AT THE SiLU: the sink rows never reach the
+    //! encrypted non-linearity.
+    //!
+    //! The paper injects its prefix as a static KV cache, so the prefix rows
+    //! are public and only their K and V meet the ciphertext. This tree puts
+    //! them in the ciphertext, and they set the SiLU's range at four layers:
+    //! measured over the rows each layer's SiLU sees, all rows -> user rows is
+    //! L0 4.11 -> 2.60, L1 15.25 -> 4.05, L29 14.53 -> 9.51, L30 18.23 ->
+    //! 10.56 (`sylph_prefix.py`). The rows are prompt INDEPENDENT (causal
+    //! masking: row `t` sees keys `0..t`), so their gate values are public
+    //! constants and the SiLU does not have to evaluate them at all.
+    //!
+    //! `silu_sink` is one factor per token, 1.0 at the user rows: it rides the
+    //! gate's own `Canonicalise` multiply (a per-token plaintext, the
+    //! `up_sink` shape), so a sink row reaches the polynomial scaled into the
+    //! USER interval. `silu_restore` is the public per-(token, channel)
+    //! difference `SiLU(g) - SiLU(g s)` at the sink rows, `[rows x live
+    //! hidden]` in token order, added to the SiLU's output as a plaintext.
+    //! The identity is exact at every row and costs no level: one plaintext
+    //! multiply already paid, one plaintext add. `silu_range` must then be
+    //! the USER rows' range. Both empty = off, unchanged operation for
+    //! operation. Module basis only: the per-(token, channel) shape on the
+    //! banded convention needs `CrossingPlaintext`'s duplicate handling.
+    std::vector<double> silu_sink;
+    std::vector<double> silu_restore;
+    //! How many leading tokens `silu_restore` covers (its rows); the live
+    //! hidden width is `silu_restore.size() / silu_restore_rows`.
+    int silu_restore_rows = 0;
   };
 
   /**
@@ -585,6 +614,10 @@ class CiLlamaLayer {
   //! comment records a bug for.
   Plaintext<word> SiluBandPlaintext(int ct, int band, const Calibration &c,
                                     double factor, double at_scale) const;
+  //! `Calibration::silu_restore` for hidden ciphertext `ct`, at the level and
+  //! scale of the SiLU output it is added to. Zero at every user row.
+  Plaintext<word> SiluRestorePlaintext(int ct, const Calibration &c,
+                                       int level, double scale) const;
   void Canonicalise(Ct &ct, const Plaintext<word> &pt) const;
 
   std::shared_ptr<const BootContext<word>> boot_;

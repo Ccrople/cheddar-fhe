@@ -457,6 +457,16 @@ Plaintext<word> CiLlamaLayer<word>::SiluBandPlaintext(
     for (int t = 0; t < cfg_.num_tokens && base + t < num_slots_; t++) {
       vals[base + t] = Complex(factor, 0.0);
     }
+    // The sink factor, when both plans are on: per TOKEN, at the token's own
+    // address `rev(t)` in the block (module basis -- asserted by the caller).
+    if (!c.silu_sink.empty()) {
+      const int log_t = Log2Ceil(cfg_.num_tokens);
+      for (int t = 0; t < cfg_.num_tokens; t++) {
+        if (c.silu_sink[t] == 1.0) continue;
+        const int pos = base + static_cast<int>(BitReverseInt(t, log_t));
+        if (pos < num_slots_) vals[pos] = Complex(factor * c.silu_sink[t], 0.0);
+      }
+    }
   }
   Plaintext<word> pt;
   boot_->encoder_.Encode(pt, slot_level_,
@@ -464,6 +474,43 @@ Plaintext<word> CiLlamaLayer<word>::SiluBandPlaintext(
                              boot_->param_.GetRescalePrimeProd(slot_level_) /
                              at_scale,
                          vals);
+  return pt;
+}
+
+template <typename word>
+Plaintext<word> CiLlamaLayer<word>::SiluRestorePlaintext(
+    int ct, const Calibration &c, int level, double scale) const {
+  AssertTrue(cfg_.module_basis,
+             "CiLlamaLayer: silu_restore is a per-(token, channel) plaintext "
+             "and is written for the module basis only");
+  const int rank = cfg_.proj_rank;
+  const int rows = c.silu_restore_rows;
+  AssertTrue(rows > 0 && rows <= cfg_.num_tokens &&
+                 static_cast<int>(c.silu_restore.size()) % rows == 0,
+             "CiLlamaLayer: silu_restore is not [silu_restore_rows x live]");
+  const int live = static_cast<int>(c.silu_restore.size()) / rows;
+  std::vector<int> of_declared;
+  HiddenMap(of_declared, cfg_.hidden_declared, rank, live, 1);
+  const int log_t = Log2Ceil(cfg_.num_tokens);
+  std::vector<Complex> vals(num_slots_, Complex(0.0, 0.0));
+  for (int local = 0; local < rank; local++) {
+    const int declared = ct * rank + local;
+    if (declared >= cfg_.hidden_declared) break;
+    const int j = of_declared[declared];
+    if (j < 0) continue;
+    const int base = local * cfg_.num_tokens;
+    for (int t = 0; t < rows; t++) {
+      const int pos = base + static_cast<int>(BitReverseInt(t, log_t));
+      if (pos < num_slots_) {
+        vals[pos] = Complex(c.silu_restore[static_cast<size_t>(t) * live + j],
+                            0.0);
+      }
+    }
+  }
+  // On the device: this is 28 encodes a layer, and the host encoder is the
+  // 1.7 s hole Doing.md 3.25 removed from `PrepareSoftMax`.
+  Plaintext<word> pt;
+  boot_->gpu_encoder_.Encode(pt, level, scale, vals);
   return pt;
 }
 
@@ -841,6 +888,18 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
           boot_, c.silu_range, op_level_, SiLuDegree(c.silu_range)));
     }
     SiLuHandler<word> &silu = *silus[0];
+    // [SYLPH] 3.1.1's prefix at the SiLU (`Calibration::silu_sink`): the
+    // per-token factor rides the gate's own multiply, the public restore is
+    // one plaintext add after the polynomial. No level either way.
+    const bool sunk = !c.silu_sink.empty();
+    AssertTrue(!sunk || static_cast<int>(c.silu_sink.size()) == cfg_.num_tokens,
+               "CiLlamaLayer: silu_sink needs one factor per token");
+    AssertTrue(!sunk || !banded || cfg_.module_basis,
+               "CiLlamaLayer: a band plan WITH silu_sink is written for the "
+               "module basis only");
+    AssertTrue(c.silu_restore.empty() || sunk,
+               "CiLlamaLayer: silu_restore without silu_sink");
+    Plaintext<word> sink_pt;
     // The 2 x 28 crossings as groups: the per-ciphertext CtS then batched
     // EvalMods, instead of 56 serial launch-bound reductions.
     std::vector<Ct> g_ups, u_ups;
@@ -860,9 +919,18 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       // `crossing_`, NOT a fit taken on the residual: these carry no O factor.
       // And `kappa_` beside it, which is the same mistake one turn further out
       // -- see the class comment.
-      if (!banded) {
+      if (!banded && !sunk) {
         Canonicalise(g_up,
                      1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range));
+      } else if (!banded) {
+        // The SAME multiply, per token: a sink row arrives scaled into the
+        // user interval. One pattern for every hidden ciphertext.
+        if (i == 0) {
+          sink_pt = CrossingPlaintext(
+              1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range),
+              c.silu_sink, g_up.GetScale());
+        }
+        Canonicalise(g_up, sink_pt);
       }
       if (c.up_sink.empty()) {
         Canonicalise(u_up, 1.0 / (kappa_ * crossing_ * c.gate_scale));
@@ -895,6 +963,13 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
             boot_->Add(sv, sv, sv_b);
           }
         }
+      }
+      if (!c.silu_restore.empty()) {
+        // `SiLU(g) - SiLU(g s)` at the sink rows, zero at the user rows: the
+        // identity that makes the scaled sink rows exact again.
+        const Plaintext<word> r = SiluRestorePlaintext(
+            i, c, p.NPToLevel(sv.GetNP()), sv.GetScale());
+        boot_->Add(sv, sv, r);
       }
       boot_->LevelDown(u_low, u_up, p.NPToLevel(sv.GetNP()));
       boot_->HMult(prod[i], sv, u_low, evk.GetMultiplicationKey());

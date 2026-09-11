@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 
@@ -75,9 +77,23 @@ class Random {
   }
 
  private:
+  // `CHEDDAR_RNG_SEED` FIXES the draw -- the secret, every error term, every
+  // sampled message. CKKS arithmetic is exact integer arithmetic, so two runs
+  // with one seed are bit-identical up to the first operation in which they
+  // differ, and an A/B on one knob then measures the knob instead of the knob
+  // plus a second secret (the model test's run-to-run spread is ~0.3 bits,
+  // larger than some of what it is asked to resolve). Unset, the generator is
+  // seeded from the device exactly as before.
+  static std::uint64_t InitialSeed() {
+    if (const char *e = std::getenv("CHEDDAR_RNG_SEED")) {
+      std::cerr << "cheddar::Random: CHEDDAR_RNG_SEED=" << e
+                << " -- a FIXED draw, for A/B testing only" << std::endl;
+      return std::strtoull(e, nullptr, 10);
+    }
+    return rd_();
+  }
   static inline std::random_device rd_{};
-  static inline std::mt19937_64 gen_{rd_()};
-  // static inline std::mt19937_64 gen_{0};
+  static inline std::mt19937_64 gen_{InitialSeed()};
 };
 
 }  // namespace cheddar

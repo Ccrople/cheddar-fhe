@@ -46,7 +46,7 @@ implemented and verified on the host, the encrypted half awaits a GPU ·
 | 3.2 | four prefill operations, formats per table 4 | YES | `CiLlamaLayer` + `CiSinCAttention` + `CiLlamaSeam` |
 | 3.2 | packing layout, token index fastest, head next | YES | `AttentionPacking`, `CiSwitchedCcmmLayout` |
 | 3.3 | **ring switching in SinC encoding** | YES | `CiSinCBasis`, `ci_sinc_basis_test` |
-| **3.4** | **slim polynomial evaluation — lemma 1, eq. (2), eq. (3), Algorithm 1, theorem 1, appendix D** | **HOST** | **`SlimPolyMath.h` + `SlimPoly.h`, new on this branch — see below** |
+| **3.4** | **slim polynomial evaluation — lemma 1, eq. (2), eq. (3), Algorithm 1, theorem 1, appendix D** | **YES (A100)** | **`SlimPolyMath.h` + `SlimPoly.h`, new on this branch — see below.** On a card 2026-09-11: `SlimAlgorithmOne` degree 16 at `j = 4` agrees with its own plan to 2.0e-04, `SlimAppendixDFold` folds 5 levels to 4 at 1.5e-04 |
 | 3.5 | end-to-end latency | n/a | a measurement, not an algorithm |
 
 ## 3. Section 4 — long heterogeneous prompts
@@ -55,7 +55,7 @@ implemented and verified on the host, the encrypted half awaits a GPU ·
 |---|---|---|---|
 | 4.1 | public prefill in the clear, private prefill on the encrypted tail | YES | `PublicPrefill`, `CiPcAttention` |
 | 4.1 | PC-attention and CC-attention split | YES | `CiPcAttention` / `CiSinCAttention` |
-| **4.2** | **eq. (5): depth-one PCMM, `tau^(l+1)(B) -> tau^l(C)`, BSGS, `O(sqrt d)` rotations** | **HOST** | **`SylphPcmmMath.h` + `SylphPcmm.h`, new on this branch** |
+| **4.2** | **eq. (5): depth-one PCMM, `tau^(l+1)(B) -> tau^l(C)`, BSGS, `O(sqrt d)` rotations** | **YES (A100)** | **`SylphPcmmMath.h` + `SylphPcmm.h`, new on this branch.** On a card: 3.5e-06 = 17.97 bits at `d = 32`, 10 rotations, ONE level -- after the first run's 0.999 relative error found the layout contract: the matrix must be TILED with period `d^2` when `d^2` is less than the slot count (`SylphPcmm::Apply`) |
 | 4.2 | `pt_{A,i,j,l}` rebuilt at runtime from one stored `tau^l sigma(A)` | HOST | `sylph_pcmm::PlaintextFor`, the `cache_plaintexts` argument |
 | 4.2 | `tau^2` applied once, right after RoPE | HOST | `sylph_pcmm::TauPermutation` + `SlotPermute`; one level, and **64 diagonals at `d = 128`, measured** -- an even power halves the orbit of `n j mod d`, so the one the paper applies is the cheapest |
 | **4.3** | **SoftMax on `tau(M)` is `tau(SoftMax(M))`** | **HOST** | verified as an identity in `SylphPcmmTest.SoftMaxSeesColumnsOfTau` |
@@ -358,8 +358,7 @@ Seven prefixes, 4 held-out prompts, ranges over user rows:
 |---|---|---|---|
 | `[BOS, .]` | 0.9126 | **27.47** | 80.92 |
 | `[BOS]` | 0.9126 | 27.59 | 80.91 |
-| `[BOS, 
-]` | 0.9136 | 27.79 | 80.88 |
+| `[BOS, \n]` | 0.9136 | 27.79 | 80.88 |
 | `[BOS x 2]` (shipped) | 0.9326 | 29.44 | 78.29 |
 | `[BOS x 2]` + rescale | 0.9342 | 29.51 | 78.23 |
 | `[BOS x 4]` | 0.9483 | 28.95 | 75.32 |
@@ -380,6 +379,78 @@ newline) changes nothing either.
 So: length, token and absorption all fail to move layer 31, on a quantity that
 needs a factor of three. The prefix axis is closed.
 
+### The prefix search on a GPU: sixty prefixes, 528 prompts, a held-out split
+
+2026-09-11, on an A100. `sylph_prefix_gpu.py` is the port: the model resident
+on the card, per-PROMPT maxima recorded, and it agrees with `sylph_prefix.py`
+to **3.3e-06 on every quantity at every layer** (fp32 accumulation order).
+1.2 s a variant at 4 prompts where numpy took ~9 min; 27 s at 528 prompts in
+TF32, which moves no recorded quantity by more than 8.3e-04.
+`prefix_heldout.py` sets every interval on 11 of 22 Gutenberg books (264
+prompts, `gutenberg_ids.py`: evenly spread windows, rows interleaved by book,
+no BOS in the ids) and serves the OTHER 11 -- different documents, which is
+the question a statistical calibration has to answer. Everything is in
+`reference/audit/2026-09-11_prefix_gpu/`.
+
+**The sink rows are prompt independent, bit for bit, at all 32 layers.**
+`SINKCHECK=1` runs one prefix over two disjoint prompt sets and compares the
+sink rows' gate: relative difference **0.000** for `[BOS]`, `[BOS x 2]`,
+`[A]` and `[BOS, A]`. This is the fact the static KV cache rests on, and it
+had only ever been checked on layer 0. (The host emulation's per-token
+rescale moves them by 1.7e-03, because it reads its target off the batch's
+user rows; the crypto's factors are calibration constants.)
+
+**BOS at position 0 is not optional.** Every prefix that starts with BOS
+leaves the user rows' attention-norm window at ~11; every prefix that does
+not puts it between 1,065 and 538,947:
+
+| prefix | L1 SiLU (user) | attn-norm window (user) | L31 SiLU (user) | L31 span |
+|---|---|---|---|---|
+| `[BOS x 2]` (shipped) | 5.82 | 11.3 | 40.90 | 84.55 |
+| `[BOS] + "Text:"` (best BOS-first at L31) | 5.75 | 11.1 | 38.48 | 87.18 |
+| `[BOS x 8]` | 4.86 | 20.8 | 42.46 | 80.60 |
+| `["A"]` | 20.99 | 121,574 | 57.05 | 87.31 |
+| `["\n"]` | 16.35 | 284,958 | 105.64 | 87.66 |
+| `["A" x 8]` | 23.26 | 1,077 | 31.44 | 87.80 |
+| none | 21.67 | 538,947 | 38.97 | 90.52 |
+
+Without BOS the model builds its attention sink on a USER token, at a
+position that depends on the prompt, so no public per-token factor can take
+it out -- and the invsqrt window the ciphertext would see goes from 11 to
+four to five orders of magnitude more. Every single token tried (`A`, `The`, ` the`, `.`, `,`, `\n`,
+`:`, `=`, ` `, `0`, `I`, `a`, `#`, `!`, `?`, `-`, `*`, `|`, `"`, `(`, `<`,
+`...`, `Hello`, and five Llama-3 special tokens) does this. `["A" x 8]`'s
+31.44 at layer 31 looks like the best number in the study and is not: its
+norm window is 1,077 and its layer 1 is 23.
+
+**Among BOS-first prefixes nothing moves layer 31.** Twenty-one of the
+twenty-two span 38.5 to 42.5 there (`[BOS x 4]` 47.5 the one outlier), and two disjoint
+halves of ONE prefix's prompts already differ by 7 % (`[BOS x 2]`: 40.90 on
+the calibration books, 38.3 on the served ones). The spread is the sampling
+noise of a maximum. The SoftMax span is the quantity a prefix does move,
+monotonically with absorption as before: `[BOS x 8]` 80.6 < `[BOS x 4]` 82.4
+< `[BOS x 2]` 84.6 < non-BOS ~87-88 < none 90.5 -- and the longer BOS runs
+pay for it in the norm window (20.8 at x 8).
+
+**And the static-KV accounting survives the held-out test.** Over the rows a
+static KV cache leaves the ciphertext, the SiLU's calibrated range at
+`[BOS x 2]`, with the served books' escapes past `1.2 x` it:
+
+| L | all rows | user rows | served escapes |
+|---|---|---|---|
+| 0 | 3.93 | 3.46 | 0 |
+| 1 | 15.59 | **5.82** | 0 |
+| 29 | 14.55 | 12.63 | 0 |
+| 30 | 18.24 | 12.27 | 0 |
+| 31 | 40.90 | 40.90 | 0 |
+
+The four-prompt study's layer 1 (15.25 -> 4.05) was the right shape; on 264
+calibration prompts it is 15.59 -> 5.82, and no prompt from another book leaves
+the user interval there. The statistical interval does still escape
+elsewhere -- 3 of 8,448 served prompt-layers at `[BOS x 2]`, one of them at
+1.86x its calibration maximum (layer 10) -- which is the case for the
+certified bands, not against the prefix.
+
 ### What was implemented, and the one thing that was not
 
 `gen_b1_pop.py` gains `SILU_SINK=1`: it measures `gate_absmax_user`, derives a
@@ -390,7 +461,8 @@ channel). The identity `y = (SiLU(g s) + restore) up` is exact at every row,
 add, so it costs no level. It also CHECKS that the sink rows' gate really is
 prompt independent rather than asserting it. Default off.
 
-**The crypto side of that restore is deliberately NOT written.** `s` is a
+**Written 2026-09-11 on the module basis, and exact on the card** -- see "On
+the card" below. What follows is why it waited for one. `s` is a
 per-token factor and `CrossingPlaintext` already handles exactly that shape,
 but `restore` is per (token, CHANNEL), and the half-density banded convention
 places a channel's duplicate one token position BACK from its live copy --
@@ -406,6 +478,70 @@ in the first place. That is [SYLPH]'s static KV cache, it is a small instance
 of the section 4 machinery this branch already has (`CiPcAttention`), and it
 would retire all three of `attn_sink`, `ffn_sink` and `up_sink` together with
 their calibration.
+
+### On the card (2026-09-11, A100-80GB, `ci16_35` + `land13c2e9` + `land17c3e10`)
+
+The oracle calibration (`reference_forward.py`), the recorded module-basis
+fused configuration, one layer per run, every A/B pair on ONE
+`CHEDDAR_RNG_SEED` -- new in `Random.h`, and checked first: the same run twice
+prints the same LAYER line to every digit (2^-6.31746 both times), so a pair's
+difference is its knob and nothing else. Logs in
+`reference/audit/2026-09-11_prefix_gpu/crypto/`.
+
+**The regression holds.** Layer 0 on the defaults: **2^-6.291 / rms 2^-6.457**
+(recorded 2^-6.31 / 2^-6.46). Nothing this branch added moves the default path.
+
+**The sink plan at the SiLU is exact** (`silu_sink_inject.py` over the oracle;
+`Calibration::silu_sink` + `silu_restore`, the restore a per-(token, channel)
+plaintext on the module basis):
+
+| layer | knob | range | user rows | sink rows |
+|---|---|---|---|---|
+| 1 | off | 18.30 | 2^-6.244 / rms 2^-6.356 | 2^-7.07 |
+| 1 | **on** | **4.46** | 2^-6.260 / rms 2^-6.353 | 2^-7.13 |
+| 30 | off | 21.88 | 2^-7.665 / rms 2^-7.476 | 2^-9.58 |
+| 30 | **on** | **12.06** | 2^-7.648 / rms 2^-7.475 | 2^-9.59 |
+
+The sink rows land where they should (a restore at the wrong address would
+show there and nowhere else, which is why the test now prints them), and the
+closing numbers do not move -- because these layers sit on the crypto floor,
+not on the SiLU. What the plan buys the SiLU itself, priced in double with the
+crypto's own polynomials (`sink_silu_sim.py`, the FFN's error alone):
+
+| L | today | sink plan | FFN out |
+|---|---|---|---|
+| 0 | 4.92, deg 31 | 2.53, deg **15** | 2^-22.7 -> 2^-19.0, **one level freed** |
+| 1 | 18.30, deg 63 | 4.46, deg **31** | 2^-10.4 -> **2^-25.6**, **one level freed** |
+| 29 | 17.44, deg 63 | 11.67, deg 63 | 2^-15.9 -> 2^-23.6 |
+| 30 | 21.88, deg 63 | 12.06, deg 63 | 2^-12.3 -> 2^-23.5 |
+| 31 | 22.08, deg 63 | 18.21, deg 63 | 2^-11.8 -> 2^-14.9 |
+
+So [SYLPH]'s prefix, done properly at the SiLU, is 3 to 15 bits on the SiLU and
+a level at two layers, for no level and one plaintext add. It shows in a
+closing number only where the SiLU is the limiter -- the held-out calibration's
+statistical interval, not this oracle.
+
+**The certified bands are CORRECT and LOSE at layer 31.** Same seed:
+
+| layer 31 | on the card | the same layer in double (`band_l31_sim.py`) |
+|---|---|---|
+| one interval (22.08), deg 63 | 2^-3.342 / rms 2^-4.972 | fit alone 2^-11.82 |
+| one interval, **deg 127** | 2^-3.342 / rms 2^-4.972 | fit alone 2^-25.60 |
+| 8 bands, deg 63 | **2^-0.72** / rms 2^-1.89 | 2^-0.67 / rms 2^-1.88 |
+| 8 bands, deg 127 | **2^-2.61** / rms 2^-3.71 | 2^-2.54 / rms 2^-3.82 |
+
+The double reproduces the card to a tenth of a bit, so the circuit is right
+(the `Rescale ... in-place` warnings the band path prints are benign) and the
+PLAN is what costs the bits. One band carries all of it: the top band's five
+channels, certified to 168.35 and reaching 15.17 on the served prompt -- an
+11x overestimate -- with the layer's largest `|u|` (14.63). And layer 31 is the
+worst place to be imprecise: its FFN output (214) cancels the residual's
+massive activation (217) down to `|h| <= 24.7`, so the FFN's relative error
+arrives multiplied by ~8. `silu_plan.py` priced the bands as an RMS over
+channels against `|SiLU|`, which sees neither the maximum, nor `u`, nor the
+cancellation; its "8 bands, deg 127, 2^-12.0 worst layer" is WRONG at layer 31
+and is withdrawn. The degree-127 single interval also settles the level
+question: it compiles and runs in the FFN ring's turn (`1 + 7 + 1 = 9` of 9).
 
 ---
 
@@ -476,3 +612,21 @@ Host-side calibration (CPU only, needs `llama3_all` and `wiki_ids.npy`):
 
     python3 reference/scripts/sylph_tables.py <model> <ids> 32 none,sink,resid,vo
     QUAROT_VO=1 python3 reference/scripts/quarot_export.py <model> <out>
+
+The knobs the card runs used (all default OFF; `ci_model_test` prints a line
+at the first layer whenever one is read, so a log proves it):
+
+    CHEDDAR_RNG_SEED=11          a fixed draw -- A/B pairs share it
+    CHEDDAR_CI_SILU_DEG=127      force the SiLU degree (0 = SiLuDegree's rule)
+    LLAMA3_REF_DIR=<ref_band>    a calib.json carrying `silu_bands`
+                                 (silu_band_inject.py <calib> <out> 8 all);
+                                 CHEDDAR_CI_SILU_BANDS=0 ignores it
+    LLAMA3_REF_DIR=<ref_sink>    `silu_sink` + silu_restore_L<NN>.f64
+                                 (silu_sink_inject.py <all> <ref> <out>);
+                                 CHEDDAR_CI_SILU_SINK=0 ignores it
+
+The prefix study on a GPU (cupy; `SIM_GPU=0` is the same code on numpy):
+
+    python3 sylph_prefix_gpu.py <ids.npy> 528 @prefix_search.json
+    SINKCHECK=1 python3 sylph_prefix_gpu.py <ids.npy> 16 bos2,bos1,A
+    python3 prefix_heldout.py <pp dir> <ids.npy.src.json>
