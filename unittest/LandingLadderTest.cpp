@@ -57,7 +57,10 @@ using cheddar::LandingLadder;
 using cheddar::Plaintext;
 
 const char *kPools[] = {"ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
-                        "ci16_42_k64_w60.json"};
+                        "ci16_42_k64_w60.json",
+                        // the second cut: one prefix, main-pair CtS levels
+                        "ci16_42_k16.json", "ci16_42_k32.json",
+                        "ci16_42_k64.json"};
 
 const char *PoolParam() {
   const char *e = std::getenv("CHEDDAR_LADDER_POOL");

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "Testbed.h"
+#include "core/MemoryPool.h"
 #include "extension/Profile.h"
 
 namespace {
@@ -106,12 +107,53 @@ TEST_P(BootBed, BootLatency) {
       std::dynamic_pointer_cast<BootContext<word>>(context_);
   ASSERT_NE(boot_context, nullptr) << "preset is not a bootstrapping one";
 
+  // WHAT A BOOTSTRAP COSTS IN MEMORY, beside what it costs in time. Three
+  // numbers, all read off the objects rather than modelled: the pool's live
+  // bytes taken by the boot's tables (EvalMod + the CtS/StC plaintexts), the
+  // evaluation keys' own bytes (every key in the map after the boot's
+  // rotations are added: rotation keys, the relinearization key and the
+  // sparse-secret pair), and one rotation key's bytes -- which is
+  // `beta * (num_q + num_aux) * 2 polys * N * sizeof(word)`, so a preset
+  // whose digit count or prime count moves shows it here first.
+  const auto pool_before = cheddar::MemoryPool::GetUsage();
   boot_context->PrepareEvalMod();
   boot_context->PrepareEvalSpecialFFT(num_slots);
+  const auto pool_tables = cheddar::MemoryPool::GetUsage();
   EvkRequest req;
   boot_context->AddRequiredRotations(req, num_slots,
                                      EnvInt("BB_MINKS", 0) != 0);
   interface_->PrepareRotationKey(req);
+  const auto pool_keys = cheddar::MemoryPool::GetUsage();
+  {
+    const auto &evk_map = interface_->GetEvkMap();
+    size_t evk_bytes = 0, rot_bytes = 0;
+    int num_keys = 0, num_rot = 0;
+    for (const auto &kv : evk_map) {
+      size_t bytes = 0;
+      for (const auto &v : kv.second.bx_) bytes += v.size();
+      for (const auto &v : kv.second.ax_) bytes += v.size();
+      evk_bytes += bytes;
+      num_keys++;
+      if (kv.first >= 0 && kv.first != EvkMap<word>::kConjugationKeyIndex) {
+        rot_bytes += bytes;
+        num_rot++;
+      }
+    }
+    const auto top_np = param_->LevelToNP(param_->max_level_);
+    std::cout << "[bench] memory: boot tables "
+              << ((pool_tables.current_bytes - pool_before.current_bytes) >> 20)
+              << " MiB (EvalMod + CtS/StC plaintexts), evaluation keys "
+              << (evk_bytes >> 20) << " MiB in " << num_keys << " keys ("
+              << num_rot << " rotation keys, " << (rot_bytes >> 20)
+              << " MiB; one key "
+              << ((num_rot > 0 ? rot_bytes / num_rot : 0) >> 20)
+              << " MiB), pool live after keys "
+              << (pool_keys.current_bytes >> 20) << " MiB; top NP ("
+              << top_np.num_main_ << ", " << top_np.num_ter_ << ") + "
+              << param_->GetMaxNumAux() << " aux, "
+              << (top_np.num_main_ + top_np.num_ter_) << " Q primes"
+              << std::endl;
+  }
 
   std::vector<Complex> msg;
   GenerateRandomMessage(msg, num_slots, -1.0, 1.0,
@@ -159,7 +201,7 @@ TEST_P(BootBed, BootLatency) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, BootBed,
-    testing::Values("bootparam_35.json", "bootparam_40.json",
+    testing::ValuesIn(PresetList({"bootparam_35.json", "bootparam_40.json",
                     "sylphflow16_35.json", "sylphflow16_40.json",
                     "ci16_35.json", "ci16_40.json", "ci16_35_stc2.json",
                     "ci16_35_land17c3e10.json", "ci16_35_land17c3e10v3.json",
@@ -186,7 +228,10 @@ INSTANTIATE_TEST_SUITE_P(
                     // they are their own shapes, not twins.
                     "ci16_35_land19v3.json", "ci16_35_land12v3.json",
                     "ci16_35_land6v3.json", "ci16_35_land5v3.json",
-                    "ci16_35_land15e9v3.json", "ci16_35_land9e9v3.json"),
+                    "ci16_35_land15e9v3.json", "ci16_35_land9e9v3.json",
+                    // The second 2^42 cut, one prefix for all three K.
+                    "ci16_42_k16.json", "ci16_42_k32.json",
+                    "ci16_42_k64.json"})),
     [](const testing::TestParamInfo<BootBed::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

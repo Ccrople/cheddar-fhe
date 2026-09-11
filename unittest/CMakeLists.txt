@@ -483,6 +483,15 @@ configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_35_land11c4e8s2.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_35_land11c4e8s2.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci16_40.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci16_40.json COPYONLY)
+# The 2^42 pools (CI_PARAM_20BIT.md): the first cut, one pool per K with
+# 20.9 / 19.6 / 18.3 bits after Boot and `LandingLadder` cutting any landing
+# at run time; and the second cut (`reference/scripts/ci42_family.py`), the
+# same on ONE compute prefix at the levels the Llama layer needs.
+foreach(P ci16_42_k16_w60 ci16_42_k32_w60 ci16_42_k64_w60
+          ci16_42_k16 ci16_42_k32 ci16_42_k64)
+  configure_file(${CMAKE_SOURCE_DIR}/parameters/${P}.json
+                 ${CMAKE_CURRENT_BINARY_DIR}/${P}.json COPYONLY)
+endforeach()
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci_ringswitch16_35.json
                ${CMAKE_CURRENT_BINARY_DIR}/ci_ringswitch16_35.json COPYONLY)
 configure_file(${CMAKE_SOURCE_DIR}/parameters/ci12_35.json
