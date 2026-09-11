@@ -350,10 +350,35 @@ statistical -- measured the whole chain at 2^-12.043 with 3 non-finite outputs
 left. The certified 8-band plan at degree 127 prices at 2^-12.0 and cannot
 produce those three, because they are escapes.
 
-And the prefix is NOT the lever for any of it: measured at prefix lengths 1, 2
-and 4, layer 31's SiLU range moves 27.59 / 29.51 / 28.95 and its SoftMax span
-80.91 / 78.23 / 75.32, while `sink_mass` only climbs 0.913 / 0.934 / 0.948.
-Two to four percent, on a quantity that needs a factor of three.
+### The prefix axis, closed
+
+Seven prefixes, 4 held-out prompts, ranges over user rows:
+
+| prefix | `sink_mass` | L31 SiLU | L31 span |
+|---|---|---|---|
+| `[BOS, .]` | 0.9126 | **27.47** | 80.92 |
+| `[BOS]` | 0.9126 | 27.59 | 80.91 |
+| `[BOS, 
+]` | 0.9136 | 27.79 | 80.88 |
+| `[BOS x 2]` (shipped) | 0.9326 | 29.44 | 78.29 |
+| `[BOS x 2]` + rescale | 0.9342 | 29.51 | 78.23 |
+| `[BOS x 4]` | 0.9483 | 28.95 | 75.32 |
+| `[BOS x 8]` | 0.9619 | **31.91** | **72.54** |
+
+**The SoftMax span responds monotonically to absorption** -- 0.913 -> 0.962
+takes it 80.9 -> 72.5, about -10 %, which is the same size of effect [SYLPH]
+table 2 attributes to prefixing (SoftMax 39.24 -> 32.78, -16 %). So the
+mechanism is real and reproduced. It is also useless to us: the SoftMax is
+already handled by the per-layer adaptive Cho count, and 10 % changes nothing.
+
+**The SiLU moves the WRONG WAY** -- the most absorbing prefix (`bos8`, 0.962)
+is the worst at 31.91 and the least absorbing (`bos1_dot`, 0.913) the best at
+27.47 -- and the 16 % spread is the sampling noise of a maximum over 4 prompts,
+which the layer 24-30 columns jitter by just as much. Changing the token (`.`,
+newline) changes nothing either.
+
+So: length, token and absorption all fail to move layer 31, on a quantity that
+needs a factor of three. The prefix axis is closed.
 
 ### What was implemented, and the one thing that was not
 
