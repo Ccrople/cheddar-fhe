@@ -97,9 +97,11 @@ class ChoSoftmax:
         self.k, self.shift, self.exp, self.inv = k, shift, exp_poly, inv_polys
         self.sq_seen = [[np.inf, -np.inf] for _ in range(k)]
 
-    def __call__(self, s):
+    def __call__(self, s, mask=None):
         u = (s - self.shift[None, :, :, None]) / float(2 ** self.k)
         y = self.exp(u)
+        if mask is not None:                               # pads: exp'd, then zeroed
+            y = y * np.isfinite(mask)
         for j in range(self.k):
             sq = (y * y).sum(axis=-1)
             self.sq_seen[j][0] = min(self.sq_seen[j][0], float(sq.min()))
@@ -109,10 +111,14 @@ class ChoSoftmax:
         return y
 
 
-def exact_cho_ranges(s, shift, k):
-    """The exact Cho walk, to size the windows before any polynomial."""
+def exact_cho_ranges(s, shift, k, valid=None):
+    """The exact Cho walk, to size the windows before any polynomial. The
+    exp domain is over EVERY key (pads are exp'd in the crypto too); the
+    sums are over the real keys."""
     u = (s - shift[None, :, :, None]) / float(2 ** k)
     y = np.exp(u)
+    if valid is not None:
+        y = y * valid[:, None, None, :]
     rng = []
     for _ in range(k):
         sq = (y * y).sum(axis=-1)
@@ -139,21 +145,30 @@ def main():
                     help="auto k: the smallest k whose first window is under this")
     a = ap.parse_args()
 
+    def mask_beside(path):
+        return os.path.join(os.path.dirname(path), "mask.u8") if path else ""
+
     m = Model(a.all_dir)
     x = m.prompts(a.inputs) if a.inputs else m.input()
+    valid = m.valid(mask_beside(a.inputs))
+    amask = Model.additive_mask(valid)
     N = x.shape[0]
-    print("calibration: %d prompt(s), T %d, H %d" % (N, m.T, m.H))
+    print("calibration: %d prompt(s), T %d, H %d%s" % (
+        N, m.T, m.H, "" if valid is None else ", padded (real tokens %d..%d)" % (
+            int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max()))))
     recs = []
-    exact = m.forward(x, records=recs)
+    exact = m.forward(x, mask=amask, records=recs)
 
     layers, hooks = [], []
     for L, r in enumerate(recs):
         s = r["s"]
-        shift = s.max(axis=(0, 3))                          # [NH, T] population
+        # the population row maximum over the REAL keys (the shift is public)
+        sv = s if valid is None else np.where(valid[:, None, None, :], s, -np.inf)
+        shift = sv.max(axis=(0, 3))                         # [NH, T]
         # Cho passes: the smallest k whose first window is narrow enough.
         ks = [a.k] if a.k else [1, 2, 3, 4]
         for k in ks:
-            (u_lo, u_hi), rng = exact_cho_ranges(s, shift, k)
+            (u_lo, u_hi), rng = exact_cho_ranges(s, shift, k, valid)
             if rng[0][1] / rng[0][0] <= a.sq_ratio or k == ks[-1]:
                 break
         exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + a.exp_margin / 4,
@@ -199,32 +214,59 @@ def main():
                 out_absmax=float(np.abs(r["z"]).max())),
         })
 
+    # The head: the pooler's tanh on the CERTIFIED interval (the last LN's
+    # sphere), so nothing about it is a statistic of any prompt.
+    head = None
+    if m.head_w is not None:
+        centre, radius = m.head_certified(m.NL - 1)
+        lo, hi = float((centre - radius).min()), float((centre + radius).max())
+        tanh_poly = Poly(np.tanh, lo, hi, a.tol, name="tanh")
+        print("head: pooler input certified in [%.2f, %.2f]" % (lo, hi))
+        print("   ", tanh_poly)
+        head = {"tanh": tanh_poly.json(), "u_certified_lo": lo, "u_certified_hi": hi,
+                "centre_absmax": float(np.abs(centre).max()),
+                "radius_max": float(radius.max())}
+        head_poly = tanh_poly
+
     # The chain with the approximations in: layer L reads L-1's approximated
     # output, so each hook is the layer's own.
-    def run(xs, label):
+    def run(xs, vmask, label):
         h = xs
-        ex = m.forward(xs)
+        am = Model.additive_mask(vmask)
+        ex = m.forward(xs, mask=am)
         print("%s: %d prompt(s)" % (label, xs.shape[0]))
         for L in range(m.NL):
             hk = hooks[L]
-            hook = lambda tag, v, hk=hk: hk[tag](v)  # noqa: E731
-            h = m.layer(h, L, hook)
+            hook = lambda tag, v, mask=None, hk=hk: (  # noqa: E731
+                hk[tag](v, mask) if tag == "softmax" else hk[tag](v))
+            h = m.layer(h, L, hook, am)
             e = rms_rel(h, ex[L])
             esc = sum(p.escapes for p in (hk["ln1"], hk["ln2"], hk["gelu"],
                                           hk["softmax"].exp) + tuple(hk["softmax"].inv))
             print("  layer %d: chain rms 2^%.2f%s" % (
                 L, -bits(e), "" if esc == 0 else "  ESCAPES %d" % esc))
+        if head is not None:
+            lg, u = m.head(h, lambda tag, v: head_poly(v))
+            lg_ex, u_ex = m.head(ex[-1])
+            agree = int((lg.argmax(axis=1) == lg_ex.argmax(axis=1)).sum())
+            print("  head: logits rms 2^%.2f, |u| <= %.2f (certified %.2f), labels "
+                  "agree %d / %d%s" % (-bits(rms_rel(lg, lg_ex)), float(np.abs(u_ex).max()),
+                                       max(abs(head["u_certified_lo"]), abs(head["u_certified_hi"])),
+                                       agree, xs.shape[0],
+                                       "" if head_poly.escapes == 0 else "  ESCAPES %d" % head_poly.escapes))
         return h
 
-    run(x, "calibration prompts")
+    run(x, valid, "calibration prompts")
     if a.held_out:
-        run(m.prompts(a.held_out), "held-out prompts")
+        run(m.prompts(a.held_out), m.valid(mask_beside(a.held_out)), "held-out prompts")
 
     out = {"model": m.meta["model"], "tokens": m.T, "channels": m.H,
            "hidden": m.I, "heads": m.NH, "head_dim": m.D, "ln_eps": m.eps,
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio},
+           "padded": valid is not None,
+           "head": head,
            "layers": layers}
     with open(a.calib, "w") as f:
         json.dump(out, f, indent=1)

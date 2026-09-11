@@ -154,6 +154,10 @@ def main():
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--prompts", type=int, default=0)
     ap.add_argument("--corpus", default="")
+    ap.add_argument("--min-len", type=int, default=0,
+                    help="with --prompts: real tokens per prompt uniform in "
+                         "[min-len, T] (padded with [PAD]); 0 = all exactly T")
+    ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
     T = a.tokens
 
@@ -199,6 +203,13 @@ def main():
             dump("L%02d/%s" % (L, fname), v)
     dump("emb_norm.f32", get(table, "embeddings.LayerNorm.weight"))
     dump("emb_norm_bias.f32", get(table, "embeddings.LayerNorm.bias"))
+    # The embedding tables and the vocabulary, so `encode.py` can turn text
+    # into the encoder's input without the checkpoint.
+    dump("emb_word.f32", get(table, "embeddings.word_embeddings.weight"))
+    dump("emb_pos.f32", get(table, "embeddings.position_embeddings.weight"))
+    dump("emb_type.f32", get(table, "embeddings.token_type_embeddings.weight"))
+    import shutil
+    shutil.copyfile(os.path.join(path, "vocab.txt"), os.path.join(a.out, "vocab.txt"))
     os.makedirs(os.path.join(a.out, "head"), exist_ok=True)
     dump("head/pool_w.f32", get(table, "pooler.dense.weight").T)
     dump("head/pool_b.f32", get(table, "pooler.dense.bias"))
@@ -229,15 +240,28 @@ def main():
     if a.prompts > 0:
         text = open(a.corpus, encoding="utf-8", errors="ignore").read()
         ws = windows(tok, text, T, a.prompts)
+        valid = np.ones((a.prompts, T), dtype=np.uint8)
+        if a.min_len > 0:
+            # Random real lengths: [CLS] body [SEP] then [PAD] to T. The mask
+            # is what the attention multiplies its exp by; padded positions
+            # are still computed (as BERT does) and never read.
+            rng = np.random.default_rng(a.seed)
+            pad_id, sep_id = tok.token_to_id("[PAD]"), tok.token_to_id("[SEP]")
+            for i, w in enumerate(ws):
+                n = int(rng.integers(a.min_len, T + 1))
+                ws[i] = w[:n - 1] + [sep_id] + [pad_id] * (T - n)
+                valid[i, n:] = 0
         xs = np.stack([embed(table, w, T, eps) for w in ws])
         pd = os.path.join(a.out, "prompts")
         os.makedirs(pd, exist_ok=True)
         np.ascontiguousarray(xs.astype(np.float32)).tofile(os.path.join(pd, "inputs.f32"))
+        valid.tofile(os.path.join(pd, "mask.u8"))
         with open(os.path.join(pd, "ids.txt"), "w") as f:
             for w in ws:
                 f.write(" ".join(str(i) for i in w) + "\n")
-        print("prompts/: %d x [%d, %d], |x| <= %.4f" % (a.prompts, T, H,
-                                                          float(np.abs(xs).max())))
+        print("prompts/: %d x [%d, %d], |x| <= %.4f, real tokens %d..%d"
+              % (a.prompts, T, H, float(np.abs(xs).max()),
+                 int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max())))
     print("done ->", a.out)
 
 

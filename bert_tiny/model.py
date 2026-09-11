@@ -35,6 +35,14 @@ class Model:
         self.NH, self.D, self.eps = m["heads"], m["head_dim"], m["ln_eps"]
         self.T = m["tokens"]
         self.w = [self._layer(L) for L in range(self.NL)]
+        # The pooler + NSP classifier (export.py's head/), when exported.
+        self.head_w = None
+        if os.path.isfile(os.path.join(all_dir, "head", "pool_w.f32")):
+            H = self.H
+            self.head_w = {"pw": self._load("head/pool_w.f32", (H, H)),
+                           "pb": self._load("head/pool_b.f32", (H,)),
+                           "cw": self._load("head/cls_w.f32", (H, 2)),
+                           "cb": self._load("head/cls_b.f32", (2,))}
 
     def _load(self, name, shape):
         a = np.fromfile(os.path.join(self.dir, name), dtype=np.float32)
@@ -59,6 +67,39 @@ class Model:
         a = np.fromfile(path, dtype=np.float32).astype(np.float64)
         return a.reshape(-1, self.T, self.H)
 
+    def valid(self, path):
+        """`mask.u8` [N, T] (1 = real token) -> bool [N, T]; None if absent."""
+        if not path or not os.path.isfile(path):
+            return None
+        return np.fromfile(path, dtype=np.uint8).reshape(-1, self.T) != 0
+
+    @staticmethod
+    def additive_mask(valid):
+        """[N, T] bool -> [N, 1, 1, T] with 0 on real keys, -inf on pads."""
+        if valid is None:
+            return None
+        m = np.zeros(valid.shape, dtype=np.float64)
+        m[~valid] = -np.inf
+        return m[:, None, None, :]
+
+    def head(self, z, hook=None):
+        """pooled = tanh(z[CLS] W + b); logits = pooled W_c + b_c. [N, 2]."""
+        w = self.head_w
+        u = z[:, 0] @ w["pw"] + w["pb"]
+        pooled = hook("tanh", u) if hook else np.tanh(u)
+        return pooled @ w["cw"] + w["cb"], u
+
+    def head_certified(self, L):
+        """The pooler input's CERTIFIED interval per channel, from the last
+        layer's LN2 alone: z = g n + b with n centred and |n| <= sqrt(H), so
+        |u_j - c_j| <= sqrt(H) ||g W_j - mean(g W_j)|| for EVERY prompt."""
+        w, hw = self.w[L], self.head_w
+        g, b = w["ffn_norm"], w["ffn_norm_bias"]
+        a = g[:, None] * hw["pw"]
+        centre = b @ hw["pw"] + hw["pb"]
+        radius = np.sqrt(self.H) * np.linalg.norm(a - a.mean(axis=0)[None, :], axis=0)
+        return centre, radius
+
     # ------------------------------------------------------------ the layer
     def layer_norm(self, x, g, b, hook=None, tag=""):
         mu = x.mean(axis=-1, keepdims=True)
@@ -75,12 +116,13 @@ class Model:
         k = (x @ w["wk"] + w["bk"]).reshape(N, T, NH, D)
         v = (x @ w["wv"] + w["bv"]).reshape(N, T, NH, D)
         s = np.einsum("nthd,nshd->nhts", q, k) / np.sqrt(float(D))
-        if mask is not None:
-            s = s + mask                                   # [N, 1, 1, T]: 0 / -inf
         if hook is not None:
-            p = hook("softmax", s)
+            # The hook gets the scores UNMASKED plus the mask, as the crypto
+            # does: pads are exp'd like every key and zeroed after.
+            p = hook("softmax", s, mask)
         else:
-            p = np.exp(s - s.max(axis=-1, keepdims=True))
+            sm = s if mask is None else s + mask           # [N, 1, 1, T]: 0 / -inf
+            p = np.exp(sm - sm.max(axis=-1, keepdims=True))
             p = p / p.sum(axis=-1, keepdims=True)
         av = np.einsum("nhts,nshd->nthd", p, v).reshape(N, T, H)
         return av @ w["wo"] + w["bo"], (q, k, v, s, p, av)

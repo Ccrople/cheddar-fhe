@@ -21,15 +21,27 @@ def main():
     ap.add_argument("all_dir")
     ap.add_argument("out")
     ap.add_argument("--inputs", default="")
+    ap.add_argument("--mask", default="", help="mask.u8 beside --inputs (default)")
     a = ap.parse_args()
     m = Model(a.all_dir)
     x = m.prompts(a.inputs) if a.inputs else m.input()
+    mask_path = a.mask or (os.path.join(os.path.dirname(a.inputs), "mask.u8")
+                           if a.inputs else "")
+    valid = m.valid(mask_path)
     os.makedirs(a.out, exist_ok=True)
     N = x.shape[0]
-    print("%d prompt(s) x [%d, %d]; input |x| <= %.4f" % (N, m.T, m.H,
-                                                          float(np.abs(x).max())))
+    print("%d prompt(s) x [%d, %d]; input |x| <= %.4f%s" % (
+        N, m.T, m.H, float(np.abs(x).max()),
+        "" if valid is None else "; padded (real tokens %d..%d)" % (
+            int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max()))))
     recs = []
-    outs = m.forward(x, records=recs)
+    outs = m.forward(x, mask=Model.additive_mask(valid), records=recs)
+    if m.head_w is not None:
+        logits, u = m.head(outs[-1])
+        logits.astype(np.float64).tofile(os.path.join(a.out, "cls_logits.f64"))
+        lab = logits.argmax(axis=1)
+        print("head: logits [N, 2] written; labels 0/1 = %d/%d; |u| <= %.3f"
+              % (int((lab == 0).sum()), int((lab == 1).sum()), float(np.abs(u).max())))
     stats = []
     for L, (z, r) in enumerate(zip(outs, recs)):
         z.astype(np.float64).tofile(os.path.join(a.out, "h_L%02d.f64" % L))
