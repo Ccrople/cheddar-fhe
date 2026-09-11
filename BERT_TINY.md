@@ -155,6 +155,21 @@ calibration, is the 2^-10. What the population moved (the knob ledger's
 "calibration" rows): k 1 -> 2, every window wider, LN2 at L0 deg 15 -> 31,
 GELU L1 deg 63 -> 127.
 
+**2026-09-11, the three service shapes.** Same binary, same ring, same
+calibration recipe (`sim.py` on the batch's own prompts, k = 2): only
+`meta.json`'s T changes the layout, the rotation stride and the BSGS split.
+
+| (T, B) | prompts | layer 0 | layer 1 (chained) | wall / layer | wide boots / layer | softmax |
+|---|---|---|---|---|---|---|
+| (128, 512) | 512 held-out | 2^-10.07 (worst 2^-9.75) | 2^-9.37 (worst 2^-7.74) | 26 / 31 s | 384 / 512 | 11.5 s |
+| (256, 256) | 256 (own) | 2^-9.53 (worst 2^-9.05) | 2^-9.02 (worst 2^-7.66) | 39 / 44 s | 640 / 768 | 22.9 s |
+| (512, 128) | 128 (own) | (running) | | | | |
+
+Per token-layer the three cost about the same (26 s / 65536 = 0.4 ms ->
+44 s / 65536 = 0.7 ms): the softmax's 2T(k-1) main-path boots grow with T
+and everything else is flat. 8640 rotations and 4870 relinearizations a
+layer at T = 256 (6080 / 2566 at 128).
+
 Probe table of the first correct run (layer 0, recorded prompt, rms bits):
 q 13.7, k 14.3, v 13.5, scores 13.0, exp 13.5, sq 14.1, r 13.2, P 11.7,
 attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out
