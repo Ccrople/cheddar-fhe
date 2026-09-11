@@ -904,6 +904,48 @@ against 2^-2.92, L31 2^-4.84 against 2^-5.03 -- the same to the spread, and
 which is what the single-layer A/Bs of the section above already said of the
 SiLU (127 invisible at the crypto floor); the cut at 13 stays the default.
 
+### The B = 1 coefficients on the batched layer 0, B = 512 (item 3)
+
+`ci_batch_test --gtest_filter='*TheLayerChainRunsOnTheRealWeights*'` with
+`CHEDDAR_CI_BATCH_PROMPTS`, the 512 real prompts, on the family (the k16
+pool as the layer preset, the k64 pool as the fused scores' tower);
+`reference/vessl/family_queue2.sh`, logs `cb_b512_*.log`:
+
+| run | calibration of layer 0 | wall | boots | worst | mean |
+|---|---|---|---|---|---|
+| the bar (2026-09-08/09, ci16_35 + land17c3e10v3) | gen512 (NCAL 1000 held out, k 2, 31/63) | 563-581 s | 16384 | 2^-5.65 .. -5.80 | 2^-6.07 .. -6.08 |
+| `b512_fam` | the same | 585.3 s | 16384 | **2^-5.68** | **2^-6.14** |
+| `b512_b1` | the B = 1 held-out bundle's layer 0 (`llama3_pop6`: k 4, first [0.42, 32.5], later [0.0071, 1.10], 31/63, its sinks, ranges and row tables) | 768.3 s | 24576 | 2^-5.52 | 2^-5.99 |
+
+So the batched layer is the bar on the family, and the B = 1 coefficients
+applied as they are RUN -- no window is left, no head blows, the test's
+2^-3 gate passes on every checked instance -- and land 0.15 bits under the
+population's own calibration at 31 % more time (the softmax 285.8 s against
+104.9: two more Cho passes are two more boot rounds, 8192 boots). Which is
+the honest reading of "똑같이 적용": what carries over is what is the same
+by construction -- the BOS x 2 sinks and their public rescale (0.9515 /
+1.3586 against gen512's 0.9442 / 1.3516), `silu_range` (4.903 against 4.900:
+the maximum sits on the deterministic sink row), the norm windows within
+3 %, the 31 / 63 invsqrt degrees, and now the span convention -- and what
+does not is what is a population statistic: gen512's windows were walked
+over 1000 prompts of THIS service at k = 2 (m_eff 48.6 gives a first window
+of 10000x that the served prompts sit inside), the B = 1 bundle's over 64
+Gutenberg windows at k = 4 for one served prompt. k = 4 buys nothing at
+layer 0 and costs two boot rounds; the per-layer k is a B = 1 lever because
+`m_eff` runs 17 .. 135 there, and at layer 0 both generators agree it is
+small.
+
+**What cannot carry, and why.** The B = 1 degrees are budgets: the SiLU
+takes 31 .. 255 from `op_level - 1 - StC`. The batched layer's SiLU is a
+degree-15 literal in four levels (`CiBatchLayer::Config::silu_degree`; its
+FFN ledger is gate/up at 7 -> 6, SiLU -> 2, the product -> 1), so a higher
+degree needs the slot-resident FFN to start higher, which is the batched
+design's landing, not a knob. And the B = 1 measurement above says what it
+would buy on the card: nothing -- the FFN pool at 19 with norms at 31 and
+the SiLU at 255 left the held-out chain where it was. The batched layer's
+precision at layer 0, like the B = 1 layer's, is the crypto floor's
+(`m_eff/2` on the boot noise), which is where the 20-bit question lives.
+
 ## Wiring
 
 **Slim is wired**, into the place section 3.4 names: `CiSinCAttention`'s
