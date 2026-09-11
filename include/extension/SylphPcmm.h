@@ -107,6 +107,17 @@ class SylphPcmm {
    * @brief `res = tau^l(A B)` from `tau_b = tau^(l+1)(B)`, Eq. (5).
    *
    * `res` must not alias `tau_b`.
+   *
+   * THE LAYOUT IS TILED. The matrix is `d^2` slots laid out row by row, and
+   * Eq. (5)'s rotations are cyclic in THOSE `d^2` slots -- but `HRot` is
+   * cyclic in all `MaxNumSlots()` of them. The two agree only if the matrix
+   * repeats with period `d^2` over every slot, so `tau_b` must carry it
+   * tiled (the plaintexts are encoded tiled to match), and `res` comes back
+   * tiled the same way. When `d^2` IS the slot count -- Sylph's d = 128 on a
+   * 2^14-slot ring -- tiling is the identity and costs nothing. Measured on
+   * the A100 before this was stated: `EquationFiveOnEncrypted` at d = 32 on
+   * 2^15 slots returned 0.999 relative error, the rotations reading zeros
+   * where the wrap should have brought rows back.
    */
   void Apply(Ct &res, const Ct &tau_b, const EvkMap<word> &evk) const;
 

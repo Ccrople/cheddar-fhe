@@ -232,10 +232,13 @@ TEST_P(Testbed32, EquationFiveOnEncrypted) {
     interface_->PrepareRotationKey(dist, level);
   }
 
+  // TILED with period d^2 -- `SylphPcmm::Apply`'s layout contract. The first
+  // run on a card put the matrix in the first d^2 slots only and came back at
+  // 0.999 relative error.
   const Mat tau_b = TauPow(b, kD, kTau + 1);
   std::vector<cheddar::Complex> msg(slots, cheddar::Complex(0.0, 0.0));
-  for (size_t s = 0; s < tau_b.size(); s++) {
-    msg[s] = cheddar::Complex(tau_b[s], 0.0);
+  for (int s = 0; s < slots; s++) {
+    msg[s] = cheddar::Complex(tau_b[s % tau_b.size()], 0.0);
   }
 
   Ciphertext<word> ct;
@@ -255,9 +258,11 @@ TEST_P(Testbed32, EquationFiveOnEncrypted) {
 
   const Mat want = TauPow(MatMul(a, b, kD), kD, kTau);
   double worst = 0.0, ref = 0.0;
-  for (size_t s = 0; s < want.size(); s++) {
-    worst = std::max(worst, std::abs(got[s].real() - want[s]));
-    ref = std::max(ref, std::abs(want[s]));
+  // Every tile, not only the first: the output comes back tiled too.
+  for (int s = 0; s < slots; s++) {
+    const double w = want[s % want.size()];
+    worst = std::max(worst, std::abs(got[s].real() - w));
+    ref = std::max(ref, std::abs(w));
   }
   std::cout << "eq. (5) encrypted, d " << kD << ", tau^" << kTau << ": worst "
             << worst << " against |C| " << ref << " ("

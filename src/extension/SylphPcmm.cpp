@@ -20,6 +20,9 @@ SylphPcmm<word>::SylphPcmm(ConstContextPtr<word> context,
   const int slots = context_->param_.MaxNumSlots();
   AssertTrue(plan_.d * plan_.d <= slots,
              "SylphPcmm: a d x d matrix laid out row by row needs d^2 slots");
+  // Tiled with period d^2 (see `Apply`), which needs d^2 to divide the slots.
+  AssertTrue(slots % (plan_.d * plan_.d) == 0,
+             "SylphPcmm: d^2 must divide the slot count for the tiled layout");
   // ONE level. That is the section's whole claim, and the assert is where it
   // is kept honest: nothing below may add a second.
   output_level_ = input_level_ - 1;
@@ -48,8 +51,11 @@ void SylphPcmm<word>::Compile() {
   for (int j = 0; j < plan_.g; j++) {
     for (int i = 0; i < plan_.b; i++) {
       const sylph_pcmm::Mat m = sylph_pcmm::PlaintextFor(plan_, i, j);
-      std::fill(msg.begin(), msg.end(), Complex(0.0, 0.0));
-      for (size_t s = 0; s < m.size(); s++) msg[s] = Complex(m[s], 0.0);
+      // TILED: every d^2 block carries the plaintext, or the full-ring
+      // rotations below read zeros where Eq. (5)'s d^2-cyclic ones wrap.
+      for (size_t s = 0; s < msg.size(); s++) {
+        msg[s] = Complex(m[s % m.size()], 0.0);
+      }
       context_->encoder_.Encode(pt_[static_cast<size_t>(j) * plan_.b + i],
                                 input_level_, pt_scale, msg);
     }
@@ -95,7 +101,9 @@ void SylphPcmm<word>::Apply(Ct &res, const Ct &tau_b,
         const sylph_pcmm::Mat m = sylph_pcmm::PlaintextFor(plan_, i, j);
         std::vector<Complex> msg(context_->param_.MaxNumSlots(),
                                  Complex(0.0, 0.0));
-        for (size_t s = 0; s < m.size(); s++) msg[s] = Complex(m[s], 0.0);
+        for (size_t s = 0; s < msg.size(); s++) {
+          msg[s] = Complex(m[s % m.size()], 0.0);   // tiled, as above
+        }
         const double out_scale = context_->param_.GetScale(output_level_);
         const double pt_scale =
             out_scale * context_->param_.GetRescalePrimeProd(input_level_) /

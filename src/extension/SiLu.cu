@@ -1,4 +1,5 @@
 #include <cmath>
+#include <map>
 
 #include "extension/Profile.h"
 #include "common/Assert.h"
@@ -41,12 +42,39 @@ SiLuHandler<word>::SiLuHandler(ConstContextPtr<word> context, double range,
     //
     // The constraint is one subtraction and costs at most one more fit error:
     // shifting `p` by `-p(0)` moves it by `|p(0)| <= eps` everywhere.
+    //
+    // It has to be taken on the polynomial the EVALUATOR runs, not on the one
+    // that was fitted. `EvalPoly` zeroes every coefficient under
+    // `kZeroCoeffThreshold` (1e-9) -- once on the whole vector and again on
+    // each half at every split of its tree -- so a `p(0)` made exactly zero on
+    // the fitted coefficients comes back at ~1e-9 (measured on the A100: the
+    // first `SiLuBandPlanSumsToSiLu` run, 1.30e-09 at a 1e-12 bar). So the
+    // tree `Compile` will build is built here, with the same trim, margin and
+    // baby threshold, and read at 0, where the Chebyshev basis is exact:
     // `T_k(0)` is 0 for odd `k` and alternates +1, -1 for even `k`.
-    double p0 = 0.0;
-    for (size_t k = 0; k < coeffs.size(); k += 2) {
-      p0 += (((k / 2) % 2 == 0) ? 1.0 : -1.0) * coeffs[k];
+    //
+    // `c_0` enters that tree with weight exactly one -- the Chebyshev fold
+    // `low[split - i] -= high[i]` runs over `i >= 1` and never reaches index
+    // 0, and the leaf reads it against `T_0 = 1` -- so ONE subtraction of the
+    // tree's own `p(0)` makes it zero to a rounding.
+    std::vector<double> trimmed = coeffs;
+    while (!trimmed.empty() &&
+           std::abs(trimmed.back()) < kZeroCoeffThreshold) {
+      trimmed.pop_back();
     }
-    coeffs[0] -= p0;
+    for (double &c : trimmed) {
+      if (std::abs(c) < kZeroCoeffThreshold) c = 0.0;
+    }
+    const int deg = static_cast<int>(trimmed.size()) - 1;
+    AssertTrue(deg >= 2, "SiLu: the fit trims below degree 2");
+    const int levels = Log2Ceil(deg + 1);
+    EvalPolyNode<word> tree(trimmed, levels, 1 << DivCeil(levels, 2),
+                            /*chebyshev=*/true);
+    std::map<int, double> at_zero;
+    for (int k = 0; k <= deg; k++) {
+      at_zero[k] = (k % 2 != 0) ? 0.0 : ((k % 4 == 0) ? 1.0 : -1.0);
+    }
+    coeffs[0] -= tree.PlainEvaluate(at_zero);
   }
 
   // The output scale has to be the canonical scale of the level the polynomial
