@@ -68,7 +68,7 @@ bool ReadF64(const std::string &path, size_t count, std::vector<double> &out) {
 }
 std::vector<double> ReadVec(const std::string &path, size_t n) {
   std::vector<float> f;
-  AssertTrue(ReadF32(path, n, f), "cannot read " + path);
+  cheddar::AssertTrue(ReadF32(path, n, f), "cannot read " + path);
   return std::vector<double>(f.begin(), f.end());
 }
 void ToDevice(cheddar::DeviceVector<float> &d, const std::vector<float> &h) {
@@ -115,7 +115,7 @@ struct LayerFiles {
   void Load(const std::string &d, int H, int I) {
     std::vector<float> f;
     auto mat = [&](const char *name, size_t n, cheddar::DeviceVector<float> &dv) {
-      AssertTrue(ReadF32(d + "/" + name, n, f), std::string("cannot read ") + name);
+      cheddar::AssertTrue(ReadF32(d + "/" + name, n, f), std::string("cannot read ") + name);
       ToDevice(dv, f);
     };
     const size_t HH = static_cast<size_t>(H) * H, HI = static_cast<size_t>(H) * I;
