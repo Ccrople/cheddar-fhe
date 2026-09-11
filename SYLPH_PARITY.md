@@ -307,10 +307,37 @@ channels against |SiLU| ~ 30:
 | certified per-channel, d63 | 2^-9.5 | **escape-proof** |
 | certified per-channel, d127 | **2^-12.3** | **escape-proof**, one more level |
 
-The fit error is roughly a wash at d63 and 3.5 bits better at d127. The real
-prize is the third column: a BOUND CANNOT BE ESCAPED, and an escape is not a
-small error -- outside its interval a degree-63 Chebyshev is
-`cosh(63 arccosh v)`.
+**That table is layer 31 only, and pricing all 32 corrects it**
+(`silu_plan.py`). The certified bound is 3 to 7x the OBSERVED range at most
+layers -- layer 2 observes 3.53 against a bound of 31.3 -- and a Chebyshev
+error is uniform in absolute terms over its interval, so a certified interval
+throws away exactly that ratio. Worst layer over the whole chain, which is what
+a chain reports:
+
+| plan | worst layer | |
+|---|---|---|
+| shipped, statistical, d63 | 2^-11.0 | + escapes |
+| prefixed rows, statistical, d63 | 2^-11.0 | + escapes |
+| 8 certified bands, d63 | **2^-7.7** | a 3.3-bit REGRESSION |
+| 8 certified bands, d127 | **2^-12.0** | escape-proof |
+
+Layer 31 looked like a wash at d63 only because its observed range (29.51)
+happens to sit at its bound's p50 (29.2); nowhere else does. **So certification
+costs one level** -- and that is the looseness of the bound, not the band
+count: more bands do not help, because the widest band still spans the bound's
+maximum.
+
+Which plan wins also depends on how many prompts the statistic saw, because the
+bound does not move and the statistic does:
+
+| layer 31 | 4 prompts | 600 prompts (measured) |
+|---|---|---|
+| shipped, d63 | 2^-11.0 | 2^-8.8, 7/600 escape |
+| certified 8 bands, d127 | 2^-12.0 | 2^-12.0 |
+
+The remaining prize is the last column either way: a BOUND CANNOT BE ESCAPED,
+and an escape is not a small error -- outside its interval a degree-63
+Chebyshev is `cosh(63 arccosh v)`.
 
 The band curve flattens at 8 (RMS at layer 31, degree 127: one band 0.368, four
 0.00986, **eight 0.00743**, thirty-two 0.00626, per-channel 0.00587) -- so eight
