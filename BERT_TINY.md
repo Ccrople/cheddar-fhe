@@ -134,6 +134,27 @@ check for free); (b) any window escape in any prompt of the batch is a
 batch-wide event, which is the argument for certified intervals (the
 GELU's sphere bound, Cho's theorem windows) over statistics.
 
+**2026-09-11, 512 DISTINCT held-out prompts on the POPULATION calibration
+(goal item 4).** Calibration: 1000 disjoint 126-piece windows of *War and
+Peace* (`export.py --prompts 1000`), `sim.py` picking Cho k = 2 (the k = 1
+first window exceeds the 300x rule), exp deg 15 on [-4.5, 0.25] / [-10.3,
+0.25], 1/sqrt windows [0.92, 76.7] deg 63 + [0.0061, 0.149] deg 31 (L0) and
+[0.14, 43.5] deg 127 + [0.0062, 0.90] deg 127 (L1), LN windows up to 16x
+at deg 15/31, GELU +-16.3 deg 127. Held out: 1000 windows of *Great
+Expectations* -- host chain 2^-21.2 / 2^-19.2 with 2 + 10 tiny escapes;
+the first 512 of them on the A100, each instance against its own float64:
+
+| | rms | worst instance | wall | boots |
+|---|---|---|---|---|
+| layer 0 | **2^-10.07** | 2^-9.75 | 26.0 s | 384 wide + 4 narrow |
+| layer 1 (chained) | **2^-9.37** | 2^-7.74 | 30.7 s | 512 wide + 4 narrow |
+
+Same accuracy as the oracle; the second Cho pass costs 2T = 256 wide
+boots a layer (softmax 0.9 -> 11.5 s). The crypto floor, not the
+calibration, is the 2^-10. What the population moved (the knob ledger's
+"calibration" rows): k 1 -> 2, every window wider, LN2 at L0 deg 15 -> 31,
+GELU L1 deg 63 -> 127.
+
 Probe table of the first correct run (layer 0, recorded prompt, rms bits):
 q 13.7, k 14.3, v 13.5, scores 13.0, exp 13.5, sq 14.1, r 13.2, P 11.7,
 attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out

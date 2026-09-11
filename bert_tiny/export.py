@@ -206,7 +206,14 @@ def main():
     dump("head/cls_b.f32", get(table, "cls.seq_relationship.bias"))
 
     tok = tokenizer(path)
-    ids = windows(tok, TEXT, T, 1)[0]
+    # The recorded prompt: TEXT where it is long enough (T <= 256), else the
+    # corpus's first window, so a T = 512 export has a real prompt too.
+    if len(tok.encode(TEXT, add_special_tokens=False).ids) >= T - 2:
+        ids = windows(tok, TEXT, T, 1)[0]
+    else:
+        assert a.corpus, "TEXT is short of T = %d pieces; give --corpus" % T
+        text = open(a.corpus, encoding="utf-8", errors="ignore").read()
+        ids = windows(tok, text, T, 1)[0]
     x0 = embed(table, ids, T, eps)
     dump("input.f32", x0)
     meta = {"model": a.model, "layers": NL, "channels": H, "hidden": I,
