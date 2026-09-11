@@ -152,6 +152,15 @@ void CiBertTinyLayer<word>::Rotate(Ct &res, const Ct &a, int dist,
 }
 
 template <typename word>
+void CiBertTinyLayer<word>::Tap(const std::string &name, const Ct &ct,
+                                double factor) const {
+  if (!probe_) return;
+  std::vector<Ct> one(1);
+  boot_->Copy(one[0], ct);
+  probe_(name, one, factor);
+}
+
+template <typename word>
 void CiBertTinyLayer<word>::BootMany(std::vector<Ct> &cts,
                                      const EvkMap<word> &evk) {
   if (!boot_->IsBootPrepared(layout_.num_slots)) {
@@ -429,13 +438,17 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
   const auto &mult_key = evk.GetMultiplicationKey();
   AssertTrue(Level(S[0]) == l_s_, "SoftMax: the scores are not at l_s");
   // y = exp((S - shift) / 2^k), the affine folded into W_Q and the shift
+  const double a_e = 0.5 * (cal_.exp.hi - cal_.exp.lo);
+  if (head == 0) Tap("s", S, 1.0 / (std::ldexp(1.0, k) * a_e));
   std::vector<Ct> y(T);
   for (int d = 0; d < T; d++) {
     Ct u;
     boot_->Add(u, S[d], shift_pt_[head]);
+    if (head == 0 && d == 0) Tap("t_exp", u, 1.0);
     exp_poly_->Evaluate(boot_, y[d], u, mult_key);
     S[d] = Ct();
   }
+  if (head == 0) Tap("y", y, 1.0);
   for (int j = 0; j < k; j++) {
     // sq = sum_d y_d^2: one relinearization
     Ct acc;
@@ -452,6 +465,7 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
     boot_->RelinearizeRescale(sq, acc, mult_key);
     stages_.relins++;
     acc = Ct();
+    if (head == 0) Tap("sq" + std::to_string(j), sq, 1.0);
     // pass j's window, in the units the walk is in: after pass j - 1 the
     // main path carries ride (the sqrt(ride) on r), so sq carries ride^2
     const double unit = (j == 0) ? 1.0 : cfg_.ride * cfg_.ride;
@@ -466,6 +480,7 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
                        degree, Level(t), t.GetScale());
     Ct r;
     inv->Evaluate(boot_, r, t, mult_key);
+    if (head == 0) Tap("r" + std::to_string(j), r, 1.0);
     if (j + 1 < k) {
       Ct rs;
       MultScalar(rs, r, std::sqrt(cfg_.ride));
@@ -491,6 +506,7 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
     }
   }
   P = std::move(y);
+  if (head == 0) Tap("p", P, 1.0);
 }
 
 // ----------------------------------------------------------- attention
@@ -523,6 +539,9 @@ void CiBertTinyLayer<word>::Attention(Stream &attn_out, const Stream &x,
     AddScalar(v[c], v[c], bv_[c]);
   }
   stages_.qkv += Since(t0);
+  Tap("q", q, q_fold_);
+  Tap("k", k, 1.0);
+  Tap("v", v, 1.0);
 
   std::vector<Ct> o_in(H);
   for (int h = 0; h < NH; h++) {
@@ -561,11 +580,13 @@ void CiBertTinyLayer<word>::Attention(Stream &attn_out, const Stream &x,
     }
     stages_.values += Since(t0);
   }
+  Tap("o_in", o_in, 1.0);
   t0 = Clock::now();
   proj_->Project(attn_out.cts, o_in, "o");
   for (int c = 0; c < H; c++) AddScalar(attn_out.cts[c], attn_out.cts[c], bo_[c]);
   attn_out.carry = c_in_;
   stages_.o += Since(t0);
+  Tap("attn", attn_out.cts, c_in_);
 }
 
 // ----------------------------------------------------------- LayerNorm
@@ -602,6 +623,7 @@ void CiBertTinyLayer<word>::LayerNorm(Stream &out, const Stream &pre,
     boot_->Sub(cen[i], hx, sum);
   }
   sum = Ct();
+  Tap(tag + "_cen", cen, static_cast<double>(H) * c);
   // V' = sum centred'^2 = H^3 c^2 var: one relinearization
   Ct acc;
   for (int i = 0; i < H; i++) {
@@ -618,6 +640,7 @@ void CiBertTinyLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   stages_.relins++;
   acc = Ct();
   const double kappa0 = 1.0 / (static_cast<double>(H) * H * H * c * c);
+  Tap(tag + "_var", V, 1.0 / kappa0);
   const int degree = n.inv.degree;
   const double undo = NarrowLift(V, Levels(degree) + 2, n.inv.hi / kappa0, evk);
   const double a = 0.5 * (n.inv.hi - n.inv.lo), bb = 0.5 * (n.inv.hi + n.inv.lo);
@@ -629,6 +652,7 @@ void CiBertTinyLayer<word>::LayerNorm(Stream &out, const Stream &pre,
       degree, Level(t), t.GetScale());
   Ct r;
   inv->Evaluate(boot_, r, t, mult_key);
+  Tap(tag + "_r", r, 1.0);
   // r = 1/sqrt(var + eps) in true units; the apply wants it a level above
   // the channels (its per-channel scalar copies cost one)
   double undo_r = 1.0;
@@ -651,6 +675,7 @@ void CiBertTinyLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   }
   out.carry = c_out;
   stages_.ln += Since(t0);
+  Tap(tag + "_out", out.cts, c_out);
 }
 
 // --------------------------------------------------------- feed-forward
@@ -671,6 +696,7 @@ void CiBertTinyLayer<word>::FeedForward(Stream &out, const Stream &h,
   proj_->Project(u, h.cts, "int");
   for (int j = 0; j < I; j++) AddScalar(u[j], u[j], bint_[j]);
   stages_.ffn += Since(t0);
+  Tap("t_gelu", u, 1.0);
   t0 = Clock::now();
   std::vector<Ct> gl(I);
   for (int j = 0; j < I; j++) {
@@ -678,11 +704,13 @@ void CiBertTinyLayer<word>::FeedForward(Stream &out, const Stream &h,
     u[j] = Ct();
   }
   stages_.gelu += Since(t0);
+  Tap("g", gl, 1.0);
   t0 = Clock::now();
   proj_->Project(out.cts, gl, "out");
   for (int i = 0; i < H; i++) AddScalar(out.cts[i], out.cts[i], bout_[i]);
   out.carry = c_h_;
   stages_.ffn += Since(t0);
+  Tap("y_ffn", out.cts, c_h_);
 }
 
 // ---------------------------------------------------------------- layer
@@ -715,6 +743,7 @@ void CiBertTinyLayer<word>::Layer(Stream &out, const Stream &in,
   }
   x.cts.clear();
   attn.cts.clear();
+  Tap("h_pre", h_pre.cts, c_in_);
   Stream h;
   LayerNorm(h, h_pre, w_.attn_norm, w_.attn_norm_bias, cal_.ln1, evk, "ln1");
   h_pre.cts.clear();
@@ -733,6 +762,7 @@ void CiBertTinyLayer<word>::Layer(Stream &out, const Stream &in,
   }
   h.cts.clear();
   y.cts.clear();
+  Tap("z_pre", z_pre.cts, c_h_);
   LayerNorm(out, z_pre, w_.ffn_norm, w_.ffn_norm_bias, cal_.ln2, evk, "ln2");
   stages_.total = Since(t_all);
   if (cfg_.verbose) {

@@ -299,8 +299,42 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     EncryptPrompt(boot, layout, x0, H, live, in.carry, level, in.cts);
     std::cout << "  input at level " << level << ", carry " << in.carry << std::endl;
   }
+  // BERT_TINY_DUMP=<dir>: every intermediate the layer taps, decrypted into
+  // <dir>/L<L>_<name>.f64 as [ct][live][T] doubles in model units, and an
+  // index.txt of "name count factor"; bert_tiny/debug.py compares them
+  // against the float64 model's own intermediates.
+  const std::string dump = Env("BERT_TINY_DUMP", "");
+  std::ofstream index;
+  int cur_layer = 0;
+  if (!dump.empty()) {
+    index.open(dump + "/index.txt");
+    ASSERT_TRUE(index.good()) << dump;
+    layer.SetProbe([&](const std::string &name,
+                       const std::vector<Ciphertext<word>> &cts, double factor) {
+      std::vector<double> all;
+      DecryptAll(boot, layout, cts, static_cast<int>(cts.size()), live, factor, all);
+      // DecryptAll is [b][t][c]; write [c][b][t]
+      const int n = static_cast<int>(cts.size());
+      std::vector<double> out(static_cast<size_t>(n) * live * T);
+      for (int c = 0; c < n; c++) {
+        for (int b = 0; b < live; b++) {
+          for (int t = 0; t < T; t++) {
+            out[(static_cast<size_t>(c) * live + b) * T + t] =
+                all[(static_cast<size_t>(b) * T + t) * n + c];
+          }
+        }
+      }
+      const std::string fname = "L" + std::to_string(cur_layer) + "_" + name;
+      std::ofstream f(dump + "/" + fname + ".f64", std::ios::binary);
+      f.write(reinterpret_cast<const char *>(out.data()),
+              static_cast<std::streamsize>(out.size() * sizeof(double)));
+      index << fname << " " << n << " " << std::setprecision(17) << factor
+            << std::endl;
+    });
+  }
   double worst = 0.0;
   for (int L = 0; L < num_layers; L++) {
+    cur_layer = L;
     if (L > 0) layer.Prepare(files[L].w, ReadCalib(calib["layers"][L]));
     Layer::Stream out;
     layer.Layer(out, in, evk);

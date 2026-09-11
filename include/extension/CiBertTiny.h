@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -180,7 +181,22 @@ class CiBertTinyLayer {
   const Stages &GetStages() const { return stages_; }
   int TopLevel() const;
 
+  /**
+   * @brief A tap on every intermediate: `probe(name, cts, factor)` where
+   * `decrypted / factor` is the model-unit quantity `bert_tiny/debug.py`
+   * recomputes on the host (its table names the quantity per `name`).
+   * Costs nothing when unset.
+   */
+  using Probe = std::function<void(const std::string &, const std::vector<Ct> &,
+                                   double)>;
+  void SetProbe(Probe p) { probe_ = std::move(p); }
+
  private:
+  void Tap(const std::string &name, const std::vector<Ct> &cts, double factor) const {
+    if (probe_) probe_(name, cts, factor);
+  }
+  void Tap(const std::string &name, const Ct &ct, double factor) const;
+  Probe probe_;
   int Level(const Ct &ct) const;
   //! Boot every ciphertext of `s` that sits below `need` (all land at top).
   void Lift(Stream &s, int need, const EvkMap<word> &evk);
