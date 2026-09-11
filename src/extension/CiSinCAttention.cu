@@ -885,6 +885,28 @@ double ExpFitError(double hb, int deg) {
   return worst;
 }
 
+//! Max RELATIVE error of the degree-`deg` interpolant of `1/sqrt` over
+//! `[lo, hi]` (the affine to [-1, 1] applied as `compile_inv` applies it).
+double InvFitError(double lo, double hi, int deg) {
+  const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+  const auto c = chebfit::Interpolate(
+      [a, b](double v) { return 1.0 / std::sqrt(a * v + b); }, deg);
+  double worst = 0.0;
+  const int kGrid = 4001;
+  for (int i = 0; i < kGrid; i++) {
+    const double s = lo + (hi - lo) * i / (kGrid - 1);
+    const double v = (s - b) / a;
+    double b0 = 0.0, b1 = 0.0;
+    for (size_t j = c.size() - 1; j > 0; j--) {
+      const double t = 2.0 * v * b0 - b1 + c[j];
+      b1 = b0;
+      b0 = t;
+    }
+    worst = std::max(worst, std::abs((v * b0 - b1 + c[0]) * std::sqrt(s) - 1.0));
+  }
+  return worst;
+}
+
 //! The degree that reaches sixteen bits, CAPPED AT 15 -- and the cap is the
 //! level budget, not the fit. Counting the walk: `exp_in = top - 1`, the
 //! polynomial spends `ceil(log2(deg+1))`, the causal mask one, the square one,
@@ -971,8 +993,57 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
   // iteration's levels rather than costing them.
   const int k = (calib_.niter > 0) ? calib_.niter : 1;
   const double hb = calib_.m_eff / static_cast<double>(1 << (k + 1));
-  const int exp_degree =
-      (calib_.exp_degree > 0) ? calib_.exp_degree : ExpDegree(hb);
+  // THE SINGLE PASS CHOOSES ITS TWO DEGREES TOGETHER (2026-09-11). The walk
+  // has `exp_in - 3 - (forward_level + 2)` levels for the exp tree and the
+  // invsqrt tree between them -- seven at top 16 -- and the rule above spent
+  // them as (15, 7) at every layer. At layer 31's hb = 24.3 a degree-15 exp
+  // is 2^-8.5 and the softmax Jacobian (m_eff / 2 = 49) turns that into the
+  // layer's 2^-3.3; degree 31 is 2^-29 there, and its level comes from the
+  // invsqrt, which at degree 3 over [0.9, 1.1] is still 2^-18. So every
+  // (exp, inv) pair that fits the budget is priced by the worse of its two
+  // fit errors and the best pair is taken: (15, 7) where hb is small, (31, 3)
+  // where it is not -- the degree follows the LAYER. A given `exp_degree` or
+  // the Cho path (whose exp reads at hb / 2^k and whose invsqrts have their
+  // own budgets) keep the old rule.
+  //
+  // AND IT LOSES ON THE CARD (`SoftMaxCalibration::pair_degrees`): layer 31
+  // at (31, 3) is 2^-2.95 against 2^-3.78 at (15, 7), same seed -- the
+  // invsqrt's fit error over [norm_lo, norm_hi] is not the error the walk
+  // pays, so the pricing is wrong by exactly the term it cannot see. The
+  // old rule stays the default; the solver runs only when asked.
+  int exp_degree = calib_.exp_degree;
+  int single_inv_degree = calib_.inv_degree;
+  if (exp_degree <= 0 && calib_.niter <= 0 && calib_.pair_degrees) {
+    const int budget = exp_in_ - 3 - (cfg_.forward_level + 2);
+    double best = 1e300, best_ee = 0.0, best_ei = 0.0;
+    for (int de : {7, 9, 15, 31, 63}) {
+      const double ee = ExpFitError(hb, de);
+      for (int di : {3, 7, 15, 31}) {
+        if (Log2Ceil(de + 1) + Log2Ceil(di + 1) > budget) continue;
+        const double ei = InvFitError(calib_.norm_lo, calib_.norm_hi, di);
+        const double score = std::max(ee, ei);
+        if (score < best) {
+          best = score;
+          best_ee = ee;
+          best_ei = ei;
+          exp_degree = de;
+          single_inv_degree = di;
+        }
+      }
+    }
+    AssertTrue(exp_degree > 0,
+               "CiSinCAttention: no (exp, invsqrt) degree pair fits the "
+               "single pass's " + std::to_string(budget) + " levels");
+    if (cfg_.verbose) {
+      std::cout << "  softmax degrees (single pass): m_eff " << calib_.m_eff
+                << ", hb " << hb << ", budget " << budget << " levels -> exp "
+                << exp_degree << " (2^" << std::log2(best_ee) << "), invsqrt "
+                << single_inv_degree << " (2^" << std::log2(best_ei) << ")"
+                << std::endl;
+    }
+  } else if (exp_degree <= 0) {
+    exp_degree = ExpDegree(hb);
+  }
   auto exp_coeffs = chebfit::Interpolate(
       [hb](double v) { return std::exp(hb * (v - 1.0)); }, exp_degree);
   const int exp_used =
@@ -1021,7 +1092,7 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     // THE SHIPPED SINGLE PASS. Byte-identical to before: same window, same
     // degree, same level, and `P = (y r)^2` lands at forward_level.
     polys_.push_back(compile_inv(calib_.norm_lo, calib_.norm_hi,
-                                 calib_.inv_degree, poly_in_,
+                                 single_inv_degree, poly_in_,
                                  cfg_.forward_level + 2, "single", &inv_used));
     inv_out = poly_in_ - Log2Ceil(inv_used + 1);
   } else {

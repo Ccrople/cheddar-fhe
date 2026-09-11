@@ -545,6 +545,216 @@ question: it compiles and runs in the FFN ring's turn (`1 + 7 + 1 = 9` of 9).
 
 ---
 
+## Per-layer degrees on a B200 (2026-09-11): what the level budget affords, operator by operator
+
+The question asked: the non-linearities' input ranges differ by layer, so let
+the DEGREE differ by layer -- layer 31's SiLU alone wants more -- and where a
+degree cannot be raised, say what stops it. Measured on the runpod B200
+(sm_100, CUDA 13, `build100`/`build100b` of `5c210ae` + this session's
+edits), B = 1, T = 128, `[BOS x 2]`, the recorded rings (`ci16_35` +
+`land13c2e9` + `land17c3e10`, module basis, fused leg), one seed for every
+A/B (`CHEDDAR_RNG_SEED=11`). Logs and tables in
+`reference/audit/2026-09-11_b200_degrees/`.
+
+### The rules already pick a degree per layer; the CAPS were the literals
+
+`SiLuDegree(range)`, `NormDegree(window)` and `ExpDegree(hb)` derive each
+layer's degree from its own calibration. What was per-layer only in name was
+the cap: 63 / 15 / 15 typed beside the rule. They are level budgets, so they
+are computed as budgets now (`CiLlamaLayer.cu`), against the FFN ring's slot
+level `op = 12` and StC level `StC = landing - slack`:
+
+| operator | the arithmetic | rungs | budget at slack 9 (StC 4) | at slack 10 (StC 3) |
+|---|---|---|---|---|
+| SiLU (FFN ring) | tree `Log2Ceil(d+1) <= op - 1 - StC` (the gate multiply needs one, ToCoeff wants it at or above StC) | 15 / 31 / 63 / **127** / 255 | 7 levels -> **127** (the old cap, 63, was one level SHORT) | 8 -> 255 |
+| RMSNorm invsqrt (both norms, FFN ring) | square + scale (2), tree, weight multiply with NO rescale one below, ToCoeff wants StC + 1: `Log2Ceil(d+1) <= op - 4 - StC` | 9 / 15 / **31** / 63 | 4 -> 15 (= the old cap) | 5 -> 31 |
+| softmax exp, single pass (tower `top` 16, `forward_level` 3) | exp tree + invsqrt tree `<= exp_in - 3 - (forward + 2) = 7`; a 4-level exp (15) leaves the invsqrt 3 (7) | 7 / 9 / 15 / 31 | (15, 7) EXACTLY; (31, 3) also fits and LOSES (below) | no ring has top 17 |
+| softmax, Cho path (`niter` k) | first invsqrt at `poly_in` 8 with floor 3 -> `<= 31`; last at `top - 2` = 14 with floor 5 -> `<= 255`; exp reads `hb = m_eff / 2^(k+1)`, so **k is the lever** | k per layer | 31 / 63 shipped | -- |
+| EvalMod K (the boot's range) | the ModRaise wrap-around, i.e. the secret's l1 norm IN THE CROSSING'S BASIS -- not the scale, not q0 | K 16 / 32 / 64 = 8 / 9 / 10 EvalMod levels | native 11.6 -> K 16 (the score Boots); module 20.0 -> K 32 (FFN); tower 32.1 at h 16, 49.7 at h 32 -> K 64 (leg) | -- |
+
+Slack 10 runs (`CHEDDAR_CI_FFN_SLACK=10`, StC 3, coefficients at level 1):
+layer 0 2^-6.32 / rms 2^-6.46 (= slack 9), layer 1 **2^-6.26 / 2^-6.35** with
+SiLU 127 and the attention invsqrt at **31** (window 12.7; = the recorded
+2^-6.24 / 2^-6.36), layer 31 2^-3.65 / 2^-4.95. So the extra level EXISTS
+and costs nothing visible; nothing on the card wanted it either.
+
+What the rules choose on the oracle calibration (`degree_plan_oracle.txt`):
+SiLU 127 at layers 1, 30, 31 (ranges 18.3, 21.9, 22.1; 63 elsewhere or
+lower), the norm's 31 at layers 1 and 2 only and only at slack 10, and the
+single-pass softmax pair (31, 3) at layers 0 and 31 only.
+
+### The 2^42 family cannot serve this layer, and K is why
+
+`ci16_42_k{16,32,64}_w60` measure p = 20.93 / 19.61 / 18.28 against the
+recorded rings' ~15 (`CI_PARAM_20BIT.md`), and land anywhere from 0 to
+13 / 12 / 11 at that p. Three things stop them here, in order of hardness:
+
+1. **The keyless crossing needs the same primes.** Ciphertexts cross the
+   three rings at shared levels because levels `0..L` are `ci16_35`'s primes
+   (`CiModelTest.cpp:467-471` asserts it). A 2^42 pool's primes are not, so
+   the FFN ring cannot move alone; all three rings move or none. (The
+   `k32ffn_L0` run in `sylph_suite.sh` stopped one step earlier, on the
+   documented build-tree trap -- `cannot open .../unittest/ci16_42_k32_w60.json`
+   -- the JSONs are copied into both trees now; the assert was not re-run.)
+2. **The leg's levels.** The tower needs landing 17 and three CtS levels
+   (k64 lands 11 with two); the score Boots need 16 on the base ring (k16
+   lands 13). Every missing level is 42 bits of logQ: k16 at 1715.6 + 3
+   levels ~ 1842, k64 at 1728.0 + 6 levels + a CtS level ~ 2050, against
+   the 1771.06-bit security anchor every ring here sits under.
+3. **K.** The wrap-around is a property of the SECRET's norm in the basis the
+   crossing reads (`ci_module_basis.py` check 6, `ci_nested_sinc.py`
+   check 5, `wraparound_K.txt`): native-sparse in native coordinates 11.6
+   (K 16 holds), module-sparse in module coordinates **20.0** (K 16 does not,
+   32 does with 1.6x), tower-sparse in tower coordinates **32.1 at h = 16,
+   49.7 at h = 32** (K 64), and any secret not sampled in the crossing's
+   basis 270-900. So the K-16 pool -- the precise one -- can serve neither
+   the FFN nor the tower at any scale, q0 does not enter (the wrap divides
+   by it), and the only knob is h, which is security: the least secure h
+   tried still needs K 32 / K 64. A double angle buys K x2 for one level and
+   ~1.2 bits, which is exactly the two levels K 64 costs over K 16 -- that is
+   the whole price and it is not negotiable. The native boot IS K-16-friendly,
+   and going back to it means the converter route the module and tower bases
+   were built to retire.
+
+### On the card, oracle calibration: three chains and the single-layer A/Bs
+
+All 32 layers, ledger on, seed 11. `base32` and `deg32` ran while the
+simulator held the card too, so their times are not the layer's.
+
+| chain | L0 | L1 | L18 | L30 | L31 | worst | median | boots |
+|---|---|---|---|---|---|---|---|---|
+| `base32`: SiLU <= 63, invsqrt <= 15, exp 15 / 7 (the recorded rule) | 2^-6.33 / -6.40 | -6.17 / -5.96 | -4.84 / -5.80 | -5.31 / -6.07 | **-3.78 / -5.34** | L31 2^-3.78 | 2^-5.71 | 3072 |
+| `deg32`: the SiLU budget ladder (127 at L1, L30, L31) | -6.33 / -6.40 | -6.19 / -5.96 | -4.83 / -5.79 | -5.33 / -6.03 | -3.72 / -5.25 | L31 2^-3.72 | 2^-5.70 | 3072 |
+| `exp32`: + the softmax (exp, invsqrt) pair solver | -6.44 / -6.46 | -6.24 / -5.97 | -4.82 / -5.77 | -5.45 / -6.02 | **-2.95 / -4.22** | L31 2^-2.95 | 2^-5.67 | 3072 |
+
+Single layers from the clean stream, seed 11: `exp_L0` 2^-6.41 / -6.51,
+`exp_L30` 2^-7.64 / -7.47, `exp_L31` **2^-2.93 / -3.88** with its seam at
+**2^-1.48** (the recorded seam there is 2^-5.63).
+
+Read together:
+
+* **The SiLU's per-layer degree is right and free, and invisible here.** 127
+  where the range asks (L1, L30, L31) changes no closing number by more than
+  the seed's own spread, because those layers sit on the crypto floor -- the
+  same finding as the sink plan's. In double the same degrees are worth 3
+  to 16 bits ON THE SiLU (`degree_plan_oracle.txt`: L1 2^-18 -> 2^-34, L30
+  2^-15.7 -> 2^-28.9, L31 2^-15.6 -> 2^-28.7), which is where they will show
+  once the floor moves.
+* **The single-pass softmax has NO per-layer degree to give.** Its budget of
+  seven levels is spent as (15, 7) or (31, 3), and (31, 3) at layer 31 --
+  where the exp fit at hb 24.3 is 2^-8.5 and looked like the limiter --
+  costs 0.8 bits on the layer and 4 bits on the seam. A degree-3 invsqrt is
+  too crude for what the walk hands it, and pricing pairs by their fit error
+  over `[norm_lo, norm_hi]` cannot see that. The solver stays in the tree
+  behind `SoftMaxCalibration::pair_degrees` (`CHEDDAR_CI_SOFTMAX_PAIR=1`),
+  off. Exp 31 WITH invsqrt 7 needs `top` 17, and no ring under the anchor
+  affords the tower a level (above).
+* **Layer 31 on the oracle is the softmax's Jacobian, and only more boots
+  move it** -- which the held-out chain then shows.
+
+### Each operator's precision, layer by layer
+
+On the card (`base32_ledger.txt`, the ledger's probes; from layer 1 on each
+probe reads the chain's inherited stream error too, so the layer-0 row is the
+one that isolates an operator; `CHEDDAR_CI_CLEAN_EACH=1` restarts every layer
+from the reference stream and was written but not run -- the card's time went
+to the held-out chains):
+
+    layer 0:  attention RMSNorm 2^-10.08 / rms 2^-10.36 (fit alone 2^-20.6),
+              seam (the softmax through its Jacobian) 2^-5.64 / -5.72,
+              layer 2^-6.33 / -6.40
+    layers 1..30 chained: RMSNorm probe 2^-4.6 .. -6.3, seam 2^-3.3 .. -5.9,
+              layer 2^-4.8 .. -6.7 (rms 2^-5.3 .. -6.1, flat)
+    layer 31: RMSNorm 2^-5.48, seam 2^-2.48 / -4.23, layer 2^-3.78 / -5.34
+
+In double, the approximation ALONE, 600 held-out wikitext-2 prompts
+(`llama_sim.py`, `SIM_ONLY`, `sim_op_table.txt`; p50 over prompts of the
+32-layer rms; 0 of 600 non-finite in every run):
+
+| what is approximate | degrees | p50 | L30 | L31 |
+|---|---|---|---|---|
+| everything, SiLU ladder to 63 (today) | | **2^-5.58** | -11.56 | -5.58 |
+| everything, SiLU ladder to 127 | | **2^-12.03** | -12.92 | -12.03 |
+| SiLU only | 63 / 127 / 255 | 2^-5.58 / -12.42 / -13.00 | | |
+| attention RMSNorm only | 15 / 31 | 2^-13.06 / -18.04 | | |
+| FFN RMSNorm only | 15 / 31 | 2^-13.80 / -17.99 | | |
+| exp only, invsqrts only, both (Cho k, 31 / 63) | | 2^-13.70 each | | |
+
+The chain is SiLU-limited to the third decimal (all 2^-5.58 = SiLU 2^-5.58)
+and the whole of it is layer 31 (L30 2^-11.56); 127 there is the 6.5 bits.
+Neither norm is within 7 bits of the limiter at any degree, and the softmax's
+three fits sit at 2^-13.7 with the Cho iteration on. So the per-layer degree
+that matters is ONE: layer 31's SiLU -- and 255 buys 0.6 bits more only
+there.
+
+### The held-out chain runs, for the first time on this path
+
+`gen_b1_pop.py` (64 calibration prompts spread over the Gutenberg stream,
+one served prompt from the wikitext-2 test set, `b1_ids.py`; `NITER=2`,
+31 / 63, per-layer k) had never met the fused module-basis layer: its Cho
+iteration boots the score ciphertexts BETWEEN passes with a native full
+`Boot` on `ci16_35`, and the fused setup skipped that ring's native tables
+because the oracle single pass never calls it -- `No BootContext available
+for num slots: 65536` at layer 0. `CiModelTest.cpp` builds them when the
+calibration carries `softmax_niter > 0` (~6 GiB). Two more things the
+generator needed: `KMAX=6` (layer 31's m_eff is **134.9** on this split, and
+k = 5 left its first window at 1231x against the derived 758; k = 6 puts it
+at 40x), and the row-shift margin (below).
+
+| chain (held-out, 3632 boots) | L0 | L1 | L18 | L30 | L31 | worst | median | s |
+|---|---|---|---|---|---|---|---|---|
+| `pop6` (KMAX 6, RS_MIN 0.10) | 2^-6.01 / -6.26 | -5.52 / -5.77 | -2.97 / -4.81 | -5.29 / -5.05 | **-5.10 / -5.12** | L19 2^-2.77 | 2^-4.74 | 349 |
+| `popsink6` (+ the SiLU sink plan) | -6.03 / -6.26 | -5.51 / -5.78 | -2.99 / -4.81 | -5.32 / -5.09 | -4.78 / -5.16 | L19 2^-2.78 | 2^-4.78 | 420 |
+| `pop7` (RS_MIN 0.25) | -6.01 / -6.26 | -5.52 / -5.77 | -2.98 / -4.79 | -5.29 / -5.05 | -5.12 / -5.17 | L19 2^-2.77 | 2^-4.74 | 350 |
+
+The Cho counts the generator chose, per layer: k = 4 at L0, L14, L18, L29,
+k = 6 at L31, k = 2 at L3, k = 3 everywhere else -- 3632 boots against the
+oracle's 3072 (+18 %). That IS "many passes at the last layer, few before".
+
+* **Layer 31 is no longer the worst layer**: 2^-5.10 held-out against
+  2^-3.78 on the oracle. Its per-layer lever was k (5 -> 6), one more Boot
+  per score ciphertext -- not a degree.
+* The worst layers are now 17-24 (2^-2.8 .. -3.8 relative, rms 2^-4.8
+  throughout), and the ledger's lane breakdown says where: ONE head per
+  layer (L14 lane 25 at 2^-2.58 against the best lane's 2^-5.43, a 2.9-bit
+  spread; L17 and L19 lane 31), the seam's rms staying at 2^-4.4 .. -5.0. A
+  served (head, row) has left a window calibrated on 64 prompts -- the
+  first-invsqrt window and the row shift are the statistical links -- and
+  the row-shift floor does nothing (`pop7` = `pop6` to the third decimal,
+  because the measured leave-one-out escape already exceeded 0.25 there).
+  `calib_audit.py`'s L18 / L31 flag (the exp reading 0.05-0.11 below its
+  lower edge) is the same fact seen from the fit. The lever is the
+  calibration POPULATION: 64 prompts here against the 384 the 600-article
+  protocol used; not run (the generator is ~1 h of host CPU at 384).
+* These excursions do not reach the output: the chain contracts them (a
+  layer's gain on an input perturbation is 0.73 .. 0.92 in float64), so the
+  32-layer closing number is L31's 2^-5.10 / rms 2^-5.12 -- 1.5 bits under
+  [SYLPH]'s 2^-6.64 bar at that point, and no perplexity has been run on
+  this output (`sylph_precision/sylph_ppl.py` would translate it).
+* The sink plan is exact again (sink rows 2^-8.4 .. -10.4 against pop6's
+  -7.6 .. -9.2; user rows unchanged) and narrows L1's range 18.3 -> 6.1
+  (degree 127 -> 31, a level) and L29/L30 17.4 / 21.9 -> 12.1 / 13.2.
+* 32 layers in 349 s with the ledger decrypting every stage: 10.9 s a layer.
+
+### Answer, in one place
+
+Per-layer degrees are the right approach and the tree does it; what it
+needed was the caps written as budgets. Where it pays: the SiLU (127 at the
+three layers that ask, a level over the old cap, 6.5 bits on held-out
+prompts in double; 255 is one slack level away and runs). Where it cannot
+pay, and why:
+
+| wanted | stopped by | the number |
+|---|---|---|
+| SiLU 255 at slack 9 | the FFN turn: 8 levels into 7 | slack 10 gives it (StC 3, coefficients at 1): runs |
+| invsqrt 31 in either norm | the weight multiply's pending rescale above StC | slack 10 gives it; buys nothing measurable (norms at 2^-13 already) |
+| exp 31 in the single pass | `top` 16 is exact; funding it from the invsqrt (3) loses 4 bits on the seam | a tower ring with top 17 = 42 bits over the anchor |
+| a better layer 31 by degree | it is the softmax Jacobian x boot noise | k 5 -> 6: 2^-3.78 -> 2^-5.10 held-out |
+| a better held-out middle (L17-24) | one head per layer leaves a window set on 64 prompts | NCAL 384 (the protocol's), not a degree, not RS_MIN |
+| the 2^42 pools' 20 / 19 / 18 bits | same-prime crossing; top 16 / 17 (k16 13, k64 11); K 32 / 64 from the wrap-around | +126 / +324 bits of logQ; K is the secret's norm, not the scale |
+
+---
+
 ## Wiring
 
 **Slim is wired**, into the place section 3.4 names: `CiSinCAttention`'s
@@ -624,6 +834,25 @@ at the first layer whenever one is read, so a log proves it):
     LLAMA3_REF_DIR=<ref_sink>    `silu_sink` + silu_restore_L<NN>.f64
                                  (silu_sink_inject.py <all> <ref> <out>);
                                  CHEDDAR_CI_SILU_SINK=0 ignores it
+    CHEDDAR_CI_FFN_SLACK=10      the FFN ring's slack (default 9): StC one
+                                 lower, one more level for the SiLU / invsqrt
+    CHEDDAR_CI_SILU_MAX_DEG=63   cap the SiLU ladder below its budget (the
+    CHEDDAR_CI_RMS_MAX_DEG=15    old literals, for an A/B); 0 = the budget
+    CHEDDAR_CI_EXP_DEG=15        pin the single pass's exp degree (invsqrt 7)
+    CHEDDAR_CI_SOFTMAX_PAIR=1    the (exp, invsqrt) pair solver -- loses
+    CHEDDAR_CI_CLEAN_EACH=1      every layer from the reference's clean
+                                 stream, one process (each layer's OWN ledger)
+    LLAMA3_REF_DIR=<pop> LLAMA3_INPUT=<pop>/input_pop.f32
+                                 a held-out bundle (gen_b1_pop.py, KMAX=6
+                                 RS_MIN=0.25 WIKI_IDS=b1_ids.npy); the test
+                                 builds ci16_35's native boot for its Cho pass
+
+The B200 recipe (`reference/vessl/sylph_b200_setup.sh` from a git bundle,
+`sylph_b200_data.sh`, `sylph_run2.sh <tag> <first> <layers> [ENV=..]` with
+`BUILD=build100b`, the suites `sylph_suite*.sh`, `sylph_host.sh`):
+`/workspace` has a QUOTA -- a 13 GB stale module-basis cache had to go before
+the 27 GB export fit -- and `pkill -f <pattern>` kills the ssh shell whose
+command line contains the pattern (use `[.]` / `[t]` in the regex).
 
 The prefix study on a GPU (cupy; `SIM_GPU=0` is the same code on numpy):
 

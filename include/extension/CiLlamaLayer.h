@@ -130,6 +130,11 @@ class CiLlamaLayer {
     //! sink gate would sit outside the interval, where a degree-31 Chebyshev
     //! is cosh(31 arccosh(3.42)) ~ 1e25 and takes the ciphertext with it.
     int silu_degree = 0;
+    //! The derived ladders stop where the LEVEL BUDGET stops them (see
+    //! `SiLuDegree` / `NormDegree`); these cap them lower, which is how the
+    //! old fixed caps (63 and 15) are reproduced for an A/B. 0 = the budget.
+    int silu_max_degree = 0;
+    int rms_max_degree = 0;
     //! 0 derives the invsqrt degree from the window, as a Chebyshev fit's
     //! uniform error requires: 9 up to 2.5, 15 up to 12, 31 beyond.
     int rms_degree = 0;

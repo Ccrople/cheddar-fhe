@@ -276,6 +276,13 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const bool min_ks = EnvInt("CHEDDAR_CI_MINKS", 0) != 0;
   g_tok_pos = EnvInt("CHEDDAR_CI_TOKPOS", 1);
   const int stop_after = EnvInt("CHEDDAR_CI_STOP_AFTER", 0);
+  // CHEDDAR_CI_CLEAN_EACH=1: every layer starts from the reference's CLEAN
+  // stream, the way `CHEDDAR_CI_FIRST_LAYER` starts one, so the ledger's
+  // probes and the closing number are each layer's OWN and not what it
+  // inherited -- in a chain the attention norm's probe reads 2^-10 at layer 0
+  // and ~2^-5.5 from layer 1 on, which is the stream's error, not the norm's.
+  // Same seed, same setup, 32 layers in one process.
+  const bool clean_each = EnvInt("CHEDDAR_CI_CLEAN_EACH", 0) != 0;
   const int first_layer = EnvInt("CHEDDAR_CI_FIRST_LAYER", 0);
 
   // ---- THE PIPELINE'S KNOBS (Doing.md 3.21) --------------------------------
@@ -420,12 +427,26 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const auto t_setup0 = Tick();
   MemRow("setup start: the rings, secrets and base keys stand");
   bctx->PrepareEvalMod();
-  if (!kFused) {
-    // Fused (Doing.md 3.16), ci16_35's native tables serve nothing: the
-    // scores and the attention output return through the tower ring, the
-    // q/k/v and the stream cross through HalfBootModule (no native table),
-    // and the seam runs on the FFN ring. Not building them keeps ~6 GiB
-    // and their rotation keys off the card.
+  // THE CHO SOFTMAX NEEDS ci16_35's NATIVE BOOT. With `softmax_niter > 0`
+  // (the held-out population calibration), `CiSinCAttention::SoftMax` boots
+  // the score ciphertexts on the BASE ring between passes -- a native full
+  // `boot_->Boot` at 65536 slots, not a HalfBootTower -- so the tables the
+  // fused path otherwise skips have to stand. The oracle single pass
+  // (niter = 0) never calls it, which is why fused mode dropped them.
+  bool cho_present = EnvInt("CHEDDAR_CI_NITER", 0) > 0;
+  for (const auto &cl : calib_all["layers"]) {
+    if (cl.value("softmax_niter", 0) > 0) cho_present = true;
+  }
+  if (!kFused || cho_present) {
+    // Fused (Doing.md 3.16), ci16_35's native tables serve nothing UNLESS the
+    // Cho softmax boots on this ring: the scores and the attention output
+    // return through the tower ring, the q/k/v and the stream cross through
+    // HalfBootModule (no native table), and the seam runs on the FFN ring.
+    // Not building them keeps ~6 GiB and their rotation keys off the card.
+    if (kFused) {
+      std::cout << "ci16_35 native boot tables: BUILT for the Cho softmax "
+                   "(softmax_niter > 0)" << std::endl;
+    }
     bctx->PrepareEvalSpecialFFT(num_slots);
     EvkRequest req;
     bctx->AddRequiredRotations(req, num_slots, min_ks);
@@ -445,7 +466,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   const std::string ffn_param =
       (ffn_param_env && ffn_param_env[0]) ? ffn_param_env : kBootParam;
   const bool ffn_own_ring = ffn_param != kBootParam;
-  Ring boot_ffn(ffn_param, boot.ui->GetSecretCoeffs(), /*slack=*/9,
+  // THE FFN RING'S SLACK is the non-linear budget of the whole slot-domain
+  // half (both RMSNorms, the SiLU): StC sits at `landing - slack`, and every
+  // degree rule caps itself against that level. Nine puts StC at 4 on the K =
+  // 32 ring (SiLU up to 127, invsqrt up to 15); ten puts it at 3 and buys each
+  // one more level (255 / 31) IF the coefficient side can live at level 1 --
+  // which is what `CHEDDAR_CI_FFN_SLACK=10` exists to measure.
+  const int ffn_slack = EnvInt("CHEDDAR_CI_FFN_SLACK", 9);
+  Ring boot_ffn(ffn_param, boot.ui->GetSecretCoeffs(), ffn_slack,
                 /*build_user_interface=*/ffn_own_ring);
   cheddar::UserInterface<word> &fui = ffn_own_ring ? *boot_ffn.ui : *boot.ui;
   const cheddar::EvkMap<word> &fevk = fui.GetEvkMap();
@@ -459,7 +487,8 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
                    .GetNumTotal()
             << " limbs), HalfBoot lands "
             << fctx->GetBootParameter().GetEvalModEndLevel() << ", StC at "
-            << fctx->GetBootParameter().GetStCStartLevel()
+            << fctx->GetBootParameter().GetStCStartLevel() << " (slack "
+            << ffn_slack << ")"
             << (ffn_own_ring ? ", its own keys" : ", the leg's keys")
             << std::endl;
   if (ffn_own_ring) {
@@ -677,6 +706,10 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   // prices at 2^-7.7 worst-layer at 63 and 2^-12.0 at 127 (`silu_plan.py`),
   // so testing the plan at all needs the degree to be a knob. 0 = derived.
   lcfg.silu_degree = EnvInt("CHEDDAR_CI_SILU_DEG", 0);
+  // The ladders are capped by the level budget now (SiLU 127 and invsqrt 15
+  // at slack 9); these reproduce the OLD literal caps (63 / 15) for an A/B.
+  lcfg.silu_max_degree = EnvInt("CHEDDAR_CI_SILU_MAX_DEG", 0);
+  lcfg.rms_max_degree = EnvInt("CHEDDAR_CI_RMS_MAX_DEG", 0);
   lcfg.verbose = true;
   // `stream_scale` is derived below from the reference, but the layer needs
   // the ciphertext's epsilon at construction, so it is computed here.
@@ -1913,8 +1946,14 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     // 0 = derive it from `m_eff`, which is per layer and runs 17.1 to 97.3
     // across the real 32: 15 is right for 31 of them and buys 8.5 bits at
     // layer 31.
-    sc.exp_degree = 0;
+    // ... and since 2026-09-11 the single pass picks its (exp, invsqrt) pair
+    // per layer under the budget; `CHEDDAR_CI_EXP_DEG=15` pins the exp and
+    // leaves the invsqrt at 7, which is the old rule at every layer.
+    sc.exp_degree = EnvInt("CHEDDAR_CI_EXP_DEG", 0);
     sc.inv_degree = 7;
+    // `CHEDDAR_CI_SOFTMAX_PAIR=1` turns the (exp, invsqrt) pair solver on:
+    // measured a net loss at layer 31 (see `SoftMaxCalibration`), off here.
+    sc.pair_degrees = EnvInt("CHEDDAR_CI_SOFTMAX_PAIR", 0) != 0;
     sc.causal = true;
     // THE POPULATION CALIBRATION (`reference/scripts/gen_b1_pop.py`). Without
     // it `calib.json` is `reference_forward.py`'s, built from the SAME prompt
@@ -2565,6 +2604,16 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     (void)resid_absmax;
 
     stream = std::move(next);
+    if (clean_each && L + 1 < first_layer + num_layers) {
+      std::vector<double> hclean;
+      const std::string hp = rdir + "/h_L" + (L < 10 ? "0" : "") +
+                             std::to_string(L) + ".f64";
+      ASSERT_TRUE(ReadF64(hp, static_cast<size_t>(kT) * kH, hclean))
+          << "cannot read " << hp;
+      stream = encrypt_stream(hclean, stream_scale);
+      std::cout << "  (clean-each: layer " << L + 1
+                << " starts from the reference's " << hp << ")" << std::endl;
+    }
   }
   cheddar::IdleWindow::Set(nullptr);
 

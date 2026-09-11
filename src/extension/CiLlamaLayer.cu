@@ -309,11 +309,33 @@ int CiLlamaLayer<word>::SiLuDegree(double range) const {
   const double r = std::max(range, 1e-9);
   const double rho = (M_PI + std::sqrt(M_PI * M_PI + r * r)) / r;
   const double want = 16.0 * std::log(2.0) / std::log(rho);
-  // The evaluator's tree is a power of two deep, so only 2^k - 1 is free.
-  for (int d : {15, 31, 63}) {
-    if (d >= want) return d;
+  // The evaluator's tree is a power of two deep, so only 2^k - 1 is free --
+  // AND THE LADDER IS CAPPED BY THE LEVEL BUDGET, NOT BY A NUMBER. The tree
+  // reads at `op_level_` and lands `Log2Ceil(d + 1)` below it, the gate
+  // multiply spends one more, and `ToCoeff` wants that product at or above
+  // the StC level. So the tree may be at most `op_level_ - 1 - StC` deep:
+  // seven levels on the K = 32 ring at slack 9 (12 - 1 - 4), which is degree
+  // 127. The ladder used to stop at 63, one level SHORT of that budget, which
+  // the real model's deep layers pay for (layer 31 asks for ~141 and got
+  // 2^-5.2); 255 is one level OVER it and needs the slack moved. The first
+  // rung that reaches `want` is taken if it fits, else the deepest that does.
+  const int budget = op_level_ - 1 - sched_.GetStCLevel();
+  int chosen = 0;
+  for (int d : {15, 31, 63, 127, 255}) {
+    if (Log2Ceil(d + 1) > budget) break;
+    if (cfg_.silu_max_degree > 0 && d > cfg_.silu_max_degree) break;
+    chosen = d;
+    if (d >= want) break;
   }
-  return 63;
+  AssertTrue(chosen > 0, "CiLlamaLayer::SiLuDegree: no SiLU degree fits in " +
+                             std::to_string(budget) + " levels");
+  if (cfg_.verbose) {
+    std::cout << "  SiLU degree: range " << range << " wants ~" << want
+              << ", budget " << budget << " levels (op " << op_level_
+              << ", StC " << sched_.GetStCLevel() << ") -> " << chosen
+              << std::endl;
+  }
+  return chosen;
 }
 
 template <typename word>
@@ -347,10 +369,27 @@ int CiLlamaLayer<word>::NormDegree(double window) const {
   const double w = std::max(window, 1.0 + 1e-9);
   const double rho = (std::sqrt(w) + 1.0) / (std::sqrt(w) - 1.0);
   const double want = 16.0 * std::log(2.0) / std::log(rho);
-  for (int d : {9, 15}) {
-    if (d >= want) return d;
+  // The cap, as a budget rather than a literal: the handler squares and
+  // scales (two levels under `op_level_`), the tree lands `Log2Ceil(d + 1)`
+  // below that, the weight multiply sits one under the tree WITHOUT a
+  // rescale, and `ToCoeff` needs that result one above the StC level to
+  // settle it. So `Log2Ceil(d + 1) <= op_level_ - 4 - StC`: four levels
+  // (degree 15) on the K = 32 ring at slack 9, five (degree 31) at slack 10.
+  const int budget = op_level_ - 4 - sched_.GetStCLevel();
+  int chosen = 0;
+  for (int d : {9, 15, 31, 63}) {
+    if (Log2Ceil(d + 1) > budget) break;
+    if (cfg_.rms_max_degree > 0 && d > cfg_.rms_max_degree) break;
+    chosen = d;
+    if (d >= want) break;
   }
-  return 15;
+  AssertTrue(chosen > 0, "CiLlamaLayer::NormDegree: no invsqrt degree fits in " +
+                             std::to_string(budget) + " levels");
+  if (cfg_.verbose && window > 2.0) {
+    std::cout << "  RMSNorm degree: window " << window << " wants ~" << want
+              << ", budget " << budget << " levels -> " << chosen << std::endl;
+  }
+  return chosen;
 }
 
 template <typename word>

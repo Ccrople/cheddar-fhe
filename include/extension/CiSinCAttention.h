@@ -185,6 +185,14 @@ class CiSinCAttention {
     double norm_hi = 2.0;
     int exp_degree = 0;   //!< 0 = derive it from `m_eff` (1.5ef)
     int inv_degree = 15;  //!< the walk has exactly four levels for it
+    //! Single pass only: choose (exp, invsqrt) TOGETHER under the level budget
+    //! by the worse of the two fit errors. MEASURED A NET LOSS (2026-09-11,
+    //! B200, one seed): at layer 31 it takes (31, 3) for (15, 7) and the seam
+    //! goes 2^-5.63 -> 2^-1.48, the layer 2^-3.78 -> 2^-2.95 -- a degree-3
+    //! invsqrt is too crude for what the walk actually hands it, and the fit
+    //! table over [norm_lo, norm_hi] does not see that. Off by default; kept
+    //! so the measurement can be repeated.
+    bool pair_degrees = false;
     bool causal = false;
     //! Causal only: each (lane, row)'s calibrated live-key maximum, indexed
     //! [lane][row] with lane the LAYOUT lane (BitRev of the head). Masked
