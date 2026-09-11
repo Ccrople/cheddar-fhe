@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 #include <utility>
+#include <memory>
 
 #include "common/Assert.h"
 #include "common/CommonUtils.h"
@@ -427,6 +428,46 @@ Plaintext<word> CiLlamaLayer<word>::CrossingPlaintext(
 }
 
 template <typename word>
+Plaintext<word> CiLlamaLayer<word>::SiluBandPlaintext(
+    int ct, int band, const Calibration &c, double factor,
+    double at_scale) const {
+  const int rank = cfg_.proj_rank;
+  const int density = cfg_.module_basis ? 1 : 2;
+  const int live = static_cast<int>(c.silu_band_of_channel.size());
+  AssertTrue(live > 0, "CiLlamaLayer: the band plan names no channels");
+  AssertTrue(cfg_.num_tokens * rank <= num_slots_,
+             "CiLlamaLayer: a hidden ciphertext does not hold rank blocks of "
+             "num_tokens slots");
+  // declared index -> live channel, or -1 for a dead slot. `HiddenMap` is the
+  // same map `Project` and the seam use, so a band cannot disagree with them
+  // about which slot is which channel.
+  std::vector<int> of_declared;
+  HiddenMap(of_declared, cfg_.hidden_declared, rank, live, density);
+  // A per-CHANNEL value is constant over a block of `num_tokens` slots: the
+  // stream's address is `channel * num_tokens + rev(token)` (1.5du), so
+  // filling the whole block covers every token without needing the reversal.
+  std::vector<Complex> vals(num_slots_, Complex(0.0, 0.0));
+  for (int local = 0; local < rank; local++) {
+    const int declared = ct * rank + local;
+    if (declared >= cfg_.hidden_declared) break;
+    const int j = of_declared[declared];
+    if (j < 0) continue;  // a dead slot of the banded convention
+    if (c.silu_band_of_channel[j] != band) continue;
+    const int base = local * cfg_.num_tokens;
+    for (int t = 0; t < cfg_.num_tokens && base + t < num_slots_; t++) {
+      vals[base + t] = Complex(factor, 0.0);
+    }
+  }
+  Plaintext<word> pt;
+  boot_->encoder_.Encode(pt, slot_level_,
+                         boot_->param_.GetScale(op_level_) *
+                             boot_->param_.GetRescalePrimeProd(slot_level_) /
+                             at_scale,
+                         vals);
+  return pt;
+}
+
+template <typename word>
 void CiLlamaLayer<word>::Canonicalise(Ct &ct, const Plaintext<word> &pt) const {
   boot_->Mult(ct, ct, pt);
   boot_->Rescale(ct, ct);
@@ -778,8 +819,28 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
   // ---- SiLU and the gate multiply ----------------------------------------
   std::vector<Ct> prod(num_hidden_cts_);
   {
-    SiLuHandler<word> silu(boot_, c.silu_range, op_level_,
-                           SiLuDegree(c.silu_range));
+    // ONE fit, or a CERTIFIED BAND PLAN. The bands' masks ride the gate's own
+    // `Canonicalise` multiply below, so a band costs one more plaintext
+    // multiply and one more SiLU and NOT one more level. Every band's fit is
+    // constrained to `p(0) = 0`, without which each channel would collect the
+    // other bands' `p(0)` off the masked input -- the BERT branch's measured
+    // +0.29 a slot.
+    const bool banded = !c.silu_bands.empty();
+    std::vector<std::unique_ptr<SiLuHandler<word>>> silus;
+    if (banded) {
+      AssertTrue(static_cast<int>(c.silu_band_of_channel.size()) > 0,
+                 "CiLlamaLayer: silu_bands without silu_band_of_channel");
+      for (double r : c.silu_bands) {
+        silus.push_back(std::make_unique<SiLuHandler<word>>(
+            boot_, r, op_level_,
+            cfg_.silu_degree > 0 ? cfg_.silu_degree : SiLuDegree(r),
+            /*zero_at_origin=*/true));
+      }
+    } else {
+      silus.push_back(std::make_unique<SiLuHandler<word>>(
+          boot_, c.silu_range, op_level_, SiLuDegree(c.silu_range)));
+    }
+    SiLuHandler<word> &silu = *silus[0];
     // The 2 x 28 crossings as groups: the per-ciphertext CtS then batched
     // EvalMods, instead of 56 serial launch-bound reductions.
     std::vector<Ct> g_ups, u_ups;
@@ -799,8 +860,10 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
       // `crossing_`, NOT a fit taken on the residual: these carry no O factor.
       // And `kappa_` beside it, which is the same mistake one turn further out
       // -- see the class comment.
-      Canonicalise(g_up,
-                   1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range));
+      if (!banded) {
+        Canonicalise(g_up,
+                     1.0 / (kappa_ * crossing_ * c.gate_scale * c.silu_range));
+      }
       if (c.up_sink.empty()) {
         Canonicalise(u_up, 1.0 / (kappa_ * crossing_ * c.gate_scale));
       } else {
@@ -810,7 +873,29 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
         }
         Canonicalise(u_up, up_pt_);
       }
-      silu.Apply(sv, g_up, evk);
+      if (!banded) {
+        silu.Apply(sv, g_up, evk);
+      } else {
+        // Each band: mask and normalise in ONE multiply (the same one the
+        // single-interval path spends), evaluate, accumulate. A channel
+        // outside the band sees zero and contributes `p_b(0)` = 0 by
+        // construction.
+        for (size_t b = 0; b < silus.size(); b++) {
+          Ct g_b, sv_b;
+          boot_->Copy(g_b, g_up);
+          Canonicalise(g_b, SiluBandPlaintext(
+                                i, static_cast<int>(b), c,
+                                1.0 / (kappa_ * crossing_ * c.gate_scale *
+                                       c.silu_bands[b]),
+                                g_up.GetScale()));
+          silus[b]->Apply(sv_b, g_b, evk);
+          if (b == 0) {
+            sv = std::move(sv_b);
+          } else {
+            boot_->Add(sv, sv, sv_b);
+          }
+        }
+      }
       boot_->LevelDown(u_low, u_up, p.NPToLevel(sv.GetNP()));
       boot_->HMult(prod[i], sv, u_low, evk.GetMultiplicationKey());
       g_ups[i] = Ct{};

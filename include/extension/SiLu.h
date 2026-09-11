@@ -127,9 +127,17 @@ class SiLuHandler {
    * @param input_level level of the input ciphertexts
    * @param degree Chebyshev degree; see the table above for what each range
    * costs at a 12-bit target
+   * @param zero_at_origin constrain the fit to `p(0) = 0`, which a BAND PLAN
+   * needs and a single fit does not. Every band's polynomial is evaluated on
+   * the MASKED input, so a channel outside band `b` hands `b` a zero and
+   * collects `p_b(0)`; `SiLU(0)` is 0 but the interpolant's `p(0)` is only 0
+   * to within the fit error, and seven other bands put seven fit errors on
+   * every slot. The BERT branch measured exactly that (+0.29 a slot, 2^+6.7
+   * in the crypto) before fixing it the same way. The constraint costs at
+   * most one more fit error.
    */
   SiLuHandler(ConstContextPtr<word> context, double range, int input_level,
-              int degree = 31);
+              int degree = 31, bool zero_at_origin = false);
 
   // disable copying (or moving also)
   SiLuHandler(const SiLuHandler &) = delete;

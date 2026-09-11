@@ -16,7 +16,8 @@ double SiLu(double x) { return x / (1.0 + std::exp(-x)); }
 
 template <typename word>
 SiLuHandler<word>::SiLuHandler(ConstContextPtr<word> context, double range,
-                               int input_level, int degree)
+                               int input_level, int degree,
+                               bool zero_at_origin)
     : context_{std::move(context)}, range_{range}, input_level_{input_level} {
   AssertTrue(range_ > 0.0, "SiLu: range must be positive");
   AssertTrue(degree > 0, "SiLu: degree must be positive");
@@ -27,6 +28,26 @@ SiLuHandler<word>::SiLuHandler(ConstContextPtr<word> context, double range,
   const double r = range_;
   auto coeffs = chebfit::Interpolate([r](double v) { return SiLu(r * v); },
                                      degree);
+
+  if (zero_at_origin) {
+    // A BAND PLAN EVALUATES EVERY FIT ON THE MASKED INPUT, so a channel
+    // outside band `b` feeds `b`'s polynomial a zero -- and collects `p_b(0)`
+    // for its trouble, once per band it is not in. `SiLU(0)` is 0, but the
+    // interpolant's `p(0)` is only 0 to within the fit error, so seven other
+    // bands put seven fit errors on every slot. That is the bug the BERT
+    // branch paid a GPU run for (Doing.md 8.8: "a band plan collects every
+    // OTHER band's p(0) ... +0.29 a slot, 2^+6.7 in the crypto -- fixed by
+    // constraining the fit to p(0) = 0").
+    //
+    // The constraint is one subtraction and costs at most one more fit error:
+    // shifting `p` by `-p(0)` moves it by `|p(0)| <= eps` everywhere.
+    // `T_k(0)` is 0 for odd `k` and alternates +1, -1 for even `k`.
+    double p0 = 0.0;
+    for (size_t k = 0; k < coeffs.size(); k += 2) {
+      p0 += (((k / 2) % 2 == 0) ? 1.0 : -1.0) * coeffs[k];
+    }
+    coeffs[0] -= p0;
+  }
 
   // The output scale has to be the canonical scale of the level the polynomial
   // *lands on*, not of the level it starts from. EvalPoly takes target_scale_

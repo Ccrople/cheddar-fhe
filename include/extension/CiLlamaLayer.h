@@ -263,6 +263,37 @@ class CiLlamaLayer {
     //! suppression. A run that uses it must suppress the residual stream to
     //! match, or the two conventions meet at the second residual add.
     std::vector<double> up_sink;
+
+    //! A CERTIFIED BANDED SiLU, which is what layer 31 wants and no other
+    //! layer needs.
+    //!
+    //! Measured (`sylph_prefix.py`, `silu_bound.py`): over the rows the
+    //! ciphertext sees, the SiLU's range is 3.5 to 10.6 at every layer but the
+    //! last and 29.51 at layer 31 -- and layer 31's excess is in the WEIGHTS,
+    //! not the activations. Its certified per-channel bound
+    //! `sqrt(H) ||gain . W[:,j]||` has max 168.4 against a p50 of 29.2, a
+    //! ratio of 5.77 where every other layer is 2.4 to 4.2. A handful of
+    //! outlier channels set the range, so one interval hands every channel the
+    //! worst one's error.
+    //!
+    //! `silu_bands` is the band TOPS, ascending, and `silu_band_of_channel`
+    //! says which band each LIVE hidden channel is in (so its size is the
+    //! hidden width, 14336). Both empty = the single-interval path, unchanged
+    //! operation for operation.
+    //!
+    //! **It costs no level.** Each band's mask rides the gate's own
+    //! `Canonicalise` multiply -- the same trick `up_sink` uses one line
+    //! below -- so a band is one more plaintext multiply and one more SiLU,
+    //! not one more level. At layer 31 alone, 8 bands is 8 SiLU evaluations
+    //! where SiLU is ~3 % of a layer: +0.7 % of the model.
+    //!
+    //! Priced at layer 31, RMS over channels against |SiLU| ~ 30: one interval
+    //! 2^-4.6, 8 certified bands 2^-8.8 at degree 63 and **2^-12.0 at degree
+    //! 127** -- against today's statistical plan at 2^-8.8, which 7 of 600
+    //! held-out prompts ESCAPE. A bound cannot be escaped, and an escape is
+    //! `cosh(63 arccosh v)`, not a small error.
+    std::vector<double> silu_bands;
+    std::vector<int> silu_band_of_channel;
   };
 
   /**
@@ -546,6 +577,14 @@ class CiLlamaLayer {
   Plaintext<word> CrossingPlaintext(double factor,
                                     const std::vector<double> &sink,
                                     double at_scale) const;
+  //! `factor` at the slots of hidden ciphertext `ct` whose LIVE channel is in
+  //! band `band`, and zero elsewhere. A per-CHANNEL pattern, which in this
+  //! layout is constant over each block of `num_tokens` slots -- the same
+  //! shape `RmsNormHandler`'s weights already are, and deliberately NOT the
+  //! per-(token, channel) shape whose duplicate handling `CrossingPlaintext`'s
+  //! comment records a bug for.
+  Plaintext<word> SiluBandPlaintext(int ct, int band, const Calibration &c,
+                                    double factor, double at_scale) const;
   void Canonicalise(Ct &ct, const Plaintext<word> &pt) const;
 
   std::shared_ptr<const BootContext<word>> boot_;
