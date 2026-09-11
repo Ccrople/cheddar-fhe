@@ -262,6 +262,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_batch_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # BERT-Tiny on the batched layout (branch BERT_tiny): one ring, the
+  # diagonal attention products, Cho softmax, LayerNorm and GELU per
+  # ciphertext; layer and chain against bert_tiny/reference.py's h_L{k}.f64
+  # with bert_tiny/sim.py's calib.json (BERT_TINY_ALL / BERT_TINY_REF).
+  add_executable(ci_bert_tiny_test CiBertTinyTest.cpp)
+  target_link_libraries(ci_bert_tiny_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)
