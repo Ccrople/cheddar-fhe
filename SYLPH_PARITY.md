@@ -312,6 +312,22 @@ prize is the third column: a BOUND CANNOT BE ESCAPED, and an escape is not a
 small error -- outside its interval a degree-63 Chebyshev is
 `cosh(63 arccosh v)`.
 
+The band curve flattens at 8 (RMS at layer 31, degree 127: one band 0.368, four
+0.00986, **eight 0.00743**, thirty-two 0.00626, per-channel 0.00587) -- so eight
+bands take 5.63 of the 5.97 bits a per-channel plan would give, and a band's
+mask is a per-CHANNEL plaintext, the shape RMSNorm's weights already are.
+
+**Two independent routes agree on 2^-12, and only one arrives clean.** The
+600-article audit's `fix_silu` variant -- the SiLU ladder extended, range still
+statistical -- measured the whole chain at 2^-12.043 with 3 non-finite outputs
+left. The certified 8-band plan at degree 127 prices at 2^-12.0 and cannot
+produce those three, because they are escapes.
+
+And the prefix is NOT the lever for any of it: measured at prefix lengths 1, 2
+and 4, layer 31's SiLU range moves 27.59 / 29.51 / 28.95 and its SoftMax span
+80.91 / 78.23 / 75.32, while `sink_mass` only climbs 0.913 / 0.934 / 0.948.
+Two to four percent, on a quantity that needs a factor of three.
+
 ### What was implemented, and the one thing that was not
 
 `gen_b1_pop.py` gains `SILU_SINK=1`: it measures `gate_absmax_user`, derives a
