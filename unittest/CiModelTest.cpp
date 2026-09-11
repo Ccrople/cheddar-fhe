@@ -101,9 +101,20 @@ const std::string kBootParam = [] {
   const char *e = std::getenv("CHEDDAR_CI_BOOT_PARAM");
   return std::string((e != nullptr && e[0] != 0) ? e : "ci16_35_k16_w58.json");
 }();
-constexpr const char *kSwitchParam = "ci_ringswitch16_35_boot.json";
-constexpr const char *kSmallParam = "ci12_35_boot.json";
-constexpr const char *kLiftedParam = "ringdegree13_35_boot.json";
+// THE SWITCHING TRIO rides the base ring's bottom levels prime for prime
+// (levels 0..4 verbatim, `reference/scripts/ci_boot_trio.py`), so a base
+// ring on another prefix brings its own: `CHEDDAR_CI_{SWITCH,SMALL,LIFTED}_PARAM`
+// (the 2^42 family's are `ci_ringswitch16_42_boot` / `ci12_42_boot` /
+// `ringdegree13_42_boot`).
+std::string EnvOr(const char *name, const char *dflt) {
+  const char *e = std::getenv(name);
+  return std::string((e != nullptr && e[0] != 0) ? e : dflt);
+}
+const std::string kSwitchParam =
+    EnvOr("CHEDDAR_CI_SWITCH_PARAM", "ci_ringswitch16_35_boot.json");
+const std::string kSmallParam = EnvOr("CHEDDAR_CI_SMALL_PARAM", "ci12_35_boot.json");
+const std::string kLiftedParam =
+    EnvOr("CHEDDAR_CI_LIFTED_PARAM", "ringdegree13_35_boot.json");
 
 // A RING FROM A POOL, CUT TO THE LANDING THE LAYER NEEDS (2026-09-11). The
 // family's three presets (`ci16_35_k{16,32,64}_w58`, one per K, all on
@@ -673,7 +684,21 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
   }
 
   typename cheddar::CiSinCAttention<word>::Config acfg;
-  acfg.restore = 1.0 / crossing;
+  // THE LEG'S RESTORE UNDOES WHAT THE IMAGES CARRY. A projection's image
+  // arrives carrying kappa * crossing = the NOMINAL 2^-log_message_ratio
+  // (the norm turn leaves kappa on the stream -- `[stage 1] carried` -- and
+  // the doorstep HalfBoot multiplies by the derived crossing), so the leg
+  // restores by 1 / (kappa * crossing), as the layer's own crossings do
+  // (`CiLlamaLayer` 963..995). `1 / crossing` alone left kappa on every
+  // image: 0.988 on ci16_35 (ratio 5, invisible at the floor), 1.371 on the
+  // 2^42 family (ratio 4 on a 2^47.5 q0), whose square took the scores past
+  // the exp window and the layer to 2^+7.5 -- while the leg test, whose
+  // images come straight from a HalfBoot and carry crossing alone, passed.
+  const double kappa =
+      std::exp2(-bctx->GetBootParameter().GetLogMessageRatio()) / crossing;
+  acfg.restore = 1.0 / (kappa * crossing);
+  std::cout << "leg restore 1/(kappa * crossing) = " << acfg.restore
+            << " (kappa " << kappa << ")" << std::endl;
   acfg.rope_base = kRopeTheta;
   // Where the q/k/v crossings land, which is where the RoPE masks are
   // encoded: the FFN ring's HalfBootModule on the module basis (dense
@@ -1149,7 +1174,7 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     req(".up", 5, &pf_model_map, &pf_hidden_map, kDeclaredH, kDeclaredHid,
         gate_scale);
     req(".down", 6, &pf_hidden_map, &pf_model_map, kDeclaredHid, kDeclaredH,
-        stream_scale);
+        stream_scale / layer.GetKappa());
     // The norms' handlers, on the compute stream in this window (~40 ms of
     // encodes that used to sit in the norm's own row).
     std::vector<double> an_dec(kDeclaredH, 0.0), fn_dec(kDeclaredH, 0.0);
@@ -2521,7 +2546,9 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
       dw_o = device_weights(to, 3, attn_map, model_map, cal.res_scale);
       dw_g = device_weights(tg, 4, model_map, hidden_map, cal.gate_scale);
       dw_u = device_weights(tu, 5, model_map, hidden_map, cal.gate_scale);
-      dw_d = device_weights(td, 6, hidden_map, model_map, stream_scale);
+      // The down operand's scale is the layer's: the stream's over kappa.
+      dw_d = device_weights(td, 6, hidden_map, model_map,
+                            stream_scale / layer.GetKappa());
       lw.o.device = &dw_o;
       lw.gate.device = &dw_g;
       lw.up.device = &dw_u;
@@ -2538,6 +2565,83 @@ TEST(CiModel, TheModelRunsAtTheFullWidth) {
     layer.FeedForward(next, h_cts, stream, lw, cal, fevk);
     if (prefetch) pf->MarkLateDone(L);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+    if (EnvInt("CHEDDAR_CI_PROBE_H1", 0) != 0 && !layer.probe_h1.empty()) {
+      // THE TWO BRANCHES OF THE RESIDUAL, APART (a diagnostic; 2026-09-11,
+      // the 2^42 family): h1 = stream + O(attn) against
+      // stream_scale * (x + av Wo), and the feed-forward branch out - h1
+      // against stream_scale * (h - h1), each with its own fitted factor --
+      // a layer whose two branches carry different factors cannot be fixed
+      // by the one scalar the LAYER line fits.
+      std::vector<double> av, ref;
+      const std::string tag2 = (L < 10 ? "0" : "") + std::to_string(L);
+      ASSERT_TRUE(ReadF64(rdir + "/av_L" + tag2 + ".f64",
+                          static_cast<size_t>(kT) * kH, av));
+      ASSERT_TRUE(ReadF64(rdir + "/h_L" + tag2 + ".f64",
+                          static_cast<size_t>(kT) * kH, ref));
+      std::vector<double> h1(av.size()), ffn(av.size());
+      const float *wo_h = to.host.data();
+      for (int t = 0; t < kT; t++) {
+        for (int m = 0; m < kH; m++) {
+          double acc = x0[static_cast<size_t>(t) * kH + m];
+          for (int c2 = 0; c2 < kH; c2++) {
+            acc += av[static_cast<size_t>(t) * kH + c2] *
+                   static_cast<double>(wo_h[static_cast<size_t>(c2) * kH + m]);
+          }
+          h1[static_cast<size_t>(t) * kH + m] = acc;
+          ffn[static_cast<size_t>(t) * kH + m] =
+              ref[static_cast<size_t>(t) * kH + m] - acc;
+        }
+      }
+      auto decode = [&](const std::vector<Ciphertext<word>> &cts) {
+        std::vector<std::vector<std::vector<double>>> g(kNumH);
+        for (int k = 0; k < kNumH; k++) {
+          Plaintext<word> pt;
+          boot.ui->Decrypt(pt, cts[k]);
+          std::vector<double> co;
+          boot_ffn.context->encoder_.DecodeCoeff(co, pt);
+          g[k] = Components(co);
+        }
+        return g;
+      };
+      const auto g1 = decode(layer.probe_h1);
+      const auto g2 = decode(next);
+      auto report = [&](const char *name, bool diff,
+                        const std::vector<double> &want_raw) {
+        double num = 0.0, den = 0.0, mx = 0.0;
+        auto at = [&](int m, int t) {
+          const int k = m / kPerModel;
+          const int c = ModelSlot(m) - k * kRank;
+          const double a = g1[k][Rev(c, 9)][Pos(t)];
+          return diff ? g2[k][Rev(c, 9)][Pos(t)] - a : a;
+        };
+        for (int m = 0; m < kH; m++) {
+          for (int t = kSinkTokens; t < kT; t++) {
+            const double w = stream_scale * want_raw[static_cast<size_t>(t) * kH + m];
+            num += at(m, t) * w;
+            den += w * w;
+            mx = std::max(mx, std::abs(w));
+          }
+        }
+        const double f = num / den;
+        double err = 0.0, q = 0.0;
+        for (int m = 0; m < kH; m++) {
+          for (int t = kSinkTokens; t < kT; t++) {
+            const double w = stream_scale * want_raw[static_cast<size_t>(t) * kH + m];
+            const double d = at(m, t) / f - w;
+            err = std::max(err, std::abs(d));
+            q += d * d;
+          }
+        }
+        std::cout << "  [probe] " << name << ": " << (err / mx) << " = 2^"
+                  << std::log2(err / mx) << ", rms 2^" << 0.5 * std::log2(q / den)
+                  << ", carried " << f << " (= " << (f / 1.0)
+                  << " x the stream's 1), |ref| <= " << (mx / stream_scale)
+                  << std::endl;
+      };
+      report("h1 = stream + O(attn)", false, h1);
+      report("the FFN branch out - h1", true, ffn);
+      layer.probe_h1.clear();
+    }
     const auto t_ffn = Tick();
     stage.reset();
     stage = std::make_unique<cheddar::NvtxScope>("stage: after-layer ledger");

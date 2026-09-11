@@ -488,6 +488,11 @@ class CiLlamaLayer {
   double GetCrossing() const { return crossing_; }
   //! What a full turn through the coefficient domain carries.
   double GetKappa() const { return kappa_; }
+  /// A DIAGNOSTIC: the residual after the O projection (`stream + O(attn)`),
+  /// kept by `FeedForward` when `CHEDDAR_CI_PROBE_H1` is set, so a test can
+  /// measure the two branches of the residual apart (2026-09-11, the 2^42
+  /// family). Empty otherwise.
+  std::vector<Ct> probe_h1;
   //! `SylphSchedule`'s levels, for a caller placing its own stages.
   const SylphSchedule<word> &GetSchedule() const { return sched_; }
   //! The projection leg, for a caller that wants its own `Project` calls.

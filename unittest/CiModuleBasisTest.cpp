@@ -664,7 +664,7 @@ TEST_P(CiModuleBoot, ModuleLiftCentresTheRepresentatives) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, CiModuleBoot, testing::Values("ci16_35_k16_w58.json"),
+    Cheddar, CiModuleBoot, testing::ValuesIn(PresetList({"ci16_35_k16_w58.json"})),
     [](const testing::TestParamInfo<CiModuleBoot::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');
@@ -672,7 +672,8 @@ INSTANTIATE_TEST_SUITE_P(
     });
 
 INSTANTIATE_TEST_SUITE_P(
-    Cheddar, CiModuleBasisTest, testing::Values("ci16_35_k16_w58.json"),
+    Cheddar, CiModuleBasisTest,
+    testing::ValuesIn(PresetList({"ci16_35_k16_w58.json"})),
     [](const testing::TestParamInfo<CiModuleBasisTest::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

@@ -7,7 +7,7 @@
   "num_cts_levels": 2,
   "num_stc_levels": 3,
   "num_double_angle": 4,
-  "log_message_ratio": 4,
+  "log_message_ratio": 5,
   "terminal_primes": [
     13631489,
     14155777,

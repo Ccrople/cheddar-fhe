@@ -1057,3 +1057,29 @@ The prefix study on a GPU (cupy; `SIM_GPU=0` is the same code on numpy):
     python3 sylph_prefix_gpu.py <ids.npy> 528 @prefix_search.json
     SINKCHECK=1 python3 sylph_prefix_gpu.py <ids.npy> 16 bos2,bos1,A
     python3 prefix_heldout.py <pp dir> <ids.npy.src.json>
+
+## The 2^42 family runs the layer, and kappa was hiding in ci16_35 (2026-09-11, evening)
+
+The B = 1 / T = 128 layer runs on the second 2^42 cut (`ci16_42_k16` base,
+`k32` cut at 13 for the FFN, `k64` tower, the `_42_boot` switching trio),
+and doing so exposed four constants that were ci16_35's own: `kappa =
+2^-log_message_ratio / GetMessageRatio()` is 0.988 on ci16_35 and 1.371 on
+the new prefix, so a forgotten kappa was 1 % there and 37 % here. The
+model test's leg restore (`1 / crossing` -> `1 / (kappa * crossing)`), the
+down projection's rejoin (`stream_scale / kappa_`), `Config::land_level =
+19` (derived now) and one message ratio per family were the four; the
+record is `reference/docs/CI_PARAM_20BIT.md` 8.6, the tool that found the
+last two is `CHEDDAR_CI_PROBE_H1=1` (the residual's two branches fitted
+apart). The family ships `log_message_ratio 5` (the layer's images are 2
+bits better there than at the boot test's peak 4).
+
+| 32 layers, seed 11, B200 | oracle: median / L31 | held-out Cho (`llama3_pop6`): median / worst / L31 |
+|---|---|---|
+| ci16_35 family, this morning | ~2^-6.4 / **2^-3.75** | 2^-4.74 / 2^-2.77 (L19) / 2^-5.06 |
+| ci16_35 family, the four fixes | 2^-9.37 / **2^-8.75** | 2^-7.55 / 2^-6.76 (L21) / 2^-7.54 |
+| **2^42 family (shipped)** | **2^-10.73 / 2^-8.65** | **2^-10.35 / 2^-9.06 (L19) / 2^-10.98** |
+
+[SYLPH]'s 2^-6.64 at L31 is cleared by two bits on either family; layer 0
+alone is 2^-13.79 on the 2^42 family against 2^-12.04 on ci16_35 (was
+2^-6.31). Nothing per prompt changed; every constant above is derived.
+11.2 s a layer on the B200, peak 77.8 GB.

@@ -1,0 +1,56 @@
+{
+  "log_default_scale": 42,
+  "boot": false,
+  "conjugate_invariant": true,
+  "terminal_primes": [
+    13631489,
+    14155777,
+    14942209,
+    16515073
+  ],
+  "main_primes": [
+    1138753537,
+    1133510657,
+    655360001,
+    1224736769,
+    793509889
+  ],
+  "auxiliary_primes": [
+    2075394049,
+    2077229057
+  ],
+  "default_encryption_level": 2,
+  "level_config": [
+    [
+      0,
+      2
+    ],
+    [
+      3,
+      0
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      5,
+      1
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      5,
+      4
+    ]
+  ],
+  "additional_base": [
+    0,
+    1
+  ],
+  "log_degree": 16,
+  "dense_hamming_weight": 32768,
+  "sparse_hamming_weight": 32768
+}

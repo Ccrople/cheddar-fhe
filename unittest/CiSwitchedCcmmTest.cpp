@@ -567,14 +567,37 @@ TEST(CiNestedPacking, TheFlatEncodingOfTheBlockSumsIsTheNestedOperand) {
 // The bootstrap trio: ci16_35's own bottom primes, so a ci16_35 ciphertext at
 // level <= 4 crosses keylessly (Doing.md 1.5bt). Correctness-lane on the small
 // ring (Q * P = 2^182+ at degree 4096); no security or timing claim.
-constexpr const char *kBootParam = "ci16_35_k16_w58.json";
-constexpr const char *kBootSwitchParam = "ci_ringswitch16_35_boot.json";
-constexpr const char *kBootSmallParam = "ci12_35_boot.json";
-constexpr const char *kBootLiftedParam = "ringdegree13_35_boot.json";
+// Another family's base ring brings its own trio and tower
+// (`CHEDDAR_CI_{BOOT,SWITCH,SMALL,LIFTED,LEG}_PARAM`, the model test's knobs;
+// the 2^42 family is `ci16_42_k16` / `ci_ringswitch16_42_boot` /
+// `ci12_42_boot` / `ringdegree13_42_boot` / `ci16_42_k64`).
+std::string PresetEnvOr(const char *name, const char *dflt) {
+  const char *e = std::getenv(name);
+  return std::string((e != nullptr && e[0] != 0) ? e : dflt);
+}
+const std::string kBootParam =
+    PresetEnvOr("CHEDDAR_CI_BOOT_PARAM", "ci16_35_k16_w58.json");
+const std::string kBootSwitchParam =
+    PresetEnvOr("CHEDDAR_CI_SWITCH_PARAM", "ci_ringswitch16_35_boot.json");
+const std::string kBootSmallParam =
+    PresetEnvOr("CHEDDAR_CI_SMALL_PARAM", "ci12_35_boot.json");
+const std::string kBootLiftedParam =
+    PresetEnvOr("CHEDDAR_CI_LIFTED_PARAM", "ringdegree13_35_boot.json");
 // The leg's fused-return ring (Doing.md 3.16): the 2^35 family's K = 64 pool,
 // ci16_35's compute prefix to L = 17 with three CtS levels for the tower CtS'
 // and K = 64 for the tower-sparse secret's wrap-around.
-constexpr const char *kTowerParam = "ci16_35_k64_w58.json";
+const std::string kTowerParam =
+    PresetEnvOr("CHEDDAR_CI_LEG_PARAM", "ci16_35_k64_w58.json");
+
+// The HalfBoot's boundary constant, measured off one ciphertext below, is
+// the ring's DERIVED crossing constant (`BootContext::GetMessageRatio()`:
+// `2^-log_message_ratio` times the rungs' drift) -- 1/32 on ci16_35, whose
+// ratio is 5, which the bar used to carry as a literal; the 2^42 family
+// ships ratios 4 and 3.
+double CrossingOf(const Ring &boot) {
+  auto b = std::dynamic_pointer_cast<cheddar::BootContext<word>>(boot.context);
+  return (b != nullptr) ? b->GetMessageRatio() : 1.0 / 32.0;
+}
 
 TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
   Ring boot(kBootParam);
@@ -586,7 +609,10 @@ TEST(CiBootSet, TheLoopRunsOnTheRealBootstrapLadder) {
   const int fwd_level = 3;      // (1,5), on ci16_35 and on the trio alike
   const int chain_level = 2;    // (4,0)
   const int inverse_level = 1;  // (2,1)
-  ASSERT_EQ(swtch.param->max_level_, 6) << "L0..L4 plus the synthetic tops";
+  // L0..L4 plus the synthetic tops that declare every prime: two on
+  // ci16_35's trio (a main and a terminal are missing at L4), one on the
+  // 2^42 family's (`ci_boot_trio.py`).
+  ASSERT_GE(swtch.param->max_level_, 5) << "L0..L4 plus the synthetic tops";
 
   // The matched-set precondition, in numbers: the rescale ladders agree at
   // every shared level because the primes do. Editing either file alone
@@ -3295,7 +3321,7 @@ TEST(CiBootSet, TheRealHalfBootDeliversTheBandedImages) {
               << std::endl;
     ASSERT_LT((rhi - rlo) / std::abs(hb_const), 2e-2)
         << "the landing is not a permutation times one constant";
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5)
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5)
         << "the constant is not the message ratio";
   }
 
@@ -3850,7 +3876,7 @@ TEST(CiBootSet, TheRealPcmmEmitsTheHalfDensityImages) {
               << " (2^" << std::log2(std::abs(hb_const)) << "), spread ["
               << rlo << ", " << rhi << "] over " << counted << std::endl;
     ASSERT_LT((rhi - rlo) / std::abs(hb_const), 5e-2);
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
 
   const double restore = 1.0 / hb_const;
@@ -4406,7 +4432,7 @@ TEST(CiBootSet, TheAttentionLegClosesEndToEnd) {
       }
     }
     hb_const = rsum / counted;
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
   const double restore = 1.0 / hb_const;
 
@@ -5536,7 +5562,7 @@ TEST(CiBootSet, TheLibraryLegReproducesTheReference) {
       }
     }
     hb_const = rsum / counted;
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
 
   // ---- the handler, its keys ------------------------------------------
@@ -6153,7 +6179,7 @@ TEST(CiBootSet, TheProjectionsRunAtFullWidth) {
     std::cout << "  boundary constant at full width " << hb_const << " (2^"
               << std::log2(std::abs(hb_const)) << "), spread [" << rlo
               << ", " << rhi << "] over " << counted << std::endl;
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
 
   const double restore = 1.0 / hb_const;
@@ -6754,7 +6780,7 @@ TEST(CiBootSet, TheLegRunsOnTheRealWeights) {
     }
     ASSERT_GT(counted, 1000);
     hb_const = rsum / counted;
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
 
   typename cheddar::CiSinCAttention<word>::Config acfg;
@@ -7847,7 +7873,7 @@ TEST(CiBootSet, TheWholeLayerRunsOnTheRealSubring) {
       }
     }
     hb_const = rsum / counted;
-    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) * 32.0)), 0.5);
+    ASSERT_LT(std::abs(std::log2(std::abs(hb_const) / CrossingOf(boot))), 0.5);
   }
 
   // ---- the handler, its keys ------------------------------------------

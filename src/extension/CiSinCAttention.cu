@@ -63,6 +63,11 @@ CiSinCAttention<word>::CiSinCAttention(
       ccmm_{switch_ctx_, small_ctx, lifted_ctx, cfg.sub_degree} {
   degree_ = boot_->param_.degree_;
   num_slots_ = boot_->param_.MaxNumSlots();
+  // The landing level is the ring's, unless the caller names another ring's
+  // (the literal 19 it used to carry was ci16_35's dec).
+  if (cfg_.land_level <= 0) {
+    cfg_.land_level = boot_->GetBootParameter().GetEvalModEndLevel();
+  }
   const auto &layout = ccmm_.GetLayout();
   AssertTrue(layout.dim == 128 && layout.lanes == 32 && layout.num_cts == 8 &&
                  cfg_.sub_degree == 32,
@@ -1139,7 +1144,12 @@ void CiSinCAttention<word>::PrepareSoftMax(const SoftMaxCalibration &calib) {
     // only has to stay above zero; the LAST pass's `(y r)^2` IS P.
     cho_inv_.push_back(compile_inv(f_lo, f_hi, iter_deg, poly_in_,
                                    /*floor=*/3, "first", &cho_used));
-    cho_inv_in_ = top - 2;
+    // The between-pass Boot runs on the BASE ring and lands where ITS ladder
+    // lands (`GetEndLevel()`: 16 on ci16_35 = `top`; 15 on the 2^42 family's
+    // K = 16 pool, whose dec is 18), so the later pass is compiled from that
+    // landing and not from the tower's top -- the two coincide only on
+    // ci16_35. `sq` lands one below it, the affine two below.
+    cho_inv_in_ = std::min(top, boot_->GetBootParameter().GetEndLevel()) - 2;
     cho_inv_.push_back(compile_inv(cho_later_lo_, cho_later_hi_, last_deg,
                                    cho_inv_in_, cfg_.forward_level + 2,
                                    "later", &inv_used));

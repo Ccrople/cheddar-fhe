@@ -88,7 +88,11 @@ class CiSinCAttention {
  public:
   struct Config {
     int sub_degree = 32;      //!< k; fixes the Llama alignment below
-    int land_level = 19;  //!< where HalfBoot lands the half-images
+    //! Where HalfBoot lands the half-images: 0 (the default) is the boot
+    //! ring's own `GetEvalModEndLevel()` -- 19 on ci16_35, 18 on the 2^42
+    //! family's K = 16 pool -- resolved in the constructor; the model test
+    //! passes the FFN ring's when the images cross there.
+    int land_level = 0;
     //! DENSE IMAGES (Doing.md 3.10/3.12): the projections write one dense
     //! ciphertext per 16-channel group, rows `head * 16 + channel` over all
     //! 32 heads, and `HalfBootModule` lands it -- which is exactly this

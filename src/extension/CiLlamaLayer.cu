@@ -875,6 +875,11 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
     for (int k = 0; k < num_model_cts_; k++) {
       boot_->Add(h_ct[k], stream[k], out[k]);
     }
+    if (const char *e = std::getenv("CHEDDAR_CI_PROBE_H1");
+        e != nullptr && e[0] == '1') {
+      probe_h1.resize(num_model_cts_);
+      for (int k = 0; k < num_model_cts_; k++) boot_->Copy(probe_h1[k], h_ct[k]);
+    }
   }
   MemoryPool::Report("ffn: after the O projection and the residual");
 
@@ -1030,9 +1035,17 @@ void CiLlamaLayer<word>::FeedForward(std::vector<Ct> &res,
     // `stream_scale`, not 1: RMSNorm is scale invariant, so `y` comes back in
     // the model's own units while `h_ct` carries the stream's factor, and the
     // two cannot be added until they agree. The weight is a plaintext, so
-    // putting it back costs nothing.
+    // putting it back costs nothing. AND OVER KAPPA (2026-09-11): the hidden
+    // product reaches this projection through `ToCoeff`, which undoes the
+    // crossing by the NOMINAL ratio -- what a full turn carries is kappa
+    // (above), and the slot half never sees it because RMSNorm is scale
+    // invariant -- but this branch rejoins the STREAM. Measured apart from
+    // the O branch (`CHEDDAR_CI_PROBE_H1`): the feed-forward branch came
+    // back at 1.3709 x the stream on the 2^42 family and 0.988 x on
+    // ci16_35 = kappa to four digits, while `stream + O(attn)` was at
+    // 1.00003. On ci16_35 that 1.2 % sat under layer 0's floor.
     Project(y, ins, cfg_.hidden_declared, cfg_.model_declared, w.down,
-            c.stream_scale, (w.tag + ".down").c_str());
+            c.stream_scale / kappa_, (w.tag + ".down").c_str());
     AssertTrue(static_cast<int>(y.size()) == num_model_cts_,
                "CiLlamaLayer: the down projection did not land in " +
                    std::to_string(num_model_cts_) + " ciphertexts");
