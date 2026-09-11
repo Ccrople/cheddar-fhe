@@ -346,6 +346,16 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
       layer.SetMask(valid);
       std::cout << "  mask " << mpath << ": shortest prompt " << shortest
                 << " real tokens of " << T << std::endl;
+      // A prompt shorter than any the calibration saw sits outside its
+      // windows, and one escape poisons every instance of the batch.
+      const int min_cal = calib.contains("min_real_tokens")
+                              ? calib["min_real_tokens"].get<int>() : 0;
+      if (shortest < min_cal) {
+        std::cout << "  WARNING: a prompt has " << shortest
+                  << " real tokens but the calibration's shortest had "
+                  << min_cal << " -- outside the calibration, expect an escape"
+                  << std::endl;
+      }
     }
   }
   // The head's tensors.

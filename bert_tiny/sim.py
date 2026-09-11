@@ -266,6 +266,10 @@ def main():
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio},
            "padded": valid is not None,
+           # the shortest prompt the windows were sized on: a served prompt
+           # shorter than this is outside the calibration (the first Cho
+           # window is a statistic of the row sum, and an escape is batch-wide)
+           "min_real_tokens": int(valid.sum(axis=1).min()) if valid is not None else m.T,
            "head": head,
            "layers": layers}
     with open(a.calib, "w") as f:

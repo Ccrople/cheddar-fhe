@@ -189,6 +189,39 @@ q 13.7, k 14.3, v 13.5, scores 13.0, exp 13.5, sq 14.1, r 13.2, P 11.7,
 attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out
 10.5 (the empty-instance leak), GELU input 11.1.
 
+## 5b. The head, the padding mask, serve mode (2026-09-11, later)
+
+* **Head** (`CiBertTinyLayer::Head`): the last layer's output booted, the
+  pooler as a Kang GEMM (128 -> 128) with the tanh's affine folded, tanh as
+  ONE polynomial on the pooler input's CERTIFIED interval, the classifier
+  as a Kang GEMM (128 -> 2) with its bias; instance b's logits sit at its
+  [CLS] slot (token 0). The interval is a theorem of the last LayerNorm:
+  `z = g n + b` with `n` centred and `|n| <= sqrt(H)`, so `|u_j - c_j| <=
+  sqrt(H) ||g W_j - mean||` for every prompt there is -- BERT-Tiny: [-26.2,
+  24.9], where the recorded prompt reaches 5.07 -- and the polynomial there
+  is degree 255 (8 levels), which the ladder affords (16 -> 15 -> 7 -> 6).
+  Every other token's slot is the same head on that token, also inside the
+  interval, so nothing can escape.
+* **Padding mask** (`SetMask`): pads are projected, scored and exp'd like
+  every key (the calibration's exp domain covers them: `sim.py` takes the
+  domain over ALL keys and the shift over the REAL ones), then `y_d` is
+  multiplied by a 0/1 per-slot plaintext `M_d[t][b] = valid[b][(t+d) mod T]`
+  before the row sum. One wide level, reserved by the plan. T plaintexts,
+  rebuilt only when the level changes. Padded positions are still computed
+  (as BERT does) and never read.
+* **Serve mode**: `bert_tiny/serve.sh <text.txt>` = `encode.py` (the
+  client: WordPiece from the exported vocab, embeddings, embedding LN,
+  padding to T, `inputs.f32` + `mask.u8`) -> the run with the population
+  calibration -> logits and labels per line; the float64 reference runs
+  beside it so every logit is checked. The head's label is BERT-Tiny's
+  pretrained NSP classifier (is-next-sentence), the only classifier the
+  checkpoint ships; a fine-tuned task head is the same two GEMMs with its
+  own weights.
+
+Ledger additions: mask = 1 wide level (choice: multiplicative on `y`);
+tanh interval = certified (theorem), degree by tol; the calibration is now
+the PADDED population (1000 prompts with random real lengths 16..128).
+
 ## 6. Plan
 
 1. B = 1, T = 128 on the A100: build, layer 0, the 2-layer chain. DONE.

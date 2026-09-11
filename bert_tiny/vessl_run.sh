@@ -12,4 +12,4 @@ nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader > "$L
     BERT_TINY_ALL=/root/bert_tiny/all BERT_TINY_REF=/root/bert_tiny/ref \
     "$@" ./ci_bert_tiny_test ) >> "$LOG" 2>&1
 echo "BT_RUN_DONE rc=$?" >> "$LOG"
-grep -aE "BERT-Tiny:|setup|plan:|input at|^LAYER|CHAIN|Failure|what\(\)|Assert|FAILED|PASSED|BT_RUN_DONE|^real" "$LOG" | cut -c1-240
+grep -aE "BERT-Tiny:|setup|plan:|input at|mask |WARNING|prompt\(s\)|^  prompt|^LAYER|CHAIN|^HEAD|Failure|what\(\)|Assert|FAILED|PASSED|BT_RUN_DONE|^real" "$LOG" | cut -c1-240
