@@ -5,10 +5,16 @@
 //   [BERT_TINY_PARAM=ci16_35_k16_w58.json] [BERT_TINY_INPUT_LEVEL=<top>]
 //   ./ci_bert_tiny_test
 //
-// One prompt (the recorded one) in instance 0; `BERT_TINY_INSTANCES=all`
-// puts the same prompt in every instance of the batch, which checks that
-// the instances are independent (a leak between prompts fails it) at no
-// extra cost -- the layer's work does not depend on how many are live.
+// THE BATCH IS ALWAYS FULL. An empty instance is an all-zero prompt, whose
+// LayerNorm variance is 0 -- outside every fitted window -- and a Chebyshev
+// evaluated outside its interval is ~1e8 there; CKKS noise lives in the
+// coefficient domain, so that one instance's garbage pollutes EVERY slot of
+// the ciphertext (measured: one hidden channel of the live prompt at 2^+18).
+// So by default (`BERT_TINY_INSTANCES=all`) the recorded prompt fills every
+// instance, which is also the leak check between instances at no extra cost;
+// `BERT_TINY_INPUTS=<inputs.f32>` ([N, T, H], export.py --prompts) fills the
+// batch with N DISTINCT prompts (cyclically if N < B), each checked against
+// its own row of `h_L{k}.f64` ([N, T, H], reference.py --inputs).
 // Layer L reads layer L-1's ENCRYPTED output: the chain is what is measured.
 
 #include <gtest/gtest.h>
@@ -144,11 +150,11 @@ struct LayerFiles {
   }
 };
 
-// `x[t][c]` of one prompt into every live instance's channel ciphertexts,
-// carrying `carry`, at `level`.
-void EncryptPrompt(Ring &ring, const CiBatchLayout &layout,
-                   const std::vector<double> &x, int H, int live, double carry,
-                   int level, std::vector<Ciphertext<word>> &cts) {
+// `x[n][t][c]`, N prompts, into the live instances' channel ciphertexts
+// (instance b holds prompt b % N), carrying `carry`, at `level`.
+void EncryptPrompts(Ring &ring, const CiBatchLayout &layout,
+                    const std::vector<double> &x, int N, int H, int live,
+                    double carry, int level, std::vector<Ciphertext<word>> &cts) {
   const int T = layout.num_tokens;
   const double scale = ring.param->GetScale(level);
   cts.clear();
@@ -157,8 +163,10 @@ void EncryptPrompt(Ring &ring, const CiBatchLayout &layout,
   std::vector<Complex> msg;
   for (int c = 0; c < H; c++) {
     for (int b = 0; b < live; b++) {
+      const size_t n = static_cast<size_t>(b % N);
       for (int t = 0; t < T; t++) {
-        values[static_cast<size_t>(b) * T + t] = carry * x[static_cast<size_t>(t) * H + c];
+        values[static_cast<size_t>(b) * T + t] =
+            carry * x[(n * T + t) * H + c];
       }
     }
     layout.Pack(msg, values);
@@ -193,16 +201,18 @@ void DecryptAll(Ring &ring, const CiBatchLayout &layout,
 struct Err {
   double rms_rel = 0.0, max_abs = 0.0, worst_instance = 0.0;
 };
+// `want` is [N][T][H]; instance b is checked against prompt b % N.
 Err Compare(const std::vector<double> &got, const std::vector<double> &want,
-            int live, int T, int H) {
+            int N, int live, int T, int H) {
   Err e;
   double se = 0.0, sr = 0.0;
   for (int b = 0; b < live; b++) {
     double seb = 0.0, srb = 0.0;
+    const size_t n = static_cast<size_t>(b % N);
     for (int t = 0; t < T; t++) {
       for (int c = 0; c < H; c++) {
         const size_t i = (static_cast<size_t>(b) * T + t) * H + c;
-        const double w = want[static_cast<size_t>(t) * H + c];
+        const double w = want[(n * T + t) * H + c];
         const double d = got[i] - w;
         seb += d * d;
         srb += w * w;
@@ -260,7 +270,7 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
   auto t0 = std::chrono::steady_clock::now();
   Layer layer(bctx, cfg);
   const CiBatchLayout &layout = layer.GetLayout();
-  const int live = std::string(Env("BERT_TINY_INSTANCES", "1")) == "all"
+  const int live = std::string(Env("BERT_TINY_INSTANCES", "all")) == "all"
                        ? layout.num_instances
                        : std::min(EnvInt("BERT_TINY_INSTANCES", 1), layout.num_instances);
   std::cout << "  BERT-Tiny: " << num_layers << " layer(s), H " << H << ", I " << I
@@ -281,8 +291,21 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
                                  std::chrono::steady_clock::now() - t0).count()
             << " s" << std::endl;
 
-  // The input, and the chain.
-  std::vector<double> x0 = ReadVec(ad + "/input.f32", static_cast<size_t>(T) * H);
+  // The input set: the recorded prompt, or BERT_TINY_INPUTS' N prompts.
+  const std::string inputs = Env("BERT_TINY_INPUTS", "");
+  std::vector<double> x0;
+  int N = 1;
+  if (inputs.empty()) {
+    x0 = ReadVec(ad + "/input.f32", static_cast<size_t>(T) * H);
+  } else {
+    std::ifstream f(inputs, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(f.good()) << inputs;
+    const size_t bytes = static_cast<size_t>(f.tellg());
+    N = static_cast<int>(bytes / (static_cast<size_t>(T) * H * sizeof(float)));
+    ASSERT_GT(N, 0);
+    x0 = ReadVec(inputs, static_cast<size_t>(N) * T * H);
+  }
+  std::cout << "  " << N << " prompt(s) -> " << live << " instance(s)" << std::endl;
   std::vector<LayerFiles> files(num_layers);
   for (int L = 0; L < num_layers; L++) {
     char d[8];
@@ -296,7 +319,7 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     in.carry = layer.InputCarry();
     const int top = layer.TopLevel();
     const int level = std::min(EnvInt("BERT_TINY_INPUT_LEVEL", top), boot.enc_level);
-    EncryptPrompt(boot, layout, x0, H, live, in.carry, level, in.cts);
+    EncryptPrompts(boot, layout, x0, N, H, live, in.carry, level, in.cts);
     std::cout << "  input at level " << level << ", carry " << in.carry << std::endl;
   }
   // BERT_TINY_DUMP=<dir>: every intermediate the layer taps, decrypted into
@@ -342,8 +365,8 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
     DecryptAll(boot, layout, out.cts, H, live, out.carry, got);
     char name[16];
     std::snprintf(name, sizeof name, "/h_L%02d.f64", L);
-    ASSERT_TRUE(ReadF64(rd + name, static_cast<size_t>(T) * H, want)) << rd + name;
-    const Err e = Compare(got, want, live, T, H);
+    ASSERT_TRUE(ReadF64(rd + name, static_cast<size_t>(N) * T * H, want)) << rd + name;
+    const Err e = Compare(got, want, N, live, T, H);
     const auto &s = layer.GetStages();
     std::cout << "LAYER " << L << ": rms 2^" << std::fixed << std::setprecision(2)
               << -Bits(e.rms_rel) << " (worst instance 2^" << -Bits(e.worst_instance)

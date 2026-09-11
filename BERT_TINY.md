@@ -102,9 +102,42 @@ CHOICE (mine, revisable).
 
 Approximation-only chain (sim, no crypto noise): L0 2^-20.6, L1 2^-17.7.
 
-## 5. Measured
+## 5. Measured (A100, `ci16_35_k16_w58`, T = 128, B = 512)
 
-(filled in as the runs land)
+**2026-09-11, the recorded prompt in every instance (= B = 1 done 512 times),
+the oracle calibration of section 4:**
+
+| | rms vs float64 | worst instance | wall | boots | of which |
+|---|---|---|---|---|---|
+| setup (keys, tables) | | | 7.7 s | | |
+| layer 0 | **2^-10.22** | 2^-10.02 | 15.2 s | 128 wide + 4 narrow | boot 5.4, GELU 4.7, scores 1.6, values 1.1, softmax 0.9 |
+| layer 1 (chained) | **2^-9.37** | 2^-7.63 | 19.0 s | 256 wide + 4 narrow | boot 10.7, GELU 3.3, scores 1.6, values 1.1, softmax 1.0 |
+
+6080 rotations and 2052 relinearizations a layer. Per instance-layer that
+is 30-37 ms; the layer's cost does not depend on how many instances are
+live, so these are the B = 512 numbers too. The approximation-only chain
+(sim) is 2^-20.6 / 2^-17.7: the crypto floor (boot noise through the
+softmax's and the norms' Jacobians) is what the 2^-10 is.
+
+**The rule found the hard way -- THE BATCH IS ALWAYS FULL.** With one live
+instance and 511 empty ones the layer came back at 2^+45. Probes (section
+3's `debug.py`) put every stage through the GELU's INPUT at 2^-11..-15 and
+exactly one hidden channel of the GELU's output at 2^+18. An empty instance
+is an all-zero prompt: its LayerNorm variance is 0, outside every window,
+where the degree-15 Chebyshev is 1.5e8; its centred value is a noisy zero,
+so its norm output is ~1e5 instead of the bias, and the GELU then runs off
+its interval there. CKKS noise lives in the coefficient domain, so ONE bad
+instance pollutes every slot of the ciphertext -- the live prompt included
+(already visible at LN1: 2^-10.5 against 2^-13 elsewhere). Consequences:
+(a) unused instances carry a real prompt (the default now, and the leak
+check for free); (b) any window escape in any prompt of the batch is a
+batch-wide event, which is the argument for certified intervals (the
+GELU's sphere bound, Cho's theorem windows) over statistics.
+
+Probe table of the first correct run (layer 0, recorded prompt, rms bits):
+q 13.7, k 14.3, v 13.5, scores 13.0, exp 13.5, sq 14.1, r 13.2, P 11.7,
+attention out 12.6, O 12.3, residual 13.1, LN1 var 14.6, r 15.5, LN1 out
+10.5 (the empty-instance leak), GELU input 11.1.
 
 ## 6. Plan
 
