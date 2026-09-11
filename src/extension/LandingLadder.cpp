@@ -112,7 +112,16 @@ bool LandingLadder<word>::IsClean(int landing) const {
   const int peak = Peak(dec);
   const auto [m, t] = pool_.level_config.at(dec);
   return m == peak && peak <= band_lo_ &&
-         !CtSPlan(t, band_lo_ - peak, NeedT(dec)).empty();
+         !CtSPlan(t, band_lo_ - peak + NumCtSMains(), NeedT(dec)).empty();
+}
+
+template <typename word>
+int LandingLadder<word>::NumCtSMains() const {
+  // The pool's own CtS main pairs sit above the band: no cut ladder's prefix
+  // or band uses them, so they serve a cut's CtS exactly as the unused
+  // compute mains do. The first 2^42 pools have none (terminal-triple CtS);
+  // the second cut's carry two to four.
+  return static_cast<int>(pool_.main_primes.size()) - (band_lo_ + 2 * nem_);
 }
 
 template <typename word>
@@ -124,7 +133,7 @@ bool LandingLadder<word>::IsJunction(int landing) const {
   // The fill takes the pinned prime plus one spare into the band and hands
   // the pool's top pair to the spares: `band_lo_ - peak + 2 - 1` remain.
   return m + 1 == peak && peak <= band_lo_ &&
-         !CtSPlan(t, band_lo_ - peak + 1, NeedT(dec)).empty();
+         !CtSPlan(t, band_lo_ - peak + 1 + NumCtSMains(), NeedT(dec)).empty();
 }
 
 template <typename word>
@@ -143,14 +152,28 @@ typename LandingLadder<word>::Result LandingLadder<word>::ForLanding(
                  " is outside [0, " + std::to_string(PoolLanding()) +
                  "]; above the pool's own landing there are no primes to "
                  "put a band on");
-  int ladder = landing;
-  bool fill = false;
   if (policy == JunctionPolicy::kFillJunction && IsJunction(landing)) {
-    fill = true;
-  } else {
-    while (!IsClean(ladder)) ladder++;
+    // The fill pairs the pinned compute prime with the best spare, and how
+    // good that pair is depends on what the compute primes ARE: on the first
+    // 2^42 cut (mains at 2^30.00) it lands within 0.06 bits of the band; on
+    // the second cut, whose B-compensated mains sit at 2^29.3-29.6, the best
+    // partner under the hoist cap leaves 0.25-0.54 bits, at the band's
+    // bottom where the recursion weights it by 2^0 -- a landing scale that
+    // far off is worse than one level of slack, which costs no precision at
+    // all. So the fill is taken only when it is a fill, else the stationary
+    // route serves the junction as it always has.
+    constexpr double kMaxFillDeviationBits = 0.15;
+    Result f = Cut(landing, /*fill_junction=*/true);
+    if (f.band_deviation_bits <= kMaxFillDeviationBits) {
+      f.landing = landing;
+      f.ladder_landing = landing;
+      f.slack = 0;
+      return f;
+    }
   }
-  Result r = Cut(ladder, fill);
+  int ladder = landing;
+  while (!IsClean(ladder)) ladder++;
+  Result r = Cut(ladder, /*fill_junction=*/false);
   r.landing = landing;
   r.ladder_landing = ladder;
   r.slack = ladder - landing;
@@ -174,9 +197,12 @@ typename LandingLadder<word>::Result LandingLadder<word>::Cut(
                           pool_.level_config.begin() + dec + 1);
     s.default_encryption_level = dec;
 
-    // The band's primes, bottom pair first, and the spares CtS may draw on.
+    // The band's primes, bottom pair first, and the spares CtS may draw on:
+    // the compute mains between the cut and the band, then the pool's own
+    // CtS mains above the band (`NumCtSMains`).
     std::vector<word> band;
     std::vector<word> spares(main.begin() + peak, main.begin() + band_lo_);
+    spares.insert(spares.end(), main.begin() + band_lo_ + 2 * nem_, main.end());
     const std::vector<word> pool_band(main.begin() + band_lo_,
                                       main.begin() + band_lo_ + 2 * nem_);
     if (!fill_junction) {

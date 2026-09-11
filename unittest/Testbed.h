@@ -76,6 +76,32 @@ void PrintVector(const std::vector<T> &vec, int print_num = 5) {
   std::cout << "] ( size: " << size << " )" << std::endl;
 }
 
+// The presets a parameterised suite instantiates over, plus whatever
+// `CHEDDAR_EXTRA_PRESETS` names (comma-separated JSON file names in
+// PARAM_DIR). A preset under measurement -- a candidate ring, a variant of a
+// shipped one -- no longer has to be written into every INSTANTIATE list to
+// be run once; the shipped lists stay the record of what is accepted. The
+// strings live for the process (gtest keeps the `const char *`).
+inline std::vector<const char *> PresetList(
+    std::initializer_list<const char *> shipped) {
+  static std::vector<std::string> extra_storage;
+  std::vector<const char *> out(shipped);
+  if (const char *e = std::getenv("CHEDDAR_EXTRA_PRESETS");
+      e != nullptr && e[0] != 0 && extra_storage.empty()) {
+    std::string s(e);
+    size_t start = 0;
+    while (start <= s.size()) {
+      size_t comma = s.find(',', start);
+      if (comma == std::string::npos) comma = s.size();
+      std::string name = s.substr(start, comma - start);
+      if (!name.empty()) extra_storage.push_back(name);
+      start = comma + 1;
+    }
+  }
+  for (const auto &name : extra_storage) out.push_back(name.c_str());
+  return out;
+}
+
 template <typename word>
 class Testbed : public testing::TestWithParam<const char *> {
  public:

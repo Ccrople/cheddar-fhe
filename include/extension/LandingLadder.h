@@ -91,6 +91,21 @@ namespace cheddar {
  * below its peak, so the levels right after it are neither clean nor
  * junctions (`peak - m` is 3, then 1): slack from above serves them too.
  *
+ * ## The second 2^42 cut (2026-09-11)
+ *
+ * `ci16_42_k{16,32,64}` (`reference/scripts/ci42_family.py`) share ONE
+ * compute prefix and encrypt at 18 / 15 / 17, and their CoeffToSlot levels
+ * are 2^60 MAIN pairs where the terminal inventory allows (a pool re-adds in
+ * triples only the terminals its prefix declared). Those CtS mains sit above
+ * the band, outside every cut ladder's prefix and band, so `Cut` counts them
+ * among the spares a cut's CtS may pair up (`NumCtSMains`); on the first
+ * cut's pools there are none and nothing changes. And `kFillJunction` is
+ * now conditional: the fill is taken only when its pair is within 0.15 bits
+ * of the band (`ForLanding`), because this family's B-compensated compute
+ * primes (2^29.3-29.6) have no partner under the hoist cap that comes
+ * closer than 0.25-0.54 bits, and a landing scale that far off is worse
+ * than the one level of slack the stationary route costs.
+ *
  * The host mirror is `reference/scripts/landing_ladder.py`; every ladder it
  * writes passes `param_audit.py --strict`, and `landing_ladder_test` diffs
  * the two implementations and runs the crossing on the device.
@@ -139,6 +154,10 @@ class LandingLadder {
   //! The largest terminal count any level 0..dec holds: a ladder cut at dec
   //! must declare at least that many, so its CtS levels have to reach it.
   int NeedT(int dec) const;
+  //! The pool's own CtS main pairs above the band (0 on a terminal-triple
+  //! CtS pool); a cut ladder's CtS may draw on them like on unused compute
+  //! mains.
+  int NumCtSMains() const;
   //! CoeffToSlot's levels from what a cut leaves: one char a level, '3' a
   //! terminal triple, 'M' a pair of unused compute mains, '2' a terminal
   //! pair. Empty when `num_cts_levels` levels cannot be formed. See the

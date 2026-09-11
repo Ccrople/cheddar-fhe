@@ -395,7 +395,7 @@ TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
 
 INSTANTIATE_TEST_SUITE_P(
     Cheddar, Testbed32,
-    testing::Values("bootparam_30.json", "bootparam_35.json",
+    testing::ValuesIn(PresetList({"bootparam_30.json", "bootparam_35.json",
                     "bootparam_40.json", "sylphflow16_35.json",
                     "sylphflow16_40.json", "ci16_40.json",
                     // THE 2^35 CI FAMILY (2026-09-11,
@@ -428,7 +428,16 @@ INSTANTIATE_TEST_SUITE_P(
                     // `num_evalmod` long, so each of these supports exactly
                     // one climb (`ring_robust.sh` section B measures it).
                     "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
-                    "ci16_42_k64_w60.json"),
+                    "ci16_42_k64_w60.json",
+                    // The second 2^42 cut (`reference/scripts/ci42_family.py`,
+                    // 2026-09-11): ONE compute prefix for all three K, the
+                    // levels the Llama layer needs (base 18, tower 17 with
+                    // three CtS levels, FFN 15), stationary 2^60 bands, and
+                    // the key-switch digits that pay for it (6 / 4 / 8 at
+                    // the top; the base pool's CtS count is a measured
+                    // trade against its radix, CI_PARAM_20BIT.md 8).
+                    "ci16_42_k16.json", "ci16_42_k32.json",
+                    "ci16_42_k64.json"})),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

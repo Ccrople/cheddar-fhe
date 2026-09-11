@@ -64,7 +64,10 @@ using cheddar::Plaintext;
 // [50, 50] CoeffToSlot the retired `ci16_35_land13c2e9` had.
 const char *kPools[] = {"ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
                         "ci16_42_k64_w60.json", "ci16_35_k16_w58.json",
-                        "ci16_35_k32_w58.json", "ci16_35_k64_w58.json"};
+                        "ci16_35_k32_w58.json", "ci16_35_k64_w58.json",
+                        // the second cut: one prefix, main-pair CtS levels
+                        "ci16_42_k16.json", "ci16_42_k32.json",
+                        "ci16_42_k64.json"};
 
 const char *PoolParam() {
   const char *e = std::getenv("CHEDDAR_LADDER_POOL");
