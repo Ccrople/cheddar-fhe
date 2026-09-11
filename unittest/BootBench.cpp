@@ -164,6 +164,8 @@ INSTANTIATE_TEST_SUITE_P(
                     "ci16_35.json", "ci16_40.json", "ci16_35_stc2.json",
                     "ci16_35_land17c3e10.json", "ci16_35_land17c3e10v3.json",
                     "ci16_35_land13c2e9.json",
+                    "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
+                    "ci16_42_k64_w60.json",
                     // The landing LADDER, land19 (= ci16_35's own shape, 60
                     // Q limbs) down to land5 (44). A boot is bandwidth-bound
                     // and most of the bytes are evaluation key, whose size is
