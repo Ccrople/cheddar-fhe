@@ -45,9 +45,17 @@ struct BootParameter {
    *        and a preset carries it as `num_double_angle` so that two rings in
    *        one process can differ.
    */
+  /**
+   * @param initial_K the base polynomial's period count. `K = initial_K *
+   *        2^num_double_angle`, so raising it reaches the same K with FEWER
+   *        double angles -- and each one costs ~1.2 bits of bootstrap
+   *        precision (measured, `reference/docs/CI_PARAM_20BIT.md`). 2 is the
+   *        shipped literal table and is bit-for-bit unchanged; anything
+   *        larger is a Bessel expansion computed at construction.
+   */
   BootParameter(int max_level, int num_cts_levels, int num_stc_levels,
                 int log_message_ratio = 5, int num_slack_levels = 0,
-                int num_double_angle = 0);
+                int num_double_angle = 0, int initial_K = 2);
 
   const int max_level_;
   const int num_cts_levels_;
@@ -76,7 +84,7 @@ struct BootParameter {
   // TODO (jongmin.kim): Allow changing these parameters
   const std::vector<double> mod_coefficients_;
   const int num_double_angle_;
-  const int initial_K_;
+  const int initial_K_;   //!< the base polynomial's period count
 
   /**
    * @brief Get the level consumption for EvalMod

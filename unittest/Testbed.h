@@ -8,11 +8,13 @@ using json = nlohmann::json;
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 
+#include "LadderJson.h"
 #include "UserInterface.h"
 
 #ifdef ENABLE_EXTENSION
@@ -94,145 +96,68 @@ class Testbed : public testing::TestWithParam<const char *> {
  protected:
   static inline constexpr double max_error_ = 1e-3;
 
+  // The StC slack a `CHEDDAR_BOOT_LANDING` ladder asks for on top of
+  // `BootSlackLevels()`: a junction landing is served by the exact ladder
+  // above it (LandingLadder.h), and this is the difference.
+  int landing_slack_ = 0;
+
   void SetUp() override {
     std::string json_path = std::string(PARAM_DIR) + "/" + GetParam();
-    std::ifstream json_file(json_path);
-    Check(json_file.is_open(), "Failed to open JSON file: " + json_path);
-    json json_data = json::parse(json_file);
-    json_file.close();
-
-    // Parsing...
-    Check(json_data.contains("log_degree"), "Missing log_degree in JSON file");
-    Check(json_data["log_degree"].is_number_integer(),
-          "log_degree should be an integer");
-    log_degree_ = json_data["log_degree"];
-
-    Check(json_data.contains("log_default_scale"),
-          "Missing log_default_scale in JSON file");
-    Check(json_data["log_default_scale"].is_number_integer(),
-          "log_default_scale should be an integer");
-    int log_default_scale = json_data["log_default_scale"];
-    default_scale_ = (UINT64_C(1) << log_default_scale);
-
-    Check(json_data.contains("default_encryption_level"),
-          "Missing default_encryption_level in JSON file");
-    Check(json_data["default_encryption_level"].is_number_integer(),
-          "default_encryption_level should be an integer");
-    default_encryption_level_ = json_data["default_encryption_level"];
-
-    main_primes_.clear();
-    Check(json_data.contains("main_primes"),
-          "Missing main_primes in JSON file");
-    auto main_primes = json_data["main_primes"];
-    Check(main_primes.is_array(), "main_primes should be an array");
-    std::vector<word> main_primes_;
-    for (const auto &prime : main_primes) {
-      Check(prime.is_number_integer(),
-            "main_primes should be an array of integers");
-      main_primes_.push_back(prime);
+    LadderSpec<word> spec;
+    try {
+      spec = ladderjson::Parse<word>(json_path);
+    } catch (const std::exception &e) {
+      Check(false, e.what());
     }
+#ifdef ENABLE_EXTENSION
+    // ONE PRESET, ANY LANDING: `CHEDDAR_BOOT_LANDING=L` cuts the ladder that
+    // climbs only as far as L needs, keeping levels 0..L verbatim.
+    landing_slack_ = ladderjson::ApplyLandingKnob<word>(spec, GetParam());
+#endif
+    log_degree_ = spec.log_degree;
+    default_scale_ = spec.base_scale;
+    default_encryption_level_ = spec.default_encryption_level;
+    main_primes_ = spec.main_primes;
+    ter_primes_ = spec.ter_primes;
+    aux_primes_ = spec.aux_primes;
+    level_config_ = spec.level_config;
+    additional_base_ = spec.additional_base;
 
-    ter_primes_.clear();
-    if (json_data.contains("terminal_primes")) {
-      auto ter_primes = json_data["terminal_primes"];
-      Check(ter_primes.is_array(), "aux_primes should be an array");
-      for (const auto &prime : ter_primes) {
-        Check(prime.is_number_integer(),
-              "terminal_primes should be an array of integers");
-        ter_primes_.push_back(prime);
-      }
-    }
-
-    aux_primes_.clear();
-    Check(json_data.contains("auxiliary_primes"),
-          "Missing auxiliary_primes in JSON file");
-    auto aux_primes = json_data["auxiliary_primes"];
-    Check(aux_primes.is_array(), "aux_primes should be an array");
-    for (const auto &prime : aux_primes) {
-      Check(prime.is_number_integer(),
-            "auxiliary_primes should be an array of integers");
-      aux_primes_.push_back(prime);
-    }
-
-    level_config_.clear();
-    Check(json_data.contains("level_config"),
-          "Missing level_config in JSON file");
-    auto level_config = json_data["level_config"];
-    Check(level_config.is_array(), "level_config should be an array");
-    for (const auto &pair : level_config) {
-      Check(pair.is_array() && pair.size() == 2,
-            "level_config should be an array of pairs");
-      level_config_.emplace_back(pair[0], pair[1]);
-    }
-
-    additional_base_ = {0, 0};
-    if (json_data.contains("additional_base")) {
-      auto additional_base = json_data["additional_base"];
-      Check(additional_base.is_array() && additional_base.size() == 2,
-            "additional_base should be an array of pairs");
-      additional_base_ = {additional_base[0], additional_base[1]};
-    }
-
-    bool conjugate_invariant = false;
-    if (json_data.contains("conjugate_invariant")) {
-      Check(json_data["conjugate_invariant"].is_boolean(),
-            "conjugate_invariant should be a boolean");
-      conjugate_invariant = json_data["conjugate_invariant"];
-    }
-
-    // Initialize Parameter
-    param_ = std::make_unique<Parameter<word>>(
-        log_degree_, default_scale_, default_encryption_level_, level_config_,
-        main_primes_, aux_primes_, ter_primes_, additional_base_,
-        conjugate_invariant);
-
-    if (json_data.contains("dense_hamming_weight")) {
-      Check(json_data["dense_hamming_weight"].is_number_integer(),
-            "dense_hamming_weight should be an integer");
-      int dense_h = json_data["dense_hamming_weight"];
-      param_->SetDenseHammingWeight(dense_h);
-    }
-    if (json_data.contains("sparse_hamming_weight")) {
-      Check(json_data["sparse_hamming_weight"].is_number_integer(),
-            "sparse_hamming_weight should be an integer");
-      int sparse_h = json_data["sparse_hamming_weight"];
-      param_->SetSparseHammingWeight(sparse_h);
-    }
+    // Initialize Parameter (hamming weights applied by the spec)
+    param_ = spec.BuildParameter();
 
 #ifdef ENABLE_EXTENSION
-    bool enable_boot = false;
-    if (json_data.contains("boot")) {
-      Check(json_data["boot"].is_boolean(), "boot should be a boolean");
-      enable_boot = json_data["boot"];
-    }
-
-    if (enable_boot) {
+    if (spec.boot) {
       // Parsed whether or not a BootContext is built: a test that only wants
       // the transforms still has to compile them against the same level split.
-      Check(json_data.contains("num_cts_levels"),
-            "Missing num_cts_levels in JSON file");
-      Check(json_data["num_cts_levels"].is_number_integer(),
-            "num_cts_levels should be an integer");
-      num_cts_levels_ = json_data["num_cts_levels"];
-      Check(json_data.contains("num_stc_levels"),
-            "Missing num_stc_levels in JSON file");
-      Check(json_data["num_stc_levels"].is_number_integer(),
-            "num_stc_levels should be an integer");
-      num_stc_levels_ = json_data["num_stc_levels"];
+      num_cts_levels_ = spec.num_cts_levels;
+      num_stc_levels_ = spec.num_stc_levels;
     }
 
-    if (enable_boot && UseBootContext()) {
+    if (spec.boot && UseBootContext()) {
       std::cout << "Bootstrapping enabled" << std::endl;
-      // A preset may pin EvalMod's double-angle count (`num_double_angle`,
-      // the K = 32 / K = 64 landing ladders); 0 leaves the process default.
-      const int num_double_angle =
-          json_data.contains("num_double_angle")
-              ? int(json_data["num_double_angle"])
-              : 0;
+      // THE MESSAGE RATIO is EvalMod's ride height and therefore the term
+      // that caps a 20-bit bootstrap: the sine's cubic leaves a relative
+      // error `a * 2^(-2 ratio)` with `a = 2.58e-3` measured (1.5cv), so
+      // ratio 5 is 2.5e-6 = 18.6 bits and every extra bit of ratio buys two
+      // -- until the additive floor `N * 2^ratio` takes over and it turns
+      // into a U. A preset states its own; the env override sweeps it.
+      int log_message_ratio = spec.log_message_ratio;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_MSG_RATIO");
+          e != nullptr && e[0] != 0) {
+        log_message_ratio = std::atoi(e);
+      }
+      std::cout << "  boot: log_message_ratio " << log_message_ratio
+                << ", double angle "
+                << (spec.num_double_angle > 0
+                        ? std::to_string(spec.num_double_angle)
+                        : std::string("default"))
+                << std::endl;
       context_ = BootContext<word>::Create(
           *param_, BootParameter(BootMaxLevel(), BootCtsLevels(),
-                                 BootStcLevels(), 5, BootSlackLevels(),
-                                 num_double_angle));
+                                 BootStcLevels(), log_message_ratio,
+                                 BootSlackLevels() + landing_slack_,
+                                 spec.num_double_angle, spec.initial_K));
     } else {
       context_ = Context<word>::Create(*param_);
     }
@@ -247,12 +172,40 @@ class Testbed : public testing::TestWithParam<const char *> {
   // CtS + EvalMod + StC -- so a test that wants a different landing level
   // overrides this. Climbing less far also makes every limb operation in
   // between shorter, which is the point.
-  virtual int BootMaxLevel() const { return param_->max_level_; }
+  virtual int BootMaxLevel() const {
+    // FREE LANDING FROM ONE PRESET. `Boot` climbs to this level and CtS,
+    // EvalMod and StC all derive from it, so a shorter climb lands lower --
+    // which is the whole of [Grafting] D.2's flexible output modulus. It
+    // needs a ladder whose EvalMod band is stationary wherever the band
+    // ends up (`ci20_family.py`); on one that is not, `EvalMod` says so by
+    // asserting that its scale ran away.
+    if (const char *e = std::getenv("CHEDDAR_BOOT_CLIMB");
+        e != nullptr && e[0] != 0) {
+      return std::atoi(e);
+    }
+    return param_->max_level_;
+  }
 
   // Levels left free between EvalMod and StC. Zero reproduces every shipped
   // preset exactly; a test wanting [SYLPH]'s schedule -- non-linear work in
   // the slot domain before the conversion -- overrides it.
-  virtual int BootSlackLevels() const { return 0; }
+  //
+  // THIS IS THE LANDING KNOB, and it is the one that does not disturb EvalMod.
+  // A shorter CLIMB (`CHEDDAR_BOOT_CLIMB`) moves CtS, EvalMod and StC together,
+  // so it drags EvalMod's band off the levels the band was mined for and the
+  // recursion `s <- s^2/prod` leaves its fixed point. Slack moves only StC:
+  // `GetStCStartLevel() = GetEvalModEndLevel() - slack`, so EvalMod still runs
+  // top to bottom inside the band, still lands at 2^60, and `Boot` crosses the
+  // gap with LevelDown -- a multiply by a level-down constant plus a rescale,
+  // which leaves the DECLARED scale alone. So one parameter set lands anywhere
+  // from `GetEndLevel()` down to 0 by choosing slack.
+  virtual int BootSlackLevels() const {
+    if (const char *e = std::getenv("CHEDDAR_BOOT_SLACK");
+        e != nullptr && e[0] != 0) {
+      return std::atoi(e);
+    }
+    return 0;
+  }
   // Levels CoeffToSlot spends. The preset's count reproduces every shipped
   // bootstrap; a test whose CoeffToSlot is a different transform, or whose
   // EvalMod is wider (CHEDDAR_BOOT_DOUBLE_ANGLE), moves it so that EvalMod

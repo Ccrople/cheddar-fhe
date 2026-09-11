@@ -314,6 +314,14 @@ if (ENABLE_EXTENSION)
   target_link_libraries(boot_landing_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # One parameter set, any landing: the runtime ladder (`extension/
+  # LandingLadder`, the ci16_42 pools cut for a landing at run time) against
+  # its host mirror, the keyless crossing between the pool and the ladder it
+  # cuts, and the climb's cost. Two rings, one secret (RingFixture).
+  add_executable(landing_ladder_test LandingLadderTest.cpp)
+  target_link_libraries(landing_ladder_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # The robust-parameter acceptance test: the scale/landing contract measured
   # against the library's nominal numbers, one preset per process
   # (CHEDDAR_ROBUST_PARAM; CHEDDAR_ROBUST_STRICT=1 is the v3 contract). The

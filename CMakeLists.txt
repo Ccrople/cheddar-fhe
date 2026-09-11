@@ -53,6 +53,7 @@ set(CKKS_GPU_SOURCES
   # src/core/BigInt.cpp
   src/core/Container.cpp
   src/core/Context.cpp
+  src/core/LadderSpec.cpp
   src/core/DeviceVector.cpp
   src/core/Streams.cpp
   src/core/Encode.cpp
@@ -111,6 +112,7 @@ if(ENABLE_EXTENSION)
     src/extension/EvalPoly.cpp
     src/extension/EvalSpecialFFT.cpp
     src/extension/Hoist.cu
+    src/extension/LandingLadder.cpp
     src/extension/LinearTransform.cpp
     src/extension/LlamaLinear.cu
     src/extension/Profile.cpp

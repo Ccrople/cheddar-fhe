@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <random>
@@ -18,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "LadderJson.h"
 #include "UserInterface.h"
 
 #ifdef ENABLE_EXTENSION
@@ -61,57 +63,89 @@ struct Ring {
                 const std::vector<int> &secret_coeffs = {},
                 int boot_slack_levels = 0,
                 bool build_user_interface = true) {
-    std::ifstream f(std::string(PARAM_DIR) + "/" + file);
-    if (!f) throw std::runtime_error("cannot open " + file);
-    json j = json::parse(f);
-
-    log_degree = j["log_degree"];
-    scale = static_cast<double>(UINT64_C(1) << int(j["log_default_scale"]));
-    enc_level = j["default_encryption_level"];
-
-    std::vector<word> main_primes, ter_primes, aux_primes;
-    for (const auto &p : j["main_primes"]) main_primes.push_back(p);
-    if (j.contains("terminal_primes")) {
-      for (const auto &p : j["terminal_primes"]) ter_primes.push_back(p);
-    }
-    for (const auto &p : j["auxiliary_primes"]) aux_primes.push_back(p);
-
-    std::vector<std::pair<int, int>> level_config;
-    for (const auto &pr : j["level_config"]) {
-      level_config.emplace_back(pr[0], pr[1]);
-    }
-    std::pair<int, int> additional_base{0, 0};
-    if (j.contains("additional_base")) {
-      additional_base = {j["additional_base"][0], j["additional_base"][1]};
-    }
-
-    // A second parser has to carry the flag too: without it a
-    // conjugate-invariant preset loads as a well-formed ORDINARY ring --
-    // 1 mod 4N implies 1 mod 2N, so nothing rejects the primes -- and every
-    // test runs, passes, and tests the wrong ring.
-    const bool conjugate_invariant =
-        j.contains("conjugate_invariant") && bool(j["conjugate_invariant"]);
-    param = std::make_unique<cheddar::Parameter<word>>(
-        log_degree, scale, enc_level, level_config, main_primes, aux_primes,
-        ter_primes, additional_base, conjugate_invariant);
-    if (j.contains("dense_hamming_weight")) {
-      param->SetDenseHammingWeight(int(j["dense_hamming_weight"]));
-    }
-    if (j.contains("sparse_hamming_weight")) {
-      param->SetSparseHammingWeight(int(j["sparse_hamming_weight"]));
-    }
+    auto spec = ladderjson::Parse<word>(std::string(PARAM_DIR) + "/" + file);
+    int extra_slack = 0;
 #ifdef ENABLE_EXTENSION
-    const bool enable_boot = j.contains("boot") && bool(j["boot"]);
-    if (enable_boot) {
-      // A preset may pin EvalMod's double-angle count (`num_double_angle`:
-      // 4 is K = 32 on nine EvalMod levels); otherwise the process default.
-      const int num_double_angle =
-          j.contains("num_double_angle") ? int(j["num_double_angle"]) : 0;
+    // ONE PRESET, ANY LANDING: `CHEDDAR_BOOT_LANDING=L` cuts the ladder that
+    // climbs only as far as L needs (LandingLadder.h), keeping levels 0..L
+    // verbatim; a junction landing's exact ladder lands above it and the
+    // difference is slack, added here AFTER the env override below.
+    extra_slack = ladderjson::ApplyLandingKnob<word>(spec, file);
+#endif
+    Build(spec, secret_coeffs, boot_slack_levels, extra_slack,
+          build_user_interface);
+  }
+
+  /**
+   * @brief A ring from a parameter set built at run time -- a
+   * `LandingLadder` cut of a pool -- rather than from a file. The same
+   * knobs; the landing knob is NOT applied (the caller chose the ladder).
+   */
+  Ring(const cheddar::LadderSpec<word> &spec,
+       const std::vector<int> &secret_coeffs = {}, int boot_slack_levels = 0,
+       bool build_user_interface = true) {
+    Build(spec, secret_coeffs, boot_slack_levels, 0, build_user_interface);
+  }
+
+ private:
+  void Build(const cheddar::LadderSpec<word> &spec,
+             const std::vector<int> &secret_coeffs, int boot_slack_levels,
+             int extra_slack, bool build_user_interface) {
+    log_degree = spec.log_degree;
+    scale = spec.base_scale;
+    enc_level = spec.default_encryption_level;
+    param = spec.BuildParameter();
+#ifdef ENABLE_EXTENSION
+    if (spec.boot) {
+      // THE MESSAGE RATIO IS A PRECISION KNOB AND IT WAS PINNED AT 5.
+      //
+      // EvalMod extracts `m` from `m + qI` through a sine, and what is left
+      // over is the sine's own cubic: the relative error is `a * w^2` with
+      // `w = 2^-log_message_ratio` the height the message rides at and
+      // `a = 2.58e-3` measured (Doing.md 1.5cv, identical to four digits
+      // across a factor of 256 in the argument). At `ratio = 5` that is
+      // `2.58e-3 * 2^-10 = 2.5e-6`, i.e. **18.6 bits** -- and `ci16_40`
+      // measures p = 18.9. So the cubic, not the scale and not the fit, is
+      // what caps a 20-bit bootstrap at this ratio, and every extra bit of
+      // ratio buys TWO bits until the additive floor `N/w` takes over.
+      //
+      // It is a U with an optimum, exactly as the ride is (1.5cv), so it
+      // belongs in the preset beside the scale that sets `N`. The env
+      // override exists to SWEEP it; a shipped preset states its own.
+      int log_message_ratio = spec.log_message_ratio;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_MSG_RATIO");
+          e != nullptr && e[0] != 0) {
+        log_message_ratio = std::atoi(e);
+      }
+      // THE CLIMB IS NOT THE LANDING KNOB -- slack is, and now so is the
+      // LADDER. A shorter climb on a fixed ladder moves CtS, EvalMod and StC
+      // together, so it drags EvalMod off the levels a stationary band was
+      // mined for and the recursion `s <- s^2/prod` walks away from its
+      // fixed point: measured, a climb one below the top lands where it is
+      // asked to and returns p = -518 bits (`EvalMod` refuses it now). Slack
+      // moves only StC (`GetStCStartLevel() = GetEvalModEndLevel() - slack`),
+      // so EvalMod still runs inside its band and the message survives -- the
+      // same three ladders land at every level from `GetEndLevel()` down to 0
+      // at full precision. And `CHEDDAR_BOOT_LANDING` (the file constructor)
+      // cuts a ladder whose band SITS where the short climb puts it, which is
+      // what makes the climb cheap without costing the band.
+      int climb = param->max_level_;
+      if (const char *e = std::getenv("CHEDDAR_BOOT_CLIMB");
+          e != nullptr && e[0] != 0) {
+        climb = std::atoi(e);
+      }
+      if (const char *e = std::getenv("CHEDDAR_BOOT_SLACK");
+          e != nullptr && e[0] != 0) {
+        boot_slack_levels = std::atoi(e);
+      }
+      boot_slack_levels += extra_slack;
       context = cheddar::BootContext<word>::Create(
-          *param, cheddar::BootParameter(param->max_level_,
-                                         int(j["num_cts_levels"]),
-                                         int(j["num_stc_levels"]), 5,
-                                         boot_slack_levels, num_double_angle));
+          *param, cheddar::BootParameter(climb, spec.num_cts_levels,
+                                         spec.num_stc_levels,
+                                         log_message_ratio,
+                                         boot_slack_levels,
+                                         spec.num_double_angle,
+                                         spec.initial_K));
     } else {
       context = cheddar::Context<word>::Create(*param);
     }
@@ -121,6 +155,8 @@ struct Ring {
     pending_secret_ = secret_coeffs;
     if (build_user_interface) BuildUserInterface();
   }
+
+ public:
 
   //! Build the deferred `UserInterface`, adopting the constructor's secret.
   void BuildUserInterface() {

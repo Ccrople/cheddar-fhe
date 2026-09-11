@@ -370,6 +370,18 @@ TEST_P(Testbed32, BootstrapPrecisionAgainstSylph) {
             << std::endl;
   std::cout << "  at Sylph's B = 128: effective " << (p - 7.0)
             << " bits, and the target is 12" << std::endl;
+  // WHERE IT LANDED, read off the ciphertext rather than predicted, because
+  // the landing level is a knob now (`CHEDDAR_BOOT_SLACK`) and a sweep that
+  // trusted the arithmetic would not notice the boot ignoring it.
+  const auto &bp = boot_context->GetBootParameter();
+  const int landed = param_->NPToLevel(ct_res.GetNP());
+  std::cout << "  LANDED at level " << landed << " (climb "
+            << bp.GetMaxLevel() << ", CtS " << bp.num_cts_levels_
+            << ", EvalMod " << bp.GetNumEvalModLevels() << " ending at "
+            << bp.GetEvalModEndLevel() << ", slack " << bp.GetNumSlackLevels()
+            << ", StC " << bp.num_stc_levels_ << ")" << std::endl;
+  EXPECT_EQ(landed, bp.GetEndLevel())
+      << "the boot did not land where its BootParameter says";
   std::cout << "  largest B this preset affords at 12 bits: 2^" << (p - 12.0)
             << " = " << std::exp2(p - 12.0) << std::endl;
   std::cout << "  ([SYLPH] has p = 20, B = 128, effective 13)" << std::endl;
@@ -388,7 +400,26 @@ INSTANTIATE_TEST_SUITE_P(
                     "sylphflow16_40.json", "ci16_35.json", "ci16_40.json",
                     // The B = 512 batched layer's preset, for the boot
                     // benches; always run filtered to one preset.
-                    "ci16_35_stc2.json"),
+                    "ci16_35_stc2.json",
+                    // THE 2^42 CI FAMILY, one ladder per K
+                    // (`reference/scripts/design_ci41.py`, band by
+                    // `ci20_family.py`). Measured p, each at the ratio it
+                    // ships -- 4, 4, 3, which are their own optima:
+                    // **20.93 / 19.61 / 18.28**. K = 16 clears [SYLPH]
+                    // 3.1.3's 20 bits and the other two do not -- a double
+                    // angle costs ~1.2 bits and only more scale buys it back.
+                    // All three pass `Bootstrap`, this test and
+                    // `param_robust_test --strict` 7/7 (`ring_accept.sh`).
+                    //
+                    // Every band level rescales by exactly 2^60, which is
+                    // EvalMod's fixed point, so the LANDING SCALE is 2^60
+                    // with wander -0.00 instead of the per-ladder solve
+                    // `gen_landing.py` v3 has to run. That is the landing
+                    // SCALE, not the landing LEVEL: the band here is exactly
+                    // `num_evalmod` long, so each of these supports exactly
+                    // one climb (`ring_robust.sh` section B measures it).
+                    "ci16_42_k16_w60.json", "ci16_42_k32_w60.json",
+                    "ci16_42_k64_w60.json"),
     [](const testing::TestParamInfo<Testbed32::ParamType> &info) {
       std::string param_name = info.param;
       std::replace(param_name.begin(), param_name.end(), '.', '_');

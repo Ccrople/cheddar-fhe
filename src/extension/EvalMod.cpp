@@ -51,11 +51,47 @@ EvalMod<word>::EvalMod(ConstContextPtr<word> context,
 
   // TODO(jongmin.kim): add support for other evalmod functions.
 
+  // THE DOUBLE ANGLES ASSUME THE FIXED POINT, AND NOTHING WAS CHECKING IT.
+  //
+  // Each is a `2x^2 - 1` constructed with the SAME scale in and out (see the
+  // `emplace_back` below: `target_scale` twice). A squaring at level L takes
+  // the scale to `s^2 / prod(L)`, so "in equals out" holds only where
+  // `prod(L) == s` -- the recursion's fixed point. The loop above walks the
+  // POLYNOMIAL's `mod_levels` and stops, so the `num_double_angle` levels
+  // under it were never examined: a ladder, or a climb, whose double-angle
+  // levels sit off the band declared a scale it did not have and returned a
+  // silently wrong answer. Measured on `ci16_42_k16_w60`: at the full climb
+  // every EvalMod level rescales by 2^60 and p = 20.93; one level shorter,
+  // the bottom EvalMod level is a 2^42.7 compute level -- a 17.3-bit drift,
+  // entirely inside the double-angle range -- the 2^62 test above never sees
+  // it, and the boot lands where it was asked to with p = **-518 bits**.
+  //
+  // The bound is measured, not guessed. Over every shipped boot preset the
+  // worst per-level drift here is 3.61 bits (`ci16_35_land9e9v3`; the 2^42
+  // family is 0.00 on every level, `ci16_35_land17c3e10v3` 1.93), so eight
+  // bits clears them all with margin and still refuses the 17.3 above.
+  constexpr double kMaxDoubleAngleDrift = 8.0;
   double sqrt2pi = std::pow(0.5 / M_PI, 1.0 / double_angle_ratio);
   for (int i = 0; i < num_double_angle; i++) {
     // 2 x^2 - 1
     sqrt2pi *= sqrt2pi;
     int double_angle_level = start_level - mod_levels - i;
+    const double prod =
+        context->param_.GetRescalePrimeProd(double_angle_level);
+    const double drift = std::log2(prod / target_scale);
+    AssertTrue(std::abs(drift) <= kMaxDoubleAngleDrift,
+               "EvalMod: double angle " + std::to_string(i) + " sits at level " +
+                   std::to_string(double_angle_level) + ", which rescales by 2^" +
+                   std::to_string(std::log2(prod)) + " against the " +
+                   "polynomial's output scale 2^" +
+                   std::to_string(std::log2(target_scale)) + " -- a drift of " +
+                   std::to_string(drift) +
+                   " bits. A `2x^2 - 1` is declared scale-preserving, which "
+                   "needs the level's rescale product to BE that scale; off it "
+                   "the declared scale is not the data's and the bootstrap "
+                   "returns a wrong answer without failing. Either the band "
+                   "does not reach this level (a climb shorter than the band's "
+                   "excess width) or the ladder's EvalMod levels are uneven.");
     double_angle_.emplace_back(context, 2, -sqrt2pi, double_angle_level,
                                target_scale, double_angle_level, target_scale);
     target_scale = target_scale * target_scale /
