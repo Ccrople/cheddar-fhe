@@ -38,7 +38,7 @@ implemented and verified on the host, the encrypted half awaits a GPU ·
 
 | § | What the paper specifies | Status | Where |
 |---|---|---|---|
-| 3.1.1 | sink-inducing prefix, precomputed KV, shared across queries | YES | `REF_SINKS=2`, the public rescaled copy at every norm |
+| 3.1.1 | sink-inducing prefix, precomputed KV, shared across queries | **DIFF** | `REF_SINKS=2` plus a public rescaled copy at every norm. **Not the paper's mechanism**: our sink rows go THROUGH the non-linearities and the paper's never do. Measured worth of the difference in "3.1.1's prefix, done properly" below |
 | 3.1.1 | **orthogonal rotations fused into down-proj, o-proj, v-proj** | **MEASURED** | `quarot_export.py` (+ `QUAROT_VO=1` for the head-space `v -> o` pair, new). Tables 2 and 3 reproduced on our model by `sylph_tables.py` -- see "What the rotations actually buy" |
 | 3.1.2 | precision requirement estimated by injecting modelled CKKS noise and reading perplexity | YES | `reference/scripts/sylph_precision/` — reproduced, and see the caveat below |
 | 3.1.3 | non-linear degree from the calibrated range (SiLU 83 -> 31) | DIFF | `CiLlamaLayer::SiLuDegree` derives the degree from the range by a Bernstein-ellipse rule and caps at 63. See "Known gaps" |
@@ -235,6 +235,111 @@ worth following for the remaining limiter.
 
 ---
 
+
+## 3.1.1's prefix, done properly, and what is actually left
+
+`sylph_tables.py` closed the rotation half of 3.1.1 (it cannot move the SiLU or
+the SoftMax at all). `sylph_prefix.py` does the prefix half, and the difference
+between the two prefixes is a mechanism, not a parameter:
+
+    ours     BOS x 2 inside the prompt plus a per-token rescaling at every
+             norm. The sink rows GO THROUGH every non-linearity.
+    [SYLPH]  the sink tokens' KV precomputed offline and injected as a STATIC
+             KV cache. Those rows are public and never reach the encrypted
+             non-linearities at all.
+
+The sink rows are prompt independent by causal masking -- row `t` sees keys
+`0..t` -- which is what makes the paper's design legal and what this tree
+already relies on for `attn_sink` / `ffn_sink` / `up_sink`. So the measurement
+is: the same forward, maxima taken over the USER rows only.
+
+**SiLU input range, all rows -> user rows** (4 held-out prompts, 32 layers):
+
+| L | all | user | |
+|---|---|---|---|
+| 0 | 4.11 | **2.60** | |
+| 1 | 15.25 | **4.05** | 3.8x; reproduces `CiLlamaLayer.h`'s independent "15.25 at the two sink rows against 3.71 at the 126 user rows" |
+| 2-28 | 3.5-10.1 | unchanged | already comfortable |
+| 29 | 14.53 | **9.51** | |
+| 30 | 18.23 | **10.56** | |
+| **31** | **29.51** | **29.51** | **does not move** |
+
+`rmsnorm_in` tells the same story from the other side: 227.42 over all rows
+without the rescaling and **27.88 over user rows either way**. The norm
+rescaling exists purely to bring the SINK rows down; take them out of the
+ciphertext and it has nothing left to do.
+
+`sink_mass` -- the mean SoftMax mass landing on the prefix keys -- is **0.93**
+for BOS x 2 already, so prefix SEARCH is not where the remaining range is.
+
+**By `SiLu.h`'s own measured table (degree 63 reaches 14.6 bits at +-24), every
+layer but 31 is comfortable at the shipped ladder and layer 1 would drop from
+degree 63 to 19, which is a LEVEL.**
+
+### Layer 31 is the whole remaining limiter, and it is a weight property
+
+The SoftMax span (which IS `m_eff`) is 16-26 at most layers, 44.94 at layer 0
+and **78.23 at layer 31**. That half is already solved, and not by prefixing:
+`gen_b1_pop.py` raises the Cho count PER LAYER until the first window fits,
+and its own comment names layer 31 as the reason ("m_eff 98.6, hb 12.3 at
+k = 2 ... one more Cho pass halves `hb` and the window collapses").
+
+The SiLU half is not, and cannot be, because it is in the WEIGHTS. The
+certified sphere bound `sqrt(H) ||gain . W[:,j]||` per channel:
+
+| L | max | p99 | p90 | p50 | max/p50 |
+|---|---|---|---|---|---|
+| 30 | 81.9 | 67.0 | 49.7 | 31.1 | 2.63 |
+| **31** | **168.4** | 61.4 | 47.5 | **29.2** | **5.77** |
+
+Every other layer is 2.4-4.2. Layer 31's MEDIAN channel is layer 30's; its tail
+is not. A handful of outlier channels set the range, and **no prefix moves a
+weight**.
+
+The fix is a CERTIFIED per-channel plan -- the BERT branch's banded / mode GELU
+plan (`GeLuHandler::ApplyModes`) on Llama's SiLU. Priced at layer 31, RMS over
+channels against |SiLU| ~ 30:
+
+| plan | RMS | |
+|---|---|---|
+| shipped, statistical `1.2 x 29.5 = 35.4`, d63 | 2^-11.1 | 7/600 prompts escape |
+| the same at the 600-prompt max `1.2 x 41 = 49` | 2^-8.8 | 7/600 escape |
+| certified per-channel, d63 | 2^-9.5 | **escape-proof** |
+| certified per-channel, d127 | **2^-12.3** | **escape-proof**, one more level |
+
+The fit error is roughly a wash at d63 and 3.5 bits better at d127. The real
+prize is the third column: a BOUND CANNOT BE ESCAPED, and an escape is not a
+small error -- outside its interval a degree-63 Chebyshev is
+`cosh(63 arccosh v)`.
+
+### What was implemented, and the one thing that was not
+
+`gen_b1_pop.py` gains `SILU_SINK=1`: it measures `gate_absmax_user`, derives a
+public per-token factor `s` that brings the sink rows inside the user interval,
+and writes the public correction `SiLU(g) - SiLU(g s)` per (sink token,
+channel). The identity `y = (SiLU(g s) + restore) up` is exact at every row,
+`s` rides the gate crossing's existing multiply and `restore` is a plaintext
+add, so it costs no level. It also CHECKS that the sink rows' gate really is
+prompt independent rather than asserting it. Default off.
+
+**The crypto side of that restore is deliberately NOT written.** `s` is a
+per-token factor and `CrossingPlaintext` already handles exactly that shape,
+but `restore` is per (token, CHANNEL), and the half-density banded convention
+places a channel's duplicate one token position BACK from its live copy --
+`CrossingPlaintext`'s own comment records the bug that convention produced and
+its symptom ("live 2^-5.99 against duplicate 2^-1.06 and a layer at relative
+265"). Writing a 2D plaintext into that convention without a card to check it
+against is how that bug comes back. The module basis has no duplicate band and
+is the easier half; the mapping still has to be read off a running layer first.
+
+And the cleaner design, which the measurement argues for, is not "suppress and
+restore" at all: if those rows are public, they should not be in the ciphertext
+in the first place. That is [SYLPH]'s static KV cache, it is a small instance
+of the section 4 machinery this branch already has (`CiPcAttention`), and it
+would retire all three of `attn_sink`, `ffn_sink` and `up_sink` together with
+their calibration.
+
+---
 
 ## Wiring
 
