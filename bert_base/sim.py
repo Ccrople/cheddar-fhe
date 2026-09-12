@@ -357,6 +357,12 @@ def main():
     ap.add_argument("--gelu-max-degree", type=int, default=511,
                     help="the GELU's level budget: ceil(log2(deg+1)) levels "
                          "under the boot's landing")
+    ap.add_argument("--inv-max-degree", type=int, default=255,
+                    help="the Cho inverse square roots' level budget. The "
+                         "LAST pass's degree caps the whole plan -- the walk "
+                         "lands `P` at `top - 3 - Levels(degree)` and it needs "
+                         "4 -- so 255 (8 levels) is the ceiling at landing 16, "
+                         "and a wider window is paid in fit error, not levels.")
     ap.add_argument("--ln-max-degree", type=int, default=511,
                     help="the LayerNorms' inverse square roots run on the "
                          "NARROW path (booted), so a degree is free of the "
@@ -437,7 +443,8 @@ def main():
               % float(np.abs(exp_poly(probe) / np.exp(probe) - 1).max()))
         inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin, hi * a.margin,
                           a.inv_tol if a.inv_tol > 0 else a.tol,
-                          relative=True, name="inv%d" % j)
+                          relative=True, name="inv%d" % j,
+                          max_degree=a.inv_max_degree)
                      for j, (lo, hi) in enumerate(seen)]
         est = None if a.no_fold else est_tabs
         sm = ChoSoftmax(k, shift, exp_poly, inv_polys, est)
@@ -593,6 +600,7 @@ def main():
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
                      "exp_margin_hi": exp_hi_margin,
+                     "inv_max_degree": a.inv_max_degree,
                      "chan_cap": a.chan_cap,
                      "ffn_tile": min(a.ffn_tile, m.I),
                      "gelu_tol": a.gelu_tol, "gelu_max_degree": a.gelu_max_degree,
