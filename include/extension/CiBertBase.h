@@ -58,8 +58,12 @@ namespace cheddar {
  *   P V           the same diagonal product the other way round:
  *                 `O_c = sum_d P_d (.) rot_{dB}(V_c)`; output = the layout.
  *   LayerNorm     mean and variance are ciphertext sums (no rotation); the
- *                 centring is `H x_c - sum` (an integer multiply, no level);
- *                 the inverse square root on the ONE variance ciphertext --
+ *                 mean is `sum / H` -- ONE level on ONE ciphertext, and NOT
+ *                 BERT-Tiny's free `H x_c - sum`, because at H = 768 that
+ *                 leaves the variance carrying `H^3 c^2 var` and the constant
+ *                 that scales it back for its bootstrap rounds to a NINE-BIT
+ *                 integer (`EncodeConstant` stores `number * scale`); the
+ *                 inverse square root on the ONE variance ciphertext --
  *                 which is the narrow path, so BERT-Base's wide L9/L10
  *                 variance windows cost a DEGREE and not a level; the gain
  *                 rides that ciphertext's H scalar copies, the bias is a

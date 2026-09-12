@@ -1231,35 +1231,62 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   AssertTrue(static_cast<int>(pre.cts.size()) == H, "LayerNorm: model channels");
   const int l = Level(pre.cts[0]);
   AssertTrue(l >= 2, "CiBertBaseLayer::LayerNorm(" + tag +
-                         "): the stream needs two levels (variance, apply)");
+                         "): the stream needs two levels (the mean and the "
+                         "centring, then the variance; the apply lands on the "
+                         "second)");
   auto t0 = Clock::now();
   const double c = pre.carry;
-  // centred' = H d_c x_c - sum_k d_k x_k  (= H c (x - mu)). The stream's
-  // public suppression comes out HERE, and this is why its entries are
-  // powers of two: an integer constant is encoded at scale 1, so both
-  // multiplies are exact and neither costs a level.
+  // The stream's public suppression comes out HERE, and this is why its
+  // entries are powers of two: an integer constant is encoded at scale 1, so
+  // the multiply is exact and costs no level.
   auto sup = [&pre](int i) {
     return pre.chan.empty() ? 1.0 : pre.chan[i];
+  };
+  auto lift = [&](Ct &dst, int i) {
+    if (sup(i) == 1.0) {
+      boot_->Copy(dst, pre.cts[i]);
+    } else {
+      MultInt(dst, pre.cts[i], sup(i));
+    }
   };
   Ct sum;
   for (int i = 0; i < H; i++) {
     Ct dx;
-    MultInt(dx, pre.cts[i], sup(i));
+    lift(dx, i);
     if (i == 0) {
       sum = std::move(dx);
     } else {
       boot_->Add(sum, sum, dx);
     }
   }
+  // mu' = sum / H, ONE level on ONE ciphertext -- and this is the whole
+  // reason the mean is formed rather than folded away.
+  //
+  // The obvious `centred = H x_c - sum` needs no division and costs no
+  // level, which is what BERT-Tiny does; at H = 768 it is a TRAP. The
+  // variance then carries `H^3 c^2 var` = 1.4e7, and the constant that
+  // scales it back for its bootstrap is `ride / (hi / kappa0)` = 1.7e-8 --
+  // which `Encoder::EncodeConstant` rounds to the INTEGER `number * scale`,
+  // i.e. to 574 at scale 2^35. That is NINE BITS of constant, and it is
+  // exactly the 2^-10.1 the probes measured on `r`; the same imbalance made
+  // the per-channel constant on `r` in the apply 3.5e-4, where the rescale's
+  // own rounding is a fifth of the message. Dividing here instead keeps
+  // every message in [0.1, 20] and every constant above 2^18. The level is
+  // free: both norms' outputs are bootstrapped immediately.
+  Ct mu;
+  MultScalar(mu, sum, 1.0 / static_cast<double>(H));
+  sum = Ct();
+  const int lc = Level(mu);
   std::vector<Ct> cen(H);
   for (int i = 0; i < H; i++) {
-    Ct hx;
-    MultInt(hx, pre.cts[i], static_cast<double>(H) * sup(i));
-    boot_->Sub(cen[i], hx, sum);
+    Ct dx, dd;
+    lift(dx, i);
+    boot_->LevelDown(dd, dx, lc);
+    boot_->Sub(cen[i], dd, mu);
   }
-  sum = Ct();
-  Tap(tag + "_cen", cen, static_cast<double>(H) * c);
-  // V' = sum centred'^2 = H^3 c^2 var: one relinearization
+  mu = Ct();
+  Tap(tag + "_cen", cen, c);
+  // V' = sum centred^2 = H c^2 var: one relinearization
   Ct acc;
   for (int i = 0; i < H; i++) {
     Ct t;
@@ -1274,7 +1301,7 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   boot_->RelinearizeRescale(V, acc, mult_key);
   stages_.relins++;
   acc = Ct();
-  const double kappa0 = 1.0 / (static_cast<double>(H) * H * H * c * c);
+  const double kappa0 = 1.0 / (static_cast<double>(H) * c * c);
   Tap(tag + "_var", V, 1.0 / kappa0);
   const int degree = n.inv.degree;
   const double undo = NarrowLift(V, Levels(degree) + 2, n.inv.hi / kappa0, evk);
@@ -1291,19 +1318,19 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   // r = 1/sqrt(var + eps) in true units; the apply wants it a level above
   // the channels (its per-channel scalar copies cost one)
   double undo_r = 1.0;
-  if (Level(r) < l + 1) undo_r = NarrowLift(r, l + 1, n.r_max, evk);
+  if (Level(r) < lc + 1) undo_r = NarrowLift(r, lc + 1, n.r_max, evk);
   const double c_out = cfg_.ride / n.out_absmax;
   const int lr = Level(r);
   out.cts.clear();
   out.cts.resize(H);
-  const int lw = std::min(l, lr - 1);
+  const int lw = std::min(lc, lr - 1);
   for (int i = 0; i < H; i++) {
-    // out_i = c_out (g_i (x - mu) r + b_i) / d_i;  centred'_i = H c (x - mu).
+    // out_i = c_out (g_i (x - mu) r + b_i) / d_i;  centred_i = c (x - mu).
     // The OUTPUT stream's suppression rides the per-channel constant that is
     // already on r, and its bias -- free, like the input's.
     const double d = out_chan.empty() ? 1.0 : out_chan[i];
     Ct rc, rd, cd, w;
-    MultScalar(rc, r, c_out * g[i] * undo_r / (static_cast<double>(H) * c * d));
+    MultScalar(rc, r, c_out * g[i] * undo_r / (c * d));
     boot_->LevelDown(rd, rc, lw);
     boot_->LevelDown(cd, cen[i], lw);
     cen[i] = Ct();
