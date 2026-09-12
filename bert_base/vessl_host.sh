@@ -17,18 +17,18 @@ cd /root/work/cheddar-bb/bert_base || exit 1
 mkdir -p "$B/ref$T" "$B/held_ref$T"
 
 # ---- the oracle: one prompt, twelve layers, its own calibration ----------
-( python3.12 reference.py "$B/all$T" "$B/ref$T" > "$B/ref$T/host.log" 2>&1 \
+( python3.12 -u reference.py "$B/all$T" "$B/ref$T" > "$B/ref$T/host.log" 2>&1 \
     || echo REF_FAIL >> "$B/ref$T/host.log"
-  python3.12 sim.py "$B/all$T" "$B/ref$T/calib.json" --no-chain \
+  python3.12 -u sim.py "$B/all$T" "$B/ref$T/calib.json" --no-chain \
     > "$B/ref$T/sim.log" 2>&1 || echo SIM_FAIL >> "$B/ref$T/sim.log" ) &
 
 # ---- the population calibration (1000 prompts) --------------------------
-( python3.12 sim.py "$B/all$T" "$B/held_ref$T/calib.json" \
+( python3.12 -u sim.py "$B/all$T" "$B/held_ref$T/calib.json" \
     --inputs "$B/all$T/prompts/inputs.f32" --no-chain \
     > "$B/held_ref$T/sim.log" 2>&1 || echo SIM_FAIL >> "$B/held_ref$T/sim.log" ) &
 
 # ---- the held-out prompts the card serves, through float64 --------------
-( python3.12 reference.py "$B/all$T" "$B/held_ref$T" \
+( python3.12 -u reference.py "$B/all$T" "$B/held_ref$T" \
     --inputs "$B/held$T/serve/inputs.f32" --mask "$B/held$T/serve/mask.u8" \
     > "$B/held_ref$T/host.log" 2>&1 || echo REF_FAIL >> "$B/held_ref$T/host.log" ) &
 wait
