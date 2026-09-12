@@ -257,6 +257,113 @@ two layers 88 s, head 8 s, decrypt; the labels file lists each line's two
 logits and its label (line 3, "call me ishmael...", is the one the NSP
 head calls class 1). Every logit is within 2^-9 of the float64 model's.
 
+## 5d. The four levers (2026-09-12)
+
+All four are switches, all four are A/B-able from the environment, and the
+accuracy is the same on both sides of every one of them:
+`BERT_TINY_FOLD` (default 1, inert unless the calibration carries an
+estimate), `BERT_TINY_HOIST` (default 1), `BERT_TINY_POLY_BATCH` (default
+1; 8 is the measured knee), and the ring and its secret are
+`BERT_TINY_PARAM`.
+
+### The Cho fold
+
+`1 / sqrt(sq) = (1 / sqrt(est)) (1 / sqrt(sq / est))` for any public
+`est > 0`, so the inverse square root can be given the RATIO and its window
+becomes what ONE ROW's population spread is instead of the whole
+population's. The estimate is
+
+    est[b][t] = ehat[head][t] * live_b ^ p ,   p = 1 at pass 0, else 0
+
+with `live_b` the instance's real-token count -- which the padding mask
+makes public -- and `ehat` the calibration's per-row geometric mean of
+`sq / live` (that choice is the one that MINIMISES the ratio window: it
+leaves `[sqrt(lo/hi), sqrt(hi/lo)]` per row). The length dependence of
+`sq_0 = a sum over exactly live_b keys` therefore leaves the window
+EXACTLY, which is the thing a short served prompt used to escape (5c).
+
+It costs no wide level and no rotation: `1/est` rides the scaling that
+already precedes the narrow path's bootstrap, and `1/sqrt(est)` rides the
+constant already on `r` -- both on the ONE ciphertext a head's row sums
+live in. Only the LAST pass pays a narrow level it did not pay before,
+which is why `sim.py --fold-passes` defaults to `first`; the later windows
+are near-theorems and the fold buys ~1.2x there.
+
+What it does to the windows (1000 padded prompts, lengths 3..128):
+
+| | pass 0 raw | pass 0 folded | pass 1 raw | pass 1 folded |
+|---|---|---|---|---|
+| layer 0, k = 1 | 20,100 x | **340 x** | | |
+| layer 0, k = 2 | 901 x | **14.6 x** | 91.4 x | 75.2 x |
+| layer 1, k = 1 | 47,700 x | **659 x** | | |
+| layer 1, k = 2 | 2,100 x | **50 x** | 107 x | 51.3 x |
+
+The auto-`k` rule is "the first window under 300x", so without the fold
+layer 1 needs k = 3 and with it k = 2 -- and one Cho pass is 2T = 256
+main-path bootstraps a layer.
+
+### Hoisted BSGS rotations, and the batched polynomials
+
+The diagonal products rotate ONE ciphertext by several distances: the baby
+set `rot(K_i, b B)` for b < baby, the giant set `rot(Q_i, -g baby B)` for
+g < giant. `CiBertTinyLayer::RotateMany` decomposes such a source ONCE
+(`ModSwitchHandler::ModUp` plus the b-part's `PseudoModUp`) and then pays
+only the key product, the mod-down and the permutation per distance -- word
+for word what `Context::MultKey` does, since `MultKeyNoModDown` takes the
+decomposition as an argument. Of the 6080 rotations a layer at T = 128,
+4736 run off 384 decompositions.
+
+`EvalMany` is `EvalPoly::EvaluateBatch` over a group of ciphertexts at one
+(level, scale): the exp over the T diagonals, the GELU over the 512 hidden
+channels, the tanh over the head's 128.
+
+Measured (A100, `ci16_35_k16_w58`, T = 128 x B = 512, the oracle
+calibration, 2 layers, seconds):
+
+| | L0 rms | L1 rms | L0 | L1 | scores | values | GELU L0 |
+|---|---|---|---|---|---|---|---|
+| neither (the 5a baseline) | 2^-10.22 | 2^-9.33 | 15.26 | 18.95 | 1.62 | 1.10 | 4.70 |
+| hoist | 2^-10.22 | 2^-9.31 | 14.76 | 18.48 | **1.33** | **0.98** | 4.67 |
+| hoist + batch 8 | 2^-10.22 | 2^-9.36 | **13.51** | **17.68** | 1.34 | 0.99 | **3.37** |
+| hoist + batch 32 | 2^-10.22 | 2^-9.36 | 13.58 | 17.73 | 1.33 | 0.98 | 3.26 |
+
+Hoisting takes the diagonal products down 18 % / 11 %; the batch takes the
+GELU down 28 % and stops paying past 8 (past 32 it costs boot memory). The
+layer is 11.5 % faster and every rms is the same to the run-to-run draw.
+(The batched Llama layer's own note records `EvaluateBatch` as FLAT for its
+degree-15 exp; it pays here because BERT-Tiny's GELU is degree 127 over 512
+ciphertexts, where the tree walk and not the card is the cost.)
+
+### What the secret is worth, in bits
+
+`reference/scripts/security_estimate.py` on this ring (primal uSVP plus the
+drop-columns sparse hybrid; an UPPER bound on security, since the published
+MITM hybrids are stronger):
+
+| secret | where it is published | classical | quantum |
+|---|---|---|---|
+| MAIN, h = 32768 | ciphertexts (logQ 1400) | 166.0 | 154.1 |
+| MAIN, h = 32768 | switching keys (logQP 1771) | 128.4 | 119.9 |
+| SPARSE, h = 32 (the preset) | the same logQP | **93.4** | -- |
+
+The binding number for BERT-Tiny as shipped is therefore **93.4 bits**, and
+it is the SPARSE secret the bootstrap's encapsulation publishes, not the
+main one. Raising it is not free, because the sparse weight and EvalMod's
+range K are ONE decision -- measured on the same 2-layer chain:
+
+| ring | sparse h | security | layer 0 | layer 1 | wall |
+|---|---|---|---|---|---|
+| `ci16_35_k16_w58` (K 16) | 32 | 93.4 | 2^-10.22 | 2^-9.33 | 14.8 / 18.5 s |
+| `ci16_35_k16_w58_h64` (K 16) | 64 | 121.1 | **2^+235.7** | 2^+270.3 | -- |
+| `ci16_35_k64_w58_h192` (K 64) | 192 | **128.4** | 2^-10.63 | 2^-9.58 | 14.6 / 19.4 s |
+
+The middle row is the mechanism made visible: at h = 64 the ModRaise
+wrap-around leaves K = 16 and the bootstrap returns garbage for every
+instance of the batch. On the K = 64 pool, h = 192 is enough that the
+hybrid buys nothing (drop 0), so the answer is **128.4 bits at +2 % wall
+and no accuracy loss** -- the k64 pool's boot is ~10 % dearer and its
+landing is 14 rather than 16, which this layer's plan has room for.
+
 ## 6. Plan
 
 1. B = 1, T = 128 on the A100: build, layer 0, the 2-layer chain. DONE.

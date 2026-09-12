@@ -122,6 +122,76 @@ void CiBertTinyLayer<word>::PerToken(Pt &pt, const std::vector<double> &per_toke
 }
 
 template <typename word>
+void CiBertTinyLayer<word>::PerSlot(Pt &pt, const std::vector<double> &values,
+                                    const Ct &like) const {
+  std::vector<Complex> msg;
+  layout_.Pack(msg, values);
+  boot_->gpu_encoder_.Encode(pt, Level(like), like.GetScale(), msg);
+}
+
+// ------------------------------------------------------------------ fold
+template <typename word>
+bool CiBertTinyLayer<word>::Folds(int j) const {
+  return cfg_.fold && j < static_cast<int>(cal_.est.size()) &&
+         !cal_.est[j].empty();
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::FoldEstimate(std::vector<double> &est, int j,
+                                         int head) const {
+  const int T = cfg_.shape.tokens, B = layout_.num_instances;
+  const auto &row = cal_.est[j][head];
+  AssertTrue(static_cast<int>(row.size()) == T,
+             "CiBertTinyLayer: the fold estimate is [pass][head][token]");
+  const int p = (j < static_cast<int>(cal_.est_live_pow.size()))
+                    ? cal_.est_live_pow[j]
+                    : 0;
+  est.assign(static_cast<size_t>(B) * T, 0.0);
+  for (int b = 0; b < B; b++) {
+    const double w = std::pow(live_[b], static_cast<double>(p));
+    for (int t = 0; t < T; t++) {
+      const double e = row[t] * w;
+      AssertTrue(e > 0.0, "CiBertTinyLayer: a fold estimate is not positive");
+      est[static_cast<size_t>(b) * T + t] = e;
+    }
+  }
+}
+
+template <typename word>
+const typename CiBertTinyLayer<word>::Pt &CiBertTinyLayer<word>::FoldScale(
+    int j, int head, const Ct &like, double unit, double hi) {
+  const int idx = j * cfg_.shape.heads + head;
+  const int lv = Level(like);
+  const double sc = like.GetScale();
+  if (fold_a_lv_[idx] != lv || std::abs(fold_a_sc_[idx] - sc) > 1e-9 * sc) {
+    std::vector<double> est;
+    FoldEstimate(est, j, head);
+    for (auto &e : est) e = cfg_.ride / (e * unit * hi);
+    PerSlot(fold_a_[idx], est, like);
+    fold_a_lv_[idx] = lv;
+    fold_a_sc_[idx] = sc;
+  }
+  return fold_a_[idx];
+}
+
+template <typename word>
+const typename CiBertTinyLayer<word>::Pt &CiBertTinyLayer<word>::FoldUndo(
+    int j, int head, const Ct &like, double unit, double tail) {
+  const int idx = j * cfg_.shape.heads + head;
+  const int lv = Level(like);
+  const double sc = like.GetScale();
+  if (fold_b_lv_[idx] != lv || std::abs(fold_b_sc_[idx] - sc) > 1e-9 * sc) {
+    std::vector<double> est;
+    FoldEstimate(est, j, head);
+    for (auto &e : est) e = tail / std::sqrt(e * unit);
+    PerSlot(fold_b_[idx], est, like);
+    fold_b_lv_[idx] = lv;
+    fold_b_sc_[idx] = sc;
+  }
+  return fold_b_[idx];
+}
+
+template <typename word>
 template <typename F>
 std::unique_ptr<EvalPoly<word>> CiBertTinyLayer<word>::Compile(
     F g, int degree, int level, double in_scale, int *landing) const {
@@ -149,6 +219,139 @@ void CiBertTinyLayer<word>::Rotate(Ct &res, const Ct &a, int dist,
   }
   boot_->HRot(res, a, evk.GetRotationKey(idx), idx);
   stages_.rotations++;
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::RotateMany(std::vector<Ct> &res, const Ct &a,
+                                       const std::vector<int> &dists,
+                                       const EvkMap<word> &evk) {
+  const int N = layout_.num_slots;
+  const int n = static_cast<int>(dists.size());
+  res.clear();
+  res.resize(n);
+  std::vector<int> idx(n);
+  for (int i = 0; i < n; i++) {
+    int d = dists[i] % N;
+    if (d < 0) d += N;
+    idx[i] = d;
+  }
+  int switches = 0;
+  for (int i = 0; i < n; i++) switches += (idx[i] != 0) ? 1 : 0;
+  if (!cfg_.hoist || switches <= 1) {
+    for (int i = 0; i < n; i++) Rotate(res[i], a, idx[i], evk);
+    return;
+  }
+  NvtxScope _nv("bert-tiny: hoisted rotations");
+  // One decomposition of the a-part serves every distance: what a key switch
+  // does per rotation is then the key product, the mod-down and the
+  // permutation -- `MultKey`'s own words, since `MultKeyNoModDown` takes the
+  // mod-up as an argument and the b-part rides its pseudo mod-up exactly as
+  // it does inside `MultKey`.
+  const Parameter<word> &param = boot_->param_;
+  const NPInfo np = a.GetNP();
+  const int level = param.NPToLevel(np);
+  const int degree = param.degree_;
+  const int num_q = np.GetNumQ();
+  const int num_aux = param.alpha_;
+  const int prime_offset = param.GetMaxNumTer() - np.num_ter_;
+  const int beta = DivCeil(num_q + prime_offset, num_aux);
+  AssertTrue(level >= 1 && np.num_aux_ == 0,
+             "CiBertTinyLayer::RotateMany: a canonical ciphertext above "
+             "level 0");
+  const auto &ms = boot_->GetModSwitchHandler(level, num_aux);
+
+  std::vector<DeviceVector<word>> modup(beta);
+  std::vector<DvView<word>> modup_view;
+  for (int i = 0; i < beta; i++) {
+    modup[i].resize(static_cast<size_t>(num_q + num_aux) * degree);
+    modup_view.push_back(modup[i].View(num_aux * degree));
+  }
+  ms.ModUp(modup_view, a.AxConstView());
+  DeviceVector<word> bxp(static_cast<size_t>(num_q) * degree);
+  {
+    DvView<word> bxp_view = bxp.View();
+    DvConstView<word> p_prod_view(boot_->p_prod_.data() + prime_offset, num_q);
+    ms.PseudoModUp(bxp_view, a.BxConstView(), p_prod_view);
+  }
+
+  for (int i = 0; i < n; i++) {
+    if (idx[i] == 0) {
+      boot_->Copy(res[i], a);
+      continue;
+    }
+    Ct accum;
+    boot_->MultKeyNoModDown(accum, modup, a, evk.GetRotationKey(idx[i]));
+    {  // the b-part, which the hoisted entry point leaves out
+      DvView<word> acc_bx(accum.bx_.data(), static_cast<size_t>(num_q) * degree, 0);
+      std::vector<DvView<word>> dst = {acc_bx};
+      std::vector<DvConstView<word>> lhs = {
+          DvConstView<word>(accum.bx_.data(), static_cast<size_t>(num_q) * degree, 0)};
+      std::vector<DvConstView<word>> rhs = {bxp.ConstView()};
+      boot_->elem_handler_.Add(dst, np, lhs, rhs);
+    }
+    Ct down;
+    down.RemoveRx();
+    down.ModifyNP(np);
+    down.SetScale(a.GetScale());
+    down.SetNumSlots(a.GetNumSlots());
+    auto bx_view = down.BxView();
+    auto ax_view = down.AxView();
+    ms.ModDown(bx_view, accum.BxConstView());
+    ms.ModDown(ax_view, accum.AxConstView());
+    accum = Ct();
+    boot_->Permute(res[i], down, idx[i]);
+    stages_.rotations++;
+  }
+}
+
+template <typename word>
+void CiBertTinyLayer<word>::EvalMany(std::vector<Ct> &cts,
+                                     const EvalPoly<word> &poly,
+                                     const Evk &mult_key) {
+  const int n = static_cast<int>(cts.size());
+  const int group = (cfg_.poly_batch > 1) ? std::min(cfg_.poly_batch, n) : 1;
+  if (group <= 1) {
+    for (int i = 0; i < n; i++) {
+      Ct out;
+      poly.Evaluate(boot_, out, cts[i], mult_key);
+      cts[i] = std::move(out);
+    }
+    return;
+  }
+  for (int c0 = 0; c0 < n; c0 += group) {
+    const int g = std::min(n - c0, group);
+    CtBatch<word> in;
+    const NPInfo np = cts[c0].GetNP();
+    in.Allocate(np, g, false);
+    in.scale_ = cts[c0].GetScale();
+    in.num_slots_ = cts[c0].GetNumSlots();
+    const size_t bytes = in.PolyWords() * sizeof(word);
+    for (int b = 0; b < g; b++) {
+      AssertTrue(cts[c0 + b].GetNP() == np && !cts[c0 + b].HasRx(),
+                 "CiBertTinyLayer::EvalMany: the group is not at one level");
+      AssertTrue(std::abs(cts[c0 + b].GetScale() - in.scale_) <= 1e-9 * in.scale_,
+                 "CiBertTinyLayer::EvalMany: the group is not at one scale");
+      cudaMemcpyAsync(in.CtData(b), cts[c0 + b].bx_.data(), bytes,
+                      cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+      cudaMemcpyAsync(in.CtData(b) + in.PolyWords(), cts[c0 + b].ax_.data(),
+                      bytes, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+    }
+    CtBatch<word> out;
+    poly.EvaluateBatch(boot_, out, in, mult_key);
+    in = CtBatch<word>();
+    const size_t out_bytes = out.PolyWords() * sizeof(word);
+    for (int b = 0; b < g; b++) {
+      Ct &dst = cts[c0 + b];
+      dst.RemoveRx();
+      dst.ModifyNP(out.np_);
+      dst.SetScale(out.scale_);
+      dst.SetNumSlots(out.num_slots_);
+      cudaMemcpyAsync(dst.bx_.data(), out.CtData(b), out_bytes,
+                      cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+      cudaMemcpyAsync(dst.ax_.data(), out.CtData(b) + out.PolyWords(),
+                      out_bytes, cudaMemcpyDeviceToDevice, cudaStreamLegacy);
+    }
+  }
 }
 
 template <typename word>
@@ -246,6 +449,30 @@ void CiBertTinyLayer<word>::Prepare(const Weights &w, const Calibration &c) {
   const int top = TopLevel();
   const Parameter<word> &param = boot_->param_;
 
+  // ---- the public live counts and the fold's slots -----------------------
+  {
+    const int B = layout_.num_instances;
+    live_.assign(B, static_cast<double>(T));
+    if (has_mask_) {
+      for (int b = 0; b < B; b++) {
+        int n = 0;
+        for (int t = 0; t < T; t++) {
+          n += mask_valid_[static_cast<size_t>(b) * T + t] ? 1 : 0;
+        }
+        AssertTrue(n > 0, "CiBertTinyLayer::Prepare: an instance has no real "
+                          "token (the batch must be full of real prompts)");
+        live_[b] = n;
+      }
+    }
+    const int nf = c.niter * s.heads;
+    fold_a_.clear(); fold_b_.clear();
+    fold_a_.resize(nf); fold_b_.resize(nf);
+    fold_a_lv_.assign(nf, -1); fold_b_lv_.assign(nf, -1);
+    fold_a_sc_.assign(nf, 0.0); fold_b_sc_.assign(nf, 0.0);
+    AssertTrue(c.est.empty() || static_cast<int>(c.est.size()) == c.niter,
+               "CiBertTinyLayer::Prepare: one fold estimate per Cho pass");
+  }
+
   // ---- the level plan (see the header) ----------------------------------
   exp_levels_ = Levels(c.exp.degree);
   const int mask_levels = has_mask_ ? 1 : 0;
@@ -254,10 +481,17 @@ void CiBertTinyLayer<word>::Prepare(const Weights &w, const Calibration &c) {
     int y = l_s_ - exp_levels_ - mask_levels;
     for (int j = 0; j < c.niter; j++) {
       const int lv = Levels(c.inv[j].degree);
+      const bool fold = Folds(j);
+      // the tensor square, then the scaling that precedes the narrow boot --
+      // a plaintext (the fold) or a constant, one level either way when a
+      // boot happens; the fold pays it even when none does
       const int sq = y - 1;
-      const int r_in = (sq < lv + 2) ? top : sq;
-      int r = r_in - 1 - lv;
-      if (j + 1 < c.niter) r -= 1;
+      const int s_in = fold ? sq - 1 : sq;
+      const int r_in = (s_in < lv + 2) ? top : s_in;
+      int r = r_in - 1 - lv;          // the affine, then the polynomial
+      // the constant on r: the fold's `1/sqrt(est)` always, the between-pass
+      // sqrt(ride) only when another pass follows
+      if (fold || j + 1 < c.niter) r -= 1;
       const int p = std::min(y, r) - 2;
       y = (j + 1 < c.niter) ? top : p;
     }
@@ -333,7 +567,27 @@ void CiBertTinyLayer<word>::Prepare(const Weights &w, const Calibration &c) {
               << l_v_in_ << ", o in " << l_o_in_ << ", GELU deg "
               << c.gelu.degree << ", Cho k " << c.niter << ", BSGS " << baby_
               << " x " << giant_ << ", carries in " << c_in << " h " << c_h
-              << (has_mask_ ? ", masked" : "") << std::endl;
+              << (has_mask_ ? ", masked" : "");
+    std::cout << "; fold ";
+    if (c.est.empty()) {
+      std::cout << "none";
+    } else if (!cfg_.fold) {
+      std::cout << "OFF (the calibration has one)";
+    } else {
+      for (int j = 0; j < c.niter; j++) {
+        std::cout << (j ? "," : "") << (Folds(j) ? "on" : "-");
+      }
+      std::cout << " (live^";
+      for (int j = 0; j < c.niter; j++) {
+        std::cout << (j ? "," : "")
+                  << (j < static_cast<int>(c.est_live_pow.size())
+                          ? c.est_live_pow[j]
+                          : 0);
+      }
+      std::cout << ")";
+    }
+    std::cout << ", hoist " << (cfg_.hoist ? "on" : "off") << ", poly batch "
+              << cfg_.poly_batch << std::endl;
   }
 }
 
@@ -426,13 +680,9 @@ void CiBertTinyLayer<word>::Head(std::vector<Ct> &logits, Stream &z,
   proj_->Project(u, z.cts, "pool");
   for (int i = 0; i < H; i++) AddScalar(u[i], u[i], hpb_[i]);
   Tap("t_tanh", u, 1.0);
-  std::vector<Ct> p(H);
-  for (int i = 0; i < H; i++) {
-    tanh_poly_->Evaluate(boot_, p[i], u[i], mult_key);
-    u[i] = Ct();
-  }
-  Tap("pooled", p, 1.0);
-  proj_->Project(logits, p, "cls");
+  EvalMany(u, *tanh_poly_, mult_key);
+  Tap("pooled", u, 1.0);
+  proj_->Project(logits, u, "cls");
   for (int c = 0; c < classes_; c++) AddScalar(logits[c], logits[c], hcb_[c]);
   Tap("logits", logits, 1.0);
   stages_.o += Since(t0);
@@ -449,23 +699,31 @@ void CiBertTinyLayer<word>::DiagonalProducts(std::vector<Ct> &res,
   const int B = layout_.num_instances, T = cfg_.shape.tokens;
   const auto &mult_key = evk.GetMultiplicationKey();
   AssertTrue(static_cast<int>(rhs.size()) == n, "DiagonalProducts: widths");
-  // baby copies of the rhs: rb[b][i] = rot(rhs[i], b B)
-  std::vector<std::vector<Ct>> rb(baby_);
-  for (int b = 0; b < baby_; b++) {
-    rb[b].resize(n);
-    for (int i = 0; i < n; i++) Rotate(rb[b][i], rhs[i], b * B, evk);
+  // baby copies of the rhs: rb[b][i] = rot(rhs[i], b B), and giant copies of
+  // the lhs: lg[g][i] = rot(lhs[i], -g baby B). Each source is rotated by
+  // several distances, so each costs ONE decomposition (`RotateMany`).
+  std::vector<int> baby_dists(baby_), giant_dists(giant_);
+  for (int b = 0; b < baby_; b++) baby_dists[b] = b * B;
+  for (int g = 0; g < giant_; g++) giant_dists[g] = -g * baby_ * B;
+  std::vector<std::vector<Ct>> rb(baby_), lg(giant_);
+  for (int b = 0; b < baby_; b++) rb[b].resize(n);
+  for (int g = 0; g < giant_; g++) lg[g].resize(n);
+  for (int i = 0; i < n; i++) {
+    std::vector<Ct> one;
+    RotateMany(one, rhs[i], baby_dists, evk);
+    for (int b = 0; b < baby_; b++) rb[b][i] = std::move(one[b]);
+    RotateMany(one, lhs[i], giant_dists, evk);
+    for (int g = 0; g < giant_; g++) lg[g][i] = std::move(one[g]);
   }
   res.clear();
   res.resize(T);
   for (int g = 0; g < giant_; g++) {
     const int G = g * baby_ * B;
-    std::vector<Ct> lg(n);
-    for (int i = 0; i < n; i++) Rotate(lg[i], lhs[i], -G, evk);
     for (int b = 0; b < baby_; b++) {
       Ct acc;
       for (int i = 0; i < n; i++) {
         Ct t;
-        boot_->Mult(t, lg[i], rb[b][i]);
+        boot_->Mult(t, lg[g][i], rb[b][i]);
         if (i == 0) {
           acc = std::move(t);
         } else {
@@ -495,10 +753,17 @@ void CiBertTinyLayer<word>::DiagonalContract(std::vector<Ct> &res,
   const int B = layout_.num_instances, T = cfg_.shape.tokens;
   const auto &mult_key = evk.GetMultiplicationKey();
   AssertTrue(static_cast<int>(lhs.size()) == T, "DiagonalContract: T diagonals");
+  // the rhs again takes baby distances off one decomposition each; the lhs
+  // here is a DIFFERENT ciphertext per (giant, baby), so its one rotation
+  // has nothing to share
+  std::vector<int> baby_dists(baby_);
+  for (int b = 0; b < baby_; b++) baby_dists[b] = b * B;
   std::vector<std::vector<Ct>> rb(baby_);
-  for (int b = 0; b < baby_; b++) {
-    rb[b].resize(n);
-    for (int i = 0; i < n; i++) Rotate(rb[b][i], rhs[i], b * B, evk);
+  for (int b = 0; b < baby_; b++) rb[b].resize(n);
+  for (int i = 0; i < n; i++) {
+    std::vector<Ct> one;
+    RotateMany(one, rhs[i], baby_dists, evk);
+    for (int b = 0; b < baby_; b++) rb[b][i] = std::move(one[b]);
   }
   res.clear();
   res.resize(n);
@@ -544,12 +809,11 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
   if (head == 0) Tap("s", S, 1.0 / (std::ldexp(1.0, k) * a_e));
   std::vector<Ct> y(T);
   for (int d = 0; d < T; d++) {
-    Ct u;
-    boot_->Add(u, S[d], shift_pt_[head]);
-    if (head == 0 && d == 0) Tap("t_exp", u, 1.0);
-    exp_poly_->Evaluate(boot_, y[d], u, mult_key);
+    boot_->Add(y[d], S[d], shift_pt_[head]);
+    if (head == 0 && d == 0) Tap("t_exp", y[d], 1.0);
     S[d] = Ct();
   }
+  EvalMany(y, *exp_poly_, mult_key);
   if (head == 0) Tap("y", y, 1.0);
   if (has_mask_) {
     // pads out of the row: y_d <- y_d (.) M_d, one wide level
@@ -581,10 +845,38 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
     // pass j's window, in the units the walk is in: after pass j - 1 the
     // main path carries ride (the sqrt(ride) on r), so sq carries ride^2
     const double unit = (j == 0) ? 1.0 : cfg_.ride * cfg_.ride;
-    const double lo = cal_.inv[j].lo * unit, hi = cal_.inv[j].hi * unit;
     const int degree = cal_.inv[j].degree;
-    const double kappa = NarrowLift(sq, Levels(degree) + 2, hi, evk);
-    const double a = 0.5 * (hi - lo), b = 0.5 * (hi + lo);
+    const int need = Levels(degree) + 2;
+    const bool fold = Folds(j);
+    double kappa = 1.0, a = 0.0, b = 0.0;
+    if (fold) {
+      // 1/sqrt(sq) = (1/sqrt(est)) (1/sqrt(sq/est)): the polynomial sees the
+      // RATIO, whose window is one row's population spread. The estimate
+      // rides the scaling that precedes the boot, so it costs no level there.
+      const double lo = cal_.inv[j].lo, hi = cal_.inv[j].hi;  // of the ratio
+      Ct t;
+      boot_->Mult(t, sq, FoldScale(j, head, sq, unit, hi));
+      boot_->Rescale(sq, t);                        // = ride (sq/est) / hi
+      if (Level(sq) < need) {
+        if (!boot_->IsBootPrepared(layout_.num_slots)) {
+          boot_->PrepareEvalSpecialFFT(layout_.num_slots);
+        }
+        auto tb = Clock::now();
+        Ct up;
+        boot_->Boot(up, sq, evk);
+        sq = std::move(up);
+        stages_.narrow_boots++;
+        stages_.boot += Since(tb);
+      }
+      kappa = hi / cfg_.ride;
+      a = 0.5 * (hi - lo);
+      b = 0.5 * (hi + lo);
+    } else {
+      const double lo = cal_.inv[j].lo * unit, hi = cal_.inv[j].hi * unit;
+      kappa = NarrowLift(sq, need, hi, evk);
+      a = 0.5 * (hi - lo);
+      b = 0.5 * (hi + lo);
+    }
     Ct t;
     MultScalar(t, sq, kappa / a);
     AddScalar(t, t, -b / a);
@@ -592,11 +884,22 @@ void CiBertTinyLayer<word>::SoftMax(std::vector<Ct> &P, std::vector<Ct> &S,
                        degree, Level(t), t.GetScale());
     Ct r;
     inv->Evaluate(boot_, r, t, mult_key);
-    if (head == 0) Tap("r" + std::to_string(j), r, 1.0);
-    if (j + 1 < k) {
+    if (fold) {
+      // r <- r / sqrt(est unit), and the between-pass sqrt(ride) with it
+      const double tail = (j + 1 < k) ? std::sqrt(cfg_.ride) : 1.0;
       Ct rs;
-      MultScalar(rs, r, std::sqrt(cfg_.ride));
-      r = std::move(rs);
+      boot_->Mult(rs, r, FoldUndo(j, head, r, unit, tail));
+      boot_->Rescale(r, rs);
+      // the tap is the same quantity either way: 1/sqrt(sq) in ct units,
+      // times the sqrt(ride) a following pass carries
+      if (head == 0) Tap("r" + std::to_string(j), r, tail);
+    } else {
+      if (head == 0) Tap("r" + std::to_string(j), r, 1.0);
+      if (j + 1 < k) {
+        Ct rs;
+        MultScalar(rs, r, std::sqrt(cfg_.ride));
+        r = std::move(rs);
+      }
     }
     // y <- (y r)^2
     const int lw = std::min(Level(y[0]), Level(r));
@@ -810,15 +1113,11 @@ void CiBertTinyLayer<word>::FeedForward(Stream &out, const Stream &h,
   stages_.ffn += Since(t0);
   Tap("t_gelu", u, 1.0);
   t0 = Clock::now();
-  std::vector<Ct> gl(I);
-  for (int j = 0; j < I; j++) {
-    gelu_poly_->Evaluate(boot_, gl[j], u[j], mult_key);
-    u[j] = Ct();
-  }
+  EvalMany(u, *gelu_poly_, mult_key);
   stages_.gelu += Since(t0);
-  Tap("g", gl, 1.0);
+  Tap("g", u, 1.0);
   t0 = Clock::now();
-  proj_->Project(out.cts, gl, "out");
+  proj_->Project(out.cts, u, "out");
   for (int i = 0; i < H; i++) AddScalar(out.cts[i], out.cts[i], bout_[i]);
   out.carry = c_h_;
   stages_.ffn += Since(t0);

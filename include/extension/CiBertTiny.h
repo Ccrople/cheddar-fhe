@@ -103,6 +103,15 @@ class CiBertTinyLayer {
     int baby_steps = 0;
     //! Output channels per projection tile.
     int rows_per_tile = 512;
+    //! Use `Calibration::est` when the calibration carries one (A/B switch).
+    bool fold = true;
+    //! Rotate a ciphertext by several distances off ONE decomposition
+    //! (`Context::MultKeyNoModDown` on a shared mod-up): the BSGS steps of
+    //! the diagonal products. False = one `HRot` each, the A/B baseline.
+    bool hoist = true;
+    //! Evaluate the exp / GELU / tanh polynomials over a batch of
+    //! ciphertexts (`EvalPoly::EvaluateBatch`); 1 = the per-ciphertext loop.
+    int poly_batch = 1;
     bool verbose = false;
   };
 
@@ -120,6 +129,25 @@ class CiBertTinyLayer {
     std::vector<std::vector<double>> shift;       //!< [heads][tokens]
     PolySpec exp;                                 //!< on (S - shift)/2^k
     std::vector<PolySpec> inv;                    //!< pass j's 1/sqrt window
+    /**
+     * @brief The FOLD: `[pass][head][token]`, a public estimate of the row's
+     * sum of squares, empty (or an empty pass) = no fold for that pass.
+     *
+     * `1 / sqrt(sq) = (1 / sqrt(est)) (1 / sqrt(sq / est))`, so with a public
+     * `est` the polynomial sees the RATIO and its window is what one row's
+     * population spread is, not what the whole population's is. The estimate
+     * that a served batch uses is
+     *
+     *     est[b][t] = `est[j][head][t]` * live_b ^ `est_live_pow[j]`
+     *
+     * with `live_b` the instance's real-token count, which the mask makes
+     * public -- so the length dependence of `sq_0 = sum over real keys`
+     * leaves the window exactly. `1 / est` rides the scaling that precedes
+     * the narrow path's bootstrap (no level of its own where a boot happens)
+     * and `1 / sqrt(est)` rides the constant on `r` (one narrow level).
+     */
+    std::vector<std::vector<std::vector<double>>> est;
+    std::vector<int> est_live_pow;                //!< [pass], 0 when absent
     // norms
     struct Norm {
       PolySpec inv;          //!< 1/sqrt(var + eps) window
@@ -242,6 +270,26 @@ class CiBertTinyLayer {
   void AddScalar(Ct &res, const Ct &a, double value) const;
   //! A per-query-token plaintext at the ciphertext's level and scale.
   void PerToken(Pt &pt, const std::vector<double> &per_token, const Ct &like) const;
+  //! A per-slot plaintext, `values[b * T + t]`, at `like`'s level and scale.
+  void PerSlot(Pt &pt, const std::vector<double> &values, const Ct &like) const;
+  //! Does pass `j` carry a fold estimate?
+  bool Folds(int j) const;
+  //! `est[b][t]` for pass j, head h: the calibration's row estimate times
+  //! the instance's public live count.
+  void FoldEstimate(std::vector<double> &est, int j, int head) const;
+  //! The two fold plaintexts of (pass, head), cached at the level and scale
+  //! they are wanted at: `ride / (est unit hi)` before the narrow boot, and
+  //! `tail / sqrt(est unit)` on `r` after the polynomial.
+  const Pt &FoldScale(int j, int head, const Ct &like, double unit, double hi);
+  const Pt &FoldUndo(int j, int head, const Ct &like, double unit, double tail);
+  //! `cts <- poly(cts)` through `EvalPoly::EvaluateBatch` in groups of
+  //! `Config::poly_batch` (1 = the per-ciphertext loop).
+  void EvalMany(std::vector<Ct> &cts, const EvalPoly<word> &poly,
+                const Evk &mult_key);
+  //! `res[i] = rot(a, dists[i])` off ONE decomposition of `a` when
+  //! `Config::hoist`, else one `HRot` each. `res` is resized.
+  void RotateMany(std::vector<Ct> &res, const Ct &a,
+                  const std::vector<int> &dists, const EvkMap<word> &evk);
   //! Chebyshev interpolant of `g` on [-1, 1] (the affine already applied),
   //! compiled at `level` for inputs at `in_scale`, landing canonical.
   template <typename F>
@@ -284,6 +332,11 @@ class CiBertTinyLayer {
   int mask_level_ = -1;
   double mask_scale_ = 0.0;
   void MaskPlaintexts(const Ct &like);
+  //! the fold, indexed `j * heads + head`; the level/scale each was built at
+  std::vector<Pt> fold_a_, fold_b_;
+  std::vector<int> fold_a_lv_, fold_b_lv_;
+  std::vector<double> fold_a_sc_, fold_b_sc_;
+  std::vector<double> live_;  //!< real tokens an instance (public), T if no mask
   // the head
   HeadWeights hw_;
   HeadCalibration hc_;

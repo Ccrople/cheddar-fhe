@@ -116,6 +116,11 @@ Layer::Calibration ReadCalib(const json &cj) {
   c.shift = sm["shift"].get<std::vector<std::vector<double>>>();
   c.exp = Spec(sm["exp"]);
   for (const auto &p : sm["inv"]) c.inv.push_back(Spec(p));
+  // the fold, when the calibration carries one (sim.py without --no-fold)
+  if (sm.contains("est") && !sm["est"].empty()) {
+    c.est = sm["est"].get<std::vector<std::vector<std::vector<double>>>>();
+    c.est_live_pow = sm["est_live_pow"].get<std::vector<int>>();
+  }
   c.ln1 = Norm(cj["ln1"]);
   c.ln2 = Norm(cj["ln2"]);
   c.gelu = Spec(cj["gelu"]);
@@ -271,6 +276,9 @@ TEST(CiBertTiny, TheChainRunsOnTheRealWeights) {
   cfg.shape.eps = meta["ln_eps"].get<double>();
   cfg.boot_group = EnvInt("BERT_TINY_BOOT_GROUP", 8);
   cfg.baby_steps = EnvInt("BERT_TINY_BABY", 0);
+  cfg.fold = EnvInt("BERT_TINY_FOLD", 1) != 0;
+  cfg.hoist = EnvInt("BERT_TINY_HOIST", 1) != 0;
+  cfg.poly_batch = EnvInt("BERT_TINY_POLY_BATCH", 1);
   cfg.verbose = EnvInt("BERT_TINY_VERBOSE", 1) != 0;
   const int H = cfg.shape.model, I = cfg.shape.hidden, T = cfg.shape.tokens;
   const int num_layers = std::min(EnvInt("BERT_TINY_LAYERS", meta["layers"].get<int>()),

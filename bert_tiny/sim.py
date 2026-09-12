@@ -83,6 +83,13 @@ class Poly:
 
 
 # ------------------------------------------------------------- the softmax
+def live_of(mask, T, N):
+    """The instance's real-token count -- PUBLIC (the server holds the mask)."""
+    if mask is None:
+        return np.full(N, float(T))
+    return np.isfinite(mask).sum(axis=1).astype(float)
+
+
 class ChoSoftmax:
     """y0 = exp((s - shift) / 2^k); k times: y = (y / ||y||)^2; P = y_k.
 
@@ -91,10 +98,19 @@ class ChoSoftmax:
     one sum of squares over the keys, one inverse square root on it, and
     one square -- what the batched layout does with T ciphertext adds, one
     narrow polynomial and one wide multiply.
+
+    THE FOLD. `1/sqrt(sq) = (1/sqrt(est)) (1/sqrt(sq/est))` for any public
+    `est > 0`, so the polynomial can be given the RATIO instead of `sq`. With
+    `est[b][h][t] = ehat[h][t] * live_b^p` the two things that make the first
+    window wide leave it: the instance's real-token count (p = 1 at pass 0,
+    where `sq_0` is a sum over exactly `live_b` keys) and the row's own place
+    in the population (`ehat`). What is left is one row's spread.
     """
 
-    def __init__(self, k, shift, exp_poly, inv_polys):
+    def __init__(self, k, shift, exp_poly, inv_polys, est=None, live_pow=None):
         self.k, self.shift, self.exp, self.inv = k, shift, exp_poly, inv_polys
+        self.est = est
+        self.live_pow = live_pow if live_pow is not None else fold_live_pow(k)
         self.sq_seen = [[np.inf, -np.inf] for _ in range(k)]
 
     def __call__(self, s, mask=None):
@@ -102,29 +118,81 @@ class ChoSoftmax:
         y = self.exp(u)
         if mask is not None:                               # pads: exp'd, then zeroed
             y = y * np.isfinite(mask)
+        live = live_of(mask, s.shape[-1], s.shape[0])
         for j in range(self.k):
             sq = (y * y).sum(axis=-1)
             self.sq_seen[j][0] = min(self.sq_seen[j][0], float(sq.min()))
             self.sq_seen[j][1] = max(self.sq_seen[j][1], float(sq.max()))
-            r = self.inv[j](sq)
+            if self.est is None or self.est[j] is None:
+                r = self.inv[j](sq)
+            else:
+                e = self.est[j][None] * (live[:, None, None] ** self.live_pow[j])
+                r = self.inv[j](sq / e) / np.sqrt(e)
             y = (y * r[..., None]) ** 2
         return y
 
 
-def exact_cho_ranges(s, shift, k, valid=None):
+def fold_live_pow(k):
+    """Pass 0's sum runs over `live` keys; the later passes' argument is a
+    normalised distribution, whose size the count no longer sets."""
+    return [1] + [0] * (k - 1)
+
+
+def fold_passes(which, k):
+    """Which passes carry a fold. The LAST pass pays a narrow level for its
+    `1/sqrt(est)` that the walk would otherwise spend on `P` (the plan needs
+    `l_p >= 4`), and the later windows are near-theorems anyway -- the wide
+    one is the first. `first` is therefore the default."""
+    if which == "none":
+        return [False] * k
+    if which == "all":
+        return [True] * k
+    return [j == 0 for j in range(k)]
+
+
+def exact_cho_ranges(s, shift, k, valid=None, fold=True):
     """The exact Cho walk, to size the windows before any polynomial. The
     exp domain is over EVERY key (pads are exp'd in the crypto too); the
-    sums are over the real keys."""
+    sums are over the real keys.
+
+    Returns the exp domain, each pass's raw `sq` range, the fold estimates
+    `[pass][head][token]` and the ranges the polynomials actually see. The
+    estimate `sqrt(min * max)` over the population of that row is the one
+    that MINIMISES the ratio window -- it leaves `[sqrt(min/max),
+    sqrt(max/min)]`, so the window's ratio becomes the worst ROW's spread
+    instead of the whole population's.
+    """
     u = (s - shift[None, :, :, None]) / float(2 ** k)
     y = np.exp(u)
     if valid is not None:
         y = y * valid[:, None, None, :]
-    rng = []
-    for _ in range(k):
-        sq = (y * y).sum(axis=-1)
+    N, T = s.shape[0], s.shape[-1]
+    live = valid.sum(axis=1).astype(float) if valid is not None else np.full(N, float(T))
+    pw = fold_live_pow(k)
+    folds = fold if isinstance(fold, (list, tuple)) else [bool(fold)] * k
+    rng, est_tabs, seen = [], [], []
+    for j in range(k):
+        sq = (y * y).sum(axis=-1)                        # [N, NH, T]
         rng.append((float(sq.min()), float(sq.max())))
+        if folds[j]:
+            w = live[:, None, None] ** pw[j]
+            z = sq / w
+            zlo, zhi = z.min(axis=0), z.max(axis=0)       # [NH, T]
+            # the geometric mean IN LOGS: the product underflows outright
+            # once the walk has squared the row a few times. A row whose
+            # smallest member has underflowed to zero has no estimate worth
+            # the name -- the walk there is degenerate, not the fold -- so it
+            # takes the largest, and the window it opens is reported.
+            zlo = np.where(zlo > 0, zlo, zhi)
+            est = np.exp(0.5 * (np.log(zlo) + np.log(zhi)))
+            rho = z / est[None]
+            seen.append((float(rho.min()), float(rho.max())))
+            est_tabs.append(est)
+        else:
+            seen.append(rng[-1])
+            est_tabs.append(None)
         y = (y / np.sqrt(sq)[..., None]) ** 2
-    return (float(u.min()), float(u.max())), rng
+    return (float(u.min()), float(u.max())), rng, est_tabs, seen
 
 
 # ------------------------------------------------------------------ main
@@ -143,6 +211,11 @@ def main():
     ap.add_argument("--gelu-margin", type=float, default=1.2)
     ap.add_argument("--sq-ratio", type=float, default=300.0,
                     help="auto k: the smallest k whose first window is under this")
+    ap.add_argument("--fold-passes", default="first",
+                    choices=["first", "all", "none"],
+                    help="which Cho passes divide by the public row estimate")
+    ap.add_argument("--no-fold", action="store_true",
+                    help="do not divide the Cho sums by a public row estimate")
     a = ap.parse_args()
 
     def mask_beside(path):
@@ -165,18 +238,23 @@ def main():
         # the population row maximum over the REAL keys (the shift is public)
         sv = s if valid is None else np.where(valid[:, None, None, :], s, -np.inf)
         shift = sv.max(axis=(0, 3))                         # [NH, T]
-        # Cho passes: the smallest k whose first window is narrow enough.
+        # Cho passes: the smallest k whose first window is narrow enough --
+        # of what the POLYNOMIAL sees, which the fold is what decides.
         ks = [a.k] if a.k else [1, 2, 3, 4]
         for k in ks:
-            (u_lo, u_hi), rng = exact_cho_ranges(s, shift, k, valid)
-            if rng[0][1] / rng[0][0] <= a.sq_ratio or k == ks[-1]:
+            (u_lo, u_hi), rng, est_tabs, seen = exact_cho_ranges(
+                s, shift, k, valid,
+                fold=fold_passes("none" if a.no_fold else a.fold_passes, k))
+            if seen[0][1] / seen[0][0] <= a.sq_ratio or k == ks[-1]:
                 break
         exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + a.exp_margin / 4,
                         a.tol, name="exp")
         inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin, hi * a.margin,
                           a.tol, relative=True, name="inv%d" % j)
-                     for j, (lo, hi) in enumerate(rng)]
-        sm = ChoSoftmax(k, shift, exp_poly, inv_polys)
+                     for j, (lo, hi) in enumerate(seen)]
+        est = None if a.no_fold else est_tabs
+        sm = ChoSoftmax(k, shift, exp_poly, inv_polys, est)
+        folded = [e is not None for e in est_tabs] if est else [False] * k
 
         lns = {}
         for tag, pre in (("ln1", r["h_pre"]), ("ln2", r["z_pre"])):
@@ -189,6 +267,11 @@ def main():
 
         print("layer %d: Cho k=%d, shift |.| <= %.3f, u [%.2f, %.2f]"
               % (L, k, float(np.abs(shift).max()), u_lo, u_hi))
+        for j in range(k):
+            print("     window %d: raw %.3g x  ->  seen %.3g x%s" % (
+                j, rng[j][1] / rng[j][0], seen[j][1] / seen[j][0],
+                "" if est is None or est_tabs[j] is None
+                else "  (fold, live^%d)" % fold_live_pow(k)[j]))
         for p in [exp_poly] + inv_polys + [lns["ln1"], gl, lns["ln2"]]:
             print("   ", p)
         hooks.append({"softmax": sm, "ln1": lns["ln1"], "ln2": lns["ln2"], "gelu": gl})
@@ -198,7 +281,14 @@ def main():
             "softmax": {"niter": k, "shift": shift.tolist(),
                         "exp": exp_poly.json(),
                         "inv": [p.json() for p in inv_polys],
-                        "sq_range": rng, "s_min": float(s.min()),
+                        # the fold: est[pass][head][token], multiplied at
+                        # serve time by the instance's live count to the
+                        # power est_live_pow[pass] (both public)
+                        "est": [] if est is None else
+                               [[] if e is None else e.tolist() for e in est],
+                        "est_live_pow": [] if est is None else fold_live_pow(k),
+                        "sq_range": rng, "sq_seen": seen,
+                        "s_min": float(s.min()),
                         "s_max": float(s.max())},
             "v_absmax": float(np.abs(r["v"]).max()),
             "av_absmax": float(np.abs(r["av"]).max()),
@@ -264,7 +354,8 @@ def main():
            "hidden": m.I, "heads": m.NH, "head_dim": m.D, "ln_eps": m.eps,
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
-                     "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio},
+                     "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
+                     "fold": "none" if a.no_fold else a.fold_passes},
            "padded": valid is not None,
            # the shortest prompt the windows were sized on: a served prompt
            # shorter than this is outside the calibration (the first Cho
