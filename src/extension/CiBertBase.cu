@@ -1392,6 +1392,7 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   // at BERT-Base's width a copy of the residual stream is gigabytes.
   Stream x;
   x.carry = in.carry;
+  x.chan = in.chan;
   x.cts = std::move(in.cts);
   in.cts.clear();
   Lift(x, l_qk_in_, evk);
