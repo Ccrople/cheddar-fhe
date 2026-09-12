@@ -168,7 +168,28 @@ class CiBertBaseLayer {
       double r_max = 1.0;    //!< 1/sqrt(lo + eps)
       double out_absmax = 1.0;
     } ln1, ln2;
-    PolySpec gelu;
+    /**
+     * @brief The GELU: ONE FIT PER FEED-FORWARD TILE, in the calibration's
+     * own channel order (`gelu_perm`, a permutation of the hidden axis).
+     *
+     * A hidden channel is a WHOLE CIPHERTEXT in this layout, so a per-channel
+     * interval costs nothing -- no mask, no band plaintext, no low-rank mode
+     * plan: sort the channels by their own `|u|` and the tile IS the band.
+     * That matters because BERT's outliers are dimension-wise: at BERT-Base
+     * layer 10 one channel reaches `|u| = 130` where the 99th percentile is
+     * 5.5, and a Chebyshev interpolant's error depends on `radius / degree`
+     * alone (0.25 -> 5e-5, 0.125 -> 1e-12), so one shared interval charges
+     * every channel for the worst one. The permutation is public: it is a
+     * property of the weights and the population, not of a prompt, and it is
+     * applied to `wint`'s columns and `wout`'s rows, which leaves the layer's
+     * output exactly unchanged (a sum over the hidden axis).
+     *
+     * Each tile's `1 / a` also rides `wint`'s columns, so the polynomial sees
+     * `[-1, 1]` as `EvalPoly` requires and the tiles cost nothing but their
+     * own degrees.
+     */
+    std::vector<PolySpec> gelu;      //!< [ffn tile]
+    std::vector<int> gelu_perm;      //!< [hidden], the order the tiles cut
     double h_pre_absmax = 1.0, z_pre_absmax = 1.0;
   };
 
@@ -346,7 +367,14 @@ class CiBertBaseLayer {
   double q_fold_ = 1.0;               //!< W_Q's factor 1/(sqrt(D) 2^k a_exp)
   std::vector<double> bq_, bk_, bv_, bo_, bint_, bout_;  //!< folded biases
   std::vector<Pt> shift_pt_;          //!< per head, at l_s
-  std::unique_ptr<EvalPoly<word>> exp_poly_, gelu_poly_;
+  std::unique_ptr<EvalPoly<word>> exp_poly_;
+  //! one GELU per feed-forward tile, and the permuted (and per-tile scaled)
+  //! feed-forward tensors the tiles are cut from
+  std::vector<std::unique_ptr<EvalPoly<word>>> gelu_poly_;
+  DeviceVector<float> wint_, wout_;
+  DeviceVector<int> perm_d_;
+  DeviceVector<float> gscale_d_;
+  void FoldFeedForwardWeights(const Weights &w, const Calibration &c);
   // the mask: T per-slot 0/1 plaintexts `M_d[t][b] = valid[b][(t + d) % T]`,
   // encoded at the level and scale `y` has (rebuilt when those change)
   std::vector<uint8_t> mask_valid_;

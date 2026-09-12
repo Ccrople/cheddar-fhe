@@ -24,6 +24,26 @@ double Since(Clock::time_point t0) {
 }
 }  // namespace
 
+namespace kernel {
+//! `dst[c][j] = src[c][perm[j]] * scale[j]`: the up projection's columns put
+//! in the calibration's channel order, each carrying its tile's `1 / a`.
+__global__ void PermuteScaleCols(float *dst, const float *src, const int *perm,
+                                 const float *scale, int in, int out) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<size_t>(in) * out) return;
+  const int c = static_cast<int>(idx / out), j = static_cast<int>(idx % out);
+  dst[idx] = src[static_cast<size_t>(c) * out + perm[j]] * scale[j];
+}
+//! `dst[j][o] = src[perm[j]][o]`: the down projection's rows, the same order.
+__global__ void PermuteRows(float *dst, const float *src, const int *perm,
+                            int rows, int cols) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<size_t>(rows) * cols) return;
+  const int j = static_cast<int>(idx / cols), o = static_cast<int>(idx % cols);
+  dst[idx] = src[static_cast<size_t>(perm[j]) * cols + o];
+}
+}  // namespace kernel
+
 // ------------------------------------------------------------ construction
 template <typename word>
 CiBertBaseLayer<word>::CiBertBaseLayer(std::shared_ptr<BootContext<word>> boot,
@@ -49,6 +69,7 @@ CiBertBaseLayer<word>::CiBertBaseLayer(std::shared_ptr<BootContext<word>> boot,
   }
   AssertTrue(T % baby_ == 0, "CiBertBaseLayer: baby steps must divide T");
   giant_ = T / baby_;
+  ffn_tiles_ = DivCeil(s.hidden, std::min(cfg_.rows_per_tile, s.hidden));
   typename CiBatchProjection<word>::Config pcfg;
   pcfg.rows_per_tile = std::min(cfg_.rows_per_tile, s.hidden);
   pcfg.verbose = false;
@@ -513,40 +534,61 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
   const double a_e = 0.5 * (c.exp.hi - c.exp.lo), b_e = 0.5 * (c.exp.hi + c.exp.lo);
   q_fold_ = 1.0 / (std::sqrt(static_cast<double>(D)) * std::ldexp(1.0, c.niter) * a_e);
   const double c_h = cfg_.ride / c.ln1.out_absmax;
-  const double a_g = 0.5 * (c.gelu.hi - c.gelu.lo), b_g = 0.5 * (c.gelu.hi + c.gelu.lo);
   c_in_ = c_in;
   c_h_ = c_h;
 
-  // The GELU is compiled BEFORE the down projection is prepared, because its
-  // LANDING is that operand's level: `Levels(degree)` is what the fit spends
-  // only when the interpolant's top coefficient survives `EvalPoly`'s own
-  // degree reduction, and the down projection has to read what is there.
-  gelu_poly_ = Compile(
-      [a_g, b_g](double t) {
-        const double u = a_g * t + b_g;
-        return 0.5 * u * (1.0 + std::erf(u / std::sqrt(2.0)));
-      },
-      c.gelu.degree, top - 1, param.GetScale(top - 1), &gelu_landing_);
+  // ---- the feed-forward's tiles: one GELU each -------------------------
+  AssertTrue(static_cast<int>(c.gelu.size()) == ffn_tiles_,
+             "CiBertBaseLayer::Prepare: one GELU fit per feed-forward tile "
+             "(the calibration's tile size and Config::rows_per_tile are one "
+             "decision; got " + std::to_string(c.gelu.size()) + " fits for " +
+             std::to_string(ffn_tiles_) + " tiles)");
+  AssertTrue(static_cast<int>(c.gelu_perm.size()) == I,
+             "CiBertBaseLayer::Prepare: the GELU permutation is [hidden]");
+  // The tiles are compiled BEFORE the down projection is prepared, because
+  // their LANDING is that operand's level, and they all have to land
+  // together: `Levels(degree)` is what a fit spends only when the
+  // interpolant's top coefficient survives `EvalPoly`'s own degree
+  // reduction, and the tiles' degrees differ by design.
+  gelu_poly_.clear();
+  gelu_poly_.resize(ffn_tiles_);
+  gelu_landing_ = top;
+  std::vector<int> landing(ffn_tiles_);
+  for (int t = 0; t < ffn_tiles_; t++) {
+    const double a = 0.5 * (c.gelu[t].hi - c.gelu[t].lo);
+    const double b = 0.5 * (c.gelu[t].hi + c.gelu[t].lo);
+    gelu_poly_[t] = Compile(
+        [a, b](double x) {
+          const double u = a * x + b;
+          return 0.5 * u * (1.0 + std::erf(u / std::sqrt(2.0)));
+        },
+        c.gelu[t].degree, top - 1, param.GetScale(top - 1), &landing[t]);
+    gelu_landing_ = std::min(gelu_landing_, landing[t]);
+  }
   AssertTrue(gelu_landing_ >= 3,
              "CiBertBaseLayer::Prepare: the GELU degree does not leave the "
              "down projection, the residual and LN2 their levels (landing " +
                  std::to_string(gelu_landing_) + ")");
+  FoldFeedForwardWeights(w, c);
 
   proj_->Prepare("q", w.wq, H, H, l_qk_in_, q_fold_ / c_in);
   proj_->Prepare("k", w.wk, H, H, l_qk_in_, 1.0 / c_in);
   proj_->Prepare("v", w.wv, H, H, l_v_in_, 1.0 / c_in);
   proj_->Prepare("o", w.wo, H, H, l_o_in_, c_in);
   // The feed-forward, tiled over the hidden axis: ONE up operand whose tiles
-  // are `rows_per_tile` hidden channels, and one DOWN operand per tile,
-  // reading that tile's rows of `wout` ([hidden][model], row-major on the
-  // device). The products are accumulated -- the same sum, in tile order.
-  proj_->Prepare("up", w.wint, H, I, top, 1.0 / (a_g * c_h));
-  ffn_tiles_ = proj_->NumTiles("up");
+  // are `rows_per_tile` hidden channels (its columns already permuted and
+  // carrying each tile's `1 / a`), and one DOWN operand per tile, reading
+  // that tile's rows of the permuted `wout`. The products are accumulated --
+  // the same sum, in tile order.
+  proj_->Prepare("up", wint_.data(), H, I, top, 1.0 / c_h);
+  AssertTrue(proj_->NumTiles("up") == ffn_tiles_,
+             "CiBertBaseLayer::Prepare: the projection's tiling is not the "
+             "calibration's");
   for (int t = 0; t < ffn_tiles_; t++) {
     const int j0 = proj_->TileStart("up", t);
     const int rows = std::min(I - j0, std::min(cfg_.rows_per_tile, I));
-    proj_->Prepare(DownName(t), w.wout + static_cast<size_t>(j0) * H, rows, H,
-                   gelu_landing_, c_h);
+    proj_->Prepare(DownName(t), wout_.data() + static_cast<size_t>(j0) * H,
+                   rows, H, gelu_landing_, c_h);
   }
   bq_.resize(H); bk_.resize(H); bv_.resize(H); bo_.resize(H);
   bint_.resize(I); bout_.resize(H);
@@ -557,7 +599,15 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
     bo_[i] = c_in * w.bo[i];
     bout_[i] = c_h * w.bout[i];
   }
-  for (int i = 0; i < I; i++) bint_[i] = (w.bint[i] - b_g) / a_g;
+  {  // the bias in the permuted order, each tile's affine applied to its own
+    const int rows = std::min(cfg_.rows_per_tile, I);
+    for (int j = 0; j < I; j++) {
+      const int t = std::min(j / rows, ffn_tiles_ - 1);
+      const double a = 0.5 * (c.gelu[t].hi - c.gelu[t].lo);
+      const double b = 0.5 * (c.gelu[t].hi + c.gelu[t].lo);
+      bint_[j] = (w.bint[c.gelu_perm[j]] - b) / a;
+    }
+  }
 
   // ---- the softmax's shift, folded with the exp's affine ----------------
   //     t = (S_model - shift) / (2^k a) - b/a ; the multiply is in W_Q
@@ -581,9 +631,13 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
     std::cout << "  [bert-base] plan: top " << top << ", S at " << l_s_
               << " (exp deg " << c.exp.degree << " = " << exp_levels_
               << " lv), P at " << l_p_ << ", q/k in " << l_qk_in_ << ", v in "
-              << l_v_in_ << ", o in " << l_o_in_ << ", GELU deg "
-              << c.gelu.degree << " -> " << gelu_landing_ << ", FFN "
-              << ffn_tiles_ << " x " << (I / std::max(1, ffn_tiles_))
+              << l_v_in_ << ", o in " << l_o_in_ << ", FFN " << ffn_tiles_
+              << " x " << (I / std::max(1, ffn_tiles_)) << " GELU deg";
+    for (int t = 0; t < ffn_tiles_; t++) {
+      std::cout << (t ? "/" : " ") << c.gelu[t].degree;
+    }
+    std::cout << " (|u| <= " << c.gelu[0].hi << ".." << c.gelu[ffn_tiles_ - 1].hi
+              << ") -> " << gelu_landing_
               << ", Cho k " << c.niter << ", BSGS " << baby_ << " x " << giant_
               << ", carries in " << c_in << " h " << c_h
               << (has_mask_ ? ", masked" : "");
@@ -609,6 +663,39 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
               << cfg_.poly_batch << ", operands "
               << (proj_->Bytes() >> 20) << " MiB" << std::endl;
   }
+}
+
+template <typename word>
+void CiBertBaseLayer<word>::FoldFeedForwardWeights(const Weights &w,
+                                                   const Calibration &c) {
+  const int H = cfg_.shape.model, I = cfg_.shape.hidden;
+  const int rows = std::min(cfg_.rows_per_tile, I);
+  // the permutation, and each hidden channel's `1 / a` (its tile's)
+  HostVector<int> perm(I);
+  HostVector<float> scale(I);
+  for (int j = 0; j < I; j++) {
+    const int t = std::min(j / rows, ffn_tiles_ - 1);
+    const double a = 0.5 * (c.gelu[t].hi - c.gelu[t].lo);
+    AssertTrue(a > 0.0, "CiBertBaseLayer: a GELU tile has an empty interval");
+    AssertTrue(c.gelu_perm[j] >= 0 && c.gelu_perm[j] < I,
+               "CiBertBaseLayer: the GELU permutation is out of range");
+    perm[j] = c.gelu_perm[j];
+    scale[j] = static_cast<float>(1.0 / a);
+  }
+  perm_d_.resize(I);
+  gscale_d_.resize(I);
+  CopyHostToDevice(perm_d_, perm);
+  CopyHostToDevice(gscale_d_, scale);
+  const size_t n = static_cast<size_t>(H) * I;
+  wint_.resize(static_cast<int>(n));
+  wout_.resize(static_cast<int>(n));
+  constexpr int kBlock = 256;
+  const int grid = static_cast<int>((n + kBlock - 1) / kBlock);
+  kernel::PermuteScaleCols<<<grid, kBlock>>>(wint_.data(), w.wint,
+                                             perm_d_.data(), gscale_d_.data(),
+                                             H, I);
+  kernel::PermuteRows<<<grid, kBlock>>>(wout_.data(), w.wout, perm_d_.data(),
+                                        I, H);
 }
 
 template <typename word>
@@ -1154,7 +1241,16 @@ void CiBertBaseLayer<word>::FeedForward(Stream &out, const Stream &h,
     stages_.ffn += Since(t0);
     if (tile == 0) Tap("t_gelu", u, 1.0);
     t0 = Clock::now();
-    EvalMany(u, *gelu_poly_, mult_key);
+    EvalMany(u, *gelu_poly_[tile], mult_key);
+    // the tiles' degrees differ, so their fits land at different levels; the
+    // down projection reads one level
+    if (Level(u[0]) > gelu_landing_) {
+      for (int j = 0; j < rows; j++) {
+        Ct d;
+        boot_->LevelDown(d, u[j], gelu_landing_);
+        u[j] = std::move(d);
+      }
+    }
     stages_.gelu += Since(t0);
     if (tile == 0) Tap("g", u, 1.0);
     t0 = Clock::now();

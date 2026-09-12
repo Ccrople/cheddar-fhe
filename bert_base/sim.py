@@ -94,10 +94,20 @@ class Poly:
 
 # ------------------------------------------------------------- the softmax
 def live_of(mask, T, N):
-    """The instance's real-token count -- PUBLIC (the server holds the mask)."""
+    """The instance's real-token count, `[N]` -- PUBLIC (the server holds the
+    mask).
+
+    The mask reaches the hook in the model's ADDITIVE form, `[N, 1, 1, T]`
+    (0 on a real key, -inf on a pad), so the count is over the LAST axis and
+    the singleton head and query axes are dropped: summing over axis 1 gives
+    a `[N, 1, T]` of ones, which broadcasts into a five-dimensional `y` two
+    lines later and is what `bert_tiny/sim.py` did (it never ran a chain
+    with both a fold and a mask -- every folded calibration there was
+    `--no-chain`).
+    """
     if mask is None:
         return np.full(N, float(T))
-    return np.isfinite(mask).sum(axis=1).astype(float)
+    return np.isfinite(mask).sum(axis=-1).reshape(-1).astype(float)
 
 
 class ChoSoftmax:
@@ -217,14 +227,45 @@ def exact_cho_ranges(s, shift, k, valid=None, fold=True, chunk=64):
 
 
 # ------------------------------------------------------ the exact sweep
+class BandedGelu:
+    """One GELU fit per feed-forward TILE, the hidden channels sorted by
+    their own `|u|`.
+
+    A hidden channel is a whole ciphertext in the batched layout, so this
+    costs nothing at all -- no mask, no band plaintext, no low-rank mode
+    plan: the permutation rides `wint`'s columns and `wout`'s rows, which
+    leaves the layer's output exactly unchanged. It matters because BERT's
+    outliers are dimension-wise: at layer 10 one channel reaches |u| = 130
+    where the 99th percentile is 5.5, and a Chebyshev interpolant's error
+    depends on `radius / degree` alone -- so ONE shared interval charges
+    every channel for the worst one (1e-1 absolute at degree 255).
+    """
+
+    def __init__(self, perm, tile, polys):
+        self.perm, self.tile, self.polys = perm, tile, polys
+
+    def __call__(self, u):
+        out = np.empty_like(u)
+        for t, p in enumerate(self.polys):
+            idx = self.perm[t * self.tile:(t + 1) * self.tile]
+            out[..., idx] = p(u[..., idx])
+        return out
+
+    @property
+    def escapes(self):
+        return sum(p.escapes for p in self.polys)
+
+
 class LayerPass:
     """One layer's exact forward over the population, a chunk at a time: the
     scores (kept whole -- the row shift is a maximum over the population),
-    both variances' ranges and the maxima the rides are sized from."""
+    both variances' ranges, the per-CHANNEL GELU input maxima and the
+    maxima the rides are sized from."""
 
-    def __init__(self, N, NH, T):
+    def __init__(self, N, NH, T, I):
         self.s = np.empty((N, NH, T, T))
         self.var = {"ln1": np.empty((N, T)), "ln2": np.empty((N, T))}
+        self.uch = np.zeros(I)
         self.mx = {}
         self.s_min, self.s_max = np.inf, -np.inf
 
@@ -237,6 +278,7 @@ class LayerPass:
         self.s_max = max(self.s_max, float(r["s"].max()))
         self.var["ln1"][c0:c1] = r["h_pre"].var(axis=-1)
         self.var["ln2"][c0:c1] = r["z_pre"].var(axis=-1)
+        np.maximum(self.uch, np.abs(r["u"]).max(axis=(0, 1)), out=self.uch)
         for key, v in (("v", r["v"]), ("av", r["av"]), ("h_pre", r["h_pre"]),
                        ("h", r["h"]), ("u", r["u"]), ("z_pre", r["z_pre"]),
                        ("z", z)):
@@ -257,6 +299,10 @@ def main():
     ap.add_argument("--exp-margin", type=float, default=1.0,
                     help="exp domain: lo - this, hi + this/4")
     ap.add_argument("--gelu-margin", type=float, default=1.2)
+    ap.add_argument("--ffn-tile", type=int, default=256,
+                    help="hidden channels a feed-forward tile: the layer's "
+                         "memory peak AND the GELU's band, since a hidden "
+                         "channel is a whole ciphertext here")
     ap.add_argument("--sq-ratio", type=float, default=300.0,
                     help="auto k: the smallest k whose first window is under this")
     ap.add_argument("--inv-tol", type=float, default=0.0,
@@ -268,7 +314,7 @@ def main():
     ap.add_argument("--gelu-tol", type=float, default=0.0,
                     help="the GELU fit's absolute tolerance (0 = --tol); at "
                          "BERT-Base's |u| an absolute tolerance is a hard ask")
-    ap.add_argument("--gelu-max-degree", type=int, default=255,
+    ap.add_argument("--gelu-max-degree", type=int, default=511,
                     help="the GELU's level budget: ceil(log2(deg+1)) levels "
                          "under the boot's landing")
     ap.add_argument("--ln-max-degree", type=int, default=511,
@@ -305,7 +351,7 @@ def main():
     for L in range(m.NL):
         # ---- the exact layer over the population, a chunk at a time -------
         nxt = np.empty_like(cur)
-        p = LayerPass(N, m.NH, m.T)
+        p = LayerPass(N, m.NH, m.T, m.I)
         in_absmax = float(np.abs(cur).max())
         for c0 in range(0, N, chunk):
             c1 = min(N, c0 + chunk)
@@ -355,9 +401,17 @@ def main():
             lns[tag] = Poly(lambda v: 1.0 / np.sqrt(v + m.eps), lo / a.margin,
                             hi * a.margin, a.tol, relative=True, name=tag,
                             max_degree=a.ln_max_degree)
-        umax = p.mx["u"] * a.gelu_margin
-        gl = Poly(gelu, -umax, umax, a.gelu_tol if a.gelu_tol > 0 else a.tol,
-                  name="gelu", max_degree=a.gelu_max_degree)
+        # the GELU, one fit per feed-forward tile, channels sorted by |u|
+        perm = np.argsort(-p.uch)
+        tile = min(a.ffn_tile, m.I)
+        ntile = int(np.ceil(m.I / tile))
+        gtol = a.gelu_tol if a.gelu_tol > 0 else a.tol
+        gts = []
+        for t in range(ntile):
+            R = float(p.uch[perm[t * tile:(t + 1) * tile]].max()) * a.gelu_margin
+            gts.append(Poly(gelu, -R, R, gtol, name="gelu%d" % t,
+                            max_degree=a.gelu_max_degree))
+        gl = BandedGelu(perm, tile, gts)
 
         print("layer %d: Cho k=%d, shift |.| <= %.3f, u [%.2f, %.2f]"
               % (L, k, float(np.abs(shift).max()), u_lo, u_hi))
@@ -366,8 +420,12 @@ def main():
                 j, rng[j][1] / rng[j][0], seen[j][1] / seen[j][0],
                 "" if est is None or est_tabs[j] is None
                 else "  (fold, live^%d)" % fold_live_pow(k)[j]))
-        for q in [exp_poly] + inv_polys + [lns["ln1"], gl, lns["ln2"]]:
+        for q in [exp_poly] + inv_polys + [lns["ln1"], lns["ln2"]]:
             print("   ", q)
+        print("     gelu   %d tiles of %d: |u| %.1f .. %.1f, deg %s, worst err "
+              "%.1e" % (ntile, tile, gts[0].hi, gts[-1].hi,
+                        "/".join(str(q.degree) for q in gts),
+                        max(q.err for q in gts)))
         hooks.append({"softmax": sm, "ln1": lns["ln1"], "ln2": lns["ln2"], "gelu": gl})
         layers.append({
             "layer": L,
@@ -389,7 +447,13 @@ def main():
             "ln1": dict(lns["ln1"].json(),
                         r_max=float(1.0 / np.sqrt(lns["ln1"].lo + m.eps)),
                         out_absmax=p.mx["h"]),
-            "gelu": gl.json(),
+            # one fit per feed-forward tile, in this permuted channel order:
+            # the layer applies the permutation to wint's columns and wout's
+            # rows, which leaves the layer's output exactly unchanged
+            "gelu": {"tile": tile, "perm": perm.tolist(),
+                     "tiles": [q.json() for q in gts],
+                     "u_per_channel_max": float(p.uch.max()),
+                     "u_per_channel_p99": float(np.quantile(p.uch, 0.99))},
             "u_absmax": p.mx["u"],
             "z_pre_absmax": p.mx["z_pre"],
             "ln2": dict(lns["ln2"].json(),
@@ -460,9 +524,11 @@ def main():
     out = {"model": m.meta["model"], "tokens": m.T, "channels": m.H,
            "hidden": m.I, "heads": m.NH, "head_dim": m.D, "ln_eps": m.eps,
            "layers_total": m.NL,
+           "ffn_tile": min(a.ffn_tile, m.I),
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
+                     "ffn_tile": min(a.ffn_tile, m.I),
                      "gelu_tol": a.gelu_tol, "gelu_max_degree": a.gelu_max_degree,
                      "inv_tol": a.inv_tol, "ln_max_degree": a.ln_max_degree,
                      "fold": "none" if a.no_fold else a.fold_passes},

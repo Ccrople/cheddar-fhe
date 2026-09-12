@@ -122,7 +122,11 @@ Layer::Calibration ReadCalib(const json &cj) {
   }
   c.ln1 = Norm(cj["ln1"]);
   c.ln2 = Norm(cj["ln2"]);
-  c.gelu = Spec(cj["gelu"]);
+  // the GELU is one fit per feed-forward tile, in the calibration's own
+  // channel order: a hidden channel is a whole ciphertext, so sorting the
+  // channels by their |u| makes the tile the band, free of any mask
+  for (const auto &p : cj["gelu"]["tiles"]) c.gelu.push_back(Spec(p));
+  c.gelu_perm = cj["gelu"]["perm"].get<std::vector<int>>();
   c.h_pre_absmax = cj["h_pre_absmax"].get<double>();
   c.z_pre_absmax = cj["z_pre_absmax"].get<double>();
   return c;
@@ -278,7 +282,9 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
   cfg.shape.eps = meta["ln_eps"].get<double>();
   cfg.boot_group = EnvInt("BERT_BASE_BOOT_GROUP", 8);
   cfg.baby_steps = EnvInt("BERT_BASE_BABY", 0);
-  cfg.rows_per_tile = EnvInt("BERT_BASE_TILE", 512);
+  // The feed-forward tile is the calibration's: it is the GELU's band as
+  // well as the layer's memory peak, so the two cannot disagree.
+  cfg.rows_per_tile = calib["ffn_tile"].get<int>();
   cfg.fold = EnvInt("BERT_BASE_FOLD", 1) != 0;
   cfg.hoist = EnvInt("BERT_BASE_HOIST", 1) != 0;
   cfg.poly_batch = EnvInt("BERT_BASE_POLY_BATCH", 1);
