@@ -317,17 +317,19 @@ class CiBertBaseLayer {
   void Head(std::vector<Ct> &logits, Stream &z, const EvkMap<word> &evk);
 
   /**
-   * @brief A tap on every intermediate: `probe(name, cts, factor)` where
-   * `decrypted / factor` is the model-unit quantity `bert_base/debug.py`
-   * recomputes on the host. Costs nothing when unset.
+   * @brief A tap on every intermediate: `probe(name, cts, factor, chan)`
+   * where `decrypted * chan[c] / factor` is the model-unit quantity
+   * `bert_base/debug.py` recomputes on the host (an empty `chan` is all
+   * ones). Costs nothing when unset.
    */
   using Probe = std::function<void(const std::string &, const std::vector<Ct> &,
-                                   double)>;
+                                   double, const std::vector<double> &)>;
   void SetProbe(Probe p) { probe_ = std::move(p); }
 
  private:
-  void Tap(const std::string &name, const std::vector<Ct> &cts, double factor) const {
-    if (probe_) probe_(name, cts, factor);
+  void Tap(const std::string &name, const std::vector<Ct> &cts, double factor,
+           const std::vector<double> &chan = {}) const {
+    if (probe_) probe_(name, cts, factor, chan);
   }
   void Tap(const std::string &name, const Ct &ct, double factor) const;
   Probe probe_;

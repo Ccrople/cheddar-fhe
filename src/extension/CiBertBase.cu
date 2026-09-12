@@ -390,7 +390,7 @@ void CiBertBaseLayer<word>::Tap(const std::string &name, const Ct &ct,
   if (!probe_) return;
   std::vector<Ct> one(1);
   boot_->Copy(one[0], ct);
-  probe_(name, one, factor);
+  probe_(name, one, factor, {});
 }
 
 template <typename word>
@@ -1212,7 +1212,7 @@ void CiBertBaseLayer<word>::Attention(Stream &attn_out, Stream &x,
   attn_out.carry = c_in_;
   attn_out.chan = x.chan;    // the O projection's columns carry 1 / chan
   stages_.o += Since(t0);
-  Tap("attn", attn_out.cts, c_in_);
+  Tap("attn", attn_out.cts, c_in_, attn_out.chan);
 }
 
 // ----------------------------------------------------------- LayerNorm
@@ -1315,7 +1315,7 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   out.carry = c_out;
   out.chan = out_chan;
   stages_.ln += Since(t0);
-  Tap(tag + "_out", out.cts, c_out);
+  Tap(tag + "_out", out.cts, c_out, out_chan);
 }
 
 // --------------------------------------------------------- feed-forward
@@ -1375,7 +1375,7 @@ void CiBertBaseLayer<word>::FeedForward(Stream &out, const Stream &h,
   for (int i = 0; i < H; i++) AddScalar(out.cts[i], out.cts[i], bout_[i]);
   out.carry = c_h_;
   out.chan = h.chan;         // the down projection's columns carry 1 / chan
-  Tap("y_ffn", out.cts, c_h_);
+  Tap("y_ffn", out.cts, c_h_, out.chan);
 }
 
 // ---------------------------------------------------------------- layer
@@ -1414,7 +1414,7 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   }
   x.cts.clear();
   attn.cts.clear();
-  Tap("h_pre", h_pre.cts, c_in_);
+  Tap("h_pre", h_pre.cts, c_in_, h_pre.chan);
   Stream h;
   LayerNorm(h, h_pre, w_.attn_norm, w_.attn_norm_bias, cal_.ln1,
             cal_.ln1_chan, evk, "ln1");
@@ -1437,7 +1437,7 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   }
   h.cts.clear();
   y.cts.clear();
-  Tap("z_pre", z_pre.cts, c_h_);
+  Tap("z_pre", z_pre.cts, c_h_, z_pre.chan);
   LayerNorm(out, z_pre, w_.ffn_norm, w_.ffn_norm_bias, cal_.ln2,
             cal_.ln2_chan, evk, "ln2");
   stages_.total = Since(t_all);

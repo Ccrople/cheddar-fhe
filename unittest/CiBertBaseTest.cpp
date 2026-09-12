@@ -451,11 +451,14 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
   if (!dump.empty()) {
     index.open(dump + "/index.txt");
     ASSERT_TRUE(index.good()) << dump;
+    const int dump_live = std::min(EnvInt("BERT_BASE_DUMP_INSTANCES", 4), live);
     layer.SetProbe([&](const std::string &name,
-                       const std::vector<Ciphertext<word>> &cts, double factor) {
+                       const std::vector<Ciphertext<word>> &cts, double factor,
+                       const std::vector<double> &chan) {
       std::vector<double> all;
-      DecryptAll(boot, layout, cts, static_cast<int>(cts.size()), live, factor,
-                 {}, all);
+      DecryptAll(boot, layout, cts, static_cast<int>(cts.size()), dump_live,
+                 factor, chan, all);
+      const int live = dump_live;
       // DecryptAll is [b][t][c]; write [c][b][t]
       const int n = static_cast<int>(cts.size());
       std::vector<double> out(static_cast<size_t>(n) * live * T);
