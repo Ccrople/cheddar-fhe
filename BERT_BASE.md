@@ -181,7 +181,7 @@ BUDGET (a level or ride bound) or a CHOICE (mine, revisable).
 
 ## 5. Measured (A100, `ci16_35_k16_w58`, T = 128 x B = 512)
 
-**The host chain (approximations only, no crypto), the recorded prompt:**
+### The host chain (approximations only, no crypto), the recorded prompt
 
 | GELU | L0 | L8 | L9 | L10 | L11 | head |
 |---|---|---|---|---|---|---|
@@ -189,17 +189,66 @@ BUDGET (a level or ride bound) or a CHOICE (mine, revisable).
 | per tile (12 x 256) | 2^-19.6 | 2^-18.8 | 2^-18.8 | 2^-11.7 | 2^-11.8 | 2^-14.1 |
 
 The remaining step at layer 10 is that layer's outlier tile: 256 channels at
-+-156, where degree 511 is 8.6e-04.
++-156, where even degree 511 is 8.6e-04.
 
-**On the card, layer 0** (768 wide boots + 14 narrow, 36480 rotations,
-12302 relinearizations, 33 GiB, 391 MiB of GEMM operands):
+### On the card: what each fix was worth, layer 0
 
-| | rms vs float64 | wall | of which |
-|---|---|---|---|
-| no suppression | **2^-6.92** | 72.9 s | boot 32.4, GELU 12.3, scores 8.0, values 5.9, softmax 5.4, ffn 4.1, qkv 3.2, ln 2.0 |
-| suppression cap 16 | 2^-6.28 | 72.9 s | (the same) |
+| | rms vs float64 | wall |
+|---|---|---|
+| as first built | 2^-6.92 | 72.9 s |
+| + per-channel suppression (cap 16) | 2^-6.28 | 72.9 s |
+| + **the LayerNorm's mean** | **2^-11.86** | 76.8 s |
 
-(in progress -- section 6.)
+768 wide + 14 narrow bootstraps, 36480 rotations, 12302 relinearizations,
+391 MiB of GEMM operands, **33 GiB** of device memory; setup 7.0 s. Of the
+76.8 s: boot 32.4, GELU 12.3, scores 8.0, values 5.9, softmax 5.4, ffn 4.1,
+qkv 3.2, ln 2.0.
+
+### The twelve-layer chain, the recorded prompt in every instance
+
+| L0 | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| -11.86 | -11.34 | -10.38 | -9.90 | -9.65 | -9.58 | -9.59 | -9.66 | -9.62 | -7.12 | -6.94 | -6.98 |
+
+(rms as `2^x`; layers 9-11 measured from an exact layer 8, the others
+chained.) **It is FLAT from layer 4 to layer 8** -- the noise reaches a
+steady state rather than accumulating -- and then the last three layers sit
+2.5 bits lower. 104 s a layer (1536 wide + 14 narrow boots), 137 s where a
+norm boots its own stream.
+
+### Where the last three layers go, probe by probe (layer 9)
+
+`BERT_BASE_DUMP` + `bert_base/debug.py`, every intermediate against the
+float64 model:
+
+| q,k,v | s | y | sq | r | P | attn | h_pre | ln1 var | ln1 r | ln1 out |
+|---|---|---|---|---|---|---|---|---|---|---|
+| -13.5..-15.4 | -12.8 | -12.2 | -12.2 | -11.7 | -11.0 | -10.8 | -12.5 | -12.8 | -12.4 | **-12.0** |
+
+so the attention and the first norm are healthy. The tail is not:
+
+| t_gelu | **g** | y_ffn | z_pre | ln2 cen | ln2 var | **ln2 r** | **ln2 out** |
+|---|---|---|---|---|---|---|---|
+| -12.6 | **-8.5** | -10.6 | -10.7 | -9.6 | -10.0 | **-8.7** | **-7.1** |
+
+Two mechanisms, both named and both with a known fix:
+
+1. **The GELU's band is still too wide.** Tile 0 at layer 9 holds the
+   channels from `|u| = 109` down to `|u| = 5.4`, and they share one `a`, so
+   the ciphertext's own error `2^-12.6` in `t` becomes an ABSOLUTE
+   `a * 2^-12.6 = 0.018` in `g` -- fine against the outlier's 91, four bits
+   against the other 255 channels' ~1. The fix is to make the GELU's band
+   independent of the memory tile and cut it GEOMETRICALLY (a band per
+   octave of `|u|`, ~6 bands), so a channel never rides more than 2x its own
+   scale.
+2. **A 4000x variance window compresses its own polynomial's input.** Even
+   with the stream booted, `t = (V kappa0 - b) / a` maps `var` onto
+   `[-1, 1]` with `a = 1167`, so a token at `var = 0.57` sits at `-1 + 5e-4`
+   and the ciphertext's absolute error in `t` is multiplied by `a / var =
+   2047` on the way back out. The fix is the TWO-STAGE inverse square root:
+   a crude `r0`, then `y0 = centred * r0` whose mean square is `(1 + e)^2`
+   BY CONSTRUCTION, so the second window is a theorem near 1 and compresses
+   nothing. It costs one more wide level, which the plan has at k = 1.
 
 ## 6. Plan
 
