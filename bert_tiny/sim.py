@@ -211,6 +211,9 @@ def main():
     ap.add_argument("--gelu-margin", type=float, default=1.2)
     ap.add_argument("--sq-ratio", type=float, default=300.0,
                     help="auto k: the smallest k whose first window is under this")
+    ap.add_argument("--no-chain", action="store_true",
+                    help="write the calibration without running the host "
+                         "chain (the windows need only the exact forward)")
     ap.add_argument("--fold-passes", default="first",
                     choices=["first", "all", "none"],
                     help="which Cho passes divide by the public row estimate")
@@ -346,9 +349,11 @@ def main():
                                        "" if head_poly.escapes == 0 else "  ESCAPES %d" % head_poly.escapes))
         return h
 
-    run(x, valid, "calibration prompts")
-    if a.held_out:
-        run(m.prompts(a.held_out), m.valid(mask_beside(a.held_out)), "held-out prompts")
+    if not a.no_chain:
+        run(x, valid, "calibration prompts")
+        if a.held_out:
+            run(m.prompts(a.held_out), m.valid(mask_beside(a.held_out)),
+                "held-out prompts")
 
     out = {"model": m.meta["model"], "tokens": m.T, "channels": m.H,
            "hidden": m.I, "heads": m.NH, "head_dim": m.D, "ln_eps": m.eps,
