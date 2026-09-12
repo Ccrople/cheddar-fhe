@@ -25,19 +25,23 @@ v[:1].tofile('/root/bert_tiny/b1/prompts/mask.u8')
 print("one prompt, %d real tokens of %d" % (int(v[0].sum()), T))
 PY
 
-ref() {  # ref <out> <inputs> [mask]
-  local out=$1 inp=$2 msk=${3:-}
+# The MODEL DIRECTORY is the first argument and it is not optional: the T
+# = 256 / 512 bundles have their own meta.json, and running their prompts
+# through the T = 128 model reshapes each prompt into two half-length ones
+# -- a reference that is 6 % wrong and looks like a crypto regression.
+ref() {  # ref <model_dir> <out> <inputs> [mask]
+  local mdl=$1 out=$2 inp=$3 msk=${4:-}
   [ -f "$out/h_L00.f64" ] && return 0
   if [ -n "$msk" ]; then
-    python3.12 reference.py "$ALL" "$out" --inputs "$inp" --mask "$msk" >> "$out/host.log" 2>&1
+    python3.12 reference.py "$mdl" "$out" --inputs "$inp" --mask "$msk" >> "$out/host.log" 2>&1
   else
-    python3.12 reference.py "$ALL" "$out" --inputs "$inp" >> "$out/host.log" 2>&1
+    python3.12 reference.py "$mdl" "$out" --inputs "$inp" >> "$out/host.log" 2>&1
   fi
 }
-ref /root/bert_tiny/f3 /root/bert_tiny/held3/prompts/inputs.f32 /root/bert_tiny/held3/prompts/mask.u8 &
-ref /root/bert_tiny/b1 /root/bert_tiny/b1/prompts/inputs.f32 /root/bert_tiny/b1/prompts/mask.u8 &
-ref /root/bert_tiny/t256_ref /root/bert_tiny/t256/prompts/inputs.f32 &
-ref /root/bert_tiny/t512_ref /root/bert_tiny/t512/prompts/inputs.f32 &
+ref "$ALL" /root/bert_tiny/f3 /root/bert_tiny/held3/prompts/inputs.f32 /root/bert_tiny/held3/prompts/mask.u8 &
+ref "$ALL" /root/bert_tiny/b1 /root/bert_tiny/b1/prompts/inputs.f32 /root/bert_tiny/b1/prompts/mask.u8 &
+ref /root/bert_tiny/t256 /root/bert_tiny/t256_ref /root/bert_tiny/t256/prompts/inputs.f32 &
+ref /root/bert_tiny/t512 /root/bert_tiny/t512_ref /root/bert_tiny/t512/prompts/inputs.f32 &
 wait
 
 # ---- every calibration at once ------------------------------------------

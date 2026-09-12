@@ -98,7 +98,11 @@ CHOICE (mine, revisable).
 | narrow boot scales | sq: ride / window hi; V': ride / (var hi / kappa0); r: ride / r_max | budget | `NarrowLift` |
 | level plan | S at exp + 6 (k=1) or exp + 2; P >= 4; GELU under top - 2 | budget (asserted) | `Prepare` |
 | padding mask | none (every prompt exactly T real tokens) | choice | -- |
-| secret | the library's default sampled by `UserInterface` | choice (security to be stated) | test |
+| **fold estimate** | `ehat[pass][head][token]`, the per-row geometric mean of `sq / live^p`; `p` = 1 at pass 0 and 0 after | calibration (the RATIO window is what the degree then sees); the multiplier `live_b` is PUBLIC, from the mask | calib `softmax.est`, sim `--fold-passes`, `BERT_TINY_FOLD` |
+| **hoisted rotations** | on | choice (exact: `MultKey`'s own words off one `ModUp`) | `BERT_TINY_HOIST` |
+| **polynomial batch** | 8 (the knee; 1 = the loop) | choice (exact: `EvaluateBatch`) | `BERT_TINY_POLY_BATCH` |
+| **secret** | sparse h = 32 on `ci16_35_k16_w58` = **93.4 bits**; h = 192 on `ci16_35_k64_w58` = **128.4 bits** | THEOREM-ish (lattice estimate, an upper bound) x budget: h and EvalMod's K are one decision | `BERT_TINY_PARAM`, `reference/scripts/security_estimate.py` |
+| **inverse-sqrt tolerance** | 1e-5 relative; 3e-4 on the K = 64 ring | budget: a degree is a level, and that ring lands two lower | sim `--inv-tol` |
 
 Approximation-only chain (sim, no crypto noise): L0 2^-20.6, L1 2^-17.7.
 
@@ -285,9 +289,12 @@ EXACTLY, which is the thing a short served prompt used to escape (5c).
 It costs no wide level and no rotation: `1/est` rides the scaling that
 already precedes the narrow path's bootstrap, and `1/sqrt(est)` rides the
 constant already on `r` -- both on the ONE ciphertext a head's row sums
-live in. Only the LAST pass pays a narrow level it did not pay before,
-which is why `sim.py --fold-passes` defaults to `first`; the later windows
-are near-theorems and the fold buys ~1.2x there.
+live in. A pass that is not the last already carries a `sqrt(ride)`
+constant on `r`, so there the fold is free OUTRIGHT; only the last pass
+would pay a narrow level it did not pay before, which is why
+`sim.py --fold-passes` defaults to `first`. At k >= 2 the level plan is
+therefore the same on both sides of the switch (`l_p = 5` either way), and
+the later windows are near-theorems where the fold buys ~1.2x anyway.
 
 What it does to the windows (1000 padded prompts, lengths 3..128):
 
@@ -301,6 +308,54 @@ What it does to the windows (1000 padded prompts, lengths 3..128):
 The auto-`k` rule is "the first window under 300x", so without the fold
 layer 1 needs k = 3 and with it k = 2 -- and one Cho pass is 2T = 256
 main-path bootstraps a layer.
+
+**What it is worth on the card.** 512 held-out prompts of lengths 3..128
+against each one's own float64 output, on the 1000-prompt population
+calibration (the 5c configuration), two layers and the head:
+
+| | Cho k | layer 0 | layer 1 | wall | wide boots | softmax | head |
+|---|---|---|---|---|---|---|---|
+| no fold, no levers | 3 / 4 | 2^-9.90 | 2^-9.00 | 36.4 + 52.3 s | 640 / 1024 | 22.3 / 33.1 s | 2^-7.58, 512/512 |
+| no fold, hoist + batch 8 | 3 / 4 | 2^-9.89 | 2^-8.99 | 34.7 + 50.5 s | 640 / 1024 | 22.3 / 33.0 s | 2^-7.35, 512/512 |
+| **fold + hoist + batch 8** | **2 / 2** | **2^-10.26** | **2^-9.56** | **23.9 + 29.0 s** | **384 / 512** | **11.5 / 11.5 s** | 2^-7.89, 512/512 |
+
+Two layers and the head go 96.3 s -> 60.0 s, a 38 % cut, and the accuracy
+does not pay for it -- it IMPROVES by 0.36 and 0.56 bits, because a Cho
+pass is 2T bootstraps on the main path and the noise of those is what the
+chain's 2^-9 has always been.
+
+**Every shape, and where the fold does nothing.** Same binary, same
+calibration recipe, each prompt against its own float64 output:
+
+| (T, B) | prompts | | Cho k | layer 0 | layer 1 | wall |
+|---|---|---|---|---|---|---|
+| (128, 512) | 512 held-out, 3..128, masked | no fold | 3 / 4 | 2^-9.90 | 2^-9.00 | 36.4 + 52.3 s |
+| | | **fold** | **2 / 2** | **2^-10.26** | **2^-9.56** | **23.9 + 29.0 s** |
+| (128, 512) | ONE prompt in every instance (B = 1) | no fold | 3 / 4 | 2^-9.76 | 2^-8.86 | 36.2 + 52.0 s |
+| | | **fold** | **2 / 2** | **2^-10.11** | **2^-9.51** | **23.9 + 29.0 s** |
+| (256, 256) | 256 own, unpadded | no fold | 2 / 2 | 2^-9.53 | 2^-8.98 | 38.3 + 43.5 s |
+| | | fold | 2 / 2 | 2^-9.53 | 2^-9.00 | 36.4 + 41.5 s |
+| (512, 128) | 128 own, unpadded | no fold | 2 / **3** | 2^-8.81 | 2^-8.44 | 63.9 + **112.2** s |
+| | | **fold** | 2 / **2** | 2^-8.82 | 2^-8.37 | 61.1 + **66.2** s |
+
+The fold pays exactly where `k` was inflated -- the PADDED population at
+T = 128 (where `live` is 3..128 and it is `live` the fold divides out) and
+T = 512's layer 1 (112.2 -> 66.2 s, 2304 -> 1280 bootstraps). At T = 256,
+where every prompt is a full 256 tokens and the first window was already
+under the rule, it correctly changes nothing but the rotations and the
+GELU. B = 1 in this design means one prompt in all 512 instances -- the
+latency is the batch's, and 511 copies is also what keeps the batch full.
+
+**k = 1 does not follow, and the reason is not the window.** Forced to one
+pass the fold still delivers (349x at layer 0, 825x at layer 1, degree 255,
+and the level plan takes it), but the chain comes back at 2^+235. At k = 1
+the exp's domain is `u in [-17.0, 0.14]`, so the smallest true `y` is
+`e^-17 = 4e-8` while a degree-15 interpolant of exp is good to 3e-6
+ABSOLUTELY -- the tail of `y` is fit error, of either sign, and the walk
+that normalises it has nothing to normalise. Cho's `k` is exactly the
+compression of that dynamic range: the fold fixes the inverse square root's
+window, not the exp's. `sim.py --exp-tol` is the knob that would buy k = 1
+(degree 63 exp = two more levels, which `l_s` has room for); untested.
 
 ### Hoisted BSGS rotations, and the batched polynomials
 
@@ -361,8 +416,23 @@ The middle row is the mechanism made visible: at h = 64 the ModRaise
 wrap-around leaves K = 16 and the bootstrap returns garbage for every
 instance of the batch. On the K = 64 pool, h = 192 is enough that the
 hybrid buys nothing (drop 0), so the answer is **128.4 bits at +2 % wall
-and no accuracy loss** -- the k64 pool's boot is ~10 % dearer and its
-landing is 14 rather than 16, which this layer's plan has room for.
+and no accuracy loss**.
+
+It composes with the fold, but the level budget has to be paid for: the
+K = 64 pool lands at **14**, not 16, and the k = 2 plan then leaves
+`l_p = 3` where it needs 4. A DEGREE is a LEVEL, so the level comes back
+from the last inverse square root -- `sim.py --inv-tol 3e-4` takes layer
+1's last window from degree 127 to 63 (fit error 3.0e-09 -> 4.5e-05, which
+is 14 bits under the chain's own noise). The 128-bit configuration
+end to end, 512 held-out prompts:
+
+| ring | security | layer 0 | layer 1 | wall | head |
+|---|---|---|---|---|---|
+| `ci16_35_k16_w58`, fold | 93.4 | 2^-10.26 | 2^-9.56 | 23.9 + 29.0 s | 2^-7.89, 512/512 |
+| `ci16_35_k64_w58_h192`, fold, `--inv-tol 3e-4` | **128.4** | 2^-10.21 | **2^-9.68** | 24.9 + 30.7 s | 2^-7.74, 512/512 |
+
+35 bits of security for 5 % of the wall clock, and layer 1 comes out 0.12
+bits AHEAD -- the k64 pool's bootstrap is the better one.
 
 ## 6. Plan
 
@@ -373,10 +443,15 @@ landing is 14 rather than 16, which this layer's plan has room for.
    first-window fold to keep k at 2.
 4. The head, the padding mask and serve mode. DONE (5b, 5c): text in,
    labels out, every logit checked.
-5. Next, in order: the `cho_est` fold (the first Cho window is the one
-   statistic left that a short prompt can escape; folding the per-row
-   estimate out takes k from 3-4 back to 2 and the softmax's boots with
-   it); per-channel certified GELU intervals (the sphere bound: nothing
-   per prompt, no escape possible); hoisted rotations and the batched
-   GELU (4.7 s of every layer); a fine-tuned task head (the same two GEMMs
-   with its weights); the security statement for the sampled secret.
+5. The Cho fold, hoisted BSGS rotations, batched polynomials, and the
+   secret's bit security. DONE (5d): k 3/4 -> 2, two layers and the head
+   96.3 -> 60.0 s at 0.4-0.6 bits BETTER, every shape measured, and
+   128.4 bits available for 5 % of the wall.
+6. Next, in order: k = 1 through `--exp-tol` (the exp's absolute fit over a
+   1e8 dynamic range is what blocks it, not the window -- degree 63 exp
+   costs two levels `l_s` has); per-channel certified GELU intervals (the
+   sphere bound: nothing per prompt, no escape possible); the fold's
+   estimate made a THEOREM rather than a population statistic (the upper
+   end already is one: `sq_0 <= live * exp(beta (esc - a span))`); a
+   fine-tuned task head (the same two GEMMs with its weights); the last
+   wide stage, the 384-512 bootstraps a layer.

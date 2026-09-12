@@ -211,6 +211,12 @@ def main():
     ap.add_argument("--gelu-margin", type=float, default=1.2)
     ap.add_argument("--sq-ratio", type=float, default=300.0,
                     help="auto k: the smallest k whose first window is under this")
+    ap.add_argument("--inv-tol", type=float, default=0.0,
+                    help="the inverse square roots' relative tolerance "
+                         "(0 = --tol); a degree is a LEVEL, so a ring with a "
+                         "lower landing buys its plan back here")
+    ap.add_argument("--exp-tol", type=float, default=0.0,
+                    help="the exp fit's absolute tolerance (0 = --tol)")
     ap.add_argument("--no-chain", action="store_true",
                     help="write the calibration without running the host "
                          "chain (the windows need only the exact forward)")
@@ -250,10 +256,20 @@ def main():
                 fold=fold_passes("none" if a.no_fold else a.fold_passes, k))
             if seen[0][1] / seen[0][0] <= a.sq_ratio or k == ks[-1]:
                 break
+        # The exp's tolerance is ABSOLUTE, and at small k its domain spans
+        # many orders of magnitude: at k = 1 the smallest true value is
+        # e^-17 = 4e-8 while a degree-15 interpolant is good to 3e-6, so the
+        # tail of y is fit error (of either sign) and the Cho walk that
+        # follows it has nothing to normalise. Cho's k is exactly the
+        # compression of that range -- `--exp-tol` is what buys k back.
         exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + a.exp_margin / 4,
-                        a.tol, name="exp")
+                        a.exp_tol if a.exp_tol > 0 else a.tol, name="exp")
+        print("     exp: worst RELATIVE error over the domain %.2e"
+              % float(np.abs(exp_poly(np.linspace(exp_poly.lo, exp_poly.hi, 4001))
+                             / np.exp(np.linspace(exp_poly.lo, exp_poly.hi, 4001)) - 1).max()))
         inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin, hi * a.margin,
-                          a.tol, relative=True, name="inv%d" % j)
+                          a.inv_tol if a.inv_tol > 0 else a.tol,
+                          relative=True, name="inv%d" % j)
                      for j, (lo, hi) in enumerate(seen)]
         est = None if a.no_fold else est_tabs
         sm = ChoSoftmax(k, shift, exp_poly, inv_polys, est)
