@@ -105,7 +105,29 @@ Each channel gets its own public factor `chan[c]`, a POWER OF TWO in
 so lifting every channel to the full ride lifts every channel to the full
 cubic term. See section 5 for what it measured.
 
-### (e) Twelve layers do not have to be one run
+### (e) A wide variance window is a RIDE problem, not a degree problem
+
+Layers 9 and 10 are the only norms in BERT-Base whose variance window is
+wide: `ln2` spans **7300x and 5800x** where every other norm in the model is
+under 200x. `NarrowLift` sizes the variance's message by the window's TOP, so
+the smallest variance rides at `ride / ratio` and the narrow bootstrap's
+ABSOLUTE error is 22 % of it. The twelve-layer chain is flat at 2^-9.6
+through layer 8, **2^-6.12 at layer 9, and 2^+130 at layer 10** -- the second
+being the first's consequence, since layer 10's windows were sized on an
+exact layer 9 and 6 % escapes them.
+
+A per-token public fold -- the Cho softmax's own trick -- does NOT help here:
+the spread is not positional, and over 256 held-out prompts the per-position
+estimate takes 4244x to 3733x. So boot the STREAM instead, for those norms
+only (`Config::ln_boot_ratio`, 200). The variance is then high enough that
+its inverse square root needs no bootstrap at all, so its error is the
+stream's own, uniformly, whatever the window; the output lands low, which
+costs nothing because both norms' outputs are bootstrapped immediately
+anyway. It costs `model` wide boots on the two layers that trip it -- 3 % of
+a chain. A norm that boots its input has to RIDE it, so the carry is sized on
+the residual as well as the stream where the flag is set.
+
+### (f) Twelve layers do not have to be one run
 
 `BERT_BASE_FIRST_LAYER=L` starts the chain at layer L from the float64
 `h_L{L-1}.f64`: the crypto chain within the window, the exact stream at its
