@@ -171,7 +171,9 @@ BUDGET (a level or ride bound) or a CHOICE (mine, revisable).
 | **per-channel suppression** | powers of two, cap 16 | choice x budget: free everywhere but EvalMod | sim `--chan-cap`, calib `*_chan` |
 | Cho passes k | 1 (oracle) | calibration: first window under `--sq-ratio` 300 | sim `--k` |
 | row shift | per (head, query t) max over prompts | calibration | calib `softmax.shift` |
-| exp domain / degree | L0 [-10.2, 0.25] deg 15 | calibration + margin / tol | sim `--exp-margin`, `--exp-tol` |
+| exp domain / degree | L0 [-10.2, 0.25] deg 15 | calibration + margin / tol | sim `--exp-margin`, `--exp-margin-hi`, `--exp-tol` |
+| **margins (population)** | `--margin 5.0 --gelu-margin 1.8 --exp-margin 2.0 --exp-margin-hi 2.0` -- BERT-Tiny's 1.3 / 1.2 / 1.0 escape | budget: a served batch is 2e8 slots a layer, so a 1-in-1e8 tail is CERTAIN | sim |
+| **inverse-sqrt degree ceiling** | 255 (8 levels) | BUDGET: the LAST Cho pass lands `P` at `top - 3 - Levels(deg)` and it needs 4 | sim `--inv-max-degree` |
 | fold estimate | per (pass, head, token) geometric mean | calibration (the RATIO window) | calib `softmax.est` |
 | 1/sqrt windows | pass 0 [0.77, 1.3] (oracle: the fold makes it exact) | calibration + margin | sim `--margin` |
 | **LN variance window / degree** | L9/L10 [0.57, 2334] deg **511** | calibration; the NARROW path is booted, so a degree is free of the wide plan | sim `--ln-max-degree` |
@@ -315,11 +317,24 @@ then the margins are the knob, and they are in the ledger.
 
 ## 6. Plan
 
-1. B = 1, T = 128: build, layer 0. **DONE** (2^-6.92).
-2. The gap between the host chain (2^-19.6) and the card (2^-6.9) is noise
-   budget, not approximation, and the suppression made it WORSE, so the
-   probes are running to name the stage. IN PROGRESS.
-3. The 12-layer chain, in windows.
-4. Population calibration on 1000 prompts, 512 held-out on the crypto.
-5. The other two shapes, (256, 256) and (512, 128).
-6. The head, the padding mask and serve mode.
+1. B = 1, T = 128: build, layer 0. **DONE** -- 2^-11.86 after the three
+   things the width broke (the GELU's band, the LayerNorm's mean, the
+   suppression).
+2. The twelve-layer chain. **DONE** -- flat at 2^-9.6 from layer 4 to 8,
+   2^-7.1 for the last three after the wide-window norms got their own
+   bootstrap.
+3. The other two shapes. **DONE** -- (256, 256) and (512, 128) at the same
+   accuracy, 87 s and 114 s a layer.
+4. 512 held-out prompts on the population calibration. **IN PROGRESS**: the
+   margins BERT-Tiny used escape at 2e8 slots a layer, the scan names every
+   window that does it, and the widened ones are clean through layer 1 on
+   the card (2^-11.34).
+5. Next, in order:
+   * the GELU's band cut GEOMETRICALLY rather than by the memory tile (an
+     octave of `|u|` per band, ~6 bands) -- worth ~4 bits at layers 9-11;
+   * the TWO-STAGE inverse square root at the wide-window norms, whose
+     second window is a theorem;
+   * windows that are theorems rather than statistics, which is the only
+     thing that removes the margin chase for good;
+   * the head, the padding mask end to end, and serve mode (the code is
+     there; `BERT_BASE_HEAD=1`).
