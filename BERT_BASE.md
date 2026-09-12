@@ -59,7 +59,32 @@ so `EvalPoly` still sees `[-1, 1]`. It is also FASTER than one interval: 11
 of 12 tiles take degree 31 where they used to take 255, and only the outlier
 tile pays 511.
 
-### (c) The streams carry a public per-channel suppression
+### (c) The LayerNorm divides by H, and that is not a detail
+
+BERT-Tiny centres for free: `centred = H x_c - sum` needs no division and
+costs no level. At H = 768 it is a TRAP, and it cost this branch its first
+two runs. The variance then carries `H^3 c^2 var` = 1.4e7, so the constant
+that scales it back for its bootstrap is `ride / (hi / kappa0)` = 1.7e-8 --
+and `Encoder::EncodeConstant` stores `BigInt(number * scale)`, so at scale
+2^35 that constant IS THE INTEGER 574. Nine bits. Its relative rounding
+error is 8.7e-4 = 2^-10.2, which is the 2^-10.12 the probes measured on `r`
+to the digit; the same imbalance leaves the apply's per-channel constant on
+`r` at 3.5e-4, where `MultScalar`'s own rescale rounding is a fifth of the
+message, and the layer came back at 2^-6.9 against a host chain of 2^-19.6.
+
+So form the mean: one `MultScalar` by 1/H on the ONE sum ciphertext, then
+`centred_i = d_i x_i - mu`. Every message is then in [0.1, 20] and every
+constant above 2^18, and **layer 0 goes 2^-6.28 -> 2^-11.86**. The level it
+costs is taken back by reading the variance off the sums --
+`H sum(x^2) - sum(x)^2` instead of `sum(centred^2)`, one level higher and a
+factor H smaller -- whose cancellation is nothing here: `mu^2 / var` over the
+twelve layers is at most 0.007, or 0.01 bits.
+
+The lesson generalises: **at this width every constant has to be checked
+against the scale it is encoded at.** A magnitude that is merely inelegant at
+H = 128 is a nine-bit constant at H = 768.
+
+### (d) The streams carry a public per-channel suppression
 
 The residual stream is dimension-wise skewed too: the LayerNorm output
 reaches 59.9 at layer 0 and **102 at layer 4** where a typical channel is
@@ -80,7 +105,7 @@ Each channel gets its own public factor `chan[c]`, a POWER OF TWO in
 so lifting every channel to the full ride lifts every channel to the full
 cubic term. See section 5 for what it measured.
 
-### (d) Twelve layers do not have to be one run
+### (e) Twelve layers do not have to be one run
 
 `BERT_BASE_FIRST_LAYER=L` starts the chain at layer L from the float64
 `h_L{L-1}.f64`: the crypto chain within the window, the exact stream at its
