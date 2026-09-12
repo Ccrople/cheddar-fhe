@@ -331,7 +331,13 @@ def main():
     ap.add_argument("--margin", type=float, default=1.3,
                     help="window margin on 1/sqrt domains (each side)")
     ap.add_argument("--exp-margin", type=float, default=1.0,
-                    help="exp domain: lo - this, hi + this/4")
+                    help="exp domain: lo - this")
+    ap.add_argument("--exp-margin-hi", type=float, default=0.0,
+                    help="exp domain: hi + this (0 = --exp-margin / 4). The "
+                         "TOP is where a held-out prompt escapes, because "
+                         "`shift` is the population's row maximum and a row "
+                         "that beats it lands above `hi` by the excess over "
+                         "2^k -- four layers of BERT-Base did exactly that.")
     ap.add_argument("--gelu-margin", type=float, default=1.2)
     ap.add_argument("--ffn-tile", type=int, default=256,
                     help="hidden channels a feed-forward tile: the layer's "
@@ -423,7 +429,8 @@ def main():
         # tail of y is fit error (of either sign) and the Cho walk that
         # follows it has nothing to normalise. Cho's k is exactly the
         # compression of that range -- `--exp-tol` is what buys k back.
-        exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + a.exp_margin / 4,
+        exp_hi_margin = a.exp_margin_hi if a.exp_margin_hi > 0 else a.exp_margin / 4
+        exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + exp_hi_margin,
                         a.exp_tol if a.exp_tol > 0 else a.tol, name="exp")
         probe = np.linspace(exp_poly.lo, exp_poly.hi, 4001)
         print("     exp: worst RELATIVE error over the domain %.2e"
@@ -585,6 +592,7 @@ def main():
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
+                     "exp_margin_hi": exp_hi_margin,
                      "chan_cap": a.chan_cap,
                      "ffn_tile": min(a.ffn_tile, m.I),
                      "gelu_tol": a.gelu_tol, "gelu_max_degree": a.gelu_max_degree,
