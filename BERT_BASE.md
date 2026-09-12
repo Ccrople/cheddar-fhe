@@ -286,13 +286,32 @@ degree-511 polynomial outside its interval is astronomical. The margins
 and at twelve layers of 768 channels they are simply too tight for a
 held-out book.
 
-Widened to **`--margin 2.0 --gelu-margin 1.5 --exp-margin 2.0`** the same
-check is clean -- 0 escapes everywhere, the worst GELU at 0.94 of its band --
-and the card follows: **layer 0 goes 2^-8.75 (worst instance 2^-4.42) to
-2^-11.34 (worst 2^-10.52)**, within half a bit of the oracle's own. What it
-costs is a degree step here and there (the GELU's first tile 127 -> 255 at
-layer 0, the exp 15 -> 31 at some layers), which is one level each on paths
-that had it.
+Widened to `--margin 2.0 --gelu-margin 1.5 --exp-margin 2.0` layers 0 and 1
+are clean and the card follows: **layer 0 goes 2^-8.75 (worst instance
+2^-4.42) to 2^-11.34 (worst 2^-10.52)**, within half a bit of the oracle's
+own. But layer 2 then explodes, and the scan over all twelve layers says
+where:
+
+| what | layers | how far over |
+|---|---|---|
+| the exp's domain, its TOP | 3, 4, 5, 7 | `u` reaches 0.93-1.10 where the domain tops at 0.60-0.81 |
+| the first Cho window's top | 2, 6 | 25.6 vs 22.4, and **69.4 vs 29.6** |
+| the GELU's band | none | worst 0.936 of its `hi` |
+
+The exp's TOP is structural and now has its own knob (`--exp-margin-hi`):
+`shift` is the population's row maximum, so a held-out row that beats it
+lands above the domain by the excess over `2^k`. The first Cho window at
+layer 6 is the fold's estimate not transferring -- `est` is a per-(head,
+token) geometric mean of the CALIBRATION book and the held-out book's rows
+sit 4.7x higher.
+
+**This is the real lesson of the width**, and it is a calibration lesson,
+not a crypto one: a served batch is `512 x 128 x 768` slots a layer and
+twelve layers, so 2e8 draws -- a tail that BERT-Tiny's two layers and margin
+1.3 never saw is CERTAIN here. The answer that scales is the one both the
+Llama line and BERT-Tiny reached: windows that are THEOREMS (the softmax's
+certified upper end, the GELU's sphere bound) rather than statistics. Until
+then the margins are the knob, and they are in the ledger.
 
 ## 6. Plan
 
