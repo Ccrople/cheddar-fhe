@@ -448,10 +448,11 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
   const std::string dump = Env("BERT_BASE_DUMP", "");
   std::ofstream index;
   int cur_layer = first;
+  // OUTSIDE the block: the probe captures by reference and outlives it.
+  const int dump_live = std::min(EnvInt("BERT_BASE_DUMP_INSTANCES", 4), live);
   if (!dump.empty()) {
     index.open(dump + "/index.txt");
     ASSERT_TRUE(index.good()) << dump;
-    const int dump_live = std::min(EnvInt("BERT_BASE_DUMP_INSTANCES", 4), live);
     layer.SetProbe([&](const std::string &name,
                        const std::vector<Ciphertext<word>> &cts, double factor,
                        const std::vector<double> &chan) {
