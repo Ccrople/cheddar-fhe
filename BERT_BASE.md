@@ -286,6 +286,14 @@ degree-511 polynomial outside its interval is astronomical. The margins
 and at twelve layers of 768 channels they are simply too tight for a
 held-out book.
 
+Widened to **`--margin 2.0 --gelu-margin 1.5 --exp-margin 2.0`** the same
+check is clean -- 0 escapes everywhere, the worst GELU at 0.94 of its band --
+and the card follows: **layer 0 goes 2^-8.75 (worst instance 2^-4.42) to
+2^-11.34 (worst 2^-10.52)**, within half a bit of the oracle's own. What it
+costs is a degree step here and there (the GELU's first tile 127 -> 255 at
+layer 0, the exp 15 -> 31 at some layers), which is one level each on paths
+that had it.
+
 ## 6. Plan
 
 1. B = 1, T = 128: build, layer 0. **DONE** (2^-6.92).
