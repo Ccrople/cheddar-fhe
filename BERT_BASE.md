@@ -325,6 +325,23 @@ the whole population. It costs half a bit (layer 0 2^-11.34 -> 2^-10.78,
 the wider windows and the degree cap), which is the right trade: a 2^-10.8
 that always runs beats a 2^-11.3 that explodes at layer 2.
 
+### The service number: 512 held-out prompts, twelve layers and the head
+
+| L0 | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | head |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| -10.78 | -9.38 | -7.63 | -7.73 | -7.70 | -7.71 | -7.71 | -7.72 | -7.65 | -5.99 | -5.47 | -5.47 | **-6.72, labels 512 / 512** |
+
+512 DISTINCT prompts of a book the calibration never saw, real lengths
+3..128, each against its own float64 output; no escape anywhere; 137-270 s a
+layer (Cho k = 2 or 3), the head 47 s. **Flat at 2^-7.7 from layer 2 to 8**,
+and the NSP classifier still agrees with float64 on every one of the 512.
+
+The two steps down are the two known mechanisms, and the margins make them
+worse rather than better: with `--margin 5.0` layer 9's `ln2` window is
+108,385x (the raw 4300x times 25), and the affine map onto `[-1, 1]` then
+multiplies the ciphertext's error by `a / var` on the way out. The two-stage
+inverse square root is what removes that, and it is item one of the plan.
+
 **This is the real lesson of the width**, and it is a calibration lesson,
 not a crypto one: a served batch is `512 x 128 x 768` slots a layer and
 twelve layers, so 2e8 draws -- a tail that BERT-Tiny's two layers and margin
