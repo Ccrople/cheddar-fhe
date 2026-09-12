@@ -101,6 +101,7 @@ if(ENABLE_EXTENSION)
     src/extension/CiBatchLayer.cu
     src/extension/CiBatchAttention.cu
     src/extension/CiBertTiny.cu
+    src/extension/CiBertBase.cu
     src/extension/CiPcAttention.cu
     src/extension/PublicPrefill.cpp
     src/extension/CiDecode.cu

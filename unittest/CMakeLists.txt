@@ -270,6 +270,15 @@ if (ENABLE_EXTENSION)
   target_link_libraries(ci_bert_tiny_test
                         PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
 
+  # BERT-Base on the same batched layout (branch BERT_base): the same
+  # operators at H 768 / 12 heads / hidden 3072 / 12 layers, with the
+  # feed-forward tiled over the hidden axis so a layer's peak is one tile
+  # and not the hidden width. BERT_BASE_ALL / BERT_BASE_REF, and
+  # bert_base/{reference,sim}.py for the float64 side.
+  add_executable(ci_bert_base_test CiBertBaseTest.cpp)
+  target_link_libraries(ci_bert_base_test
+                        PRIVATE cheddar gtest_main nlohmann_json::nlohmann_json)
+
   # S3 capability probes. Additive only; nothing above is modified.
   # These need ENABLE_EXTENSION for EvalPoly / LinearTransform / BootContext.
   add_executable(capability_probe CapabilityProbe.cpp)
