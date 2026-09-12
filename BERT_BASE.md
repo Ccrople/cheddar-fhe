@@ -317,6 +317,14 @@ layer 6 is the fold's estimate not transferring -- `est` is a per-(head,
 token) geometric mean of the CALIBRATION book and the held-out book's rows
 sit 4.7x higher.
 
+Widened again to **`--margin 5.0 --gelu-margin 1.8 --exp-margin 2.0
+--exp-margin-hi 2.0`** with the inverse square roots capped at degree 255
+(the LAST Cho pass's degree is what caps `l_p`), the scan over all twelve
+layers is **clean -- not one escaped slot anywhere** -- and the card runs
+the whole population. It costs half a bit (layer 0 2^-11.34 -> 2^-10.78,
+the wider windows and the degree cap), which is the right trade: a 2^-10.8
+that always runs beats a 2^-11.3 that explodes at layer 2.
+
 **This is the real lesson of the width**, and it is a calibration lesson,
 not a crypto one: a served batch is `512 x 128 x 768` slots a layer and
 twelve layers, so 2e8 draws -- a tail that BERT-Tiny's two layers and margin
