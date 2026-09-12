@@ -122,6 +122,11 @@ Layer::Calibration ReadCalib(const json &cj) {
   }
   c.ln1 = Norm(cj["ln1"]);
   c.ln2 = Norm(cj["ln2"]);
+  // the residual each norm reads, in its own stream's units: a norm whose
+  // variance window is wide boots it, and is scale-invariant, so it puts
+  // the stream at the bootstrap's height first
+  c.ln1.pre_absmax = cj["h_pre_absmax"].get<double>();
+  c.ln2.pre_absmax = cj["z_pre_absmax"].get<double>();
   // the GELU is one fit per feed-forward tile, in the calibration's own
   // channel order: a hidden channel is a whole ciphertext, so sorting the
   // channels by their |u| makes the tile the band, free of any mask

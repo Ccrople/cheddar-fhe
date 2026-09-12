@@ -190,6 +190,10 @@ class CiBertBaseLayer {
       PolySpec inv;          //!< 1/sqrt(var + eps) window
       double r_max = 1.0;    //!< 1/sqrt(lo + eps)
       double out_absmax = 1.0;
+      //! the RESIDUAL this norm reads, in its own stream's units: a norm
+      //! whose window is wide boots that residual, and the norm is
+      //! scale-invariant, so it is put at the boot's height first
+      double pre_absmax = 1.0;
     } ln1, ln2;
     /**
      * @brief The GELU: ONE FIT PER FEED-FORWARD TILE, in the calibration's

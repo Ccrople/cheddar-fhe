@@ -539,14 +539,10 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
   // ---- carries and folds ------------------------------------------------
   // A norm that boots its own input needs its RIDE to cover that input too,
   // so the carry is sized on the residual as well as on the stream.
-  const bool boot_ln1 = c.ln1.inv.hi > cfg_.ln_boot_ratio * c.ln1.inv.lo;
-  const bool boot_ln2 = c.ln2.inv.hi > cfg_.ln_boot_ratio * c.ln2.inv.lo;
-  const double c_in = cfg_.ride / (boot_ln1 ? std::max(c.in_absmax, c.h_pre_absmax)
-                                            : c.in_absmax);
+  const double c_in = cfg_.ride / c.in_absmax;
   const double a_e = 0.5 * (c.exp.hi - c.exp.lo), b_e = 0.5 * (c.exp.hi + c.exp.lo);
   q_fold_ = 1.0 / (std::sqrt(static_cast<double>(D)) * std::ldexp(1.0, c.niter) * a_e);
-  const double c_h = cfg_.ride / (boot_ln2 ? std::max(c.ln1.out_absmax, c.z_pre_absmax)
-                                           : c.ln1.out_absmax);
+  const double c_h = cfg_.ride / c.ln1.out_absmax;
   c_in_ = c_in;
   c_h_ = c_h;
 
@@ -1240,11 +1236,25 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, Stream &pre,
   // variance rides at `ride / ratio`. Boot the stream instead and the
   // inverse square root needs no bootstrap of its own.
   const bool pre_boot = n.inv.hi > cfg_.ln_boot_ratio * n.inv.lo;
+  if (pre_boot && cfg_.verbose) {
+    std::cout << "  [bert-base] " << tag << ": variance window "
+              << (n.inv.hi / n.inv.lo) << "x -> booting the stream first"
+              << std::endl;
+  }
+  auto t0 = Clock::now();
+  double c = pre.carry;
   if (pre_boot) {
-    if (cfg_.verbose) {
-      std::cout << "  [bert-base] " << tag << ": variance window "
-                << (n.inv.hi / n.inv.lo) << "x -> booting the stream first"
-                << std::endl;
+    // A LayerNorm is SCALE-INVARIANT, so the stream can simply be put at the
+    // bootstrap's height first -- one level, which the bootstrap gives back,
+    // and the carry contract with the consumer is untouched.
+    const double s = cfg_.ride / (c * n.pre_absmax);
+    if (std::abs(s - 1.0) > 1e-12) {
+      for (int i = 0; i < H; i++) {
+        Ct t;
+        MultScalar(t, pre.cts[i], s);
+        pre.cts[i] = std::move(t);
+      }
+      c *= s;
     }
     Lift(pre, TopLevel(), evk);
   }
@@ -1253,8 +1263,6 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, Stream &pre,
                          "): the stream needs two levels (the mean and the "
                          "centring, then the variance; the apply lands on the "
                          "second)");
-  auto t0 = Clock::now();
-  const double c = pre.carry;
   // The stream's public suppression comes out HERE, and this is why its
   // entries are powers of two: an integer constant is encoded at scale 1, so
   // the multiply is exact and costs no level.
