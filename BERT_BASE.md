@@ -218,6 +218,16 @@ steady state rather than accumulating -- and then the last three layers sit
 2.5 bits lower. 104 s a layer (1536 wide + 14 narrow boots), 137 s where a
 norm boots its own stream.
 
+Layer 11 ALONE, from an exact layer 10, is **2^-11.01**: only layers 9 and
+10 are intrinsically weak, and they are exactly the two with the 4000x
+variance window and the `|u| = 109 / 118` GELU outlier. Everything after
+them inherits it.
+
+**The head** (pooler + the pretrained NSP classifier, `BERT_BASE_HEAD=1`):
+the tanh on its CERTIFIED interval `[-54.22, 54.65]` (a theorem of the last
+LayerNorm's sphere) at degree 511, **logits 2^-13.13 and labels 512 / 512**
+in 48 s -- 4.9051 / -4.0943 against the float64 4.9059 / -4.0942.
+
 ### Where the last three layers go, probe by probe (layer 9)
 
 `BERT_BASE_DUMP` + `bert_base/debug.py`, every intermediate against the
