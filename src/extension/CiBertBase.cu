@@ -1249,14 +1249,19 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
       MultInt(dst, pre.cts[i], sup(i));
     }
   };
-  Ct sum;
+  // One pass: the channel sum AND the sum of squares, both at the stream's
+  // own level.
+  Ct sum, acc;
   for (int i = 0; i < H; i++) {
-    Ct dx;
+    Ct dx, sq;
     lift(dx, i);
+    boot_->Mult(sq, dx, dx);
     if (i == 0) {
       sum = std::move(dx);
+      acc = std::move(sq);
     } else {
       boot_->Add(sum, sum, dx);
+      boot_->Add(acc, acc, sq);
     }
   }
   // mu' = sum / H, ONE level on ONE ciphertext -- and this is the whole
@@ -1271,11 +1276,11 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   // exactly the 2^-10.1 the probes measured on `r`; the same imbalance made
   // the per-channel constant on `r` in the apply 3.5e-4, where the rescale's
   // own rounding is a fifth of the message. Dividing here instead keeps
-  // every message in [0.1, 20] and every constant above 2^18. The level is
-  // free: both norms' outputs are bootstrapped immediately.
+  // every message in [0.1, 20] and every constant above 2^18, and the level
+  // it costs is taken out of the centring alone -- the variance comes off
+  // the sums, one level up.
   Ct mu;
   MultScalar(mu, sum, 1.0 / static_cast<double>(H));
-  sum = Ct();
   const int lc = Level(mu);
   std::vector<Ct> cen(H);
   for (int i = 0; i < H; i++) {
@@ -1286,22 +1291,30 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   }
   mu = Ct();
   Tap(tag + "_cen", cen, c);
-  // V' = sum centred^2 = H c^2 var: one relinearization
-  Ct acc;
-  for (int i = 0; i < H; i++) {
-    Ct t;
-    boot_->Mult(t, cen[i], cen[i]);
-    if (i == 0) {
-      acc = std::move(t);
-    } else {
-      boot_->Add(acc, acc, t);
-    }
-  }
-  Ct V;
-  boot_->RelinearizeRescale(V, acc, mult_key);
-  stages_.relins++;
+  // V' = H sum(x^2) - sum(x)^2 = H^2 c^2 var, one level below the stream --
+  // which is where `NarrowLift` needs it, and `sum((H x - sum)^2)` would be
+  // a level lower AND a factor H bigger. What the identity costs is a
+  // cancellation, and that is nothing here: `mu^2 / var` over BERT-Base's
+  // twelve layers is at most 0.007, or 0.01 bits.
+  Ct A, S2;
+  boot_->RelinearizeRescale(A, acc, mult_key);
   acc = Ct();
-  const double kappa0 = 1.0 / (static_cast<double>(H) * c * c);
+  {
+    Ct t;
+    boot_->Mult(t, sum, sum);
+    boot_->RelinearizeRescale(S2, t, mult_key);
+  }
+  sum = Ct();
+  stages_.relins += 2;
+  Ct V;
+  {
+    Ct HA;
+    MultInt(HA, A, static_cast<double>(H));
+    A = Ct();
+    boot_->Sub(V, HA, S2);
+  }
+  S2 = Ct();
+  const double kappa0 = 1.0 / (static_cast<double>(H) * H * c * c);
   Tap(tag + "_var", V, 1.0 / kappa0);
   const int degree = n.inv.degree;
   const double undo = NarrowLift(V, Levels(degree) + 2, n.inv.hi / kappa0, evk);
