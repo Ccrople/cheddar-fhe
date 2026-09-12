@@ -250,6 +250,42 @@ Two mechanisms, both named and both with a known fix:
    BY CONSTRUCTION, so the second window is a theorem near 1 and compresses
    nothing. It costs one more wide level, which the plan has at k = 1.
 
+### The three service shapes, layers 0 and 1, each on its own oracle
+
+| (T, B) | layer 0 | layer 1 | wall | boots a layer |
+|---|---|---|---|---|
+| (128, 512) | 2^-11.86 | 2^-11.34 | 76.8 / 104.5 s | 768 / 1536 |
+| (256, 256) | 2^-11.91 | 2^-11.33 | 87.3 / 118.8 s | 768 / 1536 |
+| (512, 128) | 2^-11.71 | 2^-11.29 | 114.2 / 151.2 s | 768 / 1536 |
+
+The accuracy is FLAT in the shape, as the layout intends: only the diagonal
+products' rotation stride and the number of score ciphertexts change, and
+the extra cost is the softmax's (T ciphertexts a head).
+
+### The population calibration, and the seven slots that ruin a batch
+
+512 held-out prompts (a different book, real lengths 3..128) on the
+1000-prompt population calibration came back at 2^-8.75 with a worst
+instance of 2^-4.42, and the next layer at 2^+201. The cause is NOT the
+crypto: the same chain with only the APPROXIMATIONS in, on the host,
+already gives layer 0 seven escapes and a worst prompt of 2^-4.46. Naming
+them exactly (`bb_esc.py`, the exact stream against its own windows):
+
+| layer | what escapes | how far | of how many |
+|---|---|---|---|
+| 0 | the GELU's band | 1.170x its `hi` | 7 of 201,326,592 |
+| 1 | the GELU's band | 1.001x | 1 of 201,326,592 |
+| 1 | the exp's domain | | 11 of 786,432 |
+| 1 | the first Cho window | 1.30x its `hi` | 3 of 786,432 |
+
+**Seven slots in two hundred million.** That is the batched layout's
+standing rule from BERT-Tiny, in its sharpest form yet: CKKS noise lives in
+the coefficient domain, so one escaped slot is a batch-wide event -- and a
+degree-511 polynomial outside its interval is astronomical. The margins
+(`--margin` 1.3, `--gelu-margin` 1.2, `--exp-margin` 1.0) are BERT-Tiny's,
+and at twelve layers of 768 channels they are simply too tight for a
+held-out book.
+
 ## 6. Plan
 
 1. B = 1, T = 128: build, layer 0. **DONE** (2^-6.92).
