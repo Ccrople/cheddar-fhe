@@ -537,10 +537,16 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
                               "does not fit under the boot's landing");
 
   // ---- carries and folds ------------------------------------------------
-  const double c_in = cfg_.ride / c.in_absmax;
+  // A norm that boots its own input needs its RIDE to cover that input too,
+  // so the carry is sized on the residual as well as on the stream.
+  const bool boot_ln1 = c.ln1.inv.hi > cfg_.ln_boot_ratio * c.ln1.inv.lo;
+  const bool boot_ln2 = c.ln2.inv.hi > cfg_.ln_boot_ratio * c.ln2.inv.lo;
+  const double c_in = cfg_.ride / (boot_ln1 ? std::max(c.in_absmax, c.h_pre_absmax)
+                                            : c.in_absmax);
   const double a_e = 0.5 * (c.exp.hi - c.exp.lo), b_e = 0.5 * (c.exp.hi + c.exp.lo);
   q_fold_ = 1.0 / (std::sqrt(static_cast<double>(D)) * std::ldexp(1.0, c.niter) * a_e);
-  const double c_h = cfg_.ride / c.ln1.out_absmax;
+  const double c_h = cfg_.ride / (boot_ln2 ? std::max(c.ln1.out_absmax, c.z_pre_absmax)
+                                           : c.ln1.out_absmax);
   c_in_ = c_in;
   c_h_ = c_h;
 
@@ -1217,7 +1223,7 @@ void CiBertBaseLayer<word>::Attention(Stream &attn_out, Stream &x,
 
 // ----------------------------------------------------------- LayerNorm
 template <typename word>
-void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
+void CiBertBaseLayer<word>::LayerNorm(Stream &out, Stream &pre,
                                       const std::vector<double> &g,
                                       const std::vector<double> &b,
                                       const typename Calibration::Norm &n,
@@ -1229,6 +1235,19 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   const double eps = cfg_.shape.eps;
   const auto &mult_key = evk.GetMultiplicationKey();
   AssertTrue(static_cast<int>(pre.cts.size()) == H, "LayerNorm: model channels");
+  // A wide variance window is a RIDE problem, not a degree problem: the
+  // narrow bootstrap's error is absolute in the message and the smallest
+  // variance rides at `ride / ratio`. Boot the stream instead and the
+  // inverse square root needs no bootstrap of its own.
+  const bool pre_boot = n.inv.hi > cfg_.ln_boot_ratio * n.inv.lo;
+  if (pre_boot) {
+    if (cfg_.verbose) {
+      std::cout << "  [bert-base] " << tag << ": variance window "
+                << (n.inv.hi / n.inv.lo) << "x -> booting the stream first"
+                << std::endl;
+    }
+    Lift(pre, TopLevel(), evk);
+  }
   const int l = Level(pre.cts[0]);
   AssertTrue(l >= 2, "CiBertBaseLayer::LayerNorm(" + tag +
                          "): the stream needs two levels (the mean and the "
@@ -1331,7 +1350,9 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   // r = 1/sqrt(var + eps) in true units; the apply wants it a level above
   // the channels (its per-channel scalar copies cost one)
   double undo_r = 1.0;
-  if (Level(r) < lc + 1) undo_r = NarrowLift(r, lc + 1, n.r_max, evk);
+  if (!pre_boot && Level(r) < lc + 1) {
+    undo_r = NarrowLift(r, lc + 1, n.r_max, evk);
+  }
   const double c_out = cfg_.ride / n.out_absmax;
   const int lr = Level(r);
   out.cts.clear();

@@ -293,6 +293,8 @@ class LayerPass:
         self.uch = np.zeros(I)
         self.hch = np.zeros(0)      # per-channel |h| and |z| (the two streams
         self.zch = np.zeros(0)      # a LayerNorm writes), for the suppression
+        self.hpch = np.zeros(0)     # and the two RESIDUALS, which a wide-window
+        self.zpch = np.zeros(0)     # norm bootstraps and so must ride too
         self.mx = {}
         self.s_min, self.s_max = np.inf, -np.inf
 
@@ -306,7 +308,8 @@ class LayerPass:
         self.var["ln1"][c0:c1] = r["h_pre"].var(axis=-1)
         self.var["ln2"][c0:c1] = r["z_pre"].var(axis=-1)
         np.maximum(self.uch, np.abs(r["u"]).max(axis=(0, 1)), out=self.uch)
-        for name, v in (("hch", r["h"]), ("zch", z)):
+        for name, v in (("hch", r["h"]), ("zch", z), ("hpch", r["h_pre"]),
+                        ("zpch", r["z_pre"])):
             mx = np.abs(v).max(axis=(0, 1))
             cur = getattr(self, name)
             setattr(self, name, mx if cur.size == 0 else np.maximum(cur, mx))
@@ -493,7 +496,10 @@ def main():
                         "s_min": p.s_min, "s_max": p.s_max},
             "v_absmax": p.mx["v"],
             "av_absmax": p.mx["av"],
-            "h_pre_absmax": p.mx["h_pre"],
+            # the residuals in the units their own stream carries: a norm
+            # whose variance window is wide boots its input, and then the
+            # carry has to cover the residual and not just the stream
+            "h_pre_absmax": float((p.hpch / in_chan).max()),
             "ln1": dict(lns["ln1"].json(),
                         r_max=float(1.0 / np.sqrt(lns["ln1"].lo + m.eps)),
                         out_absmax=h_absmax),
@@ -505,7 +511,7 @@ def main():
                      "u_per_channel_max": float(p.uch.max()),
                      "u_per_channel_p99": float(np.quantile(p.uch, 0.99))},
             "u_absmax": p.mx["u"],
-            "z_pre_absmax": p.mx["z_pre"],
+            "z_pre_absmax": float((p.zpch / h_chan).max()),
             "ln2": dict(lns["ln2"].json(),
                         r_max=float(1.0 / np.sqrt(lns["ln2"].lo + m.eps)),
                         out_absmax=z_absmax),

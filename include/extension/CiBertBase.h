@@ -130,6 +130,25 @@ class CiBertBaseLayer {
     //! Evaluate the exp / GELU / tanh polynomials over a batch of
     //! ciphertexts (`EvalPoly::EvaluateBatch`); 1 = the per-ciphertext loop.
     int poly_batch = 1;
+    /**
+     * @brief A LayerNorm whose variance WINDOW is wider than this boots its
+     * input stream first, which costs `model` wide bootstraps and removes
+     * the narrow path's.
+     *
+     * The narrow bootstrap's error is ABSOLUTE in the message, and the
+     * message is `ride * var / var_max`, so a window of ratio R leaves the
+     * smallest variance with a relative error of `R * 2^-p` -- at BERT-Base
+     * layers 9 and 10, whose `ln2` variance spans 7300x and 5800x (every
+     * other norm in the model is under 200x), that is 22 %, the layer comes
+     * back at 2^-6.1 and the NEXT layer's windows are escaped: 2^+130.
+     * Booting the stream instead puts the variance high enough that the
+     * inverse square root needs no bootstrap at all, so its relative error
+     * is the stream's own, uniformly, whatever the window.
+     *
+     * The output then lands low, which costs nothing: both norms' outputs
+     * are bootstrapped immediately anyway.
+     */
+    double ln_boot_ratio = 200.0;
     bool verbose = false;
   };
 
@@ -277,7 +296,8 @@ class CiBertBaseLayer {
 
   // The halves, exposed for the tests.
   void Attention(Stream &attn_out, Stream &x, const EvkMap<word> &evk);
-  void LayerNorm(Stream &out, const Stream &pre, const std::vector<double> &g,
+  //! `pre` is CONSUMED (and bootstrapped in place when its window is wide).
+  void LayerNorm(Stream &out, Stream &pre, const std::vector<double> &g,
                  const std::vector<double> &b,
                  const typename Calibration::Norm &n,
                  const std::vector<double> &out_chan, const EvkMap<word> &evk,
