@@ -226,6 +226,31 @@ def exact_cho_ranges(s, shift, k, valid=None, fold=True, chunk=64):
     return (u_lo, u_hi), rng, est_tabs, seen
 
 
+def suppression(mx, cap):
+    """The PUBLIC per-channel suppression of a stream: `d_c` a power of two in
+    [1, cap], sized so the largest channel rides at `max / cap`.
+
+    BERT's residual stream is dimension-wise skewed -- at BERT-Base layer 4 the
+    LayerNorm output reaches 102 where a typical channel is ~1 -- and one ride
+    sizes every channel by the largest, so the typical channel sits at 1/60 of
+    the bootstrap's input height and loses those bits. In the batched layout a
+    channel is a whole ciphertext, so its own scale is free: it rides the
+    weights of whatever reads or writes the stream, and the LayerNorm undoes it
+    with an INTEGER multiply, which is why these are powers of two.
+
+    It is not free in EvalMod, though, which is why `cap` exists: the boot's
+    error is cubic in the message, so lifting every channel to the full ride
+    also lifts every channel to the full cubic term. `cap` is the trade and is
+    a knob -- 16 is where the single-prompt line settled.
+    """
+    mx = np.asarray(mx, dtype=float)
+    if cap <= 1.0:
+        return np.ones_like(mx)
+    ref = mx.max() / cap
+    d = np.exp2(np.floor(np.log2(np.maximum(mx, 1e-300) / max(ref, 1e-300))))
+    return np.clip(d, 1.0, cap)
+
+
 # ------------------------------------------------------ the exact sweep
 class BandedGelu:
     """One GELU fit per feed-forward TILE, the hidden channels sorted by
@@ -266,6 +291,8 @@ class LayerPass:
         self.s = np.empty((N, NH, T, T))
         self.var = {"ln1": np.empty((N, T)), "ln2": np.empty((N, T))}
         self.uch = np.zeros(I)
+        self.hch = np.zeros(0)      # per-channel |h| and |z| (the two streams
+        self.zch = np.zeros(0)      # a LayerNorm writes), for the suppression
         self.mx = {}
         self.s_min, self.s_max = np.inf, -np.inf
 
@@ -279,6 +306,10 @@ class LayerPass:
         self.var["ln1"][c0:c1] = r["h_pre"].var(axis=-1)
         self.var["ln2"][c0:c1] = r["z_pre"].var(axis=-1)
         np.maximum(self.uch, np.abs(r["u"]).max(axis=(0, 1)), out=self.uch)
+        for name, v in (("hch", r["h"]), ("zch", z)):
+            mx = np.abs(v).max(axis=(0, 1))
+            cur = getattr(self, name)
+            setattr(self, name, mx if cur.size == 0 else np.maximum(cur, mx))
         for key, v in (("v", r["v"]), ("av", r["av"]), ("h_pre", r["h_pre"]),
                        ("h", r["h"]), ("u", r["u"]), ("z_pre", r["z_pre"]),
                        ("z", z)):
@@ -321,6 +352,10 @@ def main():
                     help="the LayerNorms' inverse square roots run on the "
                          "NARROW path (booted), so a degree is free of the "
                          "wide plan -- this is only the ladder's own room")
+    ap.add_argument("--chan-cap", type=float, default=16.0,
+                    help="the public per-channel suppression's ceiling "
+                         "(1 = off): a stream channel is a whole ciphertext, "
+                         "so its own scale is free everywhere but EvalMod")
     ap.add_argument("--chunk", type=int, default=64, help="prompts at a time")
     ap.add_argument("--no-chain", action="store_true",
                     help="write the calibration without running the host "
@@ -348,11 +383,14 @@ def main():
 
     layers, hooks = [], []
     cur = x
+    in_chan = suppression(np.abs(x).max(axis=(0, 1)), a.chan_cap)
     for L in range(m.NL):
         # ---- the exact layer over the population, a chunk at a time -------
         nxt = np.empty_like(cur)
         p = LayerPass(N, m.NH, m.T, m.I)
-        in_absmax = float(np.abs(cur).max())
+        # the ride is sized on the SUPPRESSED stream: a suppression and its
+        # ride are one decision
+        in_absmax = float((np.abs(cur).max(axis=(0, 1)) / in_chan).max())
         for c0 in range(0, N, chunk):
             c1 = min(N, c0 + chunk)
             r = {}
@@ -426,10 +464,22 @@ def main():
               "%.1e" % (ntile, tile, gts[0].hi, gts[-1].hi,
                         "/".join(str(q.degree) for q in gts),
                         max(q.err for q in gts)))
+        h_chan = suppression(p.hch, a.chan_cap)
+        z_chan = suppression(p.zch, a.chan_cap)
+        h_absmax = float((p.hch / h_chan).max())
+        z_absmax = float((p.zch / z_chan).max())
+        print("     chan: suppression <= %.0fx  -> |x| %.2f, |h| %.2f -> %.2f, "
+              "|z| %.2f -> %.2f" % (a.chan_cap, in_absmax, p.mx["h"], h_absmax,
+                                    p.mx["z"], z_absmax))
         hooks.append({"softmax": sm, "ln1": lns["ln1"], "ln2": lns["ln2"], "gelu": gl})
         layers.append({
             "layer": L,
             "in_absmax": in_absmax,
+            # the three streams' public per-channel suppression; the next
+            # layer's in_chan IS this layer's ln2_chan (the stream is one)
+            "in_chan": in_chan.tolist(),
+            "ln1_chan": h_chan.tolist(),
+            "ln2_chan": z_chan.tolist(),
             "softmax": {"niter": k, "shift": shift.tolist(),
                         "exp": exp_poly.json(),
                         "inv": [q.json() for q in inv_polys],
@@ -446,7 +496,7 @@ def main():
             "h_pre_absmax": p.mx["h_pre"],
             "ln1": dict(lns["ln1"].json(),
                         r_max=float(1.0 / np.sqrt(lns["ln1"].lo + m.eps)),
-                        out_absmax=p.mx["h"]),
+                        out_absmax=h_absmax),
             # one fit per feed-forward tile, in this permuted channel order:
             # the layer applies the permutation to wint's columns and wout's
             # rows, which leaves the layer's output exactly unchanged
@@ -458,9 +508,10 @@ def main():
             "z_pre_absmax": p.mx["z_pre"],
             "ln2": dict(lns["ln2"].json(),
                         r_max=float(1.0 / np.sqrt(lns["ln2"].lo + m.eps)),
-                        out_absmax=p.mx["z"]),
+                        out_absmax=z_absmax),
         })
         cur = nxt
+        in_chan = z_chan
 
     # The head: the pooler's tanh on the CERTIFIED interval (the last LN's
     # sphere), so nothing about it is a statistic of any prompt.
@@ -528,6 +579,7 @@ def main():
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
+                     "chan_cap": a.chan_cap,
                      "ffn_tile": min(a.ffn_tile, m.I),
                      "gelu_tol": a.gelu_tol, "gelu_max_degree": a.gelu_max_degree,
                      "inv_tol": a.inv_tol, "ln_max_degree": a.ln_max_degree,

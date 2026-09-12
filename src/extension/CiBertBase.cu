@@ -25,22 +25,29 @@ double Since(Clock::time_point t0) {
 }  // namespace
 
 namespace kernel {
-//! `dst[c][j] = src[c][perm[j]] * scale[j]`: the up projection's columns put
-//! in the calibration's channel order, each carrying its tile's `1 / a`.
-__global__ void PermuteScaleCols(float *dst, const float *src, const int *perm,
-                                 const float *scale, int in, int out) {
+//! `dst[c][o] = src[c][cperm[o]] * rgain[c] * cgain[o]` (null = identity/1):
+//! every way a public factor enters a weight that is read by columns.
+__global__ void FoldColsKernel(float *dst, const float *src, const int *cperm,
+                               const float *rgain, const float *cgain, int in,
+                               int out) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= static_cast<size_t>(in) * out) return;
-  const int c = static_cast<int>(idx / out), j = static_cast<int>(idx % out);
-  dst[idx] = src[static_cast<size_t>(c) * out + perm[j]] * scale[j];
+  const int c = static_cast<int>(idx / out), o = static_cast<int>(idx % out);
+  float v = src[static_cast<size_t>(c) * out + (cperm ? cperm[o] : o)];
+  if (rgain) v *= rgain[c];
+  if (cgain) v *= cgain[o];
+  dst[idx] = v;
 }
-//! `dst[j][o] = src[perm[j]][o]`: the down projection's rows, the same order.
-__global__ void PermuteRows(float *dst, const float *src, const int *perm,
-                            int rows, int cols) {
+//! `dst[j][o] = src[rperm[j]][o] * cgain[o]`: the same for a weight read by
+//! rows (the down projection, whose rows are the permuted hidden axis).
+__global__ void FoldRowsKernel(float *dst, const float *src, const int *rperm,
+                               const float *cgain, int rows, int cols) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= static_cast<size_t>(rows) * cols) return;
   const int j = static_cast<int>(idx / cols), o = static_cast<int>(idx % cols);
-  dst[idx] = src[static_cast<size_t>(perm[j]) * cols + o];
+  float v = src[static_cast<size_t>(rperm[j]) * cols + o];
+  if (cgain) v *= cgain[o];
+  dst[idx] = v;
 }
 }  // namespace kernel
 
@@ -569,35 +576,40 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
              "CiBertBaseLayer::Prepare: the GELU degree does not leave the "
              "down projection, the residual and LN2 their levels (landing " +
                  std::to_string(gelu_landing_) + ")");
-  FoldFeedForwardWeights(w, c);
+  FoldWeights(w, c);
 
-  proj_->Prepare("q", w.wq, H, H, l_qk_in_, q_fold_ / c_in);
-  proj_->Prepare("k", w.wk, H, H, l_qk_in_, 1.0 / c_in);
-  proj_->Prepare("v", w.wv, H, H, l_v_in_, 1.0 / c_in);
-  proj_->Prepare("o", w.wo, H, H, l_o_in_, c_in);
+  proj_->Prepare("q", fq_.data(), H, H, l_qk_in_, q_fold_ / c_in);
+  proj_->Prepare("k", fk_.data(), H, H, l_qk_in_, 1.0 / c_in);
+  proj_->Prepare("v", fv_.data(), H, H, l_v_in_, 1.0 / c_in);
+  proj_->Prepare("o", fo_.data(), H, H, l_o_in_, c_in);
   // The feed-forward, tiled over the hidden axis: ONE up operand whose tiles
   // are `rows_per_tile` hidden channels (its columns already permuted and
   // carrying each tile's `1 / a`), and one DOWN operand per tile, reading
   // that tile's rows of the permuted `wout`. The products are accumulated --
   // the same sum, in tile order.
-  proj_->Prepare("up", wint_.data(), H, I, top, 1.0 / c_h);
+  proj_->Prepare("up", fup_.data(), H, I, top, 1.0 / c_h);
   AssertTrue(proj_->NumTiles("up") == ffn_tiles_,
              "CiBertBaseLayer::Prepare: the projection's tiling is not the "
              "calibration's");
   for (int t = 0; t < ffn_tiles_; t++) {
     const int j0 = proj_->TileStart("up", t);
     const int rows = std::min(I - j0, std::min(cfg_.rows_per_tile, I));
-    proj_->Prepare(DownName(t), wout_.data() + static_cast<size_t>(j0) * H,
+    proj_->Prepare(DownName(t), fdown_.data() + static_cast<size_t>(j0) * H,
                    rows, H, gelu_landing_, c_h);
   }
   bq_.resize(H); bk_.resize(H); bv_.resize(H); bo_.resize(H);
   bint_.resize(I); bout_.resize(H);
   for (int i = 0; i < H; i++) {
+    // q / k / v write head channels, which carry no suppression; o and down
+    // write the streams back, so their biases carry the same `1 / chan`
+    // their columns do
+    const double s_in = c.in_chan.empty() ? 1.0 : c.in_chan[i];
+    const double s_h = c.ln1_chan.empty() ? 1.0 : c.ln1_chan[i];
     bq_[i] = q_fold_ * w.bq[i];
     bk_[i] = w.bk[i];
     bv_[i] = w.bv[i];
-    bo_[i] = c_in * w.bo[i];
-    bout_[i] = c_h * w.bout[i];
+    bo_[i] = c_in * w.bo[i] / s_in;
+    bout_[i] = c_h * w.bout[i] / s_h;
   }
   {  // the bias in the permuted order, each tile's affine applied to its own
     const int rows = std::min(cfg_.rows_per_tile, I);
@@ -665,37 +677,107 @@ void CiBertBaseLayer<word>::Prepare(const Weights &w, const Calibration &c) {
   }
 }
 
+namespace {
+//! A host vector of doubles as device floats, or an empty view for null.
+template <typename T, typename U>
+void ToDev(DeviceVector<T> &d, const std::vector<U> *src) {
+  if (src == nullptr || src->empty()) return;
+  HostVector<T> h(src->size());
+  for (size_t i = 0; i < src->size(); i++) h[i] = static_cast<T>((*src)[i]);
+  d.resize(static_cast<int>(h.size()));
+  CopyHostToDevice(d, h);
+}
+}  // namespace
+
 template <typename word>
-void CiBertBaseLayer<word>::FoldFeedForwardWeights(const Weights &w,
-                                                   const Calibration &c) {
+void CiBertBaseLayer<word>::FoldCols(DeviceVector<float> &dst, const float *src,
+                                     int in, int out,
+                                     const std::vector<int> *cperm,
+                                     const std::vector<double> *rgain,
+                                     const std::vector<double> *cgain) const {
+  DeviceVector<int> perm;
+  DeviceVector<float> rg, cg;
+  ToDev(perm, cperm);
+  ToDev(rg, rgain);
+  ToDev(cg, cgain);
+  const size_t n = static_cast<size_t>(in) * out;
+  AssertTrue(n < (static_cast<size_t>(1) << 31),
+             "CiBertBaseLayer::FoldCols: the tensor does not fit an int index");
+  dst.resize(static_cast<int>(n));
+  constexpr int kBlock = 256;
+  const int grid = static_cast<int>((n + kBlock - 1) / kBlock);
+  kernel::FoldColsKernel<<<grid, kBlock>>>(
+      dst.data(), src, perm.size() ? perm.data() : nullptr,
+      rg.size() ? rg.data() : nullptr, cg.size() ? cg.data() : nullptr, in, out);
+}
+
+template <typename word>
+void CiBertBaseLayer<word>::FoldRows(DeviceVector<float> &dst, const float *src,
+                                     int rows, int cols,
+                                     const std::vector<int> &rperm,
+                                     const std::vector<double> *cgain) const {
+  DeviceVector<int> perm;
+  DeviceVector<float> cg;
+  ToDev(perm, &rperm);
+  ToDev(cg, cgain);
+  const size_t n = static_cast<size_t>(rows) * cols;
+  AssertTrue(n < (static_cast<size_t>(1) << 31),
+             "CiBertBaseLayer::FoldRows: the tensor does not fit an int index");
+  dst.resize(static_cast<int>(n));
+  constexpr int kBlock = 256;
+  const int grid = static_cast<int>((n + kBlock - 1) / kBlock);
+  kernel::FoldRowsKernel<<<grid, kBlock>>>(dst.data(), src, perm.data(),
+                                           cg.size() ? cg.data() : nullptr,
+                                           rows, cols);
+}
+
+template <typename word>
+void CiBertBaseLayer<word>::FoldWeights(const Weights &w,
+                                        const Calibration &c) {
   const int H = cfg_.shape.model, I = cfg_.shape.hidden;
   const int rows = std::min(cfg_.rows_per_tile, I);
-  // the permutation, and each hidden channel's `1 / a` (its tile's)
-  HostVector<int> perm(I);
-  HostVector<float> scale(I);
+  // The three streams' public per-channel factors. `d_in` is what enters the
+  // layer and what the attention's residual writes back; `d_h` is LN1's
+  // output and what the feed-forward's residual writes back.
+  const std::vector<double> &d_in = c.in_chan;
+  const std::vector<double> &d_h = c.ln1_chan;
+  AssertTrue(d_in.empty() || static_cast<int>(d_in.size()) == H,
+             "CiBertBaseLayer: in_chan is [model]");
+  AssertTrue(d_h.empty() || static_cast<int>(d_h.size()) == H,
+             "CiBertBaseLayer: ln1_chan is [model]");
+  std::vector<double> inv_in, inv_h;
+  auto reciprocal = [](const std::vector<double> &v, std::vector<double> &r) {
+    r.resize(v.size());
+    for (size_t i = 0; i < v.size(); i++) {
+      AssertTrue(v[i] > 0.0, "CiBertBaseLayer: a suppression is not positive");
+      r[i] = 1.0 / v[i];
+    }
+  };
+  reciprocal(d_in, inv_in);
+  reciprocal(d_h, inv_h);
+  const std::vector<double> *rin = d_in.empty() ? nullptr : &d_in;
+  const std::vector<double> *cin = inv_in.empty() ? nullptr : &inv_in;
+  const std::vector<double> *rh = d_h.empty() ? nullptr : &d_h;
+  const std::vector<double> *ch = inv_h.empty() ? nullptr : &inv_h;
+  // q / k / v read the stream; o writes it back
+  FoldCols(fq_, w.wq, H, H, nullptr, rin, nullptr);
+  FoldCols(fk_, w.wk, H, H, nullptr, rin, nullptr);
+  FoldCols(fv_, w.wv, H, H, nullptr, rin, nullptr);
+  FoldCols(fo_, w.wo, H, H, nullptr, nullptr, cin);
+  // the feed-forward: `up` reads h and its columns are the permuted hidden
+  // axis, each carrying its GELU tile's `1 / a`; `down` reads the permuted
+  // hidden axis by rows and writes h's stream back
+  std::vector<double> ga(I);
   for (int j = 0; j < I; j++) {
     const int t = std::min(j / rows, ffn_tiles_ - 1);
     const double a = 0.5 * (c.gelu[t].hi - c.gelu[t].lo);
     AssertTrue(a > 0.0, "CiBertBaseLayer: a GELU tile has an empty interval");
     AssertTrue(c.gelu_perm[j] >= 0 && c.gelu_perm[j] < I,
                "CiBertBaseLayer: the GELU permutation is out of range");
-    perm[j] = c.gelu_perm[j];
-    scale[j] = static_cast<float>(1.0 / a);
+    ga[j] = 1.0 / a;
   }
-  perm_d_.resize(I);
-  gscale_d_.resize(I);
-  CopyHostToDevice(perm_d_, perm);
-  CopyHostToDevice(gscale_d_, scale);
-  const size_t n = static_cast<size_t>(H) * I;
-  wint_.resize(static_cast<int>(n));
-  wout_.resize(static_cast<int>(n));
-  constexpr int kBlock = 256;
-  const int grid = static_cast<int>((n + kBlock - 1) / kBlock);
-  kernel::PermuteScaleCols<<<grid, kBlock>>>(wint_.data(), w.wint,
-                                             perm_d_.data(), gscale_d_.data(),
-                                             H, I);
-  kernel::PermuteRows<<<grid, kBlock>>>(wout_.data(), w.wout, perm_d_.data(),
-                                        I, H);
+  FoldCols(fup_, w.wint, H, I, &c.gelu_perm, rh, &ga);
+  FoldRows(fdown_, w.wout, I, H, c.gelu_perm, ch);
 }
 
 template <typename word>
@@ -740,7 +822,8 @@ void CiBertBaseLayer<word>::MaskPlaintexts(const Ct &like) {
 template <typename word>
 void CiBertBaseLayer<word>::PrepareHead(const HeadWeights &w,
                                         const HeadCalibration &c,
-                                        double in_absmax) {
+                                        double in_absmax,
+                                        const std::vector<double> &in_chan) {
   const int H = cfg_.shape.model;
   AssertTrue(w.pool_w != nullptr && w.cls_w != nullptr,
              "CiBertBaseLayer::PrepareHead: two tensors");
@@ -754,7 +837,12 @@ void CiBertBaseLayer<word>::PrepareHead(const HeadWeights &w,
   const Parameter<word> &param = boot_->param_;
   // t = (z W + b - b_t) / a_t rides the pooler's weight; tanh(a_t t + b_t)
   const double a_t = 0.5 * (c.tanh.hi - c.tanh.lo), b_t = 0.5 * (c.tanh.hi + c.tanh.lo);
-  proj_->Prepare("pool", w.pool_w, H, H, top, 1.0 / (a_t * c_head_));
+  // the pooler reads the last layer's output stream, so its rows carry that
+  // stream's public per-channel suppression
+  FoldCols(fpool_, w.pool_w, H, H, nullptr,
+           in_chan.empty() ? nullptr : &in_chan, nullptr);
+  head_chan_ = in_chan;
+  proj_->Prepare("pool", fpool_.data(), H, H, top, 1.0 / (a_t * c_head_));
   hpb_.resize(H);
   for (int i = 0; i < H; i++) hpb_[i] = (w.pool_b[i] - b_t) / a_t;
   int landing = 0;
@@ -781,6 +869,9 @@ void CiBertBaseLayer<word>::Head(std::vector<Ct> &logits, Stream &z,
   AssertTrue(std::abs(z.carry - c_head_) <= 1e-9 * c_head_,
              "CiBertBaseLayer::Head: the stream's carry is not the head's "
              "(ride / the last LN2's out_absmax)");
+  AssertTrue(z.chan == head_chan_,
+             "CiBertBaseLayer::Head: the stream's suppression is not the one "
+             "PrepareHead folded into the pooler");
   auto t0 = Clock::now();
   Lift(z, TopLevel(), evk);
   std::vector<Ct> u;
@@ -1045,6 +1136,9 @@ void CiBertBaseLayer<word>::Attention(Stream &attn_out, Stream &x,
              "calibration's (ride / in_absmax)");
   AssertTrue(Level(x.cts[0]) >= l_qk_in_, "Attention: the stream is below "
                                           "the q/k projection's level");
+  AssertTrue(x.chan == cal_.in_chan,
+             "CiBertBaseLayer::Attention: the stream's public suppression is "
+             "not the calibration's in_chan (the projections carry it)");
   auto t0 = Clock::now();
   std::vector<Ct> q, k, v;
   {
@@ -1116,6 +1210,7 @@ void CiBertBaseLayer<word>::Attention(Stream &attn_out, Stream &x,
   o_in.clear();
   for (int c = 0; c < H; c++) AddScalar(attn_out.cts[c], attn_out.cts[c], bo_[c]);
   attn_out.carry = c_in_;
+  attn_out.chan = x.chan;    // the O projection's columns carry 1 / chan
   stages_.o += Since(t0);
   Tap("attn", attn_out.cts, c_in_);
 }
@@ -1126,6 +1221,7 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
                                       const std::vector<double> &g,
                                       const std::vector<double> &b,
                                       const typename Calibration::Norm &n,
+                                      const std::vector<double> &out_chan,
                                       const EvkMap<word> &evk,
                                       const std::string &tag) {
   NvtxScope _nv("bert-base: LayerNorm");
@@ -1138,19 +1234,27 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
                          "): the stream needs two levels (variance, apply)");
   auto t0 = Clock::now();
   const double c = pre.carry;
-  // centred' = H x_c - sum_k x_k  (= H c (x - mu)); an integer multiply
+  // centred' = H d_c x_c - sum_k d_k x_k  (= H c (x - mu)). The stream's
+  // public suppression comes out HERE, and this is why its entries are
+  // powers of two: an integer constant is encoded at scale 1, so both
+  // multiplies are exact and neither costs a level.
+  auto sup = [&pre](int i) {
+    return pre.chan.empty() ? 1.0 : pre.chan[i];
+  };
   Ct sum;
   for (int i = 0; i < H; i++) {
+    Ct dx;
+    MultInt(dx, pre.cts[i], sup(i));
     if (i == 0) {
-      boot_->Copy(sum, pre.cts[0]);
+      sum = std::move(dx);
     } else {
-      boot_->Add(sum, sum, pre.cts[i]);
+      boot_->Add(sum, sum, dx);
     }
   }
   std::vector<Ct> cen(H);
   for (int i = 0; i < H; i++) {
     Ct hx;
-    MultInt(hx, pre.cts[i], static_cast<double>(H));
+    MultInt(hx, pre.cts[i], static_cast<double>(H) * sup(i));
     boot_->Sub(cen[i], hx, sum);
   }
   sum = Ct();
@@ -1194,18 +1298,22 @@ void CiBertBaseLayer<word>::LayerNorm(Stream &out, const Stream &pre,
   out.cts.resize(H);
   const int lw = std::min(l, lr - 1);
   for (int i = 0; i < H; i++) {
-    // out_i = c_out (g_i (x - mu) r + b_i);  centred'_i = H c (x - mu)
+    // out_i = c_out (g_i (x - mu) r + b_i) / d_i;  centred'_i = H c (x - mu).
+    // The OUTPUT stream's suppression rides the per-channel constant that is
+    // already on r, and its bias -- free, like the input's.
+    const double d = out_chan.empty() ? 1.0 : out_chan[i];
     Ct rc, rd, cd, w;
-    MultScalar(rc, r, c_out * g[i] * undo_r / (static_cast<double>(H) * c));
+    MultScalar(rc, r, c_out * g[i] * undo_r / (static_cast<double>(H) * c * d));
     boot_->LevelDown(rd, rc, lw);
     boot_->LevelDown(cd, cen[i], lw);
     cen[i] = Ct();
     boot_->Mult(w, cd, rd);
     boot_->RelinearizeRescale(out.cts[i], w, mult_key);
-    AddScalar(out.cts[i], out.cts[i], c_out * b[i]);
+    AddScalar(out.cts[i], out.cts[i], c_out * b[i] / d);
     stages_.relins++;
   }
   out.carry = c_out;
+  out.chan = out_chan;
   stages_.ln += Since(t0);
   Tap(tag + "_out", out.cts, c_out);
 }
@@ -1266,6 +1374,7 @@ void CiBertBaseLayer<word>::FeedForward(Stream &out, const Stream &h,
   }
   for (int i = 0; i < H; i++) AddScalar(out.cts[i], out.cts[i], bout_[i]);
   out.carry = c_h_;
+  out.chan = h.chan;         // the down projection's columns carry 1 / chan
   Tap("y_ffn", out.cts, c_h_);
 }
 
@@ -1292,6 +1401,7 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   // h_pre = x + attn (both carry c_in)
   Stream h_pre;
   h_pre.carry = c_in_;
+  h_pre.chan = x.chan;
   h_pre.cts.resize(H);
   const int la = Level(attn.cts[0]);
   for (int c = 0; c < H; c++) {
@@ -1305,7 +1415,8 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   attn.cts.clear();
   Tap("h_pre", h_pre.cts, c_in_);
   Stream h;
-  LayerNorm(h, h_pre, w_.attn_norm, w_.attn_norm_bias, cal_.ln1, evk, "ln1");
+  LayerNorm(h, h_pre, w_.attn_norm, w_.attn_norm_bias, cal_.ln1,
+            cal_.ln1_chan, evk, "ln1");
   h_pre.cts.clear();
 
   Lift(h, TopLevel(), evk);
@@ -1313,6 +1424,7 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   FeedForward(y, h, evk);
   Stream z_pre;
   z_pre.carry = c_h_;
+  z_pre.chan = h.chan;
   z_pre.cts.resize(H);
   const int ly = Level(y.cts[0]);
   for (int c = 0; c < H; c++) {
@@ -1325,7 +1437,8 @@ void CiBertBaseLayer<word>::Layer(Stream &out, Stream &in,
   h.cts.clear();
   y.cts.clear();
   Tap("z_pre", z_pre.cts, c_h_);
-  LayerNorm(out, z_pre, w_.ffn_norm, w_.ffn_norm_bias, cal_.ln2, evk, "ln2");
+  LayerNorm(out, z_pre, w_.ffn_norm, w_.ffn_norm_bias, cal_.ln2,
+            cal_.ln2_chan, evk, "ln2");
   stages_.total = Since(t_all);
   if (cfg_.verbose) {
     const Stages &s = stages_;

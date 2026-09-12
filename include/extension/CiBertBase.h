@@ -190,6 +190,34 @@ class CiBertBaseLayer {
      */
     std::vector<PolySpec> gelu;      //!< [ffn tile]
     std::vector<int> gelu_perm;      //!< [hidden], the order the tiles cut
+    /**
+     * @brief The PUBLIC per-channel suppression of the three streams:
+     * `in_chan` for what enters the layer, `ln1_chan` for `h`, `ln2_chan`
+     * for the output. A ciphertext's message is `carry * value / chan[c]`,
+     * and every entry is a POWER OF TWO in [1, cap].
+     *
+     * BERT's residual stream is dimension-wise skewed -- at BERT-Base layer 4
+     * the LayerNorm output reaches 102 where a typical channel is ~1 -- and a
+     * single ride sizes every channel by the largest, so the typical channel
+     * sits at 1/60 of the bootstrap's input height and loses those bits. A
+     * channel is a whole ciphertext here, so its own scale is free on every
+     * path it takes:
+     *
+     *   - a projection that READS the stream folds `chan[c]` into its
+     *     weight's rows, and one that WRITES it folds `1 / chan[o]` into its
+     *     columns (and its bias), so the residual adds two streams that
+     *     carry the same factors;
+     *   - a LayerNorm has to undo it before the channel sum, and that is why
+     *     the entries are powers of TWO: `Context` encodes an integer
+     *     constant at scale 1, so `H chan[c] x_c - sum` is exact and costs
+     *     no level at all -- which is the whole difference from the
+     *     single-prompt line, where a channel was a slot and the same idea
+     *     cost a plaintext multiply.
+     *
+     * A suppression and its ride are ONE decision: `in_absmax` and the two
+     * norms' `out_absmax` are the maxima AFTER dividing by these.
+     */
+    std::vector<double> in_chan, ln1_chan, ln2_chan;
     double h_pre_absmax = 1.0, z_pre_absmax = 1.0;
   };
 
@@ -201,10 +229,15 @@ class CiBertBaseLayer {
     std::vector<double> attn_norm, attn_norm_bias, ffn_norm, ffn_norm_bias;
   };
 
-  /** @brief `model` (or `hidden`) ciphertexts and their public factor. */
+  /**
+   * @brief `model` (or `hidden`) ciphertexts and their public factors:
+   * ciphertext `c`'s message is `carry * value_c / chan[c]` (an empty `chan`
+   * is all ones). Both are public; `chan` is `Calibration::*_chan`.
+   */
   struct Stream {
     std::vector<Ct> cts;
     double carry = 1.0;
+    std::vector<double> chan;
   };
 
   struct Stages {
@@ -242,7 +275,8 @@ class CiBertBaseLayer {
   void Attention(Stream &attn_out, Stream &x, const EvkMap<word> &evk);
   void LayerNorm(Stream &out, const Stream &pre, const std::vector<double> &g,
                  const std::vector<double> &b,
-                 const typename Calibration::Norm &n, const EvkMap<word> &evk,
+                 const typename Calibration::Norm &n,
+                 const std::vector<double> &out_chan, const EvkMap<word> &evk,
                  const std::string &tag);
   void FeedForward(Stream &out, const Stream &h, const EvkMap<word> &evk);
 
@@ -270,9 +304,10 @@ class CiBertBaseLayer {
   struct HeadCalibration {
     PolySpec tanh;  //!< the pooler input's CERTIFIED interval (the sphere)
   };
-  //! `in_absmax`: the stream the head reads (the last layer's LN2 output).
+  //! `in_absmax` / `in_chan`: the stream the head reads (the last layer's
+  //! LN2 output) and its public per-channel suppression.
   void PrepareHead(const HeadWeights &w, const HeadCalibration &c,
-                   double in_absmax);
+                   double in_absmax, const std::vector<double> &in_chan);
   /**
    * @brief `logits`: `classes` ciphertexts in model units; the answer for
    * instance b is at token 0 (the [CLS] slot). Every other token's slot is
@@ -371,10 +406,21 @@ class CiBertBaseLayer {
   //! one GELU per feed-forward tile, and the permuted (and per-tile scaled)
   //! feed-forward tensors the tiles are cut from
   std::vector<std::unique_ptr<EvalPoly<word>>> gelu_poly_;
-  DeviceVector<float> wint_, wout_;
-  DeviceVector<int> perm_d_;
-  DeviceVector<float> gscale_d_;
-  void FoldFeedForwardWeights(const Weights &w, const Calibration &c);
+  //! the weights with the public per-channel factors folded in: a column
+  //! permutation and per-row / per-column gains, which is every way a
+  //! suppression, a GELU tile's `1 / a` and a stream's units enter a tensor
+  DeviceVector<float> fq_, fk_, fv_, fo_, fup_, fdown_, fpool_;
+  void FoldWeights(const Weights &w, const Calibration &c);
+  //! `dst[c][o] = src[c][cperm ? cperm[o] : o] * rgain[c] * cgain[o]`
+  //! (a null pointer means the identity / 1).
+  void FoldCols(DeviceVector<float> &dst, const float *src, int in, int out,
+                const std::vector<int> *cperm,
+                const std::vector<double> *rgain,
+                const std::vector<double> *cgain) const;
+  //! `dst[j][o] = src[rperm[j]][o] * cgain[o]`
+  void FoldRows(DeviceVector<float> &dst, const float *src, int rows, int cols,
+                const std::vector<int> &rperm,
+                const std::vector<double> *cgain) const;
   // the mask: T per-slot 0/1 plaintexts `M_d[t][b] = valid[b][(t + d) % T]`,
   // encoded at the level and scale `y` has (rebuilt when those change)
   std::vector<uint8_t> mask_valid_;
@@ -394,6 +440,7 @@ class CiBertBaseLayer {
   std::vector<double> hpb_, hcb_;     //!< folded pooler / classifier biases
   std::unique_ptr<EvalPoly<word>> tanh_poly_;
   double c_head_ = 0.0;               //!< the carry `Head` expects
+  std::vector<double> head_chan_;     //!< the suppression it expects
   int classes_ = 0;
   mutable Stages stages_;
 };

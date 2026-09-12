@@ -127,6 +127,14 @@ Layer::Calibration ReadCalib(const json &cj) {
   // channels by their |u| makes the tile the band, free of any mask
   for (const auto &p : cj["gelu"]["tiles"]) c.gelu.push_back(Spec(p));
   c.gelu_perm = cj["gelu"]["perm"].get<std::vector<int>>();
+  // the three streams' PUBLIC per-channel suppression (powers of two)
+  auto chan = [&cj](const char *name) {
+    return cj.contains(name) ? cj[name].get<std::vector<double>>()
+                             : std::vector<double>();
+  };
+  c.in_chan = chan("in_chan");
+  c.ln1_chan = chan("ln1_chan");
+  c.ln2_chan = chan("ln2_chan");
   c.h_pre_absmax = cj["h_pre_absmax"].get<double>();
   c.z_pre_absmax = cj["z_pre_absmax"].get<double>();
   return c;
@@ -175,7 +183,8 @@ struct LayerFiles {
 // (instance b holds prompt b % N), carrying `carry`, at `level`.
 void EncryptPrompts(Ring &ring, const CiBatchLayout &layout,
                     const std::vector<double> &x, int N, int H, int live,
-                    double carry, int level, std::vector<Ciphertext<word>> &cts) {
+                    double carry, const std::vector<double> &chan, int level,
+                    std::vector<Ciphertext<word>> &cts) {
   const int T = layout.num_tokens;
   const double scale = ring.param->GetScale(level);
   cts.clear();
@@ -183,11 +192,12 @@ void EncryptPrompts(Ring &ring, const CiBatchLayout &layout,
   std::vector<double> values(static_cast<size_t>(layout.num_instances) * T, 0.0);
   std::vector<Complex> msg;
   for (int c = 0; c < H; c++) {
+    // message = carry * value / chan[c]: the public per-channel suppression
+    const double f = carry / (chan.empty() ? 1.0 : chan[c]);
     for (int b = 0; b < live; b++) {
       const size_t n = static_cast<size_t>(b % N);
       for (int t = 0; t < T; t++) {
-        values[static_cast<size_t>(b) * T + t] =
-            carry * x[(n * T + t) * H + c];
+        values[static_cast<size_t>(b) * T + t] = f * x[(n * T + t) * H + c];
       }
     }
     layout.Pack(msg, values);
@@ -200,7 +210,8 @@ void EncryptPrompts(Ring &ring, const CiBatchLayout &layout,
 // Decrypt every channel; `y[b][t][c]` in model units (divided by `carry`).
 void DecryptAll(Ring &ring, const CiBatchLayout &layout,
                 const std::vector<Ciphertext<word>> &cts, int H, int live,
-                double carry, std::vector<double> &y) {
+                double carry, const std::vector<double> &chan,
+                std::vector<double> &y) {
   const int T = layout.num_tokens;
   y.assign(static_cast<size_t>(live) * T * H, 0.0);
   std::vector<Complex> msg;
@@ -210,10 +221,11 @@ void DecryptAll(Ring &ring, const CiBatchLayout &layout,
     ring.ui->Decrypt(pt, cts[c]);
     ring.context->encoder_.Decode(msg, pt);
     layout.Unpack(values, msg);
+    const double f = (chan.empty() ? 1.0 : chan[c]) / carry;
     for (int b = 0; b < live; b++) {
       for (int t = 0; t < T; t++) {
         y[(static_cast<size_t>(b) * T + t) * H + c] =
-            values[static_cast<size_t>(b) * T + t] / carry;
+            values[static_cast<size_t>(b) * T + t] * f;
       }
     }
   }
@@ -420,9 +432,10 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
     files.Load(layer_dir(first), H, I);
     layer.Prepare(files.w, ReadCalib(calib["layers"][first]));
     in.carry = layer.InputCarry();
+    in.chan = ReadCalib(calib["layers"][first]).in_chan;
     const int top = layer.TopLevel();
     const int level = std::min(EnvInt("BERT_BASE_INPUT_LEVEL", top), boot.enc_level);
-    EncryptPrompts(boot, layout, x0, N, H, live, in.carry, level, in.cts);
+    EncryptPrompts(boot, layout, x0, N, H, live, in.carry, in.chan, level, in.cts);
     x0.clear();
     x0.shrink_to_fit();
     std::cout << "  input at level " << level << ", carry " << in.carry
@@ -441,7 +454,8 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
     layer.SetProbe([&](const std::string &name,
                        const std::vector<Ciphertext<word>> &cts, double factor) {
       std::vector<double> all;
-      DecryptAll(boot, layout, cts, static_cast<int>(cts.size()), live, factor, all);
+      DecryptAll(boot, layout, cts, static_cast<int>(cts.size()), live, factor,
+                 {}, all);
       // DecryptAll is [b][t][c]; write [c][b][t]
       const int n = static_cast<int>(cts.size());
       std::vector<double> out(static_cast<size_t>(n) * live * T);
@@ -474,7 +488,7 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
     Err e;
     if (have_ref) {
       std::vector<double> got, want;
-      DecryptAll(boot, layout, out.cts, H, live, out.carry, got);
+      DecryptAll(boot, layout, out.cts, H, live, out.carry, out.chan, got);
       char name[16];
       std::snprintf(name, sizeof name, "/h_L%02d.f64", L);
       ASSERT_TRUE(ReadF64(rd + name, static_cast<size_t>(N) * T * H, want)) << rd + name;
@@ -503,7 +517,9 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
   // The head: the pooler + classifier on the last layer's output, the
   // answer of instance b at its [CLS] slot (token 0).
   if (want_head) {
-    layer.PrepareHead(hw, hc, calib["layers"][last]["ln2"]["out_absmax"].get<double>());
+    layer.PrepareHead(hw, hc,
+                      calib["layers"][last]["ln2"]["out_absmax"].get<double>(),
+                      ReadCalib(calib["layers"][last]).ln2_chan);
     auto th = std::chrono::steady_clock::now();
     std::vector<Ciphertext<word>> logits;
     layer.Head(logits, in, evk);
@@ -512,7 +528,7 @@ TEST(CiBertBase, TheChainRunsOnTheRealWeights) {
                               std::chrono::steady_clock::now() - th).count();
     const int C = static_cast<int>(logits.size());
     std::vector<double> got;
-    DecryptAll(boot, layout, logits, C, live, 1.0, got);  // [b][t][c]
+    DecryptAll(boot, layout, logits, C, live, 1.0, {}, got);  // [b][t][c]
     std::vector<double> want;
     const bool have_logits =
         ReadF64(rd + "/cls_logits.f64", static_cast<size_t>(N) * C, want);
