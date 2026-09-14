@@ -372,6 +372,13 @@ def main():
                          "(1 = off): a stream channel is a whole ciphertext, "
                          "so its own scale is free everywhere but EvalMod")
     ap.add_argument("--chunk", type=int, default=64, help="prompts at a time")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="use only the first N calibration prompts. A window "
+                         "is a maximum over TOKEN POSITIONS, so the honest "
+                         "scaling across shapes is a constant token count: "
+                         "1000 at T = 128 is 250 at T = 512, where a "
+                         "calibration costs quadratically more through the "
+                         "scores.")
     ap.add_argument("--no-chain", action="store_true",
                     help="write the calibration without running the host "
                          "chain (the windows need only the exact forward)")
@@ -388,6 +395,9 @@ def main():
     m = Model(a.all_dir)
     x = m.prompts(a.inputs) if a.inputs else m.input()
     valid = m.valid(mask_beside(a.inputs))
+    if a.limit:
+        x = x[:a.limit]
+        valid = None if valid is None else valid[:a.limit]
     amask = Model.additive_mask(valid)
     N = x.shape[0]
     chunk = max(1, min(a.chunk, N))

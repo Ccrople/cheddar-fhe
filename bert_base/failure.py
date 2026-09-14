@@ -201,7 +201,9 @@ def main():
                "margin_p99": float(np.quantile(tracer.margin[:done], 0.99)),
                "index": idx[:done].tolist(),
                "esc_per_prompt": tracer.esc[:done].tolist(),
-               "margin_per_prompt": [round(v, 5) for v in tracer.margin[:done]],
+               # .tolist() and not a comprehension: round() on an np.float64
+               # gives an np.float64 back, which json cannot serialise
+               "margin_per_prompt": np.round(tracer.margin[:done], 5).tolist(),
                "where": {k: v for k, v in sorted(tracer.where.items())}}
         if rel is not None:
             out["rel_per_prompt"] = [float(v) for v in rel[:done]]

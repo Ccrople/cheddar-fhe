@@ -21,13 +21,18 @@ R=$B/held_ref$T
 S=/root/work/cheddar-bb/bert_base
 MARGINS="--margin 5.0 --gelu-margin 1.8 --exp-margin 2.0 --exp-margin-hi 2.0
          --inv-max-degree 255"
+# A window is a maximum over TOKEN POSITIONS, so the population is sized in
+# tokens and not in prompts: 1000 x 128 = 250 x 512. A calibration costs
+# quadratically more in T through the scores, and this is what keeps T = 512
+# from taking twelve hours to say the same thing.
+NCAL=$((128000 / T))
 rm -f "$B/host_done_$T"
 mkdir -p "$R"
 cd "$S" || exit 1
 
 # ---- the population calibration (1000 prompts of the TRAIN split) --------
 ( python3.12 -u sim.py "$B/all$T" "$R/calib.json" \
-    --inputs "$B/all$T/prompts/inputs.f32" --no-chain $MARGINS \
+    --inputs "$B/all$T/prompts/inputs.f32" --no-chain --limit "$NCAL" $MARGINS \
     > "$R/sim.log" 2>&1 || echo SIM_FAIL >> "$R/sim.log" ) &
 
 # ---- the held-out prompts the card serves, through float64 --------------
