@@ -53,6 +53,35 @@ from sim import BandedGelu, ChoSoftmax, Poly, suppression    # noqa: E402,F401
 
 
 # --------------------------------------------------------------- the tracer
+def to_gpu(m):
+    """Move the model onto the card and make `model.py` compute there.
+
+    `model.py` is written against `np`, and cupy is that API, so the whole
+    chain moves by rebinding the module's `np` and its `erf`. The weights
+    are read by `np.fromfile`, which cupy does not have, so they are loaded
+    on the host as usual and transferred here.
+
+    Worth it because the scan is a plain forward pass: 50,000 prompts of
+    T = 512 is four and a half hours on this container's ELEVEN cores (the
+    quota says 96 and lies) and minutes on the A100 beside it. The card has
+    to be free -- one memory-heavy job per GPU -- so this runs between
+    crypto runs, and its answer is checked against the host's on a shape
+    both have done.
+    """
+    import cupy as cp
+    import cupyx.scipy.special as cs
+    import model as M
+
+    cvt = lambda d: {k: cp.asarray(v) for k, v in d.items()}      # noqa: E731
+    m.w = [cvt(w) for w in m.w]
+    if m.head_w is not None:
+        m.head_w = cvt(m.head_w)
+    if hasattr(m, "_emb"):
+        m._emb = tuple(cp.asarray(v) for v in m._emb)
+    M.np, M._erf = cp, cs.erf
+    return cp
+
+
 class Tracer:
     """Per-PROMPT escape counts, worst margins, and which window it was.
 
@@ -68,6 +97,11 @@ class Tracer:
         self.where = {}                    # tag -> [slots, worst +t, worst -t]
         self.base = 0                                # this chunk's first prompt
 
+    @staticmethod
+    def host(a):
+        """cupy -> numpy; the reductions that reach here are [chunk]-sized."""
+        return a.get() if hasattr(a, "get") else a
+
     def note(self, tag, t):
         """`t` is the argument mapped onto [-1, 1]; outside it, the fit is not
         a fit. Escape is |t| > 1 either way, but the two ends fail
@@ -81,8 +115,8 @@ class Tracer:
         in 1e4 from escaping" for a calibration that is nowhere near it.
         """
         axes = tuple(range(1, t.ndim))
-        hi = t.max(axis=axes) if axes else t
-        lo = (-t).max(axis=axes) if axes else -t
+        hi = self.host(t.max(axis=axes) if axes else t)
+        lo = self.host((-t).max(axis=axes) if axes else -t)
         sl = slice(self.base, self.base + hi.shape[0])
         np.maximum(self.margin[sl], np.maximum(hi, lo), out=self.margin[sl])
         np.maximum(self.top[sl], hi, out=self.top[sl])
@@ -90,7 +124,7 @@ class Tracer:
         row[1] = max(row[1], float(hi.max()))
         row[2] = max(row[2], float(lo.max()))
         if hi.max() > 1.0 or lo.max() > 1.0:      # this chunk's own, not the
-            cnt = (np.abs(t) > 1.0).sum(axis=axes)  # accumulated maximum
+            cnt = self.host((abs(t) > 1.0).sum(axis=axes))  # accumulated max
             self.esc[sl] += cnt
             row[0] += int(cnt.sum())
 
@@ -122,7 +156,7 @@ class Checked:
         return C.chebval(t, self.c) if self.approximate else self.f(x)
 
 
-def rebuild(m, cal, tracer, approximate, L, dt=np.float64):
+def rebuild(m, cal, tracer, approximate, L, dt=np.float64, xp=np):
     """Layer L's four hooks, from the calibration as it ships.
 
     `dt` is the stream's dtype: the shift and the fold estimates are public
@@ -132,18 +166,19 @@ def rebuild(m, cal, tracer, approximate, L, dt=np.float64):
     cj = cal["layers"][L]
     mk = lambda f, j, tag: Checked(f, j["lo"], j["hi"], j["degree"],  # noqa: E731
                                    "L%02d.%s" % (L, tag), tracer, approximate)
-    inv_sqrt = lambda v: 1.0 / np.sqrt(v)                            # noqa: E731
-    ln_f = lambda v: 1.0 / np.sqrt(v + m.eps)                        # noqa: E731
+    inv_sqrt = lambda v: 1.0 / xp.sqrt(v)                            # noqa: E731
+    ln_f = lambda v: 1.0 / xp.sqrt(v + m.eps)                        # noqa: E731
 
     s = cj["softmax"]
-    est = [None if not e else np.asarray(e, dtype=dt) for e in s.get("est", [])] or None
-    sm = ChoSoftmax(s["niter"], np.asarray(s["shift"], dtype=dt),
-                    mk(np.exp, s["exp"], "exp"),
+    est = [None if not e else xp.asarray(np.asarray(e, dtype=dt))
+           for e in s.get("est", [])] or None
+    sm = ChoSoftmax(s["niter"], xp.asarray(np.asarray(s["shift"], dtype=dt)),
+                    mk(xp.exp, s["exp"], "exp"),
                     [mk(inv_sqrt, q, "inv%d" % j) for j, q in enumerate(s["inv"])],
                     est, s.get("est_live_pow") or None)
 
     g = cj["gelu"]
-    gl = BandedGelu(np.asarray(g["perm"]), int(g["tile"]),
+    gl = BandedGelu(xp.asarray(np.asarray(g["perm"])), int(g["tile"]),
                     [mk(gelu, q, "gelu%d" % t) for t, q in enumerate(g["tiles"])])
     return {"softmax": sm, "gelu": gl,
             "ln1": mk(ln_f, cj["ln1"], "ln1"), "ln2": mk(ln_f, cj["ln2"], "ln2")}
@@ -157,6 +192,10 @@ def main():
     ap.add_argument("--inputs", default="")
     ap.add_argument("--ids", default="", help="ids.u32 instead of inputs.f32")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the chain on the card through cupy (exact scan "
+                         "only). The card must be FREE -- one memory-heavy "
+                         "job per GPU.")
     ap.add_argument("--resume", action="store_true",
                     help="continue a part that already holds some prompts")
     ap.add_argument("--f32", action="store_true",
@@ -175,6 +214,7 @@ def main():
     a = ap.parse_args()
 
     m = Model(a.all_dir)
+    assert not (a.gpu and a.approx), "--gpu is the exact scan only"
     if a.f32:
         # The scan decides a RATIO of order one (is |t| over 1?), and f32's
         # 1e-7 is nowhere near any margin; sgemm is about twice dgemm, which
@@ -209,10 +249,18 @@ def main():
 
     tracer = Tracer(n)
     dt = np.float32 if a.f32 else np.float64
-    hooks = [rebuild(m, cal, tracer, a.approx, L, dt) for L in range(NL)]
+    xp = np
+    if a.gpu:
+        m.embed_ids(np.zeros((1, m.T), dtype=np.int64))   # builds m._emb first
+        xp = to_gpu(m)
+        import sim as S
+        S.np = xp                          # ChoSoftmax and live_of live there
+    hooks = [rebuild(m, cal, tracer, a.approx, L, dt, xp) for L in range(NL)]
     am = Model.additive_mask(valid)
     if am is not None and a.f32:
         am = am.astype(np.float32)          # -inf survives the cast
+    if am is not None and a.gpu:
+        am = xp.asarray(am)
     rel = np.zeros(n) if a.approx else None       # the last layer's, per prompt
     agree = np.zeros(n, dtype=bool) if a.head else None
     tanh = None
@@ -278,7 +326,8 @@ def main():
         c1 = min(n, c0 + chunk)
         tracer.base = c0
         sel = idx[c0:c1]
-        h = m.embed_ids(ids[sel]) if a.ids else xs[sel]
+        src_chunk = xp.asarray(ids[sel]) if a.ids else xp.asarray(xs[sel])
+        h = m.embed_ids(src_chunk) if a.ids else src_chunk
         if a.f32:
             h = h.astype(np.float32)
         e = h
