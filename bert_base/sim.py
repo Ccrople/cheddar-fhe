@@ -339,6 +339,13 @@ def main():
                          "that beats it lands above `hi` by the excess over "
                          "2^k -- four layers of BERT-Base did exactly that.")
     ap.add_argument("--gelu-margin", type=float, default=1.2)
+    ap.add_argument("--inv0-margin", type=float, default=0.0,
+                    help="the FIRST Cho window's margin (0 = --margin). It "
+                         "is the only window that escapes -- every escaped "
+                         "slot of 50,000 held-out prompts at T = 256 was in "
+                         "`inv0` -- because the fold's `est` is a "
+                         "calibration statistic and a held-out row's spread "
+                         "can beat every calibration row's (measured 10.9x).")
     ap.add_argument("--ln-margin", type=float, default=0.0,
                     help="the LayerNorms' variance window margin (0 = "
                          "--margin). It should NOT be the softmax's. A "
@@ -465,7 +472,19 @@ def main():
         probe = np.linspace(exp_poly.lo, exp_poly.hi, 4001)
         print("     exp: worst RELATIVE error over the domain %.2e"
               % float(np.abs(exp_poly(probe) / np.exp(probe) - 1).max()))
-        inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin, hi * a.margin,
+        # The FIRST Cho window is the one that escapes, and it is the only
+        # one: 50,000 held-out prompts at T = 256 put every escaped slot in
+        # `inv0` (L08 at 3.4x its top, L03/L07/L10 behind it) and none in
+        # `inv1`, `inv2`, the exp, the GELU or either LayerNorm. The reason
+        # is the FOLD: `est` is a per-(head, token) geometric mean of the
+        # CALIBRATION population, and a held-out row whose spread beats
+        # every calibration row's lands above the top by that excess --
+        # measured at 10.9x the population maximum. The later passes see a
+        # normalised distribution and are near-theorems, so they are not
+        # widened with it.
+        im = a.inv0_margin if a.inv0_margin > 0 else a.margin
+        inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / (im if j == 0 else a.margin),
+                          hi * (im if j == 0 else a.margin),
                           a.inv_tol if a.inv_tol > 0 else a.tol,
                           relative=True, name="inv%d" % j,
                           max_degree=a.inv_max_degree)
@@ -623,6 +642,7 @@ def main():
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
                      "gelu_margin": a.gelu_margin, "ln_margin": lnm,
+                     "inv0_margin": a.inv0_margin or a.margin,
                      "sq_ratio": a.sq_ratio,
                      "exp_margin_hi": exp_hi_margin,
                      "inv_max_degree": a.inv_max_degree,
