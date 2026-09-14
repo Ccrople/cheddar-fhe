@@ -20,13 +20,20 @@ O=$B/scan$T/out
 S=/root/work/cheddar-bb/bert_base
 mkdir -p "$O"
 cd "$S" || exit 1
+# One scan at a time. Three shapes' scans would be 72 numpy processes on 96
+# cores beside a crypto run that needs the host for its launches and
+# staging -- and the first measurement of that cost was a layer at 310 s
+# against the 137-270 s the same shape used to take. Serialising costs no
+# throughput (the total work is fixed) and gives the card its cores back.
+exec 9> /root/bert_base/.scan.lock
+flock 9
 export OMP_NUM_THREADS=$((96 / W))
 export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
 LIM=""
 [ "$LIMIT" != "0" ] && LIM="--limit $LIMIT"
 echo "==== $(date -u) scan T=$T, $W workers x $OMP_NUM_THREADS threads $LIM $*"
 for i in $(seq 0 $((W - 1))); do
-  python3.12 -u failure.py "$B/all$T" "$B/held_ref$T/calib.json" \
+  nice -n 19 python3.12 -u failure.py "$B/all$T" "$B/held_ref$T/calib.json" \
     --ids "$B/scan$T/prompts/ids.u32" --slice "$i/$W" --f32 --resume \
     --out "$O/part_$i.json" $LIM "$@" > "$O/part_$i.log" 2>&1 &
 done
