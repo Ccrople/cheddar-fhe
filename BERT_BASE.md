@@ -376,6 +376,20 @@ outside, a degree-511 polynomial is astronomical. **`T * B = 65536`, so a
 per-prompt rate `p` is a per-BATCH rate `1 - (1 - p)^B`** -- which is the
 number a deployment actually lives with.
 
+### On the card, with the same calibration the scan cleared
+
+**(512, 128), 512 held-out WikiText-2 test prompts, twelve layers + head:**
+
+| L0 | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | head |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **-11.18** | **-10.67** | -7.74 | -7.81 | -7.77 | -7.80 | -7.82 | -7.88 | -7.83 | -6.45 | **-5.51** | -5.47 | **-6.32, labels 512 / 512** |
+
+76 min 28 s, PASSED. The same shape on the margins that shipped before had
+**layer 10 at 2^+130.69 and 256 / 512 labels** — and that run's 512 prompts
+scanned CLEAN, which is what said the fault was the window's WIDTH and not
+its reach. Layers 0 and 1 are 0.45 and 0.91 bits BETTER than that run's, in
+253 s against 310 s a layer, on 2,304 bootstraps against 3,072.
+
 ### The rate, before and after
 
 50,000 WikiText-2 test prompts a shape, against the calibration that ships.
