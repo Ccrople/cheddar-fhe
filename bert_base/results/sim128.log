@@ -1,0 +1,140 @@
+calibration: 1000 prompt(s), T 128, H 768, 12 layers, padded (real tokens 3..128)
+     exp: worst RELATIVE error over the domain 6.03e-05
+layer 0: Cho k=2, shift |.| <= 14.328, u [-5.85, 0.40]
+     window 0: raw 2.45e+03 x  ->  seen 46 x  (fold, live^1)
+     window 1: raw 125 x  ->  seen 125 x
+    exp    [   -7.849,       2.4] deg  15 (4 lv) err 4.3e-08
+    inv0   [  0.02947,     203.6] deg 255 (8 lv) err 1.2e-03
+    inv1   [ 0.001595,     4.993] deg 255 (8 lv) err 5.3e-05
+    ln1    [   0.1245,     1.137] deg  15 (4 lv) err 7.8e-06
+    ln2    [   0.6572,     15.55] deg  31 (5 lv) err 6.7e-07
+     gelu   12 tiles of 256: |u| 33.8 .. 8.9, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 5.3e-06
+     chan: suppression <= 16x  -> |x| 1.39, |h| 65.38 -> 7.95, |z| 10.07 -> 1.26
+     exp: worst RELATIVE error over the domain 1.28e-02
+layer 1: Cho k=2, shift |.| <= 18.902, u [-9.00, 0.01]
+     window 0: raw 5.06e+04 x  ->  seen 79.8 x  (fold, live^1)
+     window 1: raw 119 x  ->  seen 119 x
+    exp    [      -11,     2.012] deg  15 (4 lv) err 4.5e-07
+    inv0   [  0.02239,       268] deg 255 (8 lv) err 6.1e-03
+    inv1   [ 0.001612,     4.811] deg 255 (8 lv) err 4.2e-05
+    ln1    [   0.1395,     1.356] deg  31 (5 lv) err 2.0e-10
+    ln2    [   0.5577,     17.32] deg  31 (5 lv) err 4.1e-06
+     gelu   12 tiles of 256: |u| 38.3 .. 8.4, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 6.6e-07
+     chan: suppression <= 16x  -> |x| 1.26, |h| 70.78 -> 7.83, |z| 11.39 -> 1.42
+     exp: worst RELATIVE error over the domain 3.24e-01
+layer 2: Cho k=3, shift |.| <= 36.895, u [-9.44, 1.45]
+     window 0: raw 1.75e+05 x  ->  seen 123 x  (fold, live^1)
+     window 1: raw 123 x  ->  seen 123 x
+     window 2: raw 120 x  ->  seen 120 x
+    exp    [   -11.44,     3.453] deg  15 (4 lv) err 8.1e-06
+    inv0   [  0.01805,     332.4] deg 255 (8 lv) err 1.7e-02
+    inv1   [ 0.001584,     4.876] deg 255 (8 lv) err 4.9e-05
+    inv2   [ 0.001665,         5] deg 255 (8 lv) err 4.3e-05
+    ln1    [   0.1416,     1.524] deg  31 (5 lv) err 6.3e-10
+    ln2    [   0.5764,     143.5] deg 127 (7 lv) err 3.4e-08
+     gelu   12 tiles of 256: |u| 109.0 .. 8.3, deg 511/63/63/63/63/63/63/63/63/63/63/63, worst err 2.2e-06
+     chan: suppression <= 16x  -> |x| 1.42, |h| 54.51 -> 6.72, |z| 14.84 -> 1.85
+     exp: worst RELATIVE error over the domain 9.80e-03
+layer 3: Cho k=2, shift |.| <= 19.229, u [-8.73, 0.14]
+     window 0: raw 5.66e+04 x  ->  seen 146 x  (fold, live^1)
+     window 1: raw 108 x  ->  seen 108 x
+    exp    [   -10.73,     2.141] deg  15 (4 lv) err 4.5e-07
+    inv0   [  0.01654,     362.7] deg 255 (8 lv) err 2.4e-02
+    inv1   [ 0.001753,     4.739] deg 255 (8 lv) err 2.5e-05
+    ln1    [    0.147,     1.483] deg  31 (5 lv) err 3.0e-10
+    ln2    [   0.5834,     70.57] deg  63 (6 lv) err 3.8e-06
+     gelu   12 tiles of 256: |u| 108.0 .. 8.6, deg 511/127/63/63/63/63/63/63/63/63/63/63, worst err 1.8e-06
+     chan: suppression <= 16x  -> |x| 1.85, |h| 94.21 -> 9.87, |z| 13.39 -> 1.67
+     exp: worst RELATIVE error over the domain 1.75e-04
+layer 4: Cho k=2, shift |.| <= 15.895, u [-6.54, 0.22]
+     window 0: raw 5.31e+03 x  ->  seen 164 x  (fold, live^1)
+     window 1: raw 98.1 x  ->  seen 98.1 x
+    exp    [   -8.542,     2.221] deg  15 (4 lv) err 6.4e-08
+    inv0   [  0.01562,     384.1] deg 255 (8 lv) err 2.9e-02
+    inv1   [ 0.001756,     4.307] deg 255 (8 lv) err 1.5e-05
+    ln1    [   0.1005,     1.712] deg  31 (5 lv) err 5.3e-08
+    ln2    [   0.5272,     69.12] deg  63 (6 lv) err 6.2e-06
+     gelu   12 tiles of 256: |u| 110.7 .. 8.5, deg 511/63/63/63/63/63/63/63/63/63/63/63, worst err 3.1e-06
+     chan: suppression <= 16x  -> |x| 1.67, |h| 102.77 -> 8.74, |z| 14.80 -> 1.85
+     exp: worst RELATIVE error over the domain 2.66e-02
+layer 5: Cho k=2, shift |.| <= 17.353, u [-9.17, 0.26]
+     window 0: raw 1.73e+04 x  ->  seen 205 x  (fold, live^1)
+     window 1: raw 93.9 x  ->  seen 93.9 x
+    exp    [   -11.17,     2.256] deg  15 (4 lv) err 8.1e-07
+    inv0   [  0.01396,     429.7] deg 255 (8 lv) err 4.3e-02
+    inv1   [ 0.001973,      4.63] deg 255 (8 lv) err 1.2e-05
+    ln1    [  0.08994,     1.904] deg  31 (5 lv) err 3.0e-07
+    ln2    [   0.5358,     51.85] deg  63 (6 lv) err 9.0e-07
+     gelu   12 tiles of 256: |u| 89.6 .. 8.1, deg 511/63/63/63/63/63/63/63/63/63/63/63, worst err 7.2e-07
+     chan: suppression <= 16x  -> |x| 1.85, |h| 93.39 -> 8.06, |z| 16.03 -> 2.00
+     exp: worst RELATIVE error over the domain 8.60e-03
+layer 6: Cho k=2, shift |.| <= 15.966, u [-8.47, 0.32]
+     window 0: raw 7.74e+03 x  ->  seen 109 x  (fold, live^1)
+     window 1: raw 94.5 x  ->  seen 94.5 x
+    exp    [   -10.47,     2.321] deg  15 (4 lv) err 5.1e-07
+    inv0   [  0.01913,     313.7] deg 255 (8 lv) err 1.3e-02
+    inv1   [ 0.001907,     4.504] deg 255 (8 lv) err 1.2e-05
+    ln1    [   0.1228,     1.915] deg  31 (5 lv) err 2.4e-08
+    ln2    [    0.508,     35.33] deg  63 (6 lv) err 7.9e-08
+     gelu   12 tiles of 256: |u| 46.8 .. 7.7, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 2.8e-07
+     chan: suppression <= 16x  -> |x| 2.00, |h| 92.33 -> 7.57, |z| 16.44 -> 2.05
+     exp: worst RELATIVE error over the domain 4.10e-02
+layer 7: Cho k=2, shift |.| <= 17.786, u [-9.10, 0.57]
+     window 0: raw 4.3e+03 x  ->  seen 250 x  (fold, live^1)
+     window 1: raw 72.5 x  ->  seen 72.5 x
+    exp    [    -11.1,     2.573] deg  15 (4 lv) err 1.4e-06
+    inv0   [  0.01266,     473.9] deg 255 (8 lv) err 5.8e-02
+    inv1   [ 0.002566,      4.65] deg 255 (8 lv) err 2.6e-06
+    ln1    [   0.1038,     1.885] deg  31 (5 lv) err 9.0e-08
+    ln2    [   0.5044,     21.21] deg  63 (6 lv) err 8.0e-10
+     gelu   12 tiles of 256: |u| 37.0 .. 7.8, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 3.7e-08
+     chan: suppression <= 16x  -> |x| 2.05, |h| 91.01 -> 9.90, |z| 21.72 -> 2.71
+     exp: worst RELATIVE error over the domain 4.86e-07
+layer 8: Cho k=3, shift |.| <= 17.493, u [-3.65, 0.49]
+     window 0: raw 401 x  ->  seen 19 x  (fold, live^1)
+     window 1: raw 61.8 x  ->  seen 61.8 x
+     window 2: raw 98.6 x  ->  seen 98.6 x
+    exp    [    -5.65,      2.49] deg  15 (4 lv) err 2.7e-09
+    inv0   [  0.04586,     130.8] deg 255 (8 lv) err 3.3e-05
+    inv1   [ 0.001658,     2.561] deg 255 (8 lv) err 9.3e-07
+    inv2   [ 0.001911,     4.711] deg 255 (8 lv) err 1.6e-05
+    ln1    [  0.08363,     1.944] deg  31 (5 lv) err 5.9e-07
+    ln2    [   0.3863,     96.85] deg 127 (7 lv) err 3.6e-08
+     gelu   12 tiles of 256: |u| 48.3 .. 8.1, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 1.0e-07
+     chan: suppression <= 16x  -> |x| 2.71, |h| 86.50 -> 8.46, |z| 26.52 -> 3.31
+     exp: worst RELATIVE error over the domain 4.03e-03
+layer 9: Cho k=2, shift |.| <= 18.082, u [-7.62, 0.76]
+     window 0: raw 1.23e+04 x  ->  seen 225 x  (fold, live^1)
+     window 1: raw 103 x  ->  seen 103 x
+    exp    [   -9.619,     2.762] deg  15 (4 lv) err 5.5e-07
+    inv0   [  0.01334,     449.6] deg 255 (8 lv) err 5.0e-02
+    inv1   [ 0.001676,     4.316] deg 255 (8 lv) err 2.0e-05
+    ln1    [  0.06689,     2.575] deg  63 (6 lv) err 3.1e-10
+    ln2    [   0.3571,      3244] deg 511 (9 lv) err 1.0e-05
+     gelu   12 tiles of 256: |u| 177.7 .. 8.2, deg 511/63/63/63/63/63/63/63/63/63/63/63, worst err 3.5e-03
+     chan: suppression <= 16x  -> |x| 3.31, |h| 53.85 -> 5.64, |z| 28.21 -> 3.53
+     exp: worst RELATIVE error over the domain 1.03e-02
+layer 10: Cho k=2, shift |.| <= 17.596, u [-7.97, 0.92]
+     window 0: raw 1.75e+04 x  ->  seen 216 x  (fold, live^1)
+     window 1: raw 121 x  ->  seen 121 x
+    exp    [   -9.974,     2.923] deg  15 (4 lv) err 1.0e-06
+    inv0   [   0.0136,     441.1] deg 255 (8 lv) err 4.7e-02
+    inv1   [ 0.001587,     4.786] deg 255 (8 lv) err 4.4e-05
+    ln1    [  0.02459,     2.315] deg  63 (6 lv) err 7.5e-07
+    ln2    [   0.3271,      2630] deg 511 (9 lv) err 4.9e-06
+     gelu   12 tiles of 256: |u| 259.9 .. 8.2, deg 511/63/63/63/63/63/63/63/63/63/63/63, worst err 4.6e-02
+     chan: suppression <= 16x  -> |x| 3.53, |h| 57.42 -> 6.64, |z| 32.53 -> 4.05
+     exp: worst RELATIVE error over the domain 5.61e-04
+layer 11: Cho k=2, shift |.| <= 14.158, u [-6.69, 0.65]
+     window 0: raw 5.55e+03 x  ->  seen 86.1 x  (fold, live^1)
+     window 1: raw 103 x  ->  seen 103 x
+    exp    [   -8.693,     2.654] deg  15 (4 lv) err 1.8e-07
+    inv0   [  0.02155,     278.4] deg 255 (8 lv) err 7.4e-03
+    inv1   [ 0.001703,     4.399] deg 255 (8 lv) err 2.0e-05
+    ln1    [  0.01527,      2.83] deg 127 (7 lv) err 2.4e-09
+    ln2    [   0.4392,      22.4] deg  63 (6 lv) err 5.3e-09
+     gelu   12 tiles of 256: |u| 29.4 .. 7.2, deg 255/63/63/63/63/63/63/63/63/63/63/63, worst err 2.9e-10
+     chan: suppression <= 16x  -> |x| 4.05, |h| 42.68 -> 5.12, |z| 9.85 -> 1.23
+head: pooler input certified in [-54.22, 54.65]
+    tanh   [   -54.22,     54.65] deg 511 (9 lv) err 9.3e-07
+calib -> /root/bert_base/held_ref128/calib_v3.json

@@ -1,0 +1,88 @@
+NVIDIA A100-SXM4-80GB, 0 MiB, 81920 MiB
+Running main() from /root/work/cheddar-bb/build_bb/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from CiBertBase
+[ RUN      ] CiBertBase.TheChainRunsOnTheRealWeights
+WARN: UserInterface is for testing purposes only. Do not use in production.
+  BERT-Base: layers 0..11 of 12, H 768, I 3072, 12 heads x 64; T 512 x B 128 (128 live) on ci16_35_k16_w58.json
+CtS preparation phase 0 (level 31)
+CtS preparation phase 1 (level 30)
+CtS preparation phase 2 (level 29)
+CtS preparation phase 3 (level 28)
+StC preparation phase 0
+StC preparation phase 1
+StC preparation phase 2
+  setup 7.41391 s
+  128 prompt(s) -> 128 instance(s)
+  mask /root/bert_base/held512/serve/prompts/mask.u8: shortest prompt 4 real tokens of 512
+  WARNING: a prompt has 4 real tokens but the calibration's shortest had 5 -- outside the calibration, expect an escape
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 32.9058..8.70854) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.251963 h 0.0440916, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 369 MiB
+  input at level 16, carry 0.251963
+  [bert-base] layer 375.013 s: boot 280.817 (wide 6912, narrow 14), qkv 3.32689, scores 18.5781, softmax 277.887, values 15.9906, o 0.208302, ln 2.16649, ffn 3.74658, gelu 21.0434; rotations 82176, relins 44572; out at level 4
+LAYER 0: rms 2^-9.22 (worst instance 2^-8.47, max |err| 0.0354)  375.01 s = boot 280.82 (6912 wide + 14 narrow), qkv 3.33, scores 18.58, softmax 277.89, values 15.99, o 0.21, ln 2.17, ffn 3.75, gelu 21.04; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 44.27..8.35) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.28 h 0.05, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 369 MiB
+  [bert-base] layer 406.20 s: boot 312.40 (wide 7680, narrow 14), qkv 3.33, scores 18.53, softmax 277.64, values 16.02, o 0.40, ln 1.84, ffn 3.72, gelu 21.13; rotations 82176, relins 44572; out at level 4
+LAYER 1: rms 2^-8.87 (worst instance 2^-8.26, max |err| 0.0481)  406.20 s = boot 312.40 (7680 wide + 14 narrow), qkv 3.33, scores 18.53, softmax 277.64, values 16.02, o 0.40, ln 1.84, ffn 3.72, gelu 21.13; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 511/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 108.20..8.25) -> 6, Cho k 4, BSGS 32 x 16, carries in 0.25 h 0.05, masked; fold on,-,-,- (live^1,0,0,0), hoist on, poly batch 1, operands 360 MiB
+  [bert-base] ln2: variance window 1024.58x -> booting the stream first
+  [bert-base] layer 961.43 s: boot 844.25 (wide 20736, narrow 13), qkv 3.56, scores 18.60, softmax 798.95, values 16.03, o 0.47, ln 33.61, ffn 3.52, gelu 23.25; rotations 82176, relins 69172; out at level 4
+LAYER 2: rms 2^-7.45 (worst instance 2^-7.18, max |err| 0.1377)  961.43 s = boot 844.25 (20736 wide + 13 narrow), qkv 3.56, scores 18.60, softmax 798.95, values 16.03, o 0.47, ln 33.61, ffn 3.52, gelu 23.25; 82176 rotations, 69172 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 511/127/63/63/63/63/63/63/63/63/63/63 (|u| <= 107.95..8.66) -> 6, Cho k 3, BSGS 32 x 16, carries in 0.19 h 0.04, masked; fold on,-,- (live^1,0,0), hoist on, poly batch 1, operands 360 MiB
+  [bert-base] ln2: variance window 460.20x -> booting the stream first
+  [bert-base] layer 702.00 s: boot 593.94 (wide 14592, narrow 13), qkv 3.57, scores 18.92, softmax 538.36, values 16.02, o 0.46, ln 33.51, ffn 3.55, gelu 24.07; rotations 82176, relins 56872; out at level 5
+LAYER 3: rms 2^-7.49 (worst instance 2^-7.22, max |err| 0.1252)  702.00 s = boot 593.94 (14592 wide + 13 narrow), qkv 3.57, scores 18.92, softmax 538.36, values 16.02, o 0.46, ln 33.51, ffn 3.55, gelu 24.07; 82176 rotations, 56872 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 511/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 110.59..8.56) -> 6, Cho k 3, BSGS 32 x 16, carries in 0.21 h 0.04, masked; fold on,-,- (live^1,0,0), hoist on, poly batch 1, operands 360 MiB
+  [bert-base] ln2: variance window 494.63x -> booting the stream first
+  [bert-base] layer 700.83 s: boot 593.42 (wide 14592, narrow 13), qkv 3.55, scores 18.62, softmax 537.84, values 16.13, o 0.45, ln 33.64, ffn 3.53, gelu 23.47; rotations 82176, relins 56872; out at level 5
+LAYER 4: rms 2^-7.46 (worst instance 2^-7.23, max |err| 0.1849)  700.83 s = boot 593.42 (14592 wide + 13 narrow), qkv 3.55, scores 18.62, softmax 537.84, values 16.13, o 0.45, ln 33.64, ffn 3.53, gelu 23.47; 82176 rotations, 56872 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 511/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 89.75..8.10) -> 6, Cho k 2, BSGS 32 x 16, carries in 0.19 h 0.04, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 360 MiB
+  [bert-base] ln2: variance window 379.70x -> booting the stream first
+  [bert-base] layer 442.85 s: boot 344.24 (wide 8448, narrow 13), qkv 3.60, scores 19.14, softmax 278.62, values 17.03, o 0.40, ln 33.67, ffn 3.54, gelu 23.06; rotations 82176, relins 44572; out at level 5
+LAYER 5: rms 2^-7.41 (worst instance 2^-7.16, max |err| 0.3932)  442.85 s = boot 344.24 (8448 wide + 13 narrow), qkv 3.60, scores 19.14, softmax 278.62, values 17.03, o 0.40, ln 33.67, ffn 3.54, gelu 23.06; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 46.98..7.76) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.18 h 0.04, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 369 MiB
+  [bert-base] ln2: variance window 279.43x -> booting the stream first
+  [bert-base] layer 439.41 s: boot 344.30 (wide 8448, narrow 13), qkv 3.61, scores 18.65, softmax 278.20, values 16.22, o 0.40, ln 33.79, ffn 3.73, gelu 21.05; rotations 82176, relins 44572; out at level 5
+LAYER 6: rms 2^-7.34 (worst instance 2^-6.92, max |err| 0.6034)  439.41 s = boot 344.30 (8448 wide + 13 narrow), qkv 3.61, scores 18.65, softmax 278.20, values 16.22, o 0.40, ln 33.79, ffn 3.73, gelu 21.05; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 8 (exp deg 31 = 5 lv), P at 4, q/k in 10, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 36.99..7.70) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.17 h 0.04, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 373 MiB
+  [bert-base] layer 415.73 s: boot 312.13 (wide 7680, narrow 14), qkv 3.53, scores 20.86, softmax 285.44, values 16.02, o 0.44, ln 1.73, ffn 3.71, gelu 20.36; rotations 82176, relins 44572; out at level 4
+LAYER 7: rms 2^-7.24 (worst instance 2^-6.66, max |err| 1.2098)  415.73 s = boot 312.13 (7680 wide + 14 narrow), qkv 3.53, scores 20.86, softmax 285.44, values 16.02, o 0.44, ln 1.73, ffn 3.71, gelu 20.36; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 8 (exp deg 31 = 5 lv), P at 4, q/k in 10, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 47.19..8.07) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.13 h 0.04, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 373 MiB
+  [bert-base] ln2: variance window 974.00x -> booting the stream first
+  [bert-base] layer 447.73 s: boot 342.89 (wide 8448, narrow 13), qkv 3.50, scores 21.07, softmax 285.17, values 16.04, o 0.43, ln 33.65, ffn 3.72, gelu 20.77; rotations 82176, relins 44572; out at level 4
+LAYER 8: rms 2^-7.09 (worst instance 2^-6.42, max |err| 2.1211)  447.73 s = boot 342.89 (8448 wide + 13 narrow), qkv 3.50, scores 21.07, softmax 285.17, values 16.04, o 0.43, ln 33.65, ffn 3.72, gelu 20.77; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 8 (exp deg 31 = 5 lv), P at 4, q/k in 10, v in 5, o in 3, FFN 12 x 256 GELU deg 511/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 170.55..8.22) -> 6, Cho k 2, BSGS 32 x 16, carries in 0.10 h 0.05, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 364 MiB
+  [bert-base] ln2: variance window 34771.66x -> booting the stream first
+  [bert-base] layer 449.37 s: boot 342.92 (wide 8448, narrow 13), qkv 3.50, scores 20.88, softmax 285.21, values 16.10, o 0.43, ln 33.59, ffn 3.53, gelu 22.69; rotations 82176, relins 44572; out at level 3
+LAYER 9: rms 2^-6.28 (worst instance 2^-5.89, max |err| 2.1562)  449.37 s = boot 342.92 (8448 wide + 13 narrow), qkv 3.50, scores 20.88, softmax 285.21, values 16.10, o 0.43, ln 33.59, ffn 3.53, gelu 22.69; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 511/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 255.28..8.22) -> 6, Cho k 2, BSGS 32 x 16, carries in 0.10 h 0.05, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 360 MiB
+  [bert-base] ln1: variance window 360.84x -> booting the stream first
+  [bert-base] ln2: variance window 31550.60x -> booting the stream first
+  [bert-base] layer 470.64 s: boot 374.20 (wide 9216, narrow 12), qkv 3.56, scores 18.52, softmax 277.18, values 16.02, o 0.40, ln 65.27, ffn 3.55, gelu 22.46; rotations 82176, relins 44572; out at level 3
+LAYER 10: rms 2^-5.50 (worst instance 2^-5.21, max |err| 4.5457)  470.64 s = boot 374.20 (9216 wide + 12 narrow), qkv 3.56, scores 18.52, softmax 277.18, values 16.02, o 0.40, ln 65.27, ffn 3.55, gelu 22.46; 82176 rotations, 44572 relins
+  [bert-base] plan: top 16, S at 7 (exp deg 15 = 4 lv), P at 4, q/k in 9, v in 5, o in 3, FFN 12 x 256 GELU deg 255/63/63/63/63/63/63/63/63/63/63/63 (|u| <= 32.40..7.33) -> 7, Cho k 2, BSGS 32 x 16, carries in 0.09 h 0.07, masked; fold on,- (live^1,0), hoist on, poly batch 1, operands 369 MiB
+  [bert-base] ln1: variance window 760.02x -> booting the stream first
+  [bert-base] layer 435.41 s: boot 342.75 (wide 8448, narrow 13), qkv 3.32, scores 18.52, softmax 277.03, values 16.02, o 0.41, ln 33.43, ffn 3.71, gelu 19.40; rotations 82176, relins 44572; out at level 4
+LAYER 11: rms 2^-5.48 (worst instance 2^-5.07, max |err| 2.9711)  435.41 s = boot 342.75 (8448 wide + 13 narrow), qkv 3.32, scores 18.52, softmax 277.03, values 16.02, o 0.41, ln 33.43, ffn 3.71, gelu 19.40; 82176 rotations, 44572 relins
+CHAIN worst rms 2^-5.48 over 12 layer(s), 128 instance(s)
+  [bert-base] head: pooler at 16 -> 15, tanh deg 511 on [-54.22, 54.65] -> 6, classifier -> 5, 2 classes
+  prompt 0: logits 4.6181 -3.2521 -> label 0 (float64 4.6044 -3.2330 -> 0)
+  prompt 1: logits -0.4211 2.4930 -> label 1 (float64 -0.3566 2.4194 -> 1)
+  prompt 2: logits 2.5346 -0.4934 -> label 0 (float64 2.5189 -0.4615 -> 0)
+  prompt 3: logits 3.7910 -2.5417 -> label 0 (float64 3.8271 -2.5697 -> 0)
+  prompt 4: logits 3.5515 -1.7434 -> label 0 (float64 3.5113 -1.6811 -> 0)
+  prompt 5: logits 4.0274 -2.7934 -> label 0 (float64 4.0530 -2.8145 -> 0)
+  prompt 6: logits 4.1389 -2.9676 -> label 0 (float64 4.1417 -2.9614 -> 0)
+  prompt 7: logits 3.4012 -1.7451 -> label 0 (float64 3.3913 -1.7397 -> 0)
+HEAD: 53.0117 s, logits rms 2^-6.23, labels agree 128 / 128
+[       OK ] CiBertBase.TheChainRunsOnTheRealWeights (6871948 ms)
+[----------] 1 test from CiBertBase (6871948 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (6871948 ms total)
+[  PASSED  ] 1 test.
+
+real	114m32.334s
+user	83m59.721s
+sys	30m33.156s
+BB_RUN_DONE rc=0
