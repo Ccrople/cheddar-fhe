@@ -360,6 +360,62 @@ Llama line and BERT-Tiny reached: windows that are THEOREMS (the softmax's
 certified upper end, the GELU's sphere bound) rather than statistics. Until
 then the margins are the knob, and they are in the ledger.
 
+## 5b. The held-out failure rate, and the two things it found
+
+The held-out corpus is now **WikiText-2**, calibrated on its `train` split
+and measured on its `test` split, so the number is about unseen prompts and
+not about a change of domain. 50,000 test prompts go through the twelve
+layers on the host against the calibration that ships (`bert_base/failure.py`);
+every escape is attributed to the PROMPT it came from, and the report is a
+rate plus the MARGIN -- the worst `|t|` any prompt reached, where 1.0 is the
+window's edge.
+
+A prompt succeeds exactly when every slot lands inside every window: inside,
+a fit is good to its `fit_err` (1e-5 or better) and cannot decide anything;
+outside, a degree-511 polynomial is astronomical. **`T * B = 65536`, so a
+per-prompt rate `p` is a per-BATCH rate `1 - (1 - p)^B`** -- which is the
+number a deployment actually lives with.
+
+Two failures came out of it, and they are not the same failure.
+
+### The first Cho window is the only one that escapes
+
+At T = 256, 32 prompts of 45,056 escape (0.071 %) and **all 105 escaped
+slots are `inv0`** -- L08 at 3.36x its top, then L03, L07, L10. None in
+`inv1`, `inv2`, the exp, the GELU or either LayerNorm. At T = 128 it is the
+same window (L02, 1.209).
+
+The mechanism is the FOLD. `est` is a per-(head, token) geometric mean of
+the CALIBRATION population, so what the polynomial sees is one row's spread
+-- and a held-out row whose spread beats every calibration row's lands above
+the top by that excess. Measured: **10.9x the population maximum.** It is
+always the TOP (below the interval a 1/sqrt saturates silently rather than
+blowing, and 95,000 held-out prompts put nothing there), so `--inv0-margin`
+widens that end alone and the window's ratio grows by `im / margin` rather
+than by its square.
+
+### A LayerNorm window is not a softmax window
+
+The T = 128 held-out crypto run reached layer 9 at 2^-6.05 and then layer 10
+at **2^+130.69**. It is not an escape in the calibration's sense: the 512
+served prompts scan CLEAN on the exact stream (worst top 0.956). It is the
+window's WIDTH, which is what multiplies the input's error on the way out --
+layer 9's `ln2` ran at **100,934x** where the raw range is 4,037x, because
+`--margin 5.0` widens both ends.
+
+The scan says that room is never used. Over 50,000 prompts, at every layer,
+the largest variance maps to `t = -0.58`:
+
+| | L08 | L09 | L10 | L11 |
+|---|---|---|---|---|
+| `ln1` top | -0.555 | -0.583 | -0.568 | -0.575 |
+| `ln2` top | -0.524 | -0.564 | -0.599 | -0.455 |
+
+`t = -0.6` is exactly where the calibration's own maximum lands when the top
+is widened 5x, so the held-out maximum is **1.04x the calibration's** -- a
+4 % excess bought with a 25x window. `--ln-margin` separates the two
+decisions; the softmax's windows keep 5.0, which they need.
+
 ## 6. Plan
 
 1. B = 1, T = 128: build, layer 0. **DONE** -- 2^-11.86 after the three
