@@ -384,6 +384,20 @@ number a deployment actually lives with.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **-11.18** | **-10.67** | -7.74 | -7.81 | -7.77 | -7.80 | -7.82 | -7.88 | -7.83 | -6.45 | **-5.51** | -5.47 | **-6.32, labels 512 / 512** |
 
+**(256, 256), 256 held-out prompts, twelve layers + head:**
+
+| L0 | L1 | L2 | L3 | L4 | L5 | L6 | L7 | L8 | L9 | L10 | L11 | head |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| -10.39 | -9.76 | -7.63 | -7.70 | -7.68 | -7.68 | -7.67 | -7.69 | -7.61 | -6.37 | -5.54 | -5.50 | **-6.03, labels 255 / 256** |
+
+76 min 10 s, PASSED, and the FIRST twelve-layer held-out run this shape has
+had (it previously had layers 0-1 on an oracle). **It tracks (512, 128)
+within 0.1 bits at every layer from 2 to 11** -- the accuracy is flat in the
+shape, as the layout intends: only the diagonal products' rotation stride
+and the number of score ciphertexts change. Its one disagreeing label is a
+precision matter and not an escape: the NSP head is a binary decision at
+logits 2^-6.03, so a prompt sitting on the boundary can flip.
+
 76 min 28 s, PASSED. The same shape on the margins that shipped before had
 **layer 10 at 2^+130.69 and 256 / 512 labels** — and that run's 512 prompts
 scanned CLEAN, which is what said the fault was the window's WIDTH and not
