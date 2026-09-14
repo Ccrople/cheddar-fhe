@@ -143,6 +143,8 @@ def main():
     ap.add_argument("--inputs", default="")
     ap.add_argument("--ids", default="", help="ids.u32 instead of inputs.f32")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue a part that already holds some prompts")
     ap.add_argument("--f32", action="store_true",
                     help="run the scan in float32 (~2x); the verdict is a "
                          "ratio of order one, so f32's 1e-7 decides nothing")
@@ -208,6 +210,23 @@ def main():
                        "tanh", tracer, a.approx)
     path = a.out or "failure_%s.json" % a.slice.replace("/", "_")
 
+    # RESUME. A 50,000-prompt scan is hours and the overlay is wiped whenever
+    # the laptop's session drops, so a part that already holds `done` prompts
+    # is picked up rather than redone. The saved part is a prefix of this
+    # slice in this order, which is what makes that sound.
+    start = 0
+    if a.resume and os.path.isfile(path):
+        old = json.load(open(path))
+        if old.get("slice") == a.slice and old.get("approx") == bool(a.approx):
+            start = int(old["prompts"])
+            tracer.esc[:start] = old["esc_per_prompt"]
+            tracer.margin[:start] = old["margin_per_prompt"]
+            tracer.where = {k: list(v) for k, v in old["where"].items()}
+            if rel is not None and "rel_per_prompt" in old:
+                rel[:start] = old["rel_per_prompt"]
+            start -= start % chunk                # the last save was on one
+            print("  resuming at %d of %d" % (start, n), flush=True)
+
     def save(done):
         fail = tracer.esc[:done] > 0
         out = {"calib": os.path.abspath(a.calib), "tokens": m.T, "layers": NL,
@@ -235,7 +254,7 @@ def main():
 
     # ONE CHUNK THROUGH THE WHOLE CHAIN: the alternative (a layer at a time
     # over every prompt) holds [50000, 512, 768] = 157 GB.
-    for c0 in range(0, n, chunk):
+    for c0 in range(start, n, chunk):
         c1 = min(n, c0 + chunk)
         tracer.base = c0
         sel = idx[c0:c1]

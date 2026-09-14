@@ -27,7 +27,7 @@ LIM=""
 echo "==== $(date -u) scan T=$T, $W workers x $OMP_NUM_THREADS threads $LIM $*"
 for i in $(seq 0 $((W - 1))); do
   python3.12 -u failure.py "$B/all$T" "$B/held_ref$T/calib.json" \
-    --ids "$B/scan$T/prompts/ids.u32" --slice "$i/$W" \
+    --ids "$B/scan$T/prompts/ids.u32" --slice "$i/$W" --f32 --resume \
     --out "$O/part_$i.json" $LIM "$@" > "$O/part_$i.log" 2>&1 &
 done
 wait
