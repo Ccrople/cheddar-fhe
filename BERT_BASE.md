@@ -376,6 +376,29 @@ outside, a degree-511 polynomial is astronomical. **`T * B = 65536`, so a
 per-prompt rate `p` is a per-BATCH rate `1 - (1 - p)^B`** -- which is the
 number a deployment actually lives with.
 
+### The rate, before and after
+
+50,000 WikiText-2 test prompts a shape, against the calibration that ships.
+`T * B = 65536`, so the right-hand column is what a deployment lives with.
+
+| shape | per prompt | a batch of B |
+|---|---|---|
+| B = 1, T = 128 | **0 / 50,000** | 0 % |
+| B = 512, T = 128 | **0 / 50,000** | **0 %** |
+| B = 256, T = 256 | **2 / 50,000** = 0.0040 % | **1.02 %** |
+| B = 128, T = 512 | **2 / 50,000** = 0.0040 % | **0.51 %** |
+
+Against the margins this branch shipped before the scan existed — 0.0060 %,
+0.071 % and 0.117 % — that is **all of T = 128, 18x at T = 256 and 29x at
+T = 512**, and it cost accuracy NOTHING: layer 0 at T = 128 went 2^-10.73 to
+**2^-11.18** and layer 1 2^-9.76 to **2^-10.67**, in 253 s against 310 s,
+on 2,304 bootstraps against 3,072. A window that is never reached is not
+safety; it is degree, levels, time and error amplification paid for nothing.
+
+The four escapes that remain are in exactly two windows — `L11.ln2` (three)
+and `L01.exp` (one) — with every one of the ~200 others at or under 0.97 of
+its top.
+
 Two failures came out of it, and they are not the same failure.
 
 ### The first Cho window is the only one that escapes
