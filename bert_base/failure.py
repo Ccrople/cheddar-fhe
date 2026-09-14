@@ -62,21 +62,35 @@ class Tracer:
 
     def __init__(self, n):
         self.n = n
-        self.esc = np.zeros(n, dtype=np.int64)      # escaped slots, per prompt
+        self.esc = np.zeros(n, dtype=np.int64)       # escaped slots, per prompt
         self.margin = np.zeros(n, dtype=np.float64)  # worst |t|, per prompt
-        self.where = {}                              # tag -> [slots, worst |t|]
+        self.top = np.zeros(n, dtype=np.float64)     # worst +t, per prompt
+        self.where = {}                    # tag -> [slots, worst +t, worst -t]
         self.base = 0                                # this chunk's first prompt
 
-    def note(self, tag, at):
-        """`at` = |t|, the argument mapped onto [-1, 1]. 1.0 is the edge."""
-        axes = tuple(range(1, at.ndim))
-        worst = at.max(axis=axes) if axes else at
-        sl = slice(self.base, self.base + worst.shape[0])
-        np.maximum(self.margin[sl], worst, out=self.margin[sl])
-        row = self.where.setdefault(tag, [0, 0.0])
-        row[1] = max(row[1], float(worst.max()))
-        if at.max() > 1.0:
-            cnt = (at > 1.0).sum(axis=axes)
+    def note(self, tag, t):
+        """`t` is the argument mapped onto [-1, 1]; outside it, the fit is not
+        a fit. Escape is |t| > 1 either way, but the two ends fail
+        DIFFERENTLY and are reported apart: above the interval a Chebyshev
+        polynomial is astronomical, below it an inverse square root
+        SATURATES and returns a wrong answer in silence.
+
+        The split matters for reading the numbers, not only for taste: a
+        1/sqrt window widened 5x at the bottom puts EVERY prompt's `t` at
+        -0.999 by construction, so a symmetric `max |t|` reads as "one part
+        in 1e4 from escaping" for a calibration that is nowhere near it.
+        """
+        axes = tuple(range(1, t.ndim))
+        hi = t.max(axis=axes) if axes else t
+        lo = (-t).max(axis=axes) if axes else -t
+        sl = slice(self.base, self.base + hi.shape[0])
+        np.maximum(self.margin[sl], np.maximum(hi, lo), out=self.margin[sl])
+        np.maximum(self.top[sl], hi, out=self.top[sl])
+        row = self.where.setdefault(tag, [0, -np.inf, -np.inf])
+        row[1] = max(row[1], float(hi.max()))
+        row[2] = max(row[2], float(lo.max()))
+        if hi.max() > 1.0 or lo.max() > 1.0:      # this chunk's own, not the
+            cnt = (np.abs(t) > 1.0).sum(axis=axes)  # accumulated maximum
             self.esc[sl] += cnt
             row[0] += int(cnt.sum())
 
@@ -104,7 +118,7 @@ class Checked:
 
     def __call__(self, x):
         t = (x - self.b) / self.a
-        self.tracer.note(self.tag, np.abs(t))
+        self.tracer.note(self.tag, t)
         return C.chebval(t, self.c) if self.approximate else self.f(x)
 
 
@@ -221,6 +235,7 @@ def main():
             start = int(old["prompts"])
             tracer.esc[:start] = old["esc_per_prompt"]
             tracer.margin[:start] = old["margin_per_prompt"]
+            tracer.top[:start] = old["top_per_prompt"]
             tracer.where = {k: list(v) for k, v in old["where"].items()}
             if rel is not None and "rel_per_prompt" in old:
                 rel[:start] = old["rel_per_prompt"]
@@ -235,10 +250,15 @@ def main():
                "escaped_prompts": int(fail.sum()),
                "escaped_slots": int(tracer.esc[:done].sum()),
                "margin_max": float(tracer.margin[:done].max()),
-               "margin_p50": float(np.median(tracer.margin[:done])),
-               "margin_p99": float(np.quantile(tracer.margin[:done], 0.99)),
+               # the TOP is the end that blows up, and the one a statistic
+               # window actually leaves; the bottom sits at -0.999 by
+               # construction wherever a window was widened
+               "top_max": float(tracer.top[:done].max()),
+               "top_p50": float(np.median(tracer.top[:done])),
+               "top_p99": float(np.quantile(tracer.top[:done], 0.99)),
                "index": idx[:done].tolist(),
                "esc_per_prompt": tracer.esc[:done].tolist(),
+               "top_per_prompt": np.round(tracer.top[:done], 5).tolist(),
                # .tolist() and not a comprehension: round() on an np.float64
                # gives an np.float64 back, which json cannot serialise
                "margin_per_prompt": np.round(tracer.margin[:done], 5).tolist(),
@@ -279,53 +299,57 @@ def main():
             agree[c0:c1] = lg.argmax(axis=1) == lg_ex.argmax(axis=1)
         if (c1 // chunk) % 16 == 0 or c1 == n:
             fail = save(c1)
-            print("  %6d / %d: %d escaped, worst margin %.3f%s"
-                  % (c1, n, fail.sum(), tracer.margin[:c1].max(),
+            print("  %6d / %d: %d escaped, worst top %.3f%s"
+                  % (c1, n, fail.sum(), tracer.top[:c1].max(),
                      "" if rel is None else ", rms 2^%.2f"
                      % -bits(float(np.sqrt((rel[:c1] ** 2).mean())))), flush=True)
     fail = save(n)
-    print("%d / %d prompts escaped (%.4f %%), worst margin %.3f -> %s"
-          % (fail.sum(), n, 100.0 * fail.mean(), tracer.margin.max(), path))
+    print("%d / %d prompts escaped (%.4f %%), worst top %.3f -> %s"
+          % (fail.sum(), n, 100.0 * fail.mean(), tracer.top.max(), path))
 
 
 # ---------------------------------------------------------------- the merge
 def merge(parts, B_list):
     """`python failure.py --merge 'dir/part_*.json'`: the rate and what a
     batch of B prompts then does."""
-    esc, marg, rel, tot, where, agree, T = [], [], [], 0, {}, 0, 0
+    esc, top, rel, tot, where, agree, T = [], [], [], 0, {}, 0, 0
     for p in sorted(glob.glob(parts)):
         d = json.load(open(p))
         esc += d["esc_per_prompt"]
-        marg += d["margin_per_prompt"]
+        top += d["top_per_prompt"]
         rel += d.get("rel_per_prompt", [])
         agree += d.get("labels_agree", 0)
         T = d["tokens"]
         tot += d["prompts"]
         for k, v in d["where"].items():
-            row = where.setdefault(k, [0, 0.0])
+            row = where.setdefault(k, [0, -np.inf, -np.inf])
             row[0] += v[0]
             row[1] = max(row[1], v[1])
-    esc, marg = np.asarray(esc), np.asarray(marg)
+            row[2] = max(row[2], v[2])
+    esc, top = np.asarray(esc), np.asarray(top)
     fail = esc > 0
     p = float(fail.mean())
     print("prompts %d, T %d" % (tot, T))
     print("  escaped prompts   %d  (%.4f %%)" % (fail.sum(), 100 * p))
     print("  escaped slots     %d" % esc.sum())
-    print("  margin  p50 %.3f  p99 %.3f  max %.3f" % (
-        np.median(marg), np.quantile(marg, 0.99), marg.max()))
+    print("  top of window     p50 %.3f  p99 %.3f  max %.3f  (1.0 = the edge)"
+          % (np.median(top), np.quantile(top, 0.99), top.max()))
     if rel:
         r = np.asarray(rel)
-        print("  rms     p50 2^%.2f  worst 2^%.2f" % (
+        print("  rms               p50 2^%.2f  worst 2^%.2f" % (
             -bits(float(np.median(r))), -bits(float(r.max()))))
     if agree:
         print("  labels agree      %d / %d" % (agree, tot))
+    print("  the eight windows closest to their top:")
     for k, v in sorted(where.items(), key=lambda kv: -kv[1][1])[:8]:
-        print("  %-14s worst |t| %.3f%s" % (k, v[1],
-                                            "" if not v[0] else "  ESCAPED %d slots" % v[0]))
+        print("    %-14s top %.3f  bottom %.3f%s"
+              % (k, v[1], v[2], "" if not v[0] else
+                 "   ESCAPED %d slots" % v[0]))
     for B in B_list:
         if B * T == 65536 or B == 1:
-            print("  B = %-4d (T*B = %d): a batch fails with probability "
-                  "%.4f %%" % (B, B * T, 100 * (1 - (1 - p) ** B)))
+            print("  B = %-4d (T*B = %d): one batch shares every ciphertext, so "
+                  "it fails with probability %.4f %%"
+                  % (B, B * T, 100 * (1 - (1 - p) ** B)))
 
 
 if __name__ == "__main__":
