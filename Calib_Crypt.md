@@ -58,7 +58,7 @@ The image ships none of these. In `bert_base/vessl_data.sh` and
 | `libopenblas-dev` + `update-alternatives` | the image's numpy links the reference BLAS | **2 → 140 GFLOPS** |
 | **`python3-scipy`** (apt, NOT pip) | `model.py`'s GELU falls back to `np.vectorize(math.erf)` — a **Python call per element**, 4.7 M of them per prompt | erf **48x**; the whole chain **1.9x** |
 | `python3-pyarrow` (pip) | WikiText-2 ships as parquet | — |
-| `python3.12-venv` then a venv with `numpy` `scipy` **`cupy-cuda13x`** | the scan on the card | **50,000 prompts: 80 min → 8 min** |
+| `python3.12-venv` then a venv with `numpy` `scipy` **`cupy-cuda13x`** | the scan AND the calibration on the card | scan **64 min → 8 min**; a T = 512 calibration **10 h → 42 s** |
 
 Traps, each of which cost a cycle here:
 
@@ -216,18 +216,156 @@ a ratio of 1.7 and a low degree. **A window, its degree and its wall-clock
 are one decision** — which is the other reason `--ln-margin` is worth
 having.
 
-## 7. Running it, from an empty overlay
+## 7. The tests, and the exact experiment each one is
+
+Five programs, one of which is the only thing that touches ciphertexts.
+
+| what | is | answers |
+|---|---|---|
+| `bert_base/export.py`, `wikitext.py` | host | the corpus, the weights, the prompt sets |
+| `bert_base/reference.py` | host, float64 | `h_L{k}.f64` — what the encrypted run is SCORED against |
+| `bert_base/sim.py` | host | **writes** `calib.json`: every window, degree, shift, fold and ride |
+| `bert_base/failure.py` | host | **reads** one: how many held-out prompts does it serve? |
+| `unittest/CiBertBaseTest.cpp` → **`ci_bert_base_test`** | the A100, real CKKS | the encrypted twelve layers + head against `h_L{k}.f64` |
+
+The crypto test is one gtest, `CiBertBase.TheChainRunsOnTheRealWeights`,
+and it is driven entirely by environment (`bert_base/vessl_held.sh` is this,
+repathed). Nothing about the shape is compiled in: `B` follows from the
+slot count and `T`, `N` from the input file's size.
+
+```
+CHEDDAR_POOL_MIB=0 CHEDDAR_POOL_RELEASE_MIB=0 CHEDDAR_POOL_MAX_BIN_MIB=0 \
+BERT_BASE_ALL=/root/bert_base/all<T>            # weights + meta.json
+BERT_BASE_REF=/root/bert_base/held_ref<T>       # h_L{k}.f64, cls_logits.f64
+BERT_BASE_CALIB=/root/bert_base/held_ref<T>/calib.json
+BERT_BASE_INPUTS=/root/bert_base/held<T>/serve/prompts/inputs.f32
+BERT_BASE_MASK=/root/bert_base/held<T>/serve/prompts/mask.u8
+BERT_BASE_LAYERS=12 BERT_BASE_HEAD=1 ./ci_bert_base_test
+```
+
+Other knobs it reads, none of which this session needed to move:
+`BERT_BASE_PARAM` (the ring, default `ci16_35_k16_w58`), `_FIRST_LAYER`
+(start the chain at layer L from `h_L{L-1}.f64` — how a single layer is
+isolated), `_INSTANCES`, `_BOOT_GROUP`, `_POLY_BATCH`, `_FOLD`, `_HOIST`,
+`_DUMP` / `_DUMP_INSTANCES` (tapped intermediates for `debug.py`),
+`_PRINT_LABELS`, `_LABELS_OUT`.
+
+**The five experiments, in the order they have to happen.**
+
+1. **Bring-up** — `vessl_setup.sh <branch>`: apt, cmake 3.31.6, clone,
+   configure, build the one target.
+2. **Data** — `vessl_data.sh`: OpenBLAS, scipy, pyarrow, WikiText-2, and
+   three `export.py` runs a shape (calibration population, serve set, scan
+   ids).
+3. **Calibration + reference** — `sim.py --no-chain` writes `calib.json`;
+   `reference.py` writes `h_L{k}.f64` and `cls_logits.f64` for the serve
+   set. `vessl_host.sh <T>` runs both at once.
+4. **The scan** — `failure.py ... --gpu`, 50,000 held-out prompts, then
+   `--merge` for the rate. **This decides whether step 5 is worth a GPU
+   hour**, and this session it twice said no.
+5. **The encrypted run** — `vessl_held.sh <T>`.
+
+The validation of anything that moved onto the card was the same in both
+cases: **run it both ways and diff.**
+
+* `sim.py --gpu` against `sim.py` on the same 64 prompts: every degree,
+  every channel permutation and every suppression **identical**, and the
+  worst relative difference in any window bound **6.0e-15**.
+* `failure.py --gpu` against `failure.py` on the same 256 prompts: **0 / 256
+  escaped, worst top 0.841** from both.
+
+## 8. What everything cost, measured
+
+A100 + 11 cores, this session, `ci16_35_k16_w58`. "projected" means the rate
+was measured over one or more layers and the rest extrapolated — every other
+number is a wall clock.
+
+**Setup and data, once per empty overlay**
+
+| step | time |
+|---|---|
+| `vessl_setup.sh` (apt + clone + configure 22 s + build `-j48`) | **2 min 33 s** |
+| `vessl_data.sh` (WikiText-2 + 3 exports x 3 shapes) | **~17 min** |
+| `reference.py`, 12 layers + head, the serve set | ~25 min (host, concurrent) |
+
+**Calibration — `sim.py --no-chain`, the whole population, 12 layers**
+
+| T | prompts | on 11 cores | **on the A100** |
+|---|---|---|---|
+| 128 | 1000 | 76 min (6.3 min a layer) | **19 s** |
+| 256 | 1000 | 3.8 h projected (19 min a layer) | **32 s** |
+| 512 | 500 | 10 h projected (>50 min a layer) | **42 s** |
+| 512 | 300 | — | **31 s** |
+
+The CPU column is why `sim.py` grew a `--gpu`: a calibration is quadratic in
+T through the `[N, NH, T, T]` scores, and this box has eleven cores.
+
+**The scan — `failure.py`, 50,000 WikiText-2 test prompts, 12 layers**
+
+| T | chunk | on the A100 | on 11 cores |
+|---|---|---|---|
+| 128 | 128 | **474 s / 500 s** (two runs) | 64 min projected |
+| 256 | 64 | **~19 min** (40,960 + a 188 s resume) | ~2 h projected |
+| 512 | 32 | **2,420 s = 40 min** | ~4.5 h projected |
+
+Host per-prompt cost at T = 128, measured single-threaded: **1.59 core-s
+before scipy, 0.84 after**. A 4,096-prompt GPU probe ran in **17 s**.
+
+**The encrypted runs — `ci_bert_base_test`, 12 layers + head, held out**
+
+| shape | setup | a layer | head | **total** | result |
+|---|---|---|---|---|---|
+| (512, 128) | 22.0 s | 175–509 s | 53.3 s | **76 min 28 s** | PASSED, labels 512/512 |
+| (256, 256) | 7.2 s | 224–552 s | 53.3 s | **76 min 10 s** | PASSED, labels 255/256 |
+| (128, 512) | 7.4 s | 375–961 s | 53.0 s | **114 min 32 s** | PASSED, labels 128/128 |
+
+A layer's spread is the softmax's Cho pass count `k`, which the calibration
+picks per layer and which sets the bootstrap count almost alone:
+
+| T | `k` per layer | the expensive ones |
+|---|---|---|
+| 128 | `223222223222` | L2, L8 at k = 3 |
+| 256 | `234222233232` | **L2 at k = 4** (552 s, 11,520 boots), five at k = 3 |
+| 512 | `224332222222` | **L2 at k = 4** (961 s, **20,736 boots**), L3/L4 at k = 3 |
+
+Bootstraps a layer ran 2,304 (k = 2, T = 128) to 20,736 (k = 4, T = 512),
+and boot is 60–88 % of a layer throughout. **The run that FAILED** — the
+same (512, 128) on the margins that shipped before — took 84 min to reach
+2^+130 at layer 10, which is the whole argument for step 4 costing eight
+minutes first.
+
+**The speed work, and what each piece bought**
+
+| | before | after |
+|---|---|---|
+| numpy's BLAS (reference → OpenBLAS) | 2 GFLOPS | **140 GFLOPS** |
+| the GELU's `erf` (`np.vectorize` → scipy) | 5.34 s | **0.112 s** (48x) |
+| one prompt's 12-layer host chain | 1.59 core-s | **0.84 core-s** |
+| a T = 512 calibration | 10 h | **42 s** |
+| a 50,000-prompt scan at T = 128 | 64 min | **8 min** |
+
+## 9. Running it, from an empty overlay
 
 ```
 scp bert_base/vessl_setup.sh vessl:/root/ && ssh vessl \
-  'setsid bash -c "bash /root/vessl_setup.sh BERT_base" < /dev/null &'   # ~3 min
-ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_data.sh'     # ~15 min
-ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_host.sh 128' # calib + f64 ref
-#   ... then the scan (section 4), and only then:
-ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_held.sh 128'
-bash bert_base/pull.sh          # calibrations and scan parts back to the laptop
+  'setsid bash -c "bash /root/vessl_setup.sh BERT_base" < /dev/null &'   # 2.5 min
+ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_data.sh'     # ~17 min
+ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_host.sh 128' # f64 reference
+# the calibration itself, on the card (seconds, not hours):
+ssh vessl 'cd /root/work/cheddar-bb/bert_base && /root/venv/bin/python sim.py \
+   /root/bert_base/all128 /root/bert_base/held_ref128/calib.json \
+   --inputs /root/bert_base/all128/prompts/inputs.f32 --no-chain --gpu \
+   --margin 5.0 --ln-margin 1.5 --inv0-margin 30 --gelu-margin 1.8 \
+   --exp-margin 2.0 --exp-margin-hi 2.0 --inv-max-degree 255'
+# the scan, and ONLY if it is clean:                                     # 8 min
+ssh vessl 'cd /root/work/cheddar-bb && bash bert_base/vessl_held.sh 128'  # 76 min
+bash bert_base/pull.sh          # calibrations and scan parts to the laptop
 ```
 
-`vessl_pipeline.sh` chains the last three per shape, one card job at a time.
+`vessl_pipeline.sh` chains a shape's scan and run, one card job at a time.
 Strip CR after every `scp` of a `.sh` (`sed -i 's/\r$//'`) — a file edited
-on Windows dies on line 1.
+on Windows dies on line 1. And `CUPY_GPU_MEMORY_LIMIT` matters when a scan
+runs beside an encrypted run: the run holds 40–46 GB of the 80, the scan
+needs 4 GB at T = 128 and ~20 GB at T = 512, and a calibration at T = 512
+wants 25–32 GB for its score buffer alone (`--limit` and `--chunk` are the
+knobs when it will not fit).
