@@ -489,6 +489,11 @@ def main():
     in_chan = suppression(np.abs(x).max(axis=(0, 1)), a.chan_cap)
     for L in range(m.NL):
         # ---- the exact layer over the population, a chunk at a time -------
+        if a.gpu:
+            # cupy's pool keeps every block it has freed, and one layer's
+            # chunk temporaries at T = 512 are several GB; without this the
+            # NEXT layer's [N, NH, T, T] score buffer has nowhere to land.
+            np.get_default_memory_pool().free_all_blocks()
         nxt = np.empty_like(cur)
         p = LayerPass(N, m.NH, m.T, m.I)
         # the ride is sized on the SUPPRESSED stream: a suppression and its
