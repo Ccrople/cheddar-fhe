@@ -482,8 +482,15 @@ def main():
         # measured at 10.9x the population maximum. The later passes see a
         # normalised distribution and are near-theorems, so they are not
         # widened with it.
+        # and it is the TOP that escapes, both at T = 128 (L02, 1.209) and
+        # at T = 256 (L08, 3.362): a row whose spread beats the population's
+        # lands ABOVE. The bottom is never left -- below the interval a
+        # 1/sqrt saturates silently rather than blowing, which is worth
+        # watching, but 95,000 held-out prompts put nothing there. So only
+        # the top is widened, and the window's ratio grows by `im / margin`
+        # rather than its square.
         im = a.inv0_margin if a.inv0_margin > 0 else a.margin
-        inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / (im if j == 0 else a.margin),
+        inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin,
                           hi * (im if j == 0 else a.margin),
                           a.inv_tol if a.inv_tol > 0 else a.tol,
                           relative=True, name="inv%d" % j,
