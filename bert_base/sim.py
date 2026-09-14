@@ -34,22 +34,67 @@ import json
 import os
 
 import numpy as np
+import numpy as _np                 # stays numpy even when `np` is cupy
 from numpy.polynomial import chebyshev as C
 
 from model import Model, gelu, rms_rel, bits
 
 DEGREES = [7, 15, 31, 63, 127, 255, 511]
 
+try:                                # the FITS are host work and stay here:
+    from scipy.special import erf as _erf   # `model.gelu` follows `model.np`
+except ImportError:                         # onto the card under --gpu
+    import math
+    _erf = _np.vectorize(math.erf)
+
+
+def _gelu_np(x):
+    return 0.5 * x * (1.0 + _erf(x / _np.sqrt(2.0)))
+
+
+def to_gpu(m):
+    """Move the model onto the card and make the CHAIN compute there.
+
+    `model.py` and everything below `main` are written against `np`, and
+    cupy is that API, so the heavy half moves by rebinding two module
+    globals. The FITS do not move: `Poly` interpolates on a 20,001-point
+    host probe through `numpy.polynomial`, so it is given `_np`-only
+    functions (`_gelu_np`, `_np.exp`, `_np.tanh`, `_np.sqrt`) and never sees
+    a device array.
+
+    Worth it because a calibration costs quadratically in T through the
+    scores: at T = 512 it is ten hours on this container's eleven cores
+    (`Calib_Crypt.md` 1) and minutes on the A100 beside it. The weights load
+    on the host -- `np.fromfile` has no cupy equivalent -- so this is called
+    AFTER `Model(...)`, `m.prompts(...)` and `m.valid(...)`.
+    """
+    import cupy as cp
+    import cupyx.scipy.special as cs
+    import model as M
+
+    cvt = lambda d: {k: cp.asarray(v) for k, v in d.items()}      # noqa: E731
+    m.w = [cvt(w) for w in m.w]
+    if m.head_w is not None:
+        m.head_w = cvt(m.head_w)
+    M.np, M._erf = cp, cs.erf
+    globals()["np"] = cp
+    return cp
+
+
+def host(a):
+    """Device array -> host, for the small things that reach a fit or json."""
+    return a.get() if hasattr(a, "get") else a
+
 
 # ---------------------------------------------------------------- the fits
 def cheb_interp(f, n):
     """chebfit::Interpolate: f on [-1, 1] at the n + 1 Chebyshev nodes."""
     m = n + 1
-    j = np.arange(m)
-    node = np.cos(np.pi * (j + 0.5) / m)
+    j = _np.arange(m)
+    node = _np.cos(_np.pi * (j + 0.5) / m)
     val = f(node)
-    k = np.arange(m)[:, None]
-    c = (np.cos(np.pi * k * (j[None, :] + 0.5) / m) * val[None, :]).sum(axis=1)
+    k = _np.arange(m)[:, None]
+    c = (_np.cos(_np.pi * k * (j[None, :] + 0.5) / m) * val[None, :]).sum(axis=1)
     c *= 2.0 / m
     c[0] *= 0.5
     return c
@@ -63,24 +108,24 @@ class Poly:
         self.lo, self.hi, self.name = float(lo), float(hi), name
         self.a, self.b = 0.5 * (hi - lo), 0.5 * (hi + lo)
         g = lambda t: f(self.a * t + self.b)  # noqa: E731
-        probe = np.linspace(-1, 1, 20001)
+        probe = _np.linspace(-1, 1, 20001)
         want = g(probe)
         pool = [degree] if degree else [d for d in DEGREES
                                         if not max_degree or d <= max_degree]
         for d in pool:
             c = cheb_interp(g, d)
             got = C.chebval(probe, c)
-            err = np.abs(got - want) / (np.abs(want) if relative else 1.0)
+            err = _np.abs(got - want) / (_np.abs(want) if relative else 1.0)
             self.err = float(err.max())
             self.degree, self.c = d, c
             if self.err <= tol:
                 break
-        self.levels = int(np.ceil(np.log2(self.degree + 1)))
+        self.levels = int(_np.ceil(_np.log2(self.degree + 1)))
         self.escapes = 0
 
     def __call__(self, x):
         t = (x - self.b) / self.a
-        self.escapes += int((np.abs(t) > 1.0).sum())
+        self.escapes += int((abs(t) > 1.0).sum())
         return C.chebval(t, self.c)
 
     def json(self):
@@ -399,6 +444,11 @@ def main():
                          "1000 at T = 128 is 250 at T = 512, where a "
                          "calibration costs quadratically more through the "
                          "scores.")
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the exact sweep on the card through cupy "
+                         "(needs --no-chain). A calibration costs "
+                         "quadratically in T through the scores: ten hours "
+                         "at T = 512 on this container's eleven cores.")
     ap.add_argument("--no-chain", action="store_true",
                     help="write the calibration without running the host "
                          "chain (the windows need only the exact forward)")
@@ -418,6 +468,13 @@ def main():
     if a.limit:
         x = x[:a.limit]
         valid = None if valid is None else valid[:a.limit]
+    if a.gpu:
+        # after the host reads, before any arithmetic
+        assert a.no_chain, "--gpu writes the calibration; the chain's Poly " \
+                           "evaluates through numpy.polynomial on the host"
+        xp = to_gpu(m)
+        x = xp.asarray(x)
+        valid = None if valid is None else xp.asarray(valid)
     amask = Model.additive_mask(valid)
     N = x.shape[0]
     chunk = max(1, min(a.chunk, N))
@@ -467,7 +524,7 @@ def main():
         # follows it has nothing to normalise. Cho's k is exactly the
         # compression of that range -- `--exp-tol` is what buys k back.
         exp_hi_margin = a.exp_margin_hi if a.exp_margin_hi > 0 else a.exp_margin / 4
-        exp_poly = Poly(np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + exp_hi_margin,
+        exp_poly = Poly(_np.exp, u_lo - a.exp_margin, max(u_hi, 0.0) + exp_hi_margin,
                         a.exp_tol if a.exp_tol > 0 else a.tol, name="exp")
         probe = np.linspace(exp_poly.lo, exp_poly.hi, 4001)
         print("     exp: worst RELATIVE error over the domain %.2e"
@@ -490,7 +547,7 @@ def main():
         # the top is widened, and the window's ratio grows by `im / margin`
         # rather than its square.
         im = a.inv0_margin if a.inv0_margin > 0 else a.margin
-        inv_polys = [Poly(lambda v: 1.0 / np.sqrt(v), lo / a.margin,
+        inv_polys = [Poly(lambda v: 1.0 / _np.sqrt(v), lo / a.margin,
                           hi * (im if j == 0 else a.margin),
                           a.inv_tol if a.inv_tol > 0 else a.tol,
                           relative=True, name="inv%d" % j,
@@ -503,7 +560,7 @@ def main():
         for tag in ("ln1", "ln2"):
             var = p.var[tag]
             lo, hi = float(var.min()), float(var.max())
-            lns[tag] = Poly(lambda v: 1.0 / np.sqrt(v + m.eps), lo / lnm,
+            lns[tag] = Poly(lambda v: 1.0 / _np.sqrt(v + m.eps), lo / lnm,
                             hi * lnm, a.tol, relative=True, name=tag,
                             max_degree=a.ln_max_degree)
         # the GELU, one fit per feed-forward tile, channels sorted by |u|
@@ -514,7 +571,7 @@ def main():
         gts = []
         for t in range(ntile):
             R = float(p.uch[perm[t * tile:(t + 1) * tile]].max()) * a.gelu_margin
-            gts.append(Poly(gelu, -R, R, gtol, name="gelu%d" % t,
+            gts.append(Poly(_gelu_np, -R, R, gtol, name="gelu%d" % t,
                             max_degree=a.gelu_max_degree))
         gl = BandedGelu(perm, tile, gts)
 
@@ -589,7 +646,7 @@ def main():
     if m.head_w is not None:
         centre, radius = m.head_certified(m.NL - 1)
         lo, hi = float((centre - radius).min()), float((centre + radius).max())
-        tanh_poly = Poly(np.tanh, lo, hi, a.tol, name="tanh")
+        tanh_poly = Poly(_np.tanh, lo, hi, a.tol, name="tanh")
         print("head: pooler input certified in [%.2f, %.2f]" % (lo, hi))
         print("   ", tanh_poly)
         head = {"tanh": tanh_poly.json(), "u_certified_lo": lo, "u_certified_hi": hi,
