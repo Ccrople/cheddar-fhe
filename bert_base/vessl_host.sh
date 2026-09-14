@@ -1,37 +1,42 @@
 #!/bin/bash
-# The host half on vessl (96 cores): every float64 reference and every
-# calibration BERT-Base needs, concurrently, because the overlay is wiped
-# whenever the laptop's session drops.
+# The host half on vessl (96 cores): the POPULATION calibration and the
+# float64 reference the card is checked against, for one shape.
 #   bash vessl_host.sh [T]      (T = 128 | 256 | 512)
-# Writes, under /root/bert_base:
-#   ref<T>/        the RECORDED prompt through all 12 layers + its oracle
-#                  calibration (calib.json) -- the B = 1 milestone
-#   held_ref<T>/   the 1000-prompt POPULATION calibration (calib.json) and
-#                  the float64 output of the B = N/T prompts the card serves
+# Writes, under /root/bert_base/held_ref<T>:
+#   calib.json    the 1000-prompt population calibration (WikiText-2 TRAIN)
+#   h_L*.f64      the float64 output of the B held-out prompts the card
+#                 serves (WikiText-2 TEST), and cls_logits.f64
+#
+# THE MARGINS. `--margin 5.0 --gelu-margin 1.8 --exp-margin 2.0
+# --exp-margin-hi 2.0` with the Cho inverse square roots capped at degree
+# 255 is the set that survives twelve layers on prompts the calibration
+# never saw; the defaults (1.3 / 1.2 / 1.0) are BERT-Tiny's and leak seven
+# slots in two hundred million at layer 0, which is a batch-wide event.
+# `--inv-max-degree 255` is not a taste: the LAST Cho pass's degree is what
+# caps the level plan.
 set -u
 T="${1:-128}"
 B=/root/bert_base
-STAMP=$B/host_done_$T
-rm -f "$STAMP"
-cd /root/work/cheddar-bb/bert_base || exit 1
-mkdir -p "$B/ref$T" "$B/held_ref$T"
+R=$B/held_ref$T
+S=/root/work/cheddar-bb/bert_base
+MARGINS="--margin 5.0 --gelu-margin 1.8 --exp-margin 2.0 --exp-margin-hi 2.0
+         --inv-max-degree 255"
+rm -f "$B/host_done_$T"
+mkdir -p "$R"
+cd "$S" || exit 1
 
-# ---- the oracle: one prompt, twelve layers, its own calibration ----------
-( python3.12 -u reference.py "$B/all$T" "$B/ref$T" > "$B/ref$T/host.log" 2>&1 \
-    || echo REF_FAIL >> "$B/ref$T/host.log"
-  python3.12 -u sim.py "$B/all$T" "$B/ref$T/calib.json" --no-chain \
-    > "$B/ref$T/sim.log" 2>&1 || echo SIM_FAIL >> "$B/ref$T/sim.log" ) &
-
-# ---- the population calibration (1000 prompts) --------------------------
-( python3.12 -u sim.py "$B/all$T" "$B/held_ref$T/calib.json" \
-    --inputs "$B/all$T/prompts/inputs.f32" --no-chain \
-    > "$B/held_ref$T/sim.log" 2>&1 || echo SIM_FAIL >> "$B/held_ref$T/sim.log" ) &
+# ---- the population calibration (1000 prompts of the TRAIN split) --------
+( python3.12 -u sim.py "$B/all$T" "$R/calib.json" \
+    --inputs "$B/all$T/prompts/inputs.f32" --no-chain $MARGINS \
+    > "$R/sim.log" 2>&1 || echo SIM_FAIL >> "$R/sim.log" ) &
 
 # ---- the held-out prompts the card serves, through float64 --------------
-( python3.12 -u reference.py "$B/all$T" "$B/held_ref$T" \
-    --inputs "$B/held$T/serve/inputs.f32" --mask "$B/held$T/serve/mask.u8" \
-    > "$B/held_ref$T/host.log" 2>&1 || echo REF_FAIL >> "$B/held_ref$T/host.log" ) &
+( python3.12 -u reference.py "$B/all$T" "$R" \
+    --inputs "$B/held$T/serve/prompts/inputs.f32" \
+    --mask "$B/held$T/serve/prompts/mask.u8" \
+    > "$R/host.log" 2>&1 || echo REF_FAIL >> "$R/host.log" ) &
 wait
-date -u > "$STAMP"
+date -u > "$B/host_done_$T"
 echo "==== $(date -u) BB_HOST_DONE T=$T"
-grep -l FAIL "$B/ref$T"/*.log "$B/held_ref$T"/*.log 2>/dev/null
+grep -l FAIL "$R"/*.log 2>/dev/null
+tail -3 "$R/sim.log"
