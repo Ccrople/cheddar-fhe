@@ -150,9 +150,19 @@ digit (only the reported `fit_err` moves, at 1e-9 relative).
   picks every degree and window, and writes `calib.json`. **This is where
   every knob is DECIDED; the C++ only reads it.**
 * `bert_base/debug.py` -- the tapped intermediates against the model.
+* `bert_base/failure.py` -- the other direction: `sim.py` WRITES a
+  calibration, this READS one and asks how many held-out prompts it serves.
+  Every polynomial is rebuilt at the interval and degree that ship, and
+  every escape is attributed to the PROMPT it came from (`Poly.escapes` is
+  a global counter and cannot). `--merge` turns the parts into a rate.
+* `bert_base/wikitext.py` -- WikiText-2 raw, train and test, as plain text.
 * `extension/CiBertBase.*` -- `CiBertBaseLayer`; `unittest/CiBertBaseTest.cpp`
   -- the chain against `h_L{k}.f64`.
-* `bert_base/vessl_{setup,host,run}.sh` -- bring-up, the host half, one run.
+* `bert_base/vessl_{setup,data,host,held,scan}.sh` -- bring-up, every
+  dataset, the calibration + float64 reference, one held-out crypto run,
+  and the 50,000-prompt host scan. `pull.sh` takes the small
+  irreplaceable things back to the laptop, which the last session did not
+  do and paid for.
 
 ## 4. The knob ledger
 
