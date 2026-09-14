@@ -108,8 +108,13 @@ class Checked:
         return C.chebval(t, self.c) if self.approximate else self.f(x)
 
 
-def rebuild(m, cal, tracer, approximate, L):
-    """Layer L's four hooks, from the calibration as it ships."""
+def rebuild(m, cal, tracer, approximate, L, dt=np.float64):
+    """Layer L's four hooks, from the calibration as it ships.
+
+    `dt` is the stream's dtype: the shift and the fold estimates are public
+    TABLES that multiply it, so they have to follow it or every layer
+    silently promotes back to float64.
+    """
     cj = cal["layers"][L]
     mk = lambda f, j, tag: Checked(f, j["lo"], j["hi"], j["degree"],  # noqa: E731
                                    "L%02d.%s" % (L, tag), tracer, approximate)
@@ -117,8 +122,8 @@ def rebuild(m, cal, tracer, approximate, L):
     ln_f = lambda v: 1.0 / np.sqrt(v + m.eps)                        # noqa: E731
 
     s = cj["softmax"]
-    est = [None if not e else np.asarray(e) for e in s.get("est", [])] or None
-    sm = ChoSoftmax(s["niter"], np.asarray(s["shift"]),
+    est = [None if not e else np.asarray(e, dtype=dt) for e in s.get("est", [])] or None
+    sm = ChoSoftmax(s["niter"], np.asarray(s["shift"], dtype=dt),
                     mk(np.exp, s["exp"], "exp"),
                     [mk(inv_sqrt, q, "inv%d" % j) for j, q in enumerate(s["inv"])],
                     est, s.get("est_live_pow") or None)
@@ -138,6 +143,9 @@ def main():
     ap.add_argument("--inputs", default="")
     ap.add_argument("--ids", default="", help="ids.u32 instead of inputs.f32")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--f32", action="store_true",
+                    help="run the scan in float32 (~2x); the verdict is a "
+                         "ratio of order one, so f32's 1e-7 decides nothing")
     ap.add_argument("--mask", default="")
     ap.add_argument("--slice", default="0/1", help="i/W: prompts i::W")
     ap.add_argument("--out", default="")
@@ -151,6 +159,14 @@ def main():
     a = ap.parse_args()
 
     m = Model(a.all_dir)
+    if a.f32:
+        # The scan decides a RATIO of order one (is |t| over 1?), and f32's
+        # 1e-7 is nowhere near any margin; sgemm is about twice dgemm, which
+        # is half of a 50,000-prompt scan. The reference chain the crypto is
+        # measured against stays float64 -- that is `reference.py`'s job.
+        m.w = [{k: v.astype(np.float32) for k, v in w.items()} for w in m.w]
+        if m.head_w is not None:
+            m.head_w = {k: v.astype(np.float32) for k, v in m.head_w.items()}
     cal = json.load(open(a.calib))
     assert cal["tokens"] == m.T, (cal["tokens"], m.T)
     NL = a.layers or min(m.NL, cal["layers_total"])
@@ -176,8 +192,11 @@ def main():
              "approximated" if a.approx else "exact", chunk), flush=True)
 
     tracer = Tracer(n)
-    hooks = [rebuild(m, cal, tracer, a.approx, L) for L in range(NL)]
+    dt = np.float32 if a.f32 else np.float64
+    hooks = [rebuild(m, cal, tracer, a.approx, L, dt) for L in range(NL)]
     am = Model.additive_mask(valid)
+    if am is not None and a.f32:
+        am = am.astype(np.float32)          # -inf survives the cast
     rel = np.zeros(n) if a.approx else None       # the last layer's, per prompt
     agree = np.zeros(n, dtype=bool) if a.head else None
     tanh = None
@@ -221,6 +240,8 @@ def main():
         tracer.base = c0
         sel = idx[c0:c1]
         h = m.embed_ids(ids[sel]) if a.ids else xs[sel]
+        if a.f32:
+            h = h.astype(np.float32)
         e = h
         mc = None if am is None else am[c0:c1]
         for L in range(NL):
