@@ -339,6 +339,19 @@ def main():
                          "that beats it lands above `hi` by the excess over "
                          "2^k -- four layers of BERT-Base did exactly that.")
     ap.add_argument("--gelu-margin", type=float, default=1.2)
+    ap.add_argument("--ln-margin", type=float, default=0.0,
+                    help="the LayerNorms' variance window margin (0 = "
+                         "--margin). It should NOT be the softmax's. A "
+                         "1/sqrt window's width is what multiplies the "
+                         "input's error on the way out, and 50,000 held-out "
+                         "prompts say the LayerNorms do not need the room: "
+                         "at every layer their largest variance maps to "
+                         "t = -0.58, only 1.04x the calibration's own "
+                         "maximum, so `--margin 5.0` spends a 25x window on "
+                         "a 4 % excess. At layer 9 that is 100,934x instead "
+                         "of 4,037x -- and layer 10 then blew up at 2^+130 "
+                         "on a held-out batch whose every slot was INSIDE "
+                         "its windows.")
     ap.add_argument("--ffn-tile", type=int, default=256,
                     help="hidden channels a feed-forward tile: the layer's "
                          "memory peak AND the GELU's band, since a hidden "
@@ -401,6 +414,7 @@ def main():
     amask = Model.additive_mask(valid)
     N = x.shape[0]
     chunk = max(1, min(a.chunk, N))
+    lnm = a.ln_margin if a.ln_margin > 0 else a.margin
     print("calibration: %d prompt(s), T %d, H %d, %d layers%s" % (
         N, m.T, m.H, m.NL, "" if valid is None else
         ", padded (real tokens %d..%d)" % (int(valid.sum(axis=1).min()),
@@ -463,8 +477,8 @@ def main():
         for tag in ("ln1", "ln2"):
             var = p.var[tag]
             lo, hi = float(var.min()), float(var.max())
-            lns[tag] = Poly(lambda v: 1.0 / np.sqrt(v + m.eps), lo / a.margin,
-                            hi * a.margin, a.tol, relative=True, name=tag,
+            lns[tag] = Poly(lambda v: 1.0 / np.sqrt(v + m.eps), lo / lnm,
+                            hi * lnm, a.tol, relative=True, name=tag,
                             max_degree=a.ln_max_degree)
         # the GELU, one fit per feed-forward tile, channels sorted by |u|
         perm = np.argsort(-p.uch)
@@ -608,7 +622,8 @@ def main():
            "ffn_tile": min(a.ffn_tile, m.I),
            "calibration_prompts": N,
            "knobs": {"tol": a.tol, "margin": a.margin, "exp_margin": a.exp_margin,
-                     "gelu_margin": a.gelu_margin, "sq_ratio": a.sq_ratio,
+                     "gelu_margin": a.gelu_margin, "ln_margin": lnm,
+                     "sq_ratio": a.sq_ratio,
                      "exp_margin_hi": exp_hi_margin,
                      "inv_max_degree": a.inv_max_degree,
                      "chan_cap": a.chan_cap,
