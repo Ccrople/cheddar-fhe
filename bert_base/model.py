@@ -71,6 +71,29 @@ class Model:
         a = np.fromfile(path, dtype=np.float32).astype(np.float64)
         return a.reshape(-1, self.T, self.H)
 
+    def ids(self, path):
+        """`ids.u32` [N, T] -> int [N, T]."""
+        return np.fromfile(path, dtype=np.uint32).reshape(-1, self.T).astype(np.int64)
+
+    def embed_ids(self, ids):
+        """Token ids -> the encoder's input, [n, T, H]: the three embedding
+        tables and the embedding LayerNorm, exactly `export.py`'s `embed`.
+
+        This is the client's half. It exists so a big held-out scan can ship
+        ids (100 MB) instead of inputs (78 GB at T = 512, N = 50,000)."""
+        if not hasattr(self, "_emb"):
+            V, P = self.meta["vocab"], self.meta["max_position"]
+            self._emb = (self._load("emb_word.f32", (V, self.H)),
+                         self._load("emb_pos.f32", (P, self.H)),
+                         self._load("emb_type.f32", (2, self.H)),
+                         self._load("emb_norm.f32", (self.H,)),
+                         self._load("emb_norm_bias.f32", (self.H,)))
+        we, wp, wt, g, b = self._emb
+        x = we[ids] + wp[:self.T][None] + wt[0][None, None, :]
+        xc = x - x.mean(axis=-1, keepdims=True)
+        var = (xc * xc).mean(axis=-1, keepdims=True)
+        return xc / np.sqrt(var + self.eps) * g + b
+
     def valid(self, path):
         """`mask.u8` [N, T] (1 = real token) -> bool [N, T]; None if absent."""
         if not path or not os.path.isfile(path):

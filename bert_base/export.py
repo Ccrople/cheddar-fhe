@@ -124,11 +124,25 @@ def tokenizer(path):
     return BertWordPieceTokenizer(os.path.join(path, "vocab.txt"), lowercase=True)
 
 
-def windows(tok, text, T, n):
-    """`n` disjoint id windows of exactly T tokens: [CLS] + (T-2) pieces + [SEP]."""
+def windows(tok, text, T, n, seed=0):
+    """`n` id windows of exactly T tokens: [CLS] + (T-2) pieces + [SEP].
+
+    Disjoint while the text affords it. `seed` > 0 takes RANDOM starts
+    instead, which is how a held-out set larger than the corpus's disjoint
+    window count is drawn -- WikiText-2's test split is ~280k pieces, so it
+    holds ~2,200 disjoint windows at T = 128 and ~550 at T = 512. Random
+    starts give as many distinct prompts as asked for, but they OVERLAP, so
+    the draws are correlated and a rate measured on them is not the rate of
+    that many independent prompts.
+    """
     ids = tok.encode(text, add_special_tokens=False).ids
     cls_id, sep_id = tok.token_to_id("[CLS]"), tok.token_to_id("[SEP]")
     body = T - 2
+    if seed and len(ids) < body * n:
+        assert len(ids) > body, "the text is shorter than one window"
+        rng = np.random.default_rng(seed)
+        st = rng.integers(0, len(ids) - body, size=n)
+        return [[cls_id] + ids[s:s + body] + [sep_id] for s in st]
     assert len(ids) >= body * n, "the text has %d pieces, %d windows of %d need %d" % (
         len(ids), n, body, body * n)
     return [[cls_id] + ids[i * body:(i + 1) * body] + [sep_id] for i in range(n)]
@@ -147,6 +161,56 @@ def embed(table, ids, T, eps):
     return xc / np.sqrt(var + eps) * g + b
 
 
+def emit_prompts(a, table, tok, T, eps):
+    """`prompts/` under `a.out`: inputs.f32 [N, T, H], mask.u8 [N, T], ids.txt.
+
+    `--prompts-only` writes just this, which is how a HELD-OUT set is made
+    from a corpus the calibration never saw.
+    """
+    text = open(a.corpus, encoding="utf-8", errors="ignore").read()
+    n = a.prompts
+    if n < 0:                       # as many disjoint windows as the text has
+        n = len(tok.encode(text, add_special_tokens=False).ids) // (T - 2)
+    ws = windows(tok, text, T, n, a.seed if a.overlap else 0)
+    valid = np.ones((n, T), dtype=np.uint8)
+    if a.min_len > 0:
+        # Random real lengths: [CLS] body [SEP] then [PAD] to T. The mask is
+        # what the attention multiplies its exp by; padded positions are
+        # still computed (as BERT does) and never read.
+        rng = np.random.default_rng(a.seed)
+        pad_id, sep_id = tok.token_to_id("[PAD]"), tok.token_to_id("[SEP]")
+        for i, w in enumerate(ws):
+            k = int(rng.integers(a.min_len, T + 1))
+            ws[i] = w[:k - 1] + [sep_id] + [pad_id] * (T - k)
+            valid[i, k:] = 0
+    pd = os.path.join(a.out, "prompts")
+    os.makedirs(pd, exist_ok=True)
+    valid.tofile(os.path.join(pd, "mask.u8"))
+    np.asarray(ws, dtype=np.uint32).tofile(os.path.join(pd, "ids.u32"))
+    with open(os.path.join(pd, "ids.txt"), "w") as f:
+        for w in ws:
+            f.write(" ".join(str(i) for i in w) + "\n")
+    if a.ids_only:
+        # 50,000 x [512, 768] in f32 is 78 GB; the ids are 100 MB and the
+        # embedding is a gather and a LayerNorm (`Model.embed_ids`).
+        print("prompts/: %d x %d ids (no inputs.f32), real tokens %d..%d"
+              % (n, T, int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max())))
+        return
+    # chunked, because [N, T, H] at N = 2000, T = 512 is 3 GB in float64
+    lo, mx = 0, 0.0
+    with open(os.path.join(pd, "inputs.f32"), "wb") as f:
+        while lo < n:
+            hi = min(n, lo + 256)
+            xs = np.stack([embed(table, w, T, eps) for w in ws[lo:hi]])
+            mx = max(mx, float(np.abs(xs).max()))
+            f.write(np.ascontiguousarray(xs.astype(np.float32)).tobytes())
+            lo = hi
+    H = os.path.getsize(os.path.join(pd, "inputs.f32")) // (4 * n * T)
+    print("prompts/: %d x [%d, %d], |x| <= %.4f, real tokens %d..%d"
+          % (n, T, H, mx,
+             int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max())))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -158,6 +222,15 @@ def main():
                     help="with --prompts: real tokens per prompt uniform in "
                          "[min-len, T] (padded with [PAD]); 0 = all exactly T")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--ids-only", action="store_true",
+                    help="write ids.u32 + mask.u8 and no inputs.f32; the "
+                         "reader embeds (Model.embed_ids). For big scans.")
+    ap.add_argument("--overlap", action="store_true",
+                    help="draw RANDOM window starts once the corpus runs out "
+                         "of disjoint ones (correlated draws; see windows())")
+    ap.add_argument("--prompts-only", action="store_true",
+                    help="write only prompts/ (the weights are already "
+                         "exported); this is how a HELD-OUT set is made")
     a = ap.parse_args()
     T = a.tokens
 
@@ -173,6 +246,11 @@ def main():
 
     def dump(name, arr):
         np.ascontiguousarray(arr.astype(np.float32)).tofile(os.path.join(a.out, name))
+
+    if a.prompts_only:
+        assert a.prompts != 0 and a.corpus, "--prompts-only needs --prompts/--corpus"
+        emit_prompts(a, table, tokenizer(path), T, eps)
+        return
 
     mats = [("wq.f32", "attention.self.query.weight", (H, H)),
             ("wk.f32", "attention.self.key.weight", (H, H)),
@@ -238,30 +316,7 @@ def main():
           % (a.model, NL, H, I, NH, H // NH, meta["input_absmax"]))
 
     if a.prompts > 0:
-        text = open(a.corpus, encoding="utf-8", errors="ignore").read()
-        ws = windows(tok, text, T, a.prompts)
-        valid = np.ones((a.prompts, T), dtype=np.uint8)
-        if a.min_len > 0:
-            # Random real lengths: [CLS] body [SEP] then [PAD] to T. The mask
-            # is what the attention multiplies its exp by; padded positions
-            # are still computed (as BERT does) and never read.
-            rng = np.random.default_rng(a.seed)
-            pad_id, sep_id = tok.token_to_id("[PAD]"), tok.token_to_id("[SEP]")
-            for i, w in enumerate(ws):
-                n = int(rng.integers(a.min_len, T + 1))
-                ws[i] = w[:n - 1] + [sep_id] + [pad_id] * (T - n)
-                valid[i, n:] = 0
-        xs = np.stack([embed(table, w, T, eps) for w in ws])
-        pd = os.path.join(a.out, "prompts")
-        os.makedirs(pd, exist_ok=True)
-        np.ascontiguousarray(xs.astype(np.float32)).tofile(os.path.join(pd, "inputs.f32"))
-        valid.tofile(os.path.join(pd, "mask.u8"))
-        with open(os.path.join(pd, "ids.txt"), "w") as f:
-            for w in ws:
-                f.write(" ".join(str(i) for i in w) + "\n")
-        print("prompts/: %d x [%d, %d], |x| <= %.4f, real tokens %d..%d"
-              % (a.prompts, T, H, float(np.abs(xs).max()),
-                 int(valid.sum(axis=1).min()), int(valid.sum(axis=1).max())))
+        emit_prompts(a, table, tok, T, eps)
     print("done ->", a.out)
 
 
